@@ -1,0 +1,2789 @@
+from __future__ import annotations
+
+import argparse
+import array
+import base64
+import concurrent.futures
+import difflib
+import hashlib
+import importlib.util
+import io
+import json
+import math
+import mimetypes
+import os
+import re
+import shutil
+import sqlite3
+import subprocess
+import sys
+import tempfile
+import time
+import urllib.error
+import urllib.request
+import uuid
+from pathlib import Path
+from typing import Any
+
+
+VIDEO_EXTENSIONS = {".mp4", ".mkv", ".webm", ".mov", ".avi", ".m4v"}
+
+
+def load_dotenv(path: Path) -> None:
+    """專案 .env 覆蓋繼承來的環境變數。
+
+    setdefault 會讓全域環境變數贏過專案設定：像 MINIMAX_BASE_URL 這種通用名稱
+    常被別的工具設成不相容的值（例如 .../anthropic），照著 README 建 .env 也修不掉。
+    只有非空值才覆蓋，這樣直接複製 .env.example 不會把既有金鑰清成空字串。
+    """
+    if not path.is_file():
+        return
+    for raw_line in path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip()
+        value = value.strip().strip("\"'")
+        if key and value:
+            os.environ[key] = value
+
+
+def write_text(path: Path, content: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(path.name + ".tmp")
+    try:
+        temporary.write_text(content, encoding="utf-8")
+        temporary.replace(path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def write_json(path: Path, data: Any) -> None:
+    content = json.dumps(data, ensure_ascii=False, indent=2)
+    # 內容沒變就別動檔案：無條件覆寫會讓 mtime 前進，
+    # 下游靠時間戳判斷「digest 是否過期」就會被誤導成要重跑。
+    if path.is_file():
+        try:
+            if path.read_text(encoding="utf-8") == content:
+                return
+        except OSError:
+            pass
+    write_text(path, content)
+
+
+def run_external(command: list[str], *, cwd: Path | None = None, stream: bool = False) -> str:
+    print("$ " + subprocess.list2cmdline(command))
+    if stream:
+        # 下載／轉檔動輒數十分鐘，捕捉輸出等於全程無聲，看不出是在跑還是卡死。
+        # 直接讓子行程寫到終端機；失敗時錯誤已經印出來了，不必再回傳 detail。
+        sys.stdout.flush()
+        completed = subprocess.run(command, cwd=cwd)
+        if completed.returncode:
+            raise RuntimeError(f"外部指令失敗（{completed.returncode}）：{command[0]}")
+        return ""
+    completed = subprocess.run(
+        command,
+        cwd=cwd,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    if completed.returncode:
+        detail = (completed.stderr or completed.stdout).strip()
+        raise RuntimeError(f"外部指令失敗（{completed.returncode}）：{detail[-2000:]}")
+    return completed.stdout
+
+
+def require_tool(name: str) -> str:
+    path = shutil.which(name)
+    if not path:
+        raise RuntimeError(f"找不到 {name}，請先安裝並加入 PATH。")
+    return path
+
+
+def yt_dlp_command() -> list[str]:
+    executable = shutil.which("yt-dlp")
+    if executable:
+        return [executable]
+    if importlib.util.find_spec("yt_dlp"):
+        return [sys.executable, "-m", "yt_dlp"]
+    raise RuntimeError("找不到 yt-dlp；請執行 `python -m pip install yt-dlp`。")
+
+
+def job_key(source: str, variant: str = "") -> str:
+    material = source + "\x00" + variant
+    return hashlib.sha256(material.encode("utf-8")).hexdigest()[:12]
+
+
+def marker_matches(marker: Path, signature: str) -> bool:
+    """完成標記同時記錄當時的設定，設定變了就得重做。
+
+    這讓 job 目錄只由來源決定：換 --frame-interval 只重抽畫面，
+    已經抓好的字幕與已付費的逐字稿不會跟著作廢。
+    """
+    if not marker.is_file():
+        return False
+    try:
+        return marker.read_text(encoding="utf-8").strip() == signature
+    except OSError:
+        return False
+
+
+def artifact_path(path: Path, root: Path) -> str:
+    try:
+        return str(path.resolve().relative_to(root.resolve()))
+    except ValueError:
+        return str(path.resolve())
+
+
+def locate_source_video(job_dir: Path) -> Path:
+    candidates = sorted(
+        path
+        for path in job_dir.glob("source.*")
+        if path.suffix.lower() in VIDEO_EXTENSIONS
+    )
+    if not candidates:
+        raise RuntimeError(f"下載完成但找不到影片檔：{job_dir}")
+    return candidates[0]
+
+
+def reuse_artifact(path: Path, required_key: str = "") -> Any | None:
+    """載入既有的雲端產物；壞檔或空檔一律當作沒有，寧可重算也不要餵半份資料下去。
+
+    required_key：模型偶爾不回 JSON，parse_json_object 就退回 {"raw": ...}。
+    那種半成品若被當成有效快取，這支影片永遠不會重算——實測 142 支中有 2 支中招。
+    """
+    if not path.is_file():
+        return None
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return None
+    if not value or (isinstance(value, dict) and value.get("status") == "skipped"):
+        return None
+    if required_key and isinstance(value, dict) and not value.get(required_key):
+        return None
+    return value
+
+
+def source_title(job_dir: Path, video_path: Path) -> str:
+    """yt-dlp 的 info.json 有真實標題；本機檔案就退回檔名。"""
+    info_path = job_dir / "source.info.json"
+    if info_path.is_file():
+        try:
+            title = str(json.loads(info_path.read_text(encoding="utf-8")).get("title", "")).strip()
+            if title:
+                return title
+        except (json.JSONDecodeError, OSError):
+            pass
+    return video_path.stem
+
+
+def download_video(url: str, job_dir: Path) -> Path:
+    # 只信任完整標記：中斷會留下 source.f<id>.mp4 之類的分軌檔，
+    # 直接復用會拿到無音訊的純視訊軌。重跑 yt-dlp 會自行續傳並清掉分軌。
+    done = job_dir / ".download-complete"
+    if done.is_file():
+        return locate_source_video(job_dir)
+    job_dir.mkdir(parents=True, exist_ok=True)
+    command = yt_dlp_command() + [
+        "--no-playlist",
+        "--write-info-json",
+        "--merge-output-format",
+        "mp4",
+        "--output",
+        str(job_dir / "source.%(ext)s"),
+        url,
+    ]
+    run_external(command, stream=True)
+    video_path = locate_source_video(job_dir)
+    done.touch()
+    return video_path
+
+
+def probe_video(video_path: Path) -> dict[str, Any]:
+    output = run_external(
+        [
+            require_tool("ffprobe"),
+            "-v",
+            "error",
+            "-print_format",
+            "json",
+            "-show_format",
+            "-show_streams",
+            str(video_path),
+        ]
+    )
+    return json.loads(output)
+
+
+def video_duration(probe: dict[str, Any]) -> float:
+    value = probe.get("format", {}).get("duration")
+    if value is not None:
+        return float(value)
+    for stream in probe.get("streams", []):
+        if stream.get("codec_type") == "video" and stream.get("duration"):
+            return float(stream["duration"])
+    return 0.0
+
+
+def extract_audio(video_path: Path, job_dir: Path, chunk_seconds: int) -> list[Path]:
+    audio_dir = job_dir / "audio"
+    audio_dir.mkdir(parents=True, exist_ok=True)
+    done = audio_dir / ".complete"
+    signature = f"chunk={chunk_seconds}"
+    chunks = sorted(audio_dir.glob("audio_*.mp3"))
+    if chunks and marker_matches(done, signature):
+        return chunks
+    for stale in chunks:  # 半份切段會讓逐字稿無聲缺尾，重切前先清乾淨
+        stale.unlink()
+    run_external(
+        [
+            require_tool("ffmpeg"),
+            "-y",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-stats",  # loglevel error 會連進度一起關掉，長片轉檔需要看得到還在動
+            "-i",
+            str(video_path),
+            "-map",
+            "0:a:0",
+            "-vn",
+            "-ac",
+            "1",
+            "-ar",
+            "16000",
+            "-c:a",
+            "libmp3lame",
+            "-b:a",
+            "64k",
+            "-f",
+            "segment",
+            "-segment_time",
+            str(chunk_seconds),
+            "-reset_timestamps",
+            "1",
+            str(audio_dir / "audio_%04d.mp3"),
+        ],
+        stream=True,
+    )
+    chunks = sorted(audio_dir.glob("audio_*.mp3"))
+    if not chunks:
+        raise RuntimeError("FFmpeg 沒有產生音訊片段。")
+    write_text(done, signature)
+    return chunks
+
+
+def average_hash(image_path: Path) -> str:
+    try:
+        from PIL import Image
+
+        with Image.open(image_path) as image:
+            gray = image.convert("L").resize((8, 8))
+            get_pixels = getattr(gray, "get_flattened_data", gray.getdata)
+            values = list(get_pixels())
+    except ImportError as exc:
+        raise RuntimeError("截圖去重需要 Pillow；請執行 `python -m pip install Pillow`。") from exc
+    average = sum(values) / len(values)
+    return "".join("1" if value >= average else "0" for value in values)
+
+
+def hash_distance(left: str, right: str) -> int:
+    return sum(a != b for a, b in zip(left, right))
+
+
+def limit_items(items: list[Any], max_items: int) -> list[Any]:
+    if max_items <= 0:
+        raise ValueError("max_items 必須大於 0。")
+    if len(items) <= max_items:
+        return items
+    if max_items == 1:
+        return [items[0]]
+    selected_indexes = {
+        round(index * (len(items) - 1) / (max_items - 1))
+        for index in range(max_items)
+    }
+    return [item for index, item in enumerate(items) if index in selected_indexes]
+
+
+class OptionalOCR:
+    def __init__(self, enabled: bool) -> None:
+        self.engine = None
+        self.reason = "未啟用"
+        if not enabled:
+            return
+        if not importlib.util.find_spec("paddleocr"):
+            self.reason = "未安裝 paddleocr"
+            return
+        try:
+            from paddleocr import PaddleOCR
+
+            try:
+                self.engine = PaddleOCR(lang="ch")
+            except TypeError:
+                self.engine = PaddleOCR(use_angle_cls=True, lang="ch", show_log=False)
+            self.reason = "可用"
+        except Exception as exc:  # optional dependency is allowed to fail closed
+            self.reason = f"初始化失敗：{exc}"
+
+    def read(self, image_path: Path) -> tuple[str, float | None]:
+        if self.engine is None:
+            return "", None
+        try:
+            result = self.engine.ocr(str(image_path), cls=True)
+        except TypeError:
+            result = self.engine.ocr(str(image_path))
+        except Exception:
+            return "", None
+        texts: list[str] = []
+        scores: list[float] = []
+        for page in result or []:
+            if not isinstance(page, list):
+                continue
+            for line in page:
+                if not isinstance(line, (list, tuple)) or len(line) < 2:
+                    continue
+                detail = line[1]
+                if isinstance(detail, (list, tuple)) and len(detail) >= 2:
+                    texts.append(str(detail[0]))
+                    try:
+                        scores.append(float(detail[1]))
+                    except (TypeError, ValueError):
+                        pass
+        return "\n".join(texts), (sum(scores) / len(scores) if scores else None)
+
+
+def extract_candidates(
+    video_path: Path,
+    job_dir: Path,
+    interval: float,
+    hash_threshold: int,
+    max_frames: int,
+    ocr_enabled: bool,
+    ocr_threshold: float,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    frames_dir = job_dir / "frames"
+    frames_dir.mkdir(parents=True, exist_ok=True)
+    done = frames_dir / ".complete"
+    signature = f"interval={interval:g}"
+    all_frames = sorted(frames_dir.glob("frame_*.jpg"))
+    if all_frames and not marker_matches(done, signature):
+        # 半份截圖會讓下面的 index * interval 時間戳整條錯位，寧可重抽
+        for stale in all_frames:
+            stale.unlink()
+        all_frames = []
+    if not all_frames:
+        filter_value = f"fps=1/{interval:g},scale=1280:-2:force_original_aspect_ratio=decrease"
+        run_external(
+            [
+                require_tool("ffmpeg"),
+                "-y",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-stats",
+                "-i",
+                str(video_path),
+                "-vf",
+                filter_value,
+                "-q:v",
+                "3",
+                str(frames_dir / "frame_%06d.jpg"),
+            ],
+            stream=True,
+        )
+        all_frames = sorted(frames_dir.glob("frame_*.jpg"))
+    if not all_frames:
+        raise RuntimeError("FFmpeg 沒有產生截圖。")
+    write_text(done, signature)
+
+    ocr = OptionalOCR(ocr_enabled)
+    candidates: list[dict[str, Any]] = []
+    previous_hash = ""
+    previous_text = ""
+    for index, frame_path in enumerate(all_frames):
+        image_hash = average_hash(frame_path)
+        text, confidence = ocr.read(frame_path)
+        reasons: list[str] = []
+        distance = hash_distance(previous_hash, image_hash) if previous_hash else 64
+        if not previous_hash:
+            reasons.append("first_frame")
+        elif distance >= hash_threshold:
+            reasons.append("visual_change")
+        if confidence is not None and confidence < ocr_threshold:
+            reasons.append("low_ocr_confidence")
+        if text and previous_text:
+            similarity = difflib.SequenceMatcher(None, previous_text, text).ratio()
+            if similarity < 0.7:
+                reasons.append("text_change")
+        if reasons:
+            candidates.append(
+                {
+                    "timestamp": round(index * interval, 3),
+                    "path": str(frame_path),
+                    "hash": image_hash,
+                    "hash_distance": distance,
+                    "ocr_text": text,
+                    "ocr_confidence": confidence,
+                    "reasons": reasons,
+                }
+            )
+        previous_hash = image_hash
+        previous_text = text or previous_text
+
+    candidates = limit_items(candidates, max_frames)
+    metadata = {
+        "all_frame_count": len(all_frames),
+        "candidate_count": len(candidates),
+        "ocr": {"enabled": ocr_enabled, "status": ocr.reason},
+        "method": "fixed_interval_plus_average_hash",
+    }
+    return candidates, metadata
+
+
+def steipete_command() -> list[str]:
+    executable = shutil.which("summarize")
+    if executable:
+        return [executable]
+    npx = shutil.which("npx")
+    if npx:
+        return [npx, "-y", "@steipete/summarize"]
+    raise RuntimeError("找不到 summarize 或 npx；請安裝 Node 24+ 與 @steipete/summarize。")
+
+
+def extract_steipete_candidates(
+    video_path: Path,
+    job_dir: Path,
+    max_frames: int,
+    scene_threshold: float,
+    min_duration: float,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    slides_dir = job_dir / "steipete-slides"
+    output = run_external(
+        steipete_command()
+        + [
+            "slides",
+            str(video_path),
+            "--slides-ocr",
+            "--slides-dir",
+            str(slides_dir),
+            "--slides-max",
+            str(max_frames),
+            "--slides-min-duration",
+            str(min_duration),
+            "--slides-scene-threshold",
+            str(scene_threshold),
+            "--json",
+            "--render",
+            "none",
+        ]
+    )
+    payload = parse_json_object(output)
+    slide_data = payload.get("slides", {})
+    if not isinstance(slide_data, dict) or payload.get("ok") is False:
+        raise RuntimeError(f"steipete slides 回應格式錯誤：{payload}")
+    slides = slide_data.get("slides") or []
+    candidates: list[dict[str, Any]] = []
+    for slide in slides:
+        if not isinstance(slide, dict) or not slide.get("imagePath"):
+            continue
+        image_path = Path(str(slide["imagePath"]))
+        if not image_path.is_file():
+            continue
+        candidates.append(
+            {
+                "timestamp": float(slide.get("timestamp", 0)),
+                "path": str(image_path),
+                "hash": average_hash(image_path),
+                "hash_distance": None,
+                "ocr_text": str(slide.get("ocrText", "")),
+                "ocr_confidence": slide.get("ocrConfidence"),
+                "reasons": ["steipete_scene"],
+            }
+        )
+    write_json(job_dir / "steipete-slides.json", payload)
+    return candidates, {
+        "method": "steipete/summarize slides",
+        "all_frame_count": len(slides),
+        "candidate_count": len(candidates),
+        "ocr": {"enabled": True, "status": "steipete-tesseract"},
+        "warnings": slide_data.get("warnings", []),
+    }
+
+
+def multipart_body(fields: dict[str, str], file_field: str, file_path: Path) -> tuple[bytes, str]:
+    boundary = "----codex" + uuid.uuid4().hex
+    chunks: list[bytes] = []
+    for name, value in fields.items():
+        chunks.append(
+            f'--{boundary}\r\nContent-Disposition: form-data; name="{name}"\r\n\r\n{value}\r\n'.encode()
+        )
+    content_type = mimetypes.guess_type(file_path.name)[0] or "application/octet-stream"
+    chunks.append(
+        (
+            f'--{boundary}\r\nContent-Disposition: form-data; name="{file_field}"; '
+            f'filename="{file_path.name}"\r\nContent-Type: {content_type}\r\n\r\n'
+        ).encode()
+    )
+    chunks.append(file_path.read_bytes())
+    chunks.append(f"\r\n--{boundary}--\r\n".encode())
+    return b"".join(chunks), boundary
+
+
+# Whisper 遇到靜默會硬生出 "you"、"Thank you." 之類的幻覺文字。
+# 實測 85 分鐘直播（開頭近 20 分鐘無人聲）：幻覺段 no_speech_prob 全是 0.701，
+# 688 個正常段最高只有 0.414，0.6 完美分離、零誤殺。
+NO_SPEECH_PROB_LIMIT = 0.6
+
+
+def is_silence(no_speech: Any) -> bool:
+    return isinstance(no_speech, (int, float)) and not isinstance(no_speech, bool) and no_speech > NO_SPEECH_PROB_LIMIT
+
+
+RETRY_STATUS = {408, 425, 429, 500, 502, 503, 504}
+# urllib 預設送 Python-urllib/3.x，Groq 前面的 Cloudflare 會直接 403（error code 1010）。
+USER_AGENT = "video-library-pipeline/1.0"
+
+
+def retry_delay(exc: urllib.error.HTTPError, fallback: float) -> float:
+    """尊重伺服器的 Retry-After；解析不出來就用退避值。"""
+    header = exc.headers.get("Retry-After") if exc.headers else None
+    if header:
+        try:
+            return max(0.0, min(float(header), 120.0))
+        except ValueError:
+            pass
+    return fallback
+
+
+def request_json(
+    url: str,
+    headers: dict[str, str],
+    *,
+    method: str,
+    body: bytes | None = None,
+    timeout: int,
+    attempts: int = 4,
+) -> dict[str, Any]:
+    headers = {"User-Agent": USER_AGENT, **headers}
+    delay = 2.0
+    for attempt in range(1, attempts + 1):
+        request = urllib.request.Request(url, data=body, headers=headers, method=method)
+        try:
+            with urllib.request.urlopen(request, timeout=timeout) as response:
+                raw = response.read()
+            break
+        except urllib.error.HTTPError as exc:
+            detail = exc.read().decode("utf-8", errors="replace")
+            if exc.code in RETRY_STATUS and attempt < attempts:
+                wait = retry_delay(exc, delay)
+                print(f"! API HTTP {exc.code}，{wait:.0f} 秒後重試（{attempt}/{attempts - 1}）")
+                time.sleep(wait)
+                delay *= 2
+                continue
+            # 帶上 URL：base_url 被環境變數改掉時，光看「404 page not found」查不出原因。
+            raise RuntimeError(f"API HTTP {exc.code}（{url}）：{detail[:1200]}") from exc
+        # TimeoutError 不是 URLError 的子類，只接 URLError 會讓讀取逾時完全跳過重試
+        except (urllib.error.URLError, TimeoutError) as exc:
+            reason = getattr(exc, "reason", None) or type(exc).__name__
+            if attempt < attempts:
+                print(f"! API 網路錯誤（{reason}），{delay:.0f} 秒後重試（{attempt}/{attempts - 1}）")
+                time.sleep(delay)
+                delay *= 2
+                continue
+            raise RuntimeError(f"API 網路錯誤：{reason}") from exc
+    try:
+        return json.loads(raw.decode("utf-8"))
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"API 回應不是 JSON：{raw[:500]!r}") from exc
+
+
+def post_json(url: str, headers: dict[str, str], body: bytes, timeout: int = 180) -> dict[str, Any]:
+    return request_json(url, headers, method="POST", body=body, timeout=timeout)
+
+
+def get_json(url: str, headers: dict[str, str]) -> dict[str, Any]:
+    return request_json(url, headers, method="GET", timeout=30)
+
+
+def groq_transcribe(
+    audio_path: Path,
+    api_key: str,
+    model: str,
+    language: str,
+) -> dict[str, Any]:
+    fields = {
+        "model": model,
+        "response_format": "verbose_json",
+        "temperature": "0",
+        "timestamp_granularities[]": "segment",
+    }
+    # 不傳 language 就是讓 Whisper 自動偵測；硬指定語言會把外語音訊「翻譯」成垃圾。
+    if language and language != "auto":
+        fields["language"] = language
+    body, boundary = multipart_body(fields, "file", audio_path)
+    return post_json(
+        "https://api.groq.com/openai/v1/audio/transcriptions",
+        {
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": f"multipart/form-data; boundary={boundary}",
+        },
+        body,
+    )
+
+
+def transcribe_all(
+    chunks: list[Path],
+    api_key: str,
+    model: str,
+    language: str,
+    chunk_seconds: int,
+    workers: int,
+) -> dict[str, Any]:
+    def one(item: tuple[int, Path]) -> tuple[int, dict[str, Any]]:
+        index, path = item
+        return index, groq_transcribe(path, api_key, model, language)
+
+    results: dict[int, dict[str, Any]] = {}
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, min(workers, 4))) as pool:
+        futures = [pool.submit(one, item) for item in enumerate(chunks)]
+        for future in concurrent.futures.as_completed(futures):
+            index, result = future.result()
+            results[index] = result
+
+    detected = language
+    segments: list[dict[str, Any]] = []
+    for index in sorted(results):
+        result = results[index]
+        # 記下實際偵測到的語言；照抄傳入的 "auto" 會讓產物看不出這支影片到底是什麼語言
+        detected = result.get("language") or detected
+        offset = index * chunk_seconds
+        raw_segments = result.get("segments") or []
+        if not raw_segments and result.get("text"):
+            raw_segments = [{"start": 0, "end": chunk_seconds, "text": result["text"]}]
+        for segment in raw_segments:
+            text = str(segment.get("text", "")).strip()
+            if not text or is_silence(segment.get("no_speech_prob")):
+                continue
+            item = {
+                "start": round(float(segment.get("start", 0)) + offset, 3),
+                "end": round(float(segment.get("end", chunk_seconds)) + offset, 3),
+                "text": text,
+                "chunk": index,
+            }
+            for key in ("avg_logprob", "compression_ratio", "no_speech_prob"):
+                if key in segment:
+                    item[key] = segment[key]
+            segments.append(item)
+    return {"model": model, "language": detected, "segments": sorted(segments, key=lambda x: x["start"])}
+
+
+# YouTube 字幕按「畫面顯示行」切，每行 1–3 秒、中位 37 字元，最長不過 41。
+# 直接進索引等於檢索到的都是半句話（實測命中的 snippet 只有「《XState》,」），
+# RAG 拿到的上下文更是碎的。合併成段落級：34,768 筆 → 4,203 筆，中位 306 字元。
+CAPTION_MERGE_CHARS = 320
+CAPTION_MERGE_GAP = 2.0
+
+
+def parse_caption_json3(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    segments: list[dict[str, Any]] = []
+    for event in payload.get("events") or []:
+        text = "".join(part.get("utf8", "") for part in (event.get("segs") or [])).strip()
+        if not text:
+            continue
+        start = float(event.get("tStartMs", 0)) / 1000
+        segments.append(
+            {
+                "start": round(start, 3),
+                "end": round(start + float(event.get("dDurationMs", 0)) / 1000, 3),
+                "text": text,
+                "chunk": 0,
+            }
+        )
+    return sorted(segments, key=lambda item: item["start"])
+
+
+def merge_caption_segments(
+    segments: list[dict[str, Any]],
+    max_chars: int = CAPTION_MERGE_CHARS,
+    max_gap: float = CAPTION_MERGE_GAP,
+) -> list[dict[str, Any]]:
+    """把逐行字幕併成段落。時間戳取該段第一行的開始，才能正確跳轉。"""
+    merged: list[dict[str, Any]] = []
+    for segment in segments:
+        text = str(segment.get("text", "")).strip()
+        if not text:
+            continue
+        if (
+            merged
+            and len(merged[-1]["text"]) + len(text) + 1 <= max_chars
+            and float(segment["start"]) - float(merged[-1]["end"]) <= max_gap
+        ):
+            merged[-1]["text"] += " " + text
+            merged[-1]["end"] = segment["end"]
+        else:
+            merged.append(dict(segment, text=text))
+    return merged
+
+
+def fetch_youtube_transcript(url: str, job_dir: Path, language: str) -> dict[str, Any] | None:
+    """抓 YouTube 自帶字幕。實測與 Groq large-v3 幾乎逐字相同，但免費且不必下載音訊。
+
+    沒有字幕就回 None 讓呼叫端 fallback——不是每支影片都有。
+    """
+    job_dir.mkdir(parents=True, exist_ok=True)
+    wanted = "en-orig,en" if language in ("", "auto") else f"{language}-orig,{language}"
+    run_external(
+        yt_dlp_command()
+        + [
+            "--skip-download",
+            "--write-info-json",  # --no-video 模式下這是標題與時長的唯一來源
+            "--write-subs",
+            "--write-auto-subs",
+            "--sub-langs",
+            wanted,
+            "--sub-format",
+            "json3",
+            "--output",
+            str(job_dir / "source.%(ext)s"),
+            url,
+        ],
+        stream=True,
+    )
+    files = sorted(job_dir.glob("*.json3"))
+    if not files:
+        return None
+    try:
+        payload = json.loads(files[0].read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return None
+
+    segments = merge_caption_segments(parse_caption_json3(payload))
+    if not segments:
+        return None
+    return {
+        "model": f"youtube-captions/{files[0].name.split('.')[-2]}",
+        "language": language,
+        "segments": segments,
+    }
+
+
+_WHISPER_MODELS: dict[str, Any] = {}
+
+
+def transcribe_local(
+    chunks: list[Path],
+    model_size: str,
+    language: str,
+    chunk_seconds: int,
+) -> dict[str, Any]:
+    """本機 faster-whisper：不需要金鑰，也不受 Groq 的地區／VPN 封鎖影響。"""
+    try:
+        from faster_whisper import WhisperModel
+    except ImportError as exc:
+        raise RuntimeError(
+            "本機轉錄需要 faster-whisper；或改用 `--transcribe-backend groq`。"
+        ) from exc
+    if model_size not in _WHISPER_MODELS:
+        # 預設 CPU：device="cuda" 在建構時不會報錯，缺 cublas64_12.dll 要等到真的轉錄才炸，
+        # 那時音訊已經切好、時間也花掉了。要用 GPU 就明確指定 WHISPER_DEVICE=cuda。
+        device = os.getenv("WHISPER_DEVICE", "cpu")
+        compute = os.getenv("WHISPER_COMPUTE", "float16" if device == "cuda" else "int8")
+        _WHISPER_MODELS[model_size] = WhisperModel(model_size, device=device, compute_type=compute)
+    model = _WHISPER_MODELS[model_size]
+
+    detected = language
+    segments: list[dict[str, Any]] = []
+    for index, path in enumerate(chunks):
+        offset = index * chunk_seconds
+        # language=None 就是自動偵測，跟 Groq 版的 --language auto 對齊
+        result, info = model.transcribe(
+            str(path),
+            language=None if language in ("", "auto") else language,
+            vad_filter=True,
+        )
+        detected = getattr(info, "language", None) or detected
+        for segment in result:
+            text = (segment.text or "").strip()
+            if not text or is_silence(getattr(segment, "no_speech_prob", None)):
+                continue
+            segments.append(
+                {
+                    "start": round(segment.start + offset, 3),
+                    "end": round(segment.end + offset, 3),
+                    "text": text,
+                    "chunk": index,
+                    "avg_logprob": getattr(segment, "avg_logprob", None),
+                    "no_speech_prob": getattr(segment, "no_speech_prob", None),
+                }
+            )
+    return {
+        "model": f"faster-whisper/{model_size}",
+        "language": detected,
+        "segments": sorted(segments, key=lambda item: item["start"]),
+    }
+
+
+def image_data_url(image_path: Path) -> str:
+    try:
+        from PIL import Image
+
+        with Image.open(image_path) as image:
+            image = image.convert("RGB")
+            image.thumbnail((1280, 1280))
+            buffer = io.BytesIO()
+            image.save(buffer, format="JPEG", quality=80, optimize=True)
+            encoded = base64.b64encode(buffer.getvalue()).decode("ascii")
+            return f"data:image/jpeg;base64,{encoded}"
+    except ImportError:
+        encoded = base64.b64encode(image_path.read_bytes()).decode("ascii")
+        mime = mimetypes.guess_type(image_path.name)[0] or "image/jpeg"
+        return f"data:{mime};base64,{encoded}"
+
+
+def minimax_endpoint() -> str:
+    base_url = os.getenv("MINIMAX_BASE_URL", "https://api.minimax.io/v1").rstrip("/")
+    if base_url.endswith("/chat/completions"):
+        return base_url
+    return base_url + "/chat/completions"
+
+
+def minimax_chat(
+    messages: list[dict[str, Any]],
+    api_key: str,
+    model: str,
+    max_tokens: int | None = None,
+    timeout: int = 180,
+) -> str:
+    # 預設不設上限：MiniMax-M3 是 reasoning 模型，<think> 會先吃掉配額，
+    # 給定的預算常常在真正的答案輸出前就用完，回傳半截 JSON。
+    payload: dict[str, Any] = {"model": model, "messages": messages, "temperature": 0.1}
+    if max_tokens:
+        payload["max_tokens"] = max_tokens
+    raw = post_json(
+        minimax_endpoint(),
+        {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+        json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+        timeout,
+    )
+    choices = raw.get("choices") or []
+    if not choices:
+        raise RuntimeError(f"MiniMax 回應缺少 choices：{raw}")
+    content = choices[0].get("message", {}).get("content", "")
+    if isinstance(content, list):
+        content = "".join(str(part.get("text", "")) for part in content if isinstance(part, dict))
+    # MiniMax-M3 是 reasoning 模型，回覆前面掛著 <think>…</think>。
+    # 走 parse_json_object 的地方剛好會忽略它，純文字回答卻會把推理過程一起印出來。
+    return re.sub(r"<think>.*?</think>", "", str(content), flags=re.DOTALL).strip()
+
+
+def parse_json_object(text: str) -> dict[str, Any]:
+    cleaned = text.strip()
+    cleaned = re.sub(r"^```(?:json)?\s*|\s*```$", "", cleaned, flags=re.IGNORECASE | re.DOTALL)
+    try:
+        value = json.loads(cleaned)
+        return value if isinstance(value, dict) else {"value": value}
+    except json.JSONDecodeError:
+        start, end = cleaned.find("{"), cleaned.rfind("}")
+        if start >= 0 and end > start:
+            try:
+                value = json.loads(cleaned[start : end + 1])
+                return value if isinstance(value, dict) else {"value": value}
+            except json.JSONDecodeError:
+                pass
+    return {"raw": text}
+
+
+def analyze_images(
+    candidates: list[dict[str, Any]],
+    api_key: str,
+    model: str,
+    workers: int = 1,
+) -> list[dict[str, Any]]:
+    def one(item: tuple[int, dict[str, Any]]) -> tuple[int, dict[str, Any]]:
+        index, candidate = item
+        local_ocr = str(candidate.get("ocr_text", "")).strip()
+        prompt = (
+            "請分析這張影片截圖，只輸出 JSON object，不要 Markdown。"
+            "欄位必須包含 screen_type、visible_text（字串陣列）、visual_summary、"
+            "important_details（字串陣列）、confidence（0 到 1）。"
+            "若看不清楚，保留空陣列並降低 confidence。"
+            # 同上：畫面觀察也要統一成繁體中文，知識庫才能用同一種語言檢索。
+            "描述文字一律用繁體中文，畫面上的原文照抄不要翻譯。"
+        )
+        if local_ocr:
+            prompt += f"\n本地 OCR 初篩文字（僅供交叉確認）：{local_ocr}"
+        response = minimax_chat(
+            [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": prompt},
+                        {"type": "image_url", "image_url": {"url": image_data_url(Path(candidate["path"]))}},
+                    ],
+                }
+            ],
+            api_key,
+            model,
+        )
+        observation = parse_json_object(response)
+        observation["timestamp"] = candidate["timestamp"]
+        observation["source_image"] = candidate["path"]
+        observation["local_ocr_text"] = local_ocr
+        observation["local_ocr_confidence"] = candidate.get("ocr_confidence")
+        return index, observation
+
+    results: dict[int, dict[str, Any]] = {}
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, min(workers, 4))) as pool:
+        futures = [pool.submit(one, item) for item in enumerate(candidates)]
+        for future in concurrent.futures.as_completed(futures):
+            index, observation = future.result()
+            results[index] = observation
+    return [results[index] for index in sorted(results)]
+
+
+def merge_timeline(transcript: dict[str, Any], observations: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    events: list[dict[str, Any]] = []
+    for segment in transcript.get("segments", []):
+        events.append(
+            {
+                "timestamp": segment["start"],
+                "end": segment.get("end"),
+                "type": "speech",
+                "text": segment["text"],
+                "source": {key: value for key, value in segment.items() if key not in {"start", "end", "text"}},
+            }
+        )
+    for observation in observations:
+        events.append({"timestamp": observation["timestamp"], "type": "visual", "data": observation})
+    return sorted(events, key=lambda event: (event["timestamp"], event["type"]))
+
+
+def local_observations(candidates: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [
+        {
+            "timestamp": candidate["timestamp"],
+            "screen_type": "候選畫面",
+            "visible_text": [line for line in str(candidate.get("ocr_text", "")).splitlines() if line],
+            "visual_summary": "尚未執行 MiniMax 視覺理解。",
+            "important_details": [],
+            "confidence": candidate.get("ocr_confidence"),
+            "source_image": candidate.get("path"),
+            "local_ocr_text": candidate.get("ocr_text", ""),
+            "local_ocr_confidence": candidate.get("ocr_confidence"),
+        }
+        for candidate in candidates
+    ]
+
+
+def summary_input(timeline: list[dict[str, Any]], max_chars: int) -> list[dict[str, Any]]:
+    selected: list[dict[str, Any]] = []
+    size = 0
+    for event in timeline:
+        encoded = json.dumps(event, ensure_ascii=False)
+        if selected and size + len(encoded) > max_chars:
+            break
+        selected.append(event)
+        size += len(encoded)
+    return selected
+
+
+def create_summary(
+    timeline: list[dict[str, Any]],
+    api_key: str,
+    model: str,
+    max_chars: int,
+) -> dict[str, Any]:
+    compact = summary_input(timeline, max_chars)
+    prompt = (
+        "你是影片知識整理員。根據以下依時間排序的語音與畫面事件，輸出 JSON object。"
+        "欄位：short_summary、chapters（含 title、start、end、summary）、"
+        "steps（字串陣列）、tools_and_terms（字串陣列）、"
+        "fact_check（含 timestamp、claim、reason 的陣列）、source_timestamps（數字陣列）。"
+        "不要捏造事件中沒有的內容；不確定的資訊放入 fact_check。"
+        # 不指定的話模型會跟著逐字稿語言走，外語影片產出外語摘要，中文查詢就搜不到。
+        "所有文字欄位一律用繁體中文書寫，專有名詞可保留原文。\n\n"
+        + json.dumps(compact, ensure_ascii=False)
+    )
+    summary = parse_json_object(minimax_chat([{"role": "user", "content": prompt}], api_key, model))
+    if not summary.get("short_summary"):
+        # 模型偶爾不回 JSON。重試一次通常就好，總比留下一份沒人發現的半成品強。
+        print("! 摘要不是有效 JSON，重試一次")
+        summary = parse_json_object(minimax_chat([{"role": "user", "content": prompt}], api_key, model))
+    return summary
+
+
+def source_link(url: Any, timestamp: Any) -> str:
+    """把來源 URL 加上時間戳，讓每筆結果都能直接跳到影片的那一秒。
+
+    認不出的網域就原樣回傳——寧可少個參數，也不要生出打不開的連結。
+    """
+    if not url or not isinstance(url, str):
+        return ""
+    if isinstance(timestamp, bool) or not isinstance(timestamp, (int, float)):
+        return url
+    seconds = max(0, int(timestamp))
+    if not seconds:
+        return url
+    joiner = "&" if "?" in url else "?"
+    if "youtube.com" in url or "youtu.be" in url:
+        return f"{url}{joiner}t={seconds}s"
+    if "facebook.com" in url or "fb.watch" in url:
+        return f"{url}{joiner}t={seconds}"
+    return url
+
+
+def format_timestamp(value: Any) -> str:
+    total = max(0, int(float(value or 0)))
+    hours, remainder = divmod(total, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+
+
+def render_knowledge_markdown(
+    job_dir: Path,
+    source: dict[str, Any],
+    video_path: Path,
+    transcript: dict[str, Any],
+    observations: list[dict[str, Any]],
+    timeline: list[dict[str, Any]],
+    summary: dict[str, Any] | None,
+) -> Path:
+    # 用真實影片標題；退回檔名的話每支影片在 Open Notebook 裡都叫「source」，認不出來。
+    title = source.get("title") or Path(source.get("resolved_video") or video_path.name).stem
+    lines = [f"# {title}", "", "## 來源", ""]
+    if source.get("url"):
+        lines.append(f"- URL：{source['url']}")
+    lines.extend(
+        [
+            f"- 影片檔：`{video_path.name}`",
+            f"- 工作目錄：`{job_dir.name}`",
+            "- 內容管線：yt-dlp／FFmpeg／Groq Whisper／steipete 或 native／MiniMax",
+            "",
+        ]
+    )
+
+    if summary and summary.get("short_summary"):
+        lines.extend(["## 摘要", "", str(summary["short_summary"]), ""])
+    elif summary and summary.get("status") == "skipped":
+        lines.extend(["## 摘要", "", "尚未執行雲端摘要。", ""])
+
+    chapters = (summary or {}).get("chapters") or []
+    if chapters:
+        lines.extend(["## 章節", ""])
+        for chapter in chapters:
+            if not isinstance(chapter, dict):
+                continue
+            start = format_timestamp(chapter.get("start"))
+            end = format_timestamp(chapter.get("end"))
+            jump = source_link(source.get("url"), chapter.get("start"))
+            label = f"[`{start}–{end}`]({jump})" if jump else f"`{start}–{end}`"
+            lines.append(f"- {label} **{chapter.get('title', '未命名')}**：{chapter.get('summary', '')}")
+        lines.append("")
+
+    steps = (summary or {}).get("steps") or []
+    if steps:
+        lines.extend(["## 操作步驟", ""])
+        lines.extend(f"{index}. {step}" for index, step in enumerate(steps, 1))
+        lines.append("")
+
+    terms = (summary or {}).get("tools_and_terms") or []
+    if terms:
+        lines.extend(["## 工具與專有名詞", "", ", ".join(map(str, terms)), ""])
+
+    fact_checks = (summary or {}).get("fact_check") or []
+    if fact_checks:
+        lines.extend(["## 待查證資訊", ""])
+        for item in fact_checks:
+            if isinstance(item, dict):
+                # 待查證的東西最需要能一鍵跳回原片確認
+                jump = source_link(source.get("url"), item.get("timestamp"))
+                stamp = format_timestamp(item.get("timestamp"))
+                label = f"[`{stamp}`]({jump})" if jump else f"`{stamp}`"
+                lines.append(f"- {label} {item.get('claim', '')}；原因：{item.get('reason', '')}")
+        lines.append("")
+
+    lines.extend(["## 時間軸", ""])
+    if not timeline:
+        lines.append("尚未產生時間軸事件。")
+    for event in timeline:
+        timestamp = format_timestamp(event.get("timestamp"))
+        jump = source_link(source.get("url"), event.get("timestamp"))
+        stamp = f"[`{timestamp}`]({jump})" if jump else f"`{timestamp}`"
+        if event.get("type") == "speech":
+            lines.append(f"- {stamp} 語音：{event.get('text', '')}")
+            continue
+        data = event.get("data") or {}
+        screen_type = data.get("screen_type", "畫面")
+        visual_summary = data.get("visual_summary", "")
+        ocr_text = data.get("local_ocr_text") or "／".join(data.get("visible_text") or [])
+        detail = f"{screen_type}"
+        if visual_summary:
+            detail += f"；{visual_summary}"
+        if ocr_text:
+            detail += f"；OCR：{ocr_text}"
+        image_name = Path(str(data.get("source_image", ""))).name
+        if image_name:
+            detail += f"（畫面：`{image_name}`）"
+        lines.append(f"- {stamp} 畫面：{detail}")
+
+    lines.extend(
+        [
+            "",
+            "## 處理狀態",
+            "",
+            f"- 語音段落：{len(transcript.get('segments', []))}",
+            f"- 視覺觀察：{len(observations)}",
+            "- 本檔案由影片資料庫管線產生，可重新執行以更新內容。",
+            "",
+        ]
+    )
+    output = job_dir / "knowledge.md"
+    write_text(output, "\n".join(lines).rstrip() + "\n")
+    return output
+
+
+def open_notebook_sync(
+    knowledge_path: Path,
+    base_url: str,
+    notebook_id: str,
+    password: str,
+    sources_path: str,
+    wait_seconds: int,
+    title: str = "",
+    replace_source_id: str = "",
+) -> dict[str, Any]:
+    base_url = base_url.rstrip("/")
+    sources_url = base_url + "/" + sources_path.strip("/")
+    auth_headers = {"Authorization": f"Bearer {password}", "X-Password": password}
+
+    replaced = False
+    if replace_source_id:
+        # 重跑同一支影片時先撤掉上次的條目，否則 notebook 會積出一排同名 source。
+        try:
+            request_json(
+                f"{base_url}/api/sources/{replace_source_id}",
+                auth_headers,
+                method="DELETE",
+                timeout=30,
+            )
+            replaced = True
+        except RuntimeError as exc:
+            # 使用者可能已經在 UI 手動刪掉了，那不是錯誤。
+            if "HTTP 404" not in str(exc):
+                raise
+
+    fields = {"type": "upload", "notebook_id": notebook_id, "async_processing": "true"}
+    if title:
+        # 不傳的話 Open Notebook 拿檔名當標題，整個 notebook 會是一排 knowledge.md
+        fields["title"] = title
+    body, boundary = multipart_body(fields, "file", knowledge_path)
+    headers = {**auth_headers, "Content-Type": f"multipart/form-data; boundary={boundary}"}
+    response = post_json(sources_url, headers, body)
+    source_id = response.get("id") or ""
+    command_id = response.get("command_id") or response.get("commandId")
+    if not command_id:
+        return {"status": "accepted", "source_id": source_id, "replaced": replaced, "response": response}
+
+    deadline = time.monotonic() + max(0, wait_seconds)
+    # 實測 v1-latest：/commands/{id} 是 404，正確端點是 /api/commands/jobs/{id}，
+    # 且 id 必須保留 command: 前綴（去掉會 500）。
+    command_url = f"{base_url}/api/commands/jobs/{command_id}"
+    while time.monotonic() < deadline:
+        status_data = get_json(command_url, auth_headers)
+        status = str(
+            status_data.get("status")
+            or status_data.get("state")
+            or (status_data.get("command") or {}).get("status", "")
+        ).lower()
+        if status in {"completed", "complete", "success", "succeeded", "done"}:
+            return {
+                "status": "completed",
+                "command_id": command_id,
+                "source_id": source_id,
+                "replaced": replaced,
+                "response": status_data,
+            }
+        if status in {"failed", "error", "cancelled", "canceled"}:
+            raise RuntimeError(f"Open Notebook source processing 失敗：{status_data}")
+        time.sleep(2)
+    return {"status": "pending", "command_id": command_id, "source_id": source_id, "replaced": replaced}
+
+
+def flatten_text(value: Any) -> str:
+    """把巢狀的 summary／visual 觀察攤成一串可搜尋文字。"""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, dict):
+        return " ".join(flatten_text(item) for item in value.values())
+    if isinstance(value, list):
+        return " ".join(flatten_text(item) for item in value)
+    return ""
+
+
+def index_connection(root: Path) -> sqlite3.Connection:
+    connection = sqlite3.connect(root / "library.db")
+    # tokenize='trigram'：unicode61 會把整句中文吃成單一 token，中文查詢一律落空。
+    connection.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS videos (
+            job TEXT PRIMARY KEY,
+            title TEXT,
+            source TEXT,
+            status TEXT,
+            duration REAL,
+            indexed_at TEXT,
+            categories TEXT
+        );
+        CREATE VIRTUAL TABLE IF NOT EXISTS events USING fts5(
+            job UNINDEXED,
+            timestamp UNINDEXED,
+            kind UNINDEXED,
+            text,
+            tokenize='trigram'
+        );
+        """
+    )
+    # 不同模型的向量不能混用，vectors 必須記住是誰算的，而且主鍵要含 model——
+    # 單以 event_id 當主鍵的話，換模型 embed 會 REPLACE 掉前一顆的向量，兩顆無法共存。
+    # 舊表直接重建：向量重算很便宜，不值得寫欄位搬遷。
+    # videos 加了 categories 欄位；舊表直接重建（--index 幾秒就跑完，不值得寫搬遷）
+    video_columns = {row[1] for row in connection.execute("PRAGMA table_info(videos)")}
+    if video_columns and "categories" not in video_columns:
+        connection.execute("DROP TABLE videos")
+        connection.execute(
+            """
+            CREATE TABLE videos (
+                job TEXT PRIMARY KEY, title TEXT, source TEXT, status TEXT,
+                duration REAL, indexed_at TEXT, categories TEXT
+            )
+            """
+        )
+    # 以文字內容的 hash 當鍵，不是 events.rowid——
+    # --index 會對每個 job 做 DELETE+INSERT，FTS5 的 rowid 因此全部重新分配，
+    # 綁 rowid 的話每加一支新影片都得把全部向量重算（實測 5,418 筆要 218 秒）。
+    # 主鍵含 model：不同模型的向量要能共存，否則換模型會 REPLACE 掉前一顆。
+    columns = {row[1] for row in connection.execute("PRAGMA table_info(vectors)")}
+    if columns and "text_hash" not in columns:
+        connection.execute("DROP TABLE vectors")
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS vectors (
+            text_hash TEXT,
+            model TEXT,
+            dim INTEGER,
+            vector BLOB,
+            PRIMARY KEY (text_hash, model)
+        )
+        """
+    )
+    return connection
+
+
+def text_hash(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
+
+
+def index_job(connection: sqlite3.Connection, job_dir: Path) -> int:
+    manifest_path = job_dir / "manifest.json"
+    if not manifest_path.is_file():
+        return 0
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return 0
+    job = job_dir.name
+    if (manifest.get("status") or "") == "failed":
+        # 失敗的 job 沒有內容，留在索引裡只會讓「共幾支影片」這個數字說謊。
+        # 目錄本身保留（manifest 記著錯誤原因，可用來診斷）。
+        connection.execute(
+            "DELETE FROM vectors WHERE event_id IN (SELECT rowid FROM events WHERE job = ?)", (job,)
+        )
+        connection.execute("DELETE FROM events WHERE job = ?", (job,))
+        connection.execute("DELETE FROM videos WHERE job = ?", (job,))
+        return 0
+    source = manifest.get("source") or {}
+    # 向量以文字 hash 為鍵，不隨 events 重建而失效，所以這裡只清片段
+    connection.execute("DELETE FROM events WHERE job = ?", (job,))
+    connection.execute(
+        "INSERT OR REPLACE INTO videos VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (
+            job,
+            source.get("title") or "",
+            source.get("url") or source.get("video") or "",
+            manifest.get("status") or "",
+            (manifest.get("video") or {}).get("duration_seconds"),
+            time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            json.dumps(manifest.get("categories") or [], ensure_ascii=False),
+        ),
+    )
+
+    rows: list[tuple[str, Any, str, str]] = []
+    if source.get("title"):  # 用影片名找片是最直覺的查法，標題也得進全文索引
+        rows.append((job, 0, "title", str(source["title"])))
+    timeline_path = job_dir / "timeline.json"
+    if timeline_path.is_file():
+        try:
+            timeline = json.loads(timeline_path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            timeline = []
+        for event in timeline:
+            if not isinstance(event, dict):
+                continue
+            if event.get("type") == "speech":
+                text = str(event.get("text", "")).strip()
+            else:
+                text = flatten_text(event.get("data")).strip()
+            if text:
+                rows.append((job, event.get("timestamp"), str(event.get("type", "")), text))
+
+    summary_path = job_dir / "summary.json"
+    if summary_path.is_file():
+        try:
+            summary = json.loads(summary_path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            summary = {}
+        if isinstance(summary, dict) and summary.get("status") != "skipped":
+            text = flatten_text(summary).strip()
+            if text:
+                rows.append((job, 0, "summary", text))
+            # 章節另外建一筆：整份摘要那筆的 timestamp 只能是 0，命中了也跳不回影片；
+            # 章節自帶 start，而且範圍夠窄，向量比整份摘要聚焦得多。
+            for chapter in summary.get("chapters") or []:
+                if not isinstance(chapter, dict) or not chapter.get("title"):
+                    continue
+                detail = f"{chapter['title']}：{chapter.get('summary', '')}".strip("：")
+                rows.append((job, chapter.get("start") or 0, "chapter", detail))
+
+    connection.executemany("INSERT INTO events VALUES (?, ?, ?, ?)", rows)
+    return len(rows)
+
+
+def build_index(root: Path) -> tuple[Path, int, int]:
+    connection = index_connection(root)
+    try:
+        job_dirs = sorted(path.parent for path in root.glob("jobs/*/manifest.json"))
+        total = sum(index_job(connection, job_dir) for job_dir in job_dirs)
+        connection.commit()
+        # 回報實際進索引的支數，不是掃到的目錄數——失敗的 job 有目錄但沒內容。
+        indexed = connection.execute("SELECT count(*) FROM videos").fetchone()[0]
+    finally:
+        connection.close()
+    return root / "library.db", indexed, total
+
+
+# 片段合併後每筆約 300 字元，16 個 token 的窗口看不出上下文（只會顯示「…es to 《XState》, whic…」）
+SNIPPET_WIDTH = 40
+
+
+def make_snippet(text: str, query: str, width: int = SNIPPET_WIDTH) -> str:
+    """LIKE 掃描沒有 FTS5 的 snippet()，自己截一段並把命中詞框起來。"""
+    position = text.lower().find(query.lower())
+    if position < 0:
+        return text[: width * 2]
+    end_of_hit = position + len(query)
+    start = max(0, position - width)
+    end = min(len(text), end_of_hit + width)
+    prefix = "… " if start > 0 else ""
+    suffix = " …" if end < len(text) else ""
+    return f"{prefix}{text[start:position]}《{text[position:end_of_hit]}》{text[end_of_hit:end]}{suffix}"
+
+
+def like_pattern(query: str) -> str:
+    escaped = query.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+    return f"%{escaped}%"
+
+
+def search_index(root: Path, query: str, limit: int, category: str = "") -> list[dict[str, Any]]:
+    db_path = root / "library.db"
+    if not db_path.is_file():
+        raise RuntimeError(f"索引不存在：{db_path}；先執行 `--index`。")
+
+    if not query.strip():
+        raise RuntimeError("搜尋字串不可為空。")
+
+    # categories 存成 JSON 陣列，用 LIKE 比對就夠——分類名是固定清單，不會誤匹配
+    category_clause = " AND videos.categories LIKE ?" if category else ""
+    scan = len(query) < 3
+    if scan:
+        # ponytail: trigram 索引窗口是 3 字元，「AI」「影片」這種兩字詞 MATCH 一定落空，
+        # 改掃全表。實測 5 萬列 80 ms（含下面的排序），線性成長；
+        # 真的大到會慢再換 jieba 斷詞另建 bigram 欄位。
+        where = "events.text LIKE ? ESCAPE '\\'"
+        # LIKE 沒有 FTS5 的 rank。自己排：標題命中最能代表整支影片，摘要次之，
+        # 逐字稿／畫面最後；同級再比出現次數（SQLite 無 occurrence 函式，用 replace 的長度差算）。
+        order = (
+            "CASE events.kind WHEN 'title' THEN 0 WHEN 'summary' THEN 1 ELSE 2 END, "
+            "(length(events.text) - length(replace(lower(events.text), ?, ''))) DESC, "
+            "events.rowid"
+        )
+        snippet_column = "events.text"
+        # 參數順序必須跟 SQL 中出現的順序一致：WHERE → 分類 → ORDER BY → LIMIT
+        category_params: tuple[Any, ...] = (f"%{category}%",) if category else ()
+        params: tuple[Any, ...] = (like_pattern(query),) + category_params + (query.lower(), limit)
+    else:
+        # 整段當 phrase 查，否則使用者輸入的 - 或 " 會被當成 FTS5 運算子而語法錯誤。
+        where = "events.text MATCH ?"
+        order = "rank"
+        snippet_column = f"snippet(events, 3, '《', '》', ' … ', {SNIPPET_WIDTH})"
+        category_params = (f"%{category}%",) if category else ()
+        params = ('"' + query.replace('"', '""') + '"',) + category_params + (limit,)
+
+    connection = index_connection(root)
+    try:
+        cursor = connection.execute(
+            f"""
+            SELECT videos.title, videos.source, events.job, events.timestamp,
+                   events.kind, {snippet_column}, events.text
+            FROM events JOIN videos ON videos.job = events.job
+            WHERE {where}{category_clause}
+            ORDER BY {order}
+            LIMIT ?
+            """,
+            params,
+        )
+        return [
+            {
+                "title": row[0],
+                "source": row[1],
+                "job": row[2],
+                "timestamp": row[3],
+                "kind": row[4],
+                "snippet": make_snippet(row[5], query) if scan else row[5],
+                "text": row[6],  # 完整原文：snippet 只有 16 字窗口，餵給 LLM 不夠用
+                "mode": "scan" if scan else "index",
+            }
+            for row in cursor
+        ]
+    finally:
+        connection.close()
+
+
+_LOCAL_EMBEDDERS: dict[str, Any] = {}
+
+
+def embed_texts_local(texts: list[str], model: str) -> list[list[float]]:
+    """本機 sentence-transformers。免費、離線、內容不外傳。"""
+    if model not in _LOCAL_EMBEDDERS:
+        try:
+            import torch
+            from sentence_transformers import SentenceTransformer
+        except ImportError as exc:
+            raise RuntimeError(
+                "本機嵌入需要 sentence-transformers 與 torch；"
+                "或改用 `--embed-backend openrouter`。"
+            ) from exc
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        _LOCAL_EMBEDDERS[model] = SentenceTransformer(model, device=device)
+    encoded = _LOCAL_EMBEDDERS[model].encode(texts, normalize_embeddings=False)
+    return [vector.tolist() for vector in encoded]
+
+
+def embed_texts(texts: list[str], api_key: str, model: str, backend: str = "openrouter") -> list[list[float]]:
+    if backend == "local":
+        return embed_texts_local(texts, model)
+    return embed_texts_openrouter(texts, api_key, model)
+
+
+def embed_texts_openrouter(texts: list[str], api_key: str, model: str) -> list[list[float]]:
+    """OpenRouter 的 embeddings 端點。模型清單查不到它、文件也沒寫，但實測可用。"""
+    response = post_json(
+        os.getenv("EMBED_BASE_URL", "https://openrouter.ai/api/v1").rstrip("/") + "/embeddings",
+        {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+        json.dumps({"model": model, "input": texts}, ensure_ascii=False).encode("utf-8"),
+    )
+    items = response.get("data") or []
+    if len(items) != len(texts):
+        raise RuntimeError(f"embedding 回傳數量不符：送 {len(texts)} 筆、收 {len(items)} 筆")
+    return [item["embedding"] for item in items]
+
+
+def pack_vector(vector: list[float]) -> bytes:
+    return array.array("f", vector).tobytes()
+
+
+def unpack_vector(blob: bytes) -> array.array:
+    vector = array.array("f")
+    vector.frombytes(blob)
+    return vector
+
+
+def similarity_cutoff(top_score: float, threshold: float | None = None) -> float:
+    if threshold is not None:
+        return threshold
+    return max(SIMILARITY_FLOOR, top_score * SIMILARITY_RATIO)
+
+
+def cosine(left: Any, right: Any) -> float:
+    dot = sum(a * b for a, b in zip(left, right))
+    left_norm = math.sqrt(sum(a * a for a in left))
+    right_norm = math.sqrt(sum(b * b for b in right))
+    return dot / (left_norm * right_norm) if left_norm and right_norm else 0.0
+
+
+# 免費額度算「呼叫次數」不算 token，所以批次要盡量塞滿。
+# 實測 OpenRouter embeddings 上限：256 可用，512 回 "exceeds maximum allowed batch size"。
+# 4,203 筆片段：batch=32 要 132 次，batch=256 只要 17 次。
+EMBED_BATCH_SIZE = 256
+
+
+def build_embeddings(
+    root: Path, api_key: str, model: str, backend: str = "openrouter", batch_size: int = EMBED_BATCH_SIZE
+) -> tuple[int, int]:
+    """只補算這個模型還沒算過的片段：重跑不重複付費，換模型則自動重算。"""
+    connection = index_connection(root)
+    try:
+        have = {row[0] for row in connection.execute("SELECT text_hash FROM vectors WHERE model = ?", (model,))}
+        seen: set[str] = set()
+        pending: list[tuple[str, str]] = []
+        for (text,) in connection.execute("SELECT text FROM events WHERE length(text) > 0"):
+            digest = text_hash(text)
+            if digest in have or digest in seen:
+                continue  # 內容相同的片段共用一份向量，不重複付費
+            seen.add(digest)
+            pending.append((digest, text))
+
+        done = 0
+        for start in range(0, len(pending), batch_size):
+            batch = pending[start : start + batch_size]
+            vectors = embed_texts([text for _, text in batch], api_key, model, backend)
+            connection.executemany(
+                "INSERT OR REPLACE INTO vectors VALUES (?, ?, ?, ?)",
+                [
+                    (digest, model, len(vector), pack_vector(vector))
+                    for (digest, _), vector in zip(batch, vectors)
+                ],
+            )
+            connection.commit()
+            done += len(batch)
+            print(f"  已嵌入 {done}/{len(pending)}")
+        total = connection.execute("SELECT count(*) FROM vectors WHERE model = ?", (model,)).fetchone()[0]
+        return done, total
+    finally:
+        connection.close()
+
+
+# 各家模型的分數尺度差很多：bge-m3 無關項也有 0.33，nemotron 無關項只有 0.004。
+# 寫死絕對門檻必定誤殺其中一種，改成「最高分的一半」再加一個很低的地板。
+# 0.10 有實測依據：nemotron vl 對無關查詢最高只到 0.089，對正確命中是 0.158 起。
+SIMILARITY_FLOOR = 0.10
+SIMILARITY_RATIO = 0.5
+# OpenRouter 預設走 :free（實測 cost=0）；本機走 bge-m3（HuggingFace 大小寫敏感）。
+DEFAULT_EMBED_MODEL = {"openrouter": "nvidia/nemotron-3-embed-1b:free", "local": "BAAI/bge-m3"}
+
+
+def semantic_search(
+    root: Path,
+    query: str,
+    api_key: str,
+    model: str,
+    limit: int,
+    backend: str = "openrouter",
+    threshold: float | None = None,
+) -> list[dict[str, Any]]:
+    db_path = root / "library.db"
+    if not db_path.is_file():
+        raise RuntimeError(f"索引不存在：{db_path}；先執行 `--index`。")
+    query_vector = embed_texts([query], api_key, model, backend)[0]
+    connection = index_connection(root)
+    try:
+        # 向量以文字 hash 為鍵，SQLite 沒有內建 sha256，所以在 Python 端對應
+        stored = dict(connection.execute("SELECT text_hash, vector FROM vectors WHERE model = ?", (model,)))
+        rows = [
+            (title, source, job, timestamp, kind, text, stored[text_hash(text)])
+            for title, source, job, timestamp, kind, text in connection.execute(
+                """
+                SELECT videos.title, videos.source, events.job, events.timestamp,
+                       events.kind, events.text
+                FROM events JOIN videos ON videos.job = events.job
+                """
+            )
+            if text_hash(text) in stored
+        ]
+    finally:
+        connection.close()
+    if not rows:
+        raise RuntimeError(f"索引裡沒有 {model} 的向量；先執行 `--embed`。")
+    # ponytail: 純 Python 全掃描。幾千個向量是毫秒級；真的大到會慢再換 sqlite-vec。
+    scored = sorted(
+        (
+            {
+                "title": row[0],
+                "source": row[1],
+                "job": row[2],
+                "timestamp": row[3],
+                "kind": row[4],
+                "text": row[5],
+                "snippet": row[5][:120],
+                "score": cosine(query_vector, unpack_vector(row[6])),
+                "mode": "semantic",
+            }
+            for row in rows
+        ),
+        key=lambda item: item["score"],
+        reverse=True,
+    )
+    # 沒有下限的話每次都回傳整個索引，末幾筆只是「最不像的那些」，不是命中。
+    if not scored:
+        return []
+    cutoff = similarity_cutoff(scored[0]["score"], threshold)
+    return [item for item in scored if item["score"] >= cutoff][:limit]
+
+
+def question_keywords(question: str, api_key: str, model: str) -> list[str]:
+    """把問句拆成檢索詞。
+
+    整句丟進 FTS5 是 phrase 比對，長問句必定 0 筆；靠標點斷詞對中文又沒用。
+    花一次便宜的呼叫換檢索品質，比自己寫斷詞規則划算。
+    """
+    prompt = (
+        "從問題抽出 2 到 5 個用於全文檢索的關鍵詞，只輸出 JSON："
+        '{"keywords": ["...", "..."]}。'
+        "關鍵詞要是會實際出現在影片逐字稿或畫面文字裡的名詞或動詞，"
+        "去掉「請問」「怎麼」「嗎」「如何」這類疑問詞。\n\n問題：" + question
+    )
+    try:
+        data = parse_json_object(minimax_chat([{"role": "user", "content": prompt}], api_key, model))
+        keywords = [str(item).strip() for item in (data.get("keywords") or []) if str(item).strip()]
+    except RuntimeError:
+        keywords = []
+    return keywords or [question]
+
+
+def answer_question(
+    root: Path,
+    question: str,
+    api_key: str,
+    model: str,
+    limit: int,
+    embed_key: str = "",
+    embed_model: str = "",
+    embed_backend: str = "",
+) -> dict[str, Any]:
+    if embed_backend:
+        # 有向量就直接拿問句比對語意，不必先抽關鍵詞——少一次呼叫，命中也更準。
+        keywords = ["（語意檢索）"]
+        hits = semantic_search(root, question, embed_key, embed_model, limit, embed_backend)
+    else:
+        keywords = question_keywords(question, api_key, model)
+        # 逐詞取滿再換下一個，等於讓第一個關鍵詞吃光配額——問「TDD 搭配 AI 編碼」時
+        # 抽出的是「Matt、TDD、AI、編碼」，人名 Matt 先塞滿，真正相關的 TDD 一筆都進不來。
+        # 改成輪流取：每個關鍵詞先貢獻第一名，再回頭拿第二名。
+        per_keyword = [search_index(root, keyword, limit) for keyword in keywords]
+        seen: set[tuple[Any, ...]] = set()
+        hits = []
+        for rank in range(limit):
+            for results in per_keyword:
+                if rank >= len(results):
+                    continue
+                hit = results[rank]
+                key = (hit["job"], hit["timestamp"], hit["kind"])
+                if key in seen:
+                    continue
+                seen.add(key)
+                hits.append(hit)
+                if len(hits) >= limit:
+                    break
+            if len(hits) >= limit:
+                break
+    if not hits:
+        return {"question": question, "keywords": keywords, "answer": "索引裡找不到相關片段。", "citations": []}
+
+    context = "\n".join(
+        f"[{index}] 《{hit['title'] or hit['job']}》 {format_timestamp(hit['timestamp'])} "
+        f"（{hit['kind']}）：{hit['text']}"
+        for index, hit in enumerate(hits, 1)
+    )
+    prompt = (
+        "你是影片知識庫的問答助手。只根據下列片段回答問題，"
+        "不要引入片段以外的知識；片段不足以回答就直說找不到。"
+        "回答用繁體中文，並在每個論點後標註引用編號如 [1]、[3]。\n\n"
+        f"問題：{question}\n\n片段：\n{context}"
+    )
+    answer = minimax_chat([{"role": "user", "content": prompt}], api_key, model)
+    return {"question": question, "keywords": keywords, "answer": answer, "citations": hits}
+
+
+def build_digest(root: Path, api_key: str, model: str, max_chars: int = 90000) -> Path:
+    """把每支影片的摘要合成一份全頻道總覽。
+
+    單支影片的 chapters／steps／術語表在 summary.json 裡已經有了，
+    這裡補的是它們看不到的東西：主題怎麼分群、哪些術語反覆出現、該照什麼順序看。
+    """
+    entries = load_video_entries(root)
+    if not entries:
+        raise RuntimeError("沒有可用的摘要；先跑完整流程（不加 --local-only／--dry-run）再產生總覽。")
+
+    # 有分類就由程式碼分群：模型每次都會漏掉不同的幾支，而 GROUP BY 不會。
+    catalog = reuse_artifact(root / "categories.json") or {}
+    order = [str(c) for c in (catalog.get("categories") or [])]
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    for item in entries:
+        for category in item["categories"] or ["未分類"]:
+            grouped.setdefault(category, []).append(item)
+    if grouped and any(item["categories"] for item in entries):
+        lines = []
+        for category in order + [c for c in grouped if c not in order]:
+            members = grouped.get(category)
+            if not members:
+                continue
+            lines.append(f"\n### {category}（{len(members)} 支）\n")
+            for item in sorted(members, key=lambda x: -float(x["minutes"] or 0)):
+                brief = (item["summary"] or "").split("。")[0][:70]
+                lines.append(f"- [{item['title']}]({item['url']}) · {item['minutes']} 分 — {brief}")
+        grouping = "\n".join(lines)
+        prompt = (
+            "下面是已經分好類的影片清單，分類與歸屬都已確定。請用繁體中文輸出 Markdown，"
+            "**不要重複列出影片清單**，只要：\n"
+            "1. 一段整體描述，說明這批影片涵蓋什麼\n"
+            "2. `## 反覆出現的工具與術語`：跨影片出現多次的詞，標註出現在哪幾支\n"
+            "3. `## 建議觀看順序`：依分類排出從入門到進階的路徑並說明理由\n"
+            "4. `## 涵蓋落差`：這批影片沒談到、但主題上應該要有的內容\n\n"
+            + json.dumps(
+                [
+                    {"category": c, "titles": [m["title"] for m in grouped[c]], "terms": [t for m in grouped[c] for t in m["terms"]][:20]}
+                    for c in grouped
+                ],
+                ensure_ascii=False,
+            )[:max_chars]
+        )
+        report = minimax_chat([{"role": "user", "content": prompt}], api_key, model, timeout=900)
+        header = f"# 影片知識庫總覽\n\n- 影片數：{len(entries)}\n- 分類數：{len(grouped)}\n\n"
+        output = root / "digest.md"
+        write_text(output, header + report.rstrip() + "\n\n## 主題分群\n" + grouping + "\n")
+        return output
+
+    # 影片夠多時 prompt 會爆掉。截斷要明說截了多少——悄悄砍掉會讓人以為總覽涵蓋全部。
+    dropped = 0
+    while len(json.dumps(entries, ensure_ascii=False)) > max_chars and len(entries) > 1:
+        entries.pop()
+        dropped += 1
+    if dropped:
+        print(f"! 摘要總量超過 {max_chars} 字元上限，本次總覽只涵蓋前 {len(entries)} 支，略過 {dropped} 支")
+
+    prompt = (
+        "你是知識庫編輯。下面是同一批影片各自的摘要，請輸出一份 Markdown 總覽，"
+        "全文用繁體中文，專有名詞保留原文。必須包含：\n"
+        "1. 一段整體描述，說明這批影片涵蓋什麼\n"
+        "2. `## 主題分群`：把影片按主題歸類，每群列出影片與一句話說明；"
+        "影片標題一律寫成 Markdown 連結 `[標題](url)`，url 用資料裡的欄位，不可杜撰\n"
+        "3. `## 反覆出現的工具與術語`：跨影片出現多次的詞，標註出現在哪幾支\n"
+        "4. `## 建議觀看順序`：從入門到進階排序並說明理由\n"
+        "5. `## 涵蓋落差`：這批影片沒談到、但主題上應該要有的內容\n"
+        "只根據提供的摘要，不要臆測影片沒有的內容。\n\n"
+        + json.dumps(entries, ensure_ascii=False, indent=2)
+    )
+    # 總覽要輸出上百個標題與連結，reasoning 模型會跑很久，180 秒的預設值不夠
+    report = minimax_chat([{"role": "user", "content": prompt}], api_key, model, timeout=900)
+
+    # 模型會自行取捨，實測 142 支裡漏掉 8 支且毫無提示。與其重跑，不如補在末尾——
+    # 「總覽」漏了東西卻不說，比列得不夠漂亮嚴重得多。
+    missing = [item for item in entries if item["title"] and item["title"][:20] not in report]
+    if missing:
+        print(f"! 模型的分群漏掉 {len(missing)} 支，已補列在總覽末尾")
+        report = report.rstrip() + "\n\n## 未列入上述分群的影片\n\n" + "\n".join(
+            f"- [{item['title']}]({item['url']}) — {item['summary'] or ''}"[:300] for item in missing
+        )
+
+    header = f"# 影片知識庫總覽\n\n- 影片數：{len(entries)}\n\n"
+    output = root / "digest.md"
+    write_text(output, header + report.rstrip() + "\n")
+    return output
+
+
+CATEGORY_BATCH = 20
+
+
+def load_video_entries(root: Path) -> list[dict[str, Any]]:
+    """讀出所有已完成影片的標題與摘要，分類與總覽都用這份資料。"""
+    entries: list[dict[str, Any]] = []
+    for manifest_path in sorted(root.glob("jobs/*/manifest.json")):
+        summary = reuse_artifact(manifest_path.parent / "summary.json", "short_summary")
+        if summary is None:
+            continue
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            continue
+        if manifest.get("status") != "completed":
+            continue
+        source = manifest.get("source") or {}
+        entries.append(
+            {
+                "job": manifest_path.parent.name,
+                "title": source.get("title") or manifest_path.parent.name,
+                "url": source.get("url") or source.get("video"),
+                "minutes": round(float((manifest.get("video") or {}).get("duration_seconds") or 0) / 60, 1),
+                "summary": summary.get("short_summary"),
+                "chapters": [
+                    chapter.get("title")
+                    for chapter in (summary.get("chapters") or [])
+                    if isinstance(chapter, dict)
+                ][:6],
+                "terms": (summary.get("tools_and_terms") or [])[:8],
+                "categories": manifest.get("categories") or [],
+            }
+        )
+    return entries
+
+
+def categorize_library(root: Path, api_key: str, model: str) -> tuple[list[str], int]:
+    """兩階段分類。
+
+    一次全丟給模型分群，它每次都會漏掉不同的幾支（實測 142 支漏 5–8 支且無提示）。
+    改成先產出固定的分類清單，再分批把影片歸進去——模型只能從清單裡選，
+    標籤不會發散（實測自由標註時 12 支就長出 20 種標籤，只有 4 個被重用）。
+    """
+    entries = load_video_entries(root)
+    if not entries:
+        raise RuntimeError("沒有可用的摘要；先跑完整流程再分類。")
+
+    catalog_path = root / "categories.json"
+    existing = reuse_artifact(catalog_path) or {}
+    categories = [str(c) for c in (existing.get("categories") or []) if str(c).strip()]
+    catalog_is_new = not categories
+    if not categories:
+        overview = [{"title": item["title"], "summary": (item["summary"] or "")[:120]} for item in entries]
+        prompt = (
+            "看完這批影片，歸納出 8 到 12 個分類，只輸出 JSON：{\"categories\": [\"...\", ...]}。"
+            "分類要粒度一致、彼此可區分、合起來能涵蓋全部影片；用繁體中文，技術名詞保留原文。"
+            "不要用「其他」「雜項」這種收納類。\n\n" + json.dumps(overview, ensure_ascii=False)
+        )
+        data = parse_json_object(minimax_chat([{"role": "user", "content": prompt}], api_key, model, timeout=600))
+        categories = [str(c).strip() for c in (data.get("categories") or []) if str(c).strip()]
+        if not categories:
+            raise RuntimeError("模型沒有回傳分類清單。")
+        write_json(catalog_path, {"categories": categories})
+        print(f"· 產生 {len(categories)} 個分類：{'、'.join(categories)}")
+    else:
+        print(f"· 沿用既有的 {len(categories)} 個分類（刪掉 categories.json 可重新產生）")
+
+    # 分類體系沒變的話只歸類還沒分類的：新增一支影片不該重跑全部 142 支。
+    # 想整批重來就刪掉 categories.json，那會重新產生體系並全部重歸。
+    targets = entries if catalog_is_new else [item for item in entries if not item["categories"]]
+    if not targets:
+        print(f"· {len(entries)} 支影片都已分類，無需處理")
+        return categories, 0
+    print(f"· 待歸類 {len(targets)} 支（共 {len(entries)} 支）")
+
+    assigned = 0
+    for start in range(0, len(targets), CATEGORY_BATCH):
+        batch = targets[start : start + CATEGORY_BATCH]
+        payload = [
+            {"job": item["job"], "title": item["title"], "summary": (item["summary"] or "")[:200]}
+            for item in batch
+        ]
+        prompt = (
+            "把每支影片歸進下列分類，每支選 1 到 2 個，**只能從清單裡挑**，不可自創：\n"
+            + json.dumps(categories, ensure_ascii=False)
+            + '\n\n只輸出 JSON：{"results": [{"job": "...", "categories": ["..."], "level": "入門|中階|進階"}]}\n\n'
+            + json.dumps(payload, ensure_ascii=False)
+        )
+        data = parse_json_object(minimax_chat([{"role": "user", "content": prompt}], api_key, model, timeout=600))
+        by_job = {str(r.get("job")): r for r in (data.get("results") or []) if isinstance(r, dict)}
+        for item in batch:
+            result = by_job.get(item["job"])
+            if not result:
+                continue
+            picked = [str(c) for c in (result.get("categories") or []) if str(c) in categories]
+            if not picked:
+                continue
+            manifest_path = root / "jobs" / item["job"] / "manifest.json"
+            try:
+                manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            except (json.JSONDecodeError, OSError):
+                continue
+            manifest["categories"] = picked
+            manifest["level"] = str(result.get("level") or "")
+            write_json(manifest_path, manifest)
+            assigned += 1
+        print(f"  已歸類 {min(start + CATEGORY_BATCH, len(targets))}/{len(targets)}")
+    return categories, assigned
+
+
+def list_videos(root: Path, category: str = "") -> int:
+    """列出影片。沒有這個就只能開 digest.md 或自己查 DB。"""
+    db_path = root / "library.db"
+    if not db_path.is_file():
+        raise RuntimeError(f"索引不存在：{db_path}；先執行 `--index`。")
+    connection = index_connection(root)
+    try:
+        rows = connection.execute(
+            "SELECT title, source, duration, categories FROM videos ORDER BY duration DESC"
+        ).fetchall()
+    finally:
+        connection.close()
+
+    grouped: dict[str, list[tuple[Any, ...]]] = {}
+    for title, source, duration, raw in rows:
+        try:
+            cats = json.loads(raw or "[]") or ["未分類"]
+        except json.JSONDecodeError:
+            cats = ["未分類"]
+        for name in cats:
+            if category and category not in name:
+                continue
+            grouped.setdefault(name, []).append((title, source, duration))
+
+    shown = 0
+    for name in sorted(grouped, key=lambda k: -len(grouped[k])):
+        members = grouped[name]
+        print(f"\n## {name}（{len(members)} 支）")
+        for title, source, duration in members:
+            print(f"  {float(duration or 0)/60:5.1f} 分  {title}")
+            print(f"          {source}")
+            shown += 1
+    return shown
+
+
+def show_video(root: Path, keyword: str) -> bool:
+    """依關鍵字找出影片並印出摘要與章節。
+
+    知道標題卻要先查出 12 碼 hash 才能打開 knowledge.md，這一步不該由人來做。
+    """
+    matches = [item for item in load_video_entries(root) if keyword.lower() in (item["title"] or "").lower()]
+    if not matches:
+        print(f"找不到標題含「{keyword}」的影片。")
+        return False
+    if len(matches) > 1:
+        print(f"符合的有 {len(matches)} 支，請給更明確的關鍵字：")
+        for item in matches[:10]:
+            print(f"  - {item['title']}")
+        return False
+
+    item = matches[0]
+    job_dir = root / "jobs" / item["job"]
+    summary = reuse_artifact(job_dir / "summary.json", "short_summary") or {}
+    print(f"# {item['title']}")
+    print(f"  {item['url']}")
+    print(f"  {item['minutes']} 分   分類：{'、'.join(item['categories']) or '未分類'}")
+    print(f"\n## 摘要\n{summary.get('short_summary', '')}")
+    chapters = [c for c in (summary.get("chapters") or []) if isinstance(c, dict)]
+    if chapters:
+        print("\n## 章節")
+        for chapter in chapters:
+            jump = source_link(item["url"], chapter.get("start"))
+            print(f"  [{format_timestamp(chapter.get('start'))}] {chapter.get('title', '')}")
+            print(f"      {jump}")
+    terms = summary.get("tools_and_terms") or []
+    if terms:
+        print(f"\n## 工具與術語\n  {'、'.join(map(str, terms))}")
+    print(f"\n完整內容：{job_dir / 'knowledge.md'}")
+    return True
+
+
+def audit_library(root: Path) -> list[str]:
+    """健檢：把踩過的坑變成可重複執行的檢查。
+
+    這些問題全是事後靠一次性腳本挖出來的——壞掉的摘要仍標 completed、
+    索引落後於 jobs、向量沒跟上新影片、字幕碎片化。它們不會自己浮出水面。
+    """
+    issues: list[str] = []
+    jobs = sorted(path.parent for path in root.glob("jobs/*/manifest.json"))
+    if not jobs:
+        return ["沒有任何 job；先跑一次管線。"]
+
+    completed: set[str] = set()
+    failed: list[str] = []
+    broken_summary: list[str] = []
+    for job in jobs:
+        try:
+            manifest = json.loads((job / "manifest.json").read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            issues.append(f"{job.name}：manifest.json 讀不了")
+            continue
+        status = manifest.get("status") or ""
+        if status == "failed":
+            failed.append(job.name)
+            continue
+        if status not in {"completed", "local-only", "dry-run"}:
+            issues.append(f"{job.name}：狀態停在 {status}（可能中途被中斷）")
+        if status == "completed":
+            completed.add(job.name)
+            summary = reuse_artifact(job / "summary.json", "short_summary")
+            if summary is None:
+                broken_summary.append(job.name)
+
+    print(f"  影片：{len(jobs)} 支（completed {len(completed)}、failed {len(failed)}）")
+    if failed:
+        issues.append(f"{len(failed)} 支處理失敗：{', '.join(failed[:3])}{' …' if len(failed) > 3 else ''}")
+    if broken_summary:
+        issues.append(
+            f"{len(broken_summary)} 支的摘要缺 short_summary（模型沒回 JSON）"
+            f"；刪掉那幾支的 summary.json 再重跑即可補齊"
+        )
+
+    db_path = root / "library.db"
+    if not db_path.is_file():
+        issues.append("尚未建立索引 → python pipeline.py --index")
+        return issues
+
+    connection = index_connection(root)
+    try:
+        indexed = {row[0] for row in connection.execute("SELECT job FROM videos")}
+        events = connection.execute("SELECT count(*) FROM events").fetchone()[0]
+        lengths = [row[0] for row in connection.execute("SELECT length(text) FROM events WHERE kind='speech'")]
+        vectors = dict(connection.execute("SELECT model, count(*) FROM vectors GROUP BY model"))
+    finally:
+        connection.close()
+
+    print(f"  索引：{len(indexed)} 支、{events} 筆片段")
+    missing = completed - indexed
+    stale = indexed - completed
+    if missing:
+        issues.append(f"{len(missing)} 支已完成但不在索引裡 → python pipeline.py --index")
+    if stale:
+        issues.append(f"索引裡有 {len(stale)} 支已不存在於 jobs\\ → python pipeline.py --index")
+
+    if lengths:
+        lengths.sort()
+        median = lengths[len(lengths) // 2]
+        print(f"  片段長度中位數：{median} 字元")
+        if median < 60:
+            issues.append(
+                f"speech 片段中位數僅 {median} 字元，碎片化會嚴重拖累檢索與問答品質"
+                "（YouTube 字幕是逐行切的，需合併成段落）"
+            )
+
+    if vectors:
+        for model, count in vectors.items():
+            print(f"  向量：{count} / {events} 筆（{model}）")
+            if count < events:
+                issues.append(f"{events - count} 筆片段還沒有 {model} 的向量 → python pipeline.py --embed")
+    else:
+        issues.append("尚未建立向量，--semantic 無法使用 → python pipeline.py --embed")
+
+    digest = root / "digest.md"
+    if digest.is_file():
+        # 比對摘要而不是 library.db：--embed 只動 vectors 表，卻會讓整個 db 的 mtime 前進，
+        # 拿 db 當判準會把「只是重建了向量」誤報成「總覽過期」。
+        newest_summary = max(
+            (path.stat().st_mtime for path in root.glob("jobs/*/summary.json")), default=0.0
+        )
+        if digest.stat().st_mtime < newest_summary:
+            issues.append("有摘要比 digest.md 新 → python pipeline.py --digest")
+    return issues
+
+
+def self_test() -> None:
+    assert hash_distance("0000", "0000") == 0
+    assert hash_distance("0000", "1111") == 4
+    assert limit_items([1, 2, 3], 1) == [1]
+    assert parse_json_object("```json\n{\"ok\": true}\n```")["ok"] is True
+    timeline = merge_timeline(
+        {"segments": [{"start": 3, "end": 4, "text": "語音"}]},
+        [{"timestamp": 1, "screen_type": "畫面"}],
+    )
+    assert [event["timestamp"] for event in timeline] == [1, 3]
+    assert format_timestamp(65.2) == "00:01:05"
+
+    # 可溯源：搜尋結果要能直接跳到影片的那一秒
+    youtube = "https://www.youtube.com/watch?v=abc"
+    assert source_link(youtube, 3457) == youtube + "&t=3457s"
+    assert source_link("https://youtu.be/abc", 90.7) == "https://youtu.be/abc?t=90s"  # 無 query 用 ?
+    assert source_link("https://www.facebook.com/x/videos/1", 42) == "https://www.facebook.com/x/videos/1?t=42"
+    assert source_link(youtube, 0) == youtube  # 0 秒不必加參數
+    assert source_link("D:\\local\\clip.mp4", 30) == "D:\\local\\clip.mp4"  # 認不出就別亂加
+    assert source_link(youtube, None) == youtube and source_link(youtube, True) == youtube
+    assert source_link(None, 10) == ""
+    assert local_observations([{"timestamp": 2, "ocr_text": "OCR"}])[0]["local_ocr_text"] == "OCR"
+
+    # 字幕合併：逐行字幕併成段落，時間戳取第一行的開始
+    rows = [
+        {"start": 0.0, "end": 1.5, "text": "What's up folks?", "chunk": 0},
+        {"start": 1.5, "end": 3.0, "text": "I'm going to build", "chunk": 0},
+        {"start": 3.0, "end": 4.5, "text": "an MCP server.", "chunk": 0},
+        {"start": 60.0, "end": 61.0, "text": "隔了很久之後的另一段", "chunk": 0},
+    ]
+    joined = merge_caption_segments(rows, max_chars=100, max_gap=2.0)
+    assert len(joined) == 2, joined
+    assert joined[0]["text"] == "What's up folks? I'm going to build an MCP server."
+    assert joined[0]["start"] == 0.0 and joined[0]["end"] == 4.5
+    assert joined[1]["start"] == 60.0  # 間隔超過 max_gap 就另起一段
+    assert len(merge_caption_segments(rows, max_chars=20)) == 4  # 字數上限也會斷開
+    assert merge_caption_segments([{"start": 0, "end": 1, "text": "  "}]) == []
+    assert parse_caption_json3({"events": [{"tStartMs": 2000, "dDurationMs": 900, "segs": [{"utf8": "hi"}]}]}) == [
+        {"start": 2.0, "end": 2.9, "text": "hi", "chunk": 0}
+    ]
+
+    # 靜默幻覺過濾：實測幻覺段 0.701、正常段最高 0.414
+    assert is_silence(0.701) and is_silence(0.61)
+    assert not is_silence(0.414) and not is_silence(0.028) and not is_silence(0.0)
+    assert not is_silence(None) and not is_silence("0.9") and not is_silence(True)
+
+    assert retry_delay(urllib.error.HTTPError("u", 429, "", {"Retry-After": "7"}, None), 2.0) == 7.0
+    assert retry_delay(urllib.error.HTTPError("u", 429, "", {"Retry-After": "999"}, None), 2.0) == 120.0
+    assert retry_delay(urllib.error.HTTPError("u", 500, "", {}, None), 3.0) == 3.0
+
+    # 併發回收後必須還原輸入順序，否則時間軸會跟錯圖。
+    # 讓越前面的圖睡越久，完成順序必定反轉：沒排序就會被抓到。
+    count = 6
+    original_chat, original_data_url = minimax_chat, image_data_url
+    globals()["image_data_url"] = lambda path: "data:image/jpeg;base64,x"
+    globals()["minimax_chat"] = lambda messages, *rest: (
+        lambda tag: (time.sleep((count - int(tag[3:])) * 0.02), json.dumps({"tag": tag}))[1]
+    )(messages[0]["content"][0]["text"].rsplit("：", 1)[-1])
+    try:
+        observations = analyze_images(
+            [{"timestamp": i, "path": f"f{i}.jpg", "ocr_text": f"OCR{i}"} for i in range(count)],
+            "key",
+            "model",
+            workers=4,
+        )
+    finally:
+        globals()["minimax_chat"], globals()["image_data_url"] = original_chat, original_data_url
+    assert [item["tag"] for item in observations] == [f"OCR{i}" for i in range(count)]
+    assert [item["timestamp"] for item in observations] == list(range(count))
+
+    assert flatten_text({"a": ["x", {"b": "y"}]}) == "x y"
+
+    # 完成標記要綁設定：換了 --frame-interval 就必須重抽，沿用舊截圖會讓時間戳錯位
+    with tempfile.TemporaryDirectory() as temporary:
+        marker = Path(temporary) / ".complete"
+        assert not marker_matches(marker, "interval=10")  # 還沒有標記
+        write_text(marker, "interval=10")
+        assert marker_matches(marker, "interval=10")
+        assert not marker_matches(marker, "interval=15")  # 設定變了
+
+    assert unpack_vector(pack_vector([1.0, -0.5, 0.25])).tolist() == [1.0, -0.5, 0.25]
+    assert abs(cosine([1.0, 0.0], [1.0, 0.0]) - 1.0) < 1e-6
+    assert abs(cosine([1.0, 0.0], [0.0, 1.0])) < 1e-6
+    assert abs(cosine([1.0, 0.0], [-1.0, 0.0]) + 1.0) < 1e-6
+    assert cosine([0.0, 0.0], [1.0, 0.0]) == 0.0  # 零向量不可除以零
+    assert abs(cosine([3.0, 4.0], [30.0, 40.0]) - 1.0) < 1e-6  # 只看方向不看長度
+    assert DEFAULT_EMBED_MODEL["local"] != DEFAULT_EMBED_MODEL["openrouter"]  # HF 大小寫敏感
+
+    # 門檻要跟著模型的分數尺度走：bge-m3 命中約 0.6、nemotron 命中約 0.29，
+    # 寫死絕對值必定誤殺其中一種。
+    assert similarity_cutoff(0.60) == 0.30
+    assert similarity_cutoff(0.29) == 0.145
+    assert similarity_cutoff(0.05) == SIMILARITY_FLOOR  # 全部都很低時由地板接手
+    assert similarity_cutoff(0.60, 0.9) == 0.9  # 明確指定就照指定的來
+
+    # 舊版 vectors 表要被重建而不是沿用：沒有 model 欄位、或主鍵只有 event_id
+    # （後者會讓第二顆模型 REPLACE 掉第一顆的向量，兩顆無法共存）
+    assert text_hash("abc") == text_hash("abc") and text_hash("abc") != text_hash("abd")
+    for legacy_schema, legacy_row in (
+        ("CREATE TABLE vectors (event_id INTEGER PRIMARY KEY, dim INTEGER, vector BLOB)", (1, 3, b"\x00")),
+        (
+            "CREATE TABLE vectors (event_id INTEGER, model TEXT, dim INTEGER, vector BLOB, PRIMARY KEY (event_id, model))",
+            (1, "m", 3, b"\x00"),
+        ),
+    ):
+        with tempfile.TemporaryDirectory() as temporary:
+            legacy_root = Path(temporary)
+            legacy = sqlite3.connect(legacy_root / "library.db")
+            legacy.execute(legacy_schema)
+            legacy.execute(
+                "INSERT INTO vectors VALUES (" + ",".join("?" * len(legacy_row)) + ")", legacy_row
+            )
+            legacy.commit()
+            legacy.close()
+            migrated = index_connection(legacy_root)
+            try:
+                # 綁 events.rowid 的舊 schema 一律重建：rowid 會隨 --index 重新分配
+                assert "text_hash" in {row[1] for row in migrated.execute("PRAGMA table_info(vectors)")}
+                assert migrated.execute("SELECT count(*) FROM vectors").fetchone()[0] == 0
+                # 同一段文字在兩顆模型下必須能共存
+                migrated.execute("INSERT INTO vectors VALUES ('h1', 'a', 2, x'0000')")
+                migrated.execute("INSERT INTO vectors VALUES ('h1', 'b', 2, x'1111')")
+                assert migrated.execute("SELECT count(*) FROM vectors").fetchone()[0] == 2
+            finally:
+                migrated.close()
+    with tempfile.TemporaryDirectory() as temporary:
+        index_root = Path(temporary)
+        fake_job = index_root / "jobs" / "abc123456789"
+        fake_job.mkdir(parents=True)
+        write_json(
+            fake_job / "manifest.json",
+            {
+                "status": "completed",
+                "source": {"url": "https://example.com/v", "title": "時間軸合併教學"},
+                "video": {"duration_seconds": 12.0},
+            },
+        )
+        write_json(
+            fake_job / "timeline.json",
+            [
+                {"timestamp": 3.0, "type": "speech", "text": "這段說明時間軸合併的做法"},
+                {"timestamp": 5.0, "type": "visual", "data": {"visual_summary": "終端機畫面"}},
+                {"timestamp": 7.0, "type": "visual", "data": {"visual_summary": "合併前後對照，合併結果如圖"}},
+            ],
+        )
+        assert build_index(index_root)[1:] == (1, 4)
+        assert search_index(index_root, "時間軸", 10)[0]["title"] == "時間軸合併教學"
+        assert search_index(index_root, "終端機", 10)[0]["kind"] == "visual"
+        assert search_index(index_root, "完全不相干的字串", 10) == []
+        assert search_index(index_root, 'a-b "c OR d', 10) == []  # FTS5 運算子不可炸
+        assert build_index(index_root)[1:] == (1, 4)  # 重跑不重複灌
+
+        # 短於 3 字元的查詢 trigram 一定落空，必須自動回退全表掃描
+        short = search_index(index_root, "畫面", 10)
+        assert short and short[0]["mode"] == "scan", short
+        assert "《畫面》" in short[0]["snippet"], short[0]["snippet"]
+        assert search_index(index_root, "教學", 10)[0]["kind"] == "title"
+        assert search_index(index_root, "zz", 10) == []
+        assert search_index(index_root, "%", 10) == []  # LIKE 萬用字元要被逃脫
+
+        # 掃描模式沒有 rank，排序得自己來：標題優先，同級比出現次數
+        ranked = search_index(index_root, "合併", 10)
+        assert [item["kind"] for item in ranked] == ["title", "visual", "speech"], ranked
+        assert "《合併》前後對照" in ranked[1]["snippet"], ranked[1]["snippet"]
+        for blank in ("", "   "):
+            try:
+                search_index(index_root, blank, 10)
+                raise AssertionError("空查詢必須報錯")
+            except RuntimeError:
+                pass
+
+    print("self-test: OK")
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="影片語音＋畫面時間軸摘要管線")
+    source = parser.add_mutually_exclusive_group()
+    source.add_argument("--url", help="YouTube／Facebook 等 yt-dlp 支援的影片 URL")
+    source.add_argument("--video", help="本機影片路徑")
+    source.add_argument("--url-file", type=Path, help="批次 URL 清單；每行一個影片 URL")
+    parser.add_argument("--root", type=Path, default=Path(__file__).resolve().parent)
+    parser.add_argument("--dry-run", action="store_true", help="只做本地處理，不下載或呼叫雲端 API")
+    parser.add_argument("--local-only", action="store_true", help="下載／本地處理，但跳過所有雲端 API")
+    parser.add_argument("--chunk-seconds", type=int, default=900)
+    parser.add_argument("--workers", type=int, default=2, help="Groq 轉錄併發數，最多 4")
+    parser.add_argument("--language", default=None, help="逐字稿語言；auto 交給 Whisper 自動偵測")
+    parser.add_argument(
+        "--transcribe-backend",
+        choices=("groq", "local", "youtube"),
+        default=os.getenv("TRANSCRIBE_BACKEND", "groq"),
+        help="local 走本機 faster-whisper；youtube 直接抓平台字幕（最快、免費，沒字幕時自動退回 groq）",
+    )
+    parser.add_argument("--whisper-model", default=os.getenv("WHISPER_MODEL", "base"), help="本機 whisper 模型大小")
+    parser.add_argument(
+        "--groq-model",
+        default=os.getenv("GROQ_MODEL", "whisper-large-v3"),
+        help="Groq 轉錄模型；turbo 快約一倍但實測會漏字",
+    )
+    parser.add_argument("--frame-interval", type=float, default=10.0)
+    parser.add_argument("--hash-threshold", "--phash-threshold", dest="hash_threshold", type=int, default=8)
+    parser.add_argument("--slide-extractor", choices=("native", "steipete"), default="native")
+    parser.add_argument("--scene-threshold", type=float, default=0.3)
+    parser.add_argument("--min-slide-duration", type=float, default=2.0)
+    parser.add_argument("--max-vision-frames", type=int, default=40)
+    parser.add_argument("--ocr", action="store_true", help="若已安裝 PaddleOCR，啟用本地 OCR 初篩")
+    parser.add_argument("--sync-open-notebook", action="store_true", help="將 knowledge.md 匯入 Open Notebook")
+    parser.add_argument("--notebook-id", default=os.getenv("OPEN_NOTEBOOK_NOTEBOOK_ID", ""))
+    parser.add_argument("--open-notebook-url", default=os.getenv("OPEN_NOTEBOOK_URL", "http://127.0.0.1:5055"))
+    parser.add_argument("--open-notebook-sources-path", default=os.getenv("OPEN_NOTEBOOK_SOURCES_PATH", "/api/sources"))
+    parser.add_argument("--open-notebook-wait-seconds", type=int, default=300)
+    parser.add_argument("--index", action="store_true", help="掃描 jobs\\ 重建本地搜尋索引 library.db")
+    parser.add_argument("--search", help="在本地索引全文搜尋（跑過的影片會自動入索引）")
+    parser.add_argument("--search-limit", type=int, default=20)
+    parser.add_argument("--ask", help="用索引內容回答問題並附引用（需要 MINIMAX_API_KEY）")
+    parser.add_argument("--ask-limit", type=int, default=12, help="--ask 餵給模型的片段上限")
+    parser.add_argument("--digest", action="store_true", help="彙整所有影片摘要成 digest.md 全頻道總覽")
+    parser.add_argument("--embed", action="store_true", help="替索引片段補算向量（需 OPENROUTER_API_KEY）")
+    parser.add_argument("--semantic", action="store_true", help="--search／--ask 改走語意檢索（需先 --embed）")
+    parser.add_argument(
+        "--embed-backend",
+        choices=("openrouter", "local"),
+        default=os.getenv("EMBED_BACKEND", "openrouter"),
+        help="local 走本機 sentence-transformers（免費、離線、內容不外傳）",
+    )
+    parser.add_argument("--embed-model", default=os.getenv("EMBED_MODEL"), help="不指定則依 backend 取預設")
+    parser.add_argument(
+        "--min-similarity",
+        type=float,
+        default=None,
+        help="語意檢索的相似度下限；不指定則自動取「最高分的一半」以適應各模型的分數尺度",
+    )
+    parser.add_argument(
+        "--no-video",
+        action="store_true",
+        help="不下載影片、不抽幀，只靠字幕建索引；之後重跑同一支會自動補上畫面分析",
+    )
+    parser.add_argument("--list", action="store_true", help="列出所有影片（可搭配 --category 篩選）")
+    parser.add_argument("--show", help="依標題關鍵字顯示某支影片的摘要與章節")
+    parser.add_argument("--category", default="", help="限定分類；可搭配 --list 或 --search")
+    parser.add_argument("--categorize", action="store_true", help="產生固定分類並歸類所有影片（讓 --digest 用程式碼分群）")
+    parser.add_argument("--audit", action="store_true", help="健檢知識庫：找出壞掉的摘要、落後的索引與向量")
+    parser.add_argument("--refresh", action="store_true", help="忽略既有的逐字稿／視覺／摘要，全部重新呼叫 API")
+    parser.add_argument("--self-test", action="store_true")
+    return parser.parse_args()
+
+
+def read_url_file(path: Path) -> list[str]:
+    path = path.expanduser().resolve()
+    if not path.is_file():
+        raise FileNotFoundError(path)
+    urls: list[str] = []
+    seen: set[str] = set()
+    for raw_line in path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if line and not line.startswith("#") and line not in seen:
+            seen.add(line)
+            urls.append(line)
+    if not urls:
+        raise ValueError(f"URL 清單沒有可處理的項目：{path}")
+    return urls
+
+
+def run_batch(args: argparse.Namespace) -> Path:
+    url_file = Path(args.url_file).expanduser().resolve()
+    urls = read_url_file(url_file)
+    root = args.root.resolve()
+    root.mkdir(parents=True, exist_ok=True)
+    batch_dir = root / "batches" / job_key(str(url_file), "\n".join(urls))
+    batch_dir.mkdir(parents=True, exist_ok=True)
+    items: list[dict[str, Any]] = []
+    for index, url in enumerate(urls, 1):
+        item_args = argparse.Namespace(**vars(args))
+        item_args.url = url
+        item_args.video = None
+        item_args.url_file = None
+        try:
+            manifest_path = run_pipeline(item_args)
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            items.append(
+                {
+                    "index": index,
+                    "url": url,
+                    "status": manifest.get("status", "unknown"),
+                    "manifest": artifact_path(manifest_path, root),
+                }
+            )
+        except Exception as exc:
+            items.append({"index": index, "url": url, "status": "failed", "error": str(exc)})
+
+    failures = sum(item["status"] == "failed" for item in items)
+    status = "failed" if failures == len(items) else "partial" if failures else "completed"
+    output = batch_dir / "batch-manifest.json"
+    write_json(
+        output,
+        {
+            "schema_version": 1,
+            "status": status,
+            "source_file": str(url_file),
+            "count": len(items),
+            "failed": failures,
+            "items": items,
+        },
+    )
+    return output
+
+
+def run_pipeline(args: argparse.Namespace) -> Path:
+    root = args.root.resolve()
+    root.mkdir(parents=True, exist_ok=True)
+    # --root 是輸出目錄，不該綁著設定檔：先讀專案自己的 .env，再讓輸出目錄的 .env 覆蓋。
+    load_dotenv(Path(__file__).resolve().parent / ".env")
+    load_dotenv(root / ".env")
+    args.notebook_id = args.notebook_id or os.getenv("OPEN_NOTEBOOK_NOTEBOOK_ID", "")
+    if args.open_notebook_url == "http://127.0.0.1:5055":
+        args.open_notebook_url = os.getenv("OPEN_NOTEBOOK_URL", args.open_notebook_url)
+    if args.open_notebook_sources_path == "/api/sources":
+        args.open_notebook_sources_path = os.getenv("OPEN_NOTEBOOK_SOURCES_PATH", args.open_notebook_sources_path)
+    language = args.language if args.language is not None else os.getenv("GROQ_LANGUAGE", "zh")
+    if args.chunk_seconds <= 0 or args.frame_interval <= 0 or args.max_vision_frames <= 0:
+        raise ValueError("chunk-seconds、frame-interval 與 max-vision-frames 必須大於 0。")
+    if not 0.1 <= args.scene_threshold <= 1.0 or args.min_slide_duration < 0:
+        raise ValueError("scene-threshold 必須介於 0.1 到 1.0，min-slide-duration 不可小於 0。")
+    if args.url is None and args.video is None:
+        raise ValueError("請提供 --url 或 --video。")
+    if not args.dry_run and not args.local_only:
+        needs_groq = args.transcribe_backend == "groq"  # 本機轉錄不需要 Groq 金鑰
+        if (needs_groq and not os.getenv("GROQ_API_KEY")) or not os.getenv("MINIMAX_API_KEY"):
+            missing = "GROQ_API_KEY 與 MINIMAX_API_KEY" if needs_groq else "MINIMAX_API_KEY"
+            raise RuntimeError(f"完整流程需要 {missing}；先用 --dry-run 驗證本地流程。")
+
+    source_name = args.url or str(Path(args.video).expanduser().resolve())
+    artifact_config = {
+        "chunk_seconds": args.chunk_seconds,
+        "frame_interval": args.frame_interval,
+        "hash_threshold": args.hash_threshold,
+        "slide_extractor": args.slide_extractor,
+        "scene_threshold": args.scene_threshold,
+        "min_slide_duration": args.min_slide_duration,
+        "max_vision_frames": args.max_vision_frames,
+        "ocr": args.ocr,
+    }
+    # job 目錄只由來源決定。設定變動由各層的 .complete 簽章判斷要不要重做，
+    # 否則階段一（--no-video）與階段二（補畫面）會落在不同目錄，字幕與已付費的產物全部作廢。
+    job_dir = root / "jobs" / job_key(source_name)
+    job_dir.mkdir(parents=True, exist_ok=True)
+    manifest_path = job_dir / "manifest.json"
+    # manifest 每次重建，但上次同步的 source_id 得留著：忘了它，重跑就會在 notebook 疊出重複條目。
+    previous: dict[str, Any] = {}
+    if manifest_path.is_file():
+        try:
+            previous = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            previous = {}
+    previous_sync = previous.get("open_notebook") or {}
+    # 只有上次完整跑完才敢重用雲端產物：音訊與截圖有 sentinel，但逐字稿／視覺／摘要
+    # 每次都重新呼叫 API，批次跑到一半中斷就是把前面的錢再花一次。
+    reuse_cloud = previous.get("status") == "completed" and not args.refresh
+    previous_source_id = str(
+        previous_sync.get("source_id")
+        # 早期的 manifest 沒有頂層 source_id，只把它埋在 response.result 裡
+        or ((previous_sync.get("response") or {}).get("result") or {}).get("source_id")
+        or ""
+    )
+    manifest: dict[str, Any] = {
+        "schema_version": 1,
+        "status": "running",
+        "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "source": {"url": args.url, "video": args.video},
+        "job_dir": artifact_path(job_dir, root),
+        "config": {
+            **artifact_config,
+            "workers": min(max(args.workers, 1), 4),
+            "language": language,
+            "transcribe_backend": args.transcribe_backend,
+            "sync_open_notebook": args.sync_open_notebook,
+            "notebook_id": args.notebook_id or None,
+        },
+    }
+    if previous_source_id:
+        manifest["open_notebook"] = {**previous_sync, "source_id": previous_source_id}  # 這次沒同步也不能弄丟
+    # 後處理階段（--categorize）寫進 manifest 的欄位，也要跟著保留：
+    # manifest 每次重建，重跑一次批次就會把分類全部沖掉，下次 --categorize 又得整批重來。
+    for preserved in ("categories", "level"):
+        if previous.get(preserved):
+            manifest[preserved] = previous[preserved]
+    write_json(manifest_path, manifest)
+
+    try:
+        captions_only: dict[str, Any] | None = None
+        if args.no_video:
+            # 只抓字幕：不下載影片、不切音訊、不抽幀。標題與時長改由 info.json 提供。
+            if not args.url:
+                raise ValueError("--no-video 只支援 --url。")
+            captions_only = reuse_artifact(job_dir / "transcript.json") if reuse_cloud else None
+            if captions_only is None:
+                captions_only = fetch_youtube_transcript(args.url, job_dir, language)
+            if captions_only is None:
+                raise RuntimeError("這支影片沒有字幕，--no-video 無法處理；改用完整流程。")
+            info = reuse_artifact(job_dir / "source.info.json") or {}
+            manifest["source"]["title"] = str(info.get("title") or job_dir.name)
+            manifest["video"] = {"duration_seconds": float(info.get("duration") or 0.0), "streams": []}
+            video_path = Path(str(info.get("title") or job_dir.name))  # 只用於 knowledge.md 的顯示名
+            audio_chunks, candidates, frame_meta = [], [], {"method": "captions-only", "candidate_count": 0}
+        elif args.url:
+            if args.dry_run:
+                manifest["status"] = "dry-run"
+                manifest["next"] = "移除 --dry-run 後才會使用 yt-dlp 下載影片。"
+                write_json(manifest_path, manifest)
+                return manifest_path
+            video_path = download_video(args.url, job_dir)
+        else:
+            video_path = Path(args.video).expanduser().resolve()
+            if not video_path.is_file():
+                raise FileNotFoundError(video_path)
+
+        if not args.no_video:
+            manifest["source"]["resolved_video"] = artifact_path(video_path, root)
+            manifest["source"]["title"] = source_title(job_dir, video_path)
+
+            probe = probe_video(video_path)
+            manifest["video"] = {
+                "duration_seconds": video_duration(probe),
+                "streams": [
+                    {"codec_type": stream.get("codec_type"), "codec_name": stream.get("codec_name")}
+                    for stream in probe.get("streams", [])
+                ],
+            }
+            audio_chunks = extract_audio(video_path, job_dir, args.chunk_seconds)
+        if args.no_video:
+            pass
+        elif args.slide_extractor == "steipete":
+            candidates, frame_meta = extract_steipete_candidates(
+                video_path,
+                job_dir,
+                args.max_vision_frames,
+                args.scene_threshold,
+                args.min_slide_duration,
+            )
+        else:
+            candidates, frame_meta = extract_candidates(
+                video_path,
+                job_dir,
+                args.frame_interval,
+                args.hash_threshold,
+                args.max_vision_frames,
+                args.ocr,
+                0.75,
+            )
+        write_json(job_dir / "frame_candidates.json", {"frames": candidates, "meta": frame_meta})
+        manifest["artifacts"] = {
+            "audio_chunks": [artifact_path(path, root) for path in audio_chunks],
+            "frame_candidates": artifact_path(job_dir / "frame_candidates.json", root),
+        }
+        if args.slide_extractor == "steipete":
+            manifest["artifacts"]["steipete_slides"] = artifact_path(job_dir / "steipete-slides.json", root)
+
+        reused_observations = False
+        if captions_only is not None:
+            transcript: dict[str, Any] = captions_only
+            observations = []  # 空的：下次不帶 --no-video 重跑時 reuse_artifact 會判定為無、自動補畫面
+            # 這個模式本來就沒有畫面，不算「這次新增了畫面」——否則每次重跑都會白白重算摘要。
+            # 階段二真的補上畫面時，走的是下面的 else 分支，那裡才會讓摘要重算。
+            reused_observations = True
+        elif args.dry_run or args.local_only:
+            transcript = {"status": "skipped", "reason": "dry-run" if args.dry_run else "local-only", "segments": []}
+            observations = local_observations(candidates)
+        else:
+            transcript = reuse_artifact(job_dir / "transcript.json") if reuse_cloud else None
+            if transcript is None and args.transcribe_backend == "youtube":
+                if not args.url:
+                    raise ValueError("--transcribe-backend youtube 需要 --url。")
+                transcript = fetch_youtube_transcript(args.url, job_dir, language)
+                if transcript is None:
+                    print("! 這支影片沒有字幕，退回 Groq 轉錄")
+            if transcript is None:
+                if args.transcribe_backend == "local":
+                    transcript = transcribe_local(
+                        audio_chunks, args.whisper_model, language, args.chunk_seconds
+                    )
+                else:
+                    transcript = transcribe_all(
+                        audio_chunks,
+                        os.environ["GROQ_API_KEY"],
+                        args.groq_model,
+                        language,
+                        args.chunk_seconds,
+                        args.workers,
+                    )
+            else:
+                print("· 重用既有逐字稿（--refresh 可強制重算）")
+
+            observations = reuse_artifact(job_dir / "visual.json") if reuse_cloud else None
+            if observations is None:
+                observations = analyze_images(
+                    candidates,
+                    os.environ["MINIMAX_API_KEY"],
+                    os.getenv("MINIMAX_MODEL", "MiniMax-M3"),
+                    args.workers,
+                )
+            else:
+                reused_observations = True
+                print("· 重用既有視覺觀察")
+        # 記下每個階段實際由誰產生：換模型後回頭看產物才知道該不該重跑
+        manifest["models"] = {
+            "transcript": transcript.get("model") if isinstance(transcript, dict) else None,
+            "visual": os.getenv("MINIMAX_MODEL", "MiniMax-M3") if observations else None,
+        }
+        write_json(job_dir / "transcript.json", transcript)
+        write_json(job_dir / "visual.json", observations)
+        timeline = merge_timeline(transcript, observations)
+        write_json(job_dir / "timeline.json", timeline)
+        manifest["artifacts"].update(
+            {
+                "transcript": artifact_path(job_dir / "transcript.json", root),
+                "visual": artifact_path(job_dir / "visual.json", root),
+                "timeline": artifact_path(job_dir / "timeline.json", root),
+            }
+        )
+        summary: dict[str, Any]
+        if args.dry_run or args.local_only:
+            summary = {"status": "skipped", "reason": "dry-run" if args.dry_run else "local-only"}
+            write_json(job_dir / "summary.json", summary)
+            manifest["artifacts"]["summary"] = artifact_path(job_dir / "summary.json", root)
+            manifest["status"] = "dry-run" if args.dry_run else "local-only"
+        else:
+            # 只有視覺觀察也是沿用的才敢重用摘要：階段二補上畫面後，
+            # 舊摘要是「只看過語音」的版本，必須重算才會納入程式碼識別字。
+            summary = (
+                reuse_artifact(job_dir / "summary.json", "short_summary")
+                if reuse_cloud and reused_observations
+                else None
+            )
+            if summary is None:
+                summary = create_summary(
+                    timeline,
+                    os.environ["MINIMAX_API_KEY"],
+                    os.getenv("MINIMAX_MODEL", "MiniMax-M3"),
+                    800000,
+                )
+                manifest["models"]["summary"] = os.getenv("MINIMAX_MODEL", "MiniMax-M3")
+            else:
+                print("· 重用既有摘要")
+            write_json(job_dir / "summary.json", summary)
+            manifest["artifacts"]["summary"] = artifact_path(job_dir / "summary.json", root)
+            manifest["status"] = "completed"
+        knowledge_path = render_knowledge_markdown(
+            job_dir,
+            manifest["source"],
+            video_path,
+            transcript,
+            observations,
+            timeline,
+            summary,
+        )
+        manifest["artifacts"]["knowledge_markdown"] = artifact_path(knowledge_path, root)
+        if args.sync_open_notebook:
+            if args.dry_run or args.local_only:
+                manifest["open_notebook"] = {"status": "skipped", "reason": "dry-run/local-only"}
+            else:
+                password = os.getenv("OPEN_NOTEBOOK_PASSWORD", "")
+                if not args.notebook_id or not password:
+                    raise RuntimeError("同步 Open Notebook 需要 --notebook-id 與 OPEN_NOTEBOOK_PASSWORD。")
+                manifest["open_notebook"] = open_notebook_sync(
+                    knowledge_path,
+                    args.open_notebook_url,
+                    args.notebook_id,
+                    password,
+                    args.open_notebook_sources_path,
+                    args.open_notebook_wait_seconds,
+                    manifest["source"].get("title", ""),
+                    previous_source_id,
+                )
+        write_json(manifest_path, manifest)
+        connection = index_connection(root)
+        try:
+            index_job(connection, job_dir)
+            connection.commit()
+        finally:
+            connection.close()
+        return manifest_path
+    except Exception as exc:
+        manifest["status"] = "failed"
+        manifest["error"] = str(exc)
+        write_json(manifest_path, manifest)
+        raise
+
+
+def main() -> int:
+    args = parse_args()
+    if args.self_test:
+        self_test()
+        return 0
+    if args.list or args.show:  # 純本地查詢，不需要金鑰
+        root = args.root.resolve()
+        try:
+            if args.list:
+                total = list_videos(root, args.category)
+                print(f"\n共 {total} 支" + (f"（分類含「{args.category}」）" if args.category else ""))
+            if args.show:
+                if not show_video(root, args.show):
+                    return 1
+        except (RuntimeError, sqlite3.Error) as exc:
+            print(f"錯誤：{exc}", file=sys.stderr)
+            return 1
+        return 0
+    if args.audit:  # 純本地檢查，不需要任何金鑰
+        print("=== 知識庫健檢 ===")
+        problems = audit_library(args.root.resolve())
+        if problems:
+            print(f"\n發現 {len(problems)} 個問題：")
+            for problem in problems:
+                print(f"  ! {problem}")
+            return 1
+        print("\n無異常。")
+        return 0
+    if args.index or args.search is not None or args.ask or args.digest or args.embed or args.categorize:  # 空字串是 falsy，用 is not None 才攔得住
+        root = args.root.resolve()
+        # --ask 要打 MiniMax，同樣需要 .env 覆蓋掉全域的 MINIMAX_BASE_URL
+        load_dotenv(Path(__file__).resolve().parent / ".env")
+        load_dotenv(root / ".env")
+        try:
+            if args.index:
+                db_path, video_count, event_count = build_index(root)
+                print(f"索引完成：{db_path}（{video_count} 支影片、{event_count} 筆片段）")
+            embed_model = args.embed_model or DEFAULT_EMBED_MODEL[args.embed_backend]
+            embed_key = os.getenv("OPENROUTER_API_KEY", "")
+            # 本機後端不需要金鑰；只有走 OpenRouter 才擋。
+            if (args.embed or args.semantic) and args.embed_backend == "openrouter" and not embed_key:
+                raise RuntimeError("OpenRouter 後端需要 OPENROUTER_API_KEY，或改用 `--embed-backend local`。")
+            semantic_backend = args.embed_backend if args.semantic else ""
+            if args.embed:
+                added, total = build_embeddings(root, embed_key, embed_model, args.embed_backend)
+                print(f"向量完成：新增 {added} 筆，索引共 {total} 筆（{args.embed_backend}／{embed_model}）")
+            if args.search is not None:
+                if semantic_backend:
+                    hits = semantic_search(
+                        root,
+                        args.search,
+                        embed_key,
+                        embed_model,
+                        args.search_limit,
+                        semantic_backend,
+                        args.min_similarity,
+                    )
+                    mode = f"語意檢索：{semantic_backend}／{embed_model}"
+                else:
+                    hits = search_index(root, args.search, args.search_limit, args.category)
+                    mode = "全表掃描：查詢短於 3 字元" if len(args.search) < 3 else "索引"
+                    if args.category:
+                        mode += f"，限定「{args.category}」"
+                print(f"命中 {len(hits)} 筆（{mode}）：")
+                for hit in hits:
+                    label = hit["title"] or hit["job"]
+                    score = f" {hit['score']:.3f}" if "score" in hit else ""
+                    print(f"-{score} [{format_timestamp(hit['timestamp'])}] {label}（{hit['kind']}）")
+                    print(f"    {hit['snippet']}")
+                    print(f"    {source_link(hit['source'], hit['timestamp'])}")
+            if args.categorize:
+                if not os.getenv("MINIMAX_API_KEY"):
+                    raise RuntimeError("--categorize 需要 MINIMAX_API_KEY。")
+                cats, assigned = categorize_library(
+                    root, os.environ["MINIMAX_API_KEY"], os.getenv("MINIMAX_MODEL", "MiniMax-M3")
+                )
+                print(f"分類完成：{len(cats)} 個分類，{assigned} 支影片已歸類（記得重跑 --index）")
+            if args.digest:
+                if not os.getenv("MINIMAX_API_KEY"):
+                    raise RuntimeError("--digest 需要 MINIMAX_API_KEY。")
+                digest_path = build_digest(
+                    root,
+                    os.environ["MINIMAX_API_KEY"],
+                    os.getenv("MINIMAX_MODEL", "MiniMax-M3"),
+                )
+                print(f"總覽已產生：{digest_path}")
+            if args.ask:
+                if not os.getenv("MINIMAX_API_KEY"):
+                    raise RuntimeError("--ask 需要 MINIMAX_API_KEY。")
+                result = answer_question(
+                    root,
+                    args.ask,
+                    os.environ["MINIMAX_API_KEY"],
+                    os.getenv("MINIMAX_MODEL", "MiniMax-M3"),
+                    args.ask_limit,
+                    embed_key,
+                    embed_model,
+                    semantic_backend,
+                )
+                print(f"檢索詞：{'、'.join(result['keywords'])}")
+                print()
+                print(result["answer"])
+                if result["citations"]:
+                    print("\n引用：")
+                    for index, hit in enumerate(result["citations"], 1):
+                        label = hit["title"] or hit["job"]
+                        print(f"  [{index}] {label} {format_timestamp(hit['timestamp'])}（{hit['kind']}）")
+                        print(f"      {source_link(hit['source'], hit['timestamp'])}")
+                        # 附上原文：不點開影片就能判斷這個引用該不該信
+                        excerpt = " ".join(str(hit.get("text") or "").split())
+                        if excerpt:
+                            print(f"      「{excerpt[:160]}{'…' if len(excerpt) > 160 else ''}」")
+        except (RuntimeError, sqlite3.Error) as exc:
+            print(f"錯誤：{exc}", file=sys.stderr)
+            return 1
+        return 0
+    try:
+        if args.url_file:
+            manifest = run_batch(args)
+            print(f"batch-manifest: {manifest}")
+        else:
+            manifest = run_pipeline(args)
+            print(f"manifest: {manifest}")
+        return 0
+    except Exception as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

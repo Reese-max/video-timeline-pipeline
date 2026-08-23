@@ -1,0 +1,3 @@
+# FFmpeg 與 ffprobe 需另行安裝或由系統提供。
+yt-dlp
+Pillow

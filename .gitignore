@@ -1,0 +1,7 @@
+.env
+jobs/
+batches/
+canary/
+library.db
+__pycache__/
+*.tmp
