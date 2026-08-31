@@ -2968,11 +2968,13 @@ def hybrid_search(
     """以 RRF 合併精確詞與語意結果；不同分數尺度不直接相加。"""
     if not query.strip():
         raise RuntimeError("搜尋字串不可為空。")
+    if limit <= 0:
+        raise ValueError("limit 必須大於 0。")
     lexical: list[dict[str, Any]] = []
     keywords: list[str] = []
     direct = search_index(root, query, max(limit * 4, 20), category)
     lexical.extend(direct)
-    if not direct or len(query.strip()) > 12 or any(char.isspace() for char in query):
+    if api_key and (not direct or len(query.strip()) > 12 or any(char.isspace() for char in query)):
         try:
             keywords = question_keywords(
                 query,
@@ -3005,7 +3007,12 @@ def hybrid_search(
     merged: dict[tuple[Any, ...], dict[str, Any]] = {}
     for source_rank, results in enumerate(sources):
         for rank, hit in enumerate(results, 1):
-            key = (hit["job"], round(float(hit.get("timestamp") or 0), 3), hit["kind"])
+            key = (
+                hit["job"],
+                round(float(hit.get("timestamp") or 0), 3),
+                hit["kind"],
+                text_hash(str(hit.get("text") or "")),
+            )
             item = merged.setdefault(key, {**hit, "fusion_score": 0.0})
             item["fusion_score"] += 1.0 / (RRF_K + rank)
             if source_rank == 0:
