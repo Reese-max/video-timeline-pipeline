@@ -450,6 +450,8 @@ def validate_summary_sources(
             end = start
         ranges.append((start, max(start, end)))
     errors: list[str] = []
+    if timeline and not summary.get("source_timestamps"):
+        errors.append("摘要缺少 source_timestamps")
     for key in ("source_timestamps", "fact_check"):
         values = summary.get(key) or []
         for index, item in enumerate(values):
