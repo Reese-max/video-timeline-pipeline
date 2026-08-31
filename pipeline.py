@@ -97,6 +97,24 @@ def run_external(command: list[str], *, cwd: Path | None = None, stream: bool = 
     return completed.stdout
 
 
+
+def run_external_capture(command: list[str], *, cwd: Path | None = None) -> tuple[str, str]:
+    """執行外部指令並同時保留 stdout／stderr；抽幀需要從 showinfo 讀回原始 PTS。"""
+    print("$ " + subprocess.list2cmdline(command))
+    completed = subprocess.run(
+        command,
+        cwd=cwd,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    if completed.returncode:
+        detail = (completed.stderr or completed.stdout).strip()
+        raise RuntimeError(f"外部指令失敗（{completed.returncode}）：{detail[-2000:]}")
+    return completed.stdout, completed.stderr
+
 def require_tool(name: str) -> str:
     path = shutil.which(name)
     if not path:
@@ -117,6 +135,297 @@ def job_key(source: str, variant: str = "") -> str:
     material = source + "\x00" + variant
     return hashlib.sha256(material.encode("utf-8")).hexdigest()[:12]
 
+
+
+PIPELINE_SCHEMA_VERSION = 2
+ARTIFACT_SCHEMA_VERSION = 2
+FRAME_EXTRACTOR_VERSION = "native-pts-scene-v2"
+AUDIO_EXTRACTOR_VERSION = "audio-window-v2"
+CAPTION_EXTRACTOR_VERSION = "youtube-caption-v2"
+PROMPT_VERSIONS = {
+    "visual": "2026-08-31.visual-v2",
+    "visual_review": "2026-08-31.visual-review-v1",
+    "summary": "2026-08-31.summary-v2",
+    "summary_chunk": "2026-08-31.summary-chunk-v1",
+    "keywords": "2026-08-31.keywords-v1",
+    "answer": "2026-08-31.answer-v1",
+}
+SUMMARY_CHUNK_CHARS = 180000
+RRF_K = 60
+
+
+class ArtifactValidationError(RuntimeError):
+    """產物未通過結構、時間或來源驗證。"""
+
+
+def read_json_file(path: Path) -> Any | None:
+    if not path.is_file():
+        return None
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return None
+
+
+def stable_json(value: Any) -> str:
+    return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str)
+
+
+def digest_value(value: Any, length: int = 24) -> str:
+    return hashlib.sha256(stable_json(value).encode("utf-8")).hexdigest()[:length]
+
+
+def source_metadata_fingerprint(info: dict[str, Any], fallback: str) -> str:
+    material = {
+        "source": info.get("webpage_url") or info.get("original_url") or fallback,
+        "id": info.get("id"),
+        "duration": info.get("duration"),
+        "language": info.get("language"),
+        "upload_date": info.get("upload_date"),
+        "timestamp": info.get("timestamp"),
+    }
+    return digest_value(material)
+
+
+def file_fingerprint(path: Path, cache_path: Path | None = None) -> str:
+    """用檔案內容指紋判斷本機影片是否真的變了；相同 stat 直接重用已算過的 hash。"""
+    stat = path.stat()
+    if cache_path:
+        cached = read_json_file(cache_path)
+        if (
+            isinstance(cached, dict)
+            and cached.get("size") == stat.st_size
+            and cached.get("mtime_ns") == stat.st_mtime_ns
+            and cached.get("sha256")
+        ):
+            return str(cached["sha256"])
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for block in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(block)
+    result = digest.hexdigest()
+    if cache_path:
+        write_json(
+            cache_path,
+            {"schema_version": ARTIFACT_SCHEMA_VERSION, "size": stat.st_size, "mtime_ns": stat.st_mtime_ns, "sha256": result},
+        )
+    return result
+
+
+def stage_signature(
+    stage: str,
+    source_fingerprint: str,
+    settings: dict[str, Any] | None = None,
+    dependencies: list[str] | None = None,
+) -> str:
+    return digest_value(
+        {
+            "schema_version": PIPELINE_SCHEMA_VERSION,
+            "stage": stage,
+            "source_fingerprint": source_fingerprint,
+            "settings": settings or {},
+            "dependencies": dependencies or [],
+        }
+    )
+
+
+def stage_cache_value(
+    previous_stages: dict[str, Any],
+    stage: str,
+    path: Path,
+    signature: str,
+    validator: Any = None,
+    refresh: bool = False,
+) -> Any | None:
+    """只有階段簽章、檔案內容與驗證都通過才重用，與整支影片完成狀態脫鉤。"""
+    if refresh:
+        return None
+    record = previous_stages.get(stage) or {}
+    if record.get("signature") != signature or record.get("status") != "completed":
+        return None
+    value = read_json_file(path)
+    if value is None:
+        return None
+    if validator is not None and validator(value):
+        return None
+    return value
+
+
+def write_stage_part(path: Path, stage: str, signature: str, result: Any, **metadata: Any) -> None:
+    write_json(
+        path,
+        {
+            "schema_version": ARTIFACT_SCHEMA_VERSION,
+            "stage": stage,
+            "signature": signature,
+            "result": result,
+            **metadata,
+        },
+    )
+
+
+def read_stage_part(path: Path, stage: str, signature: str) -> Any | None:
+    value = read_json_file(path)
+    if not isinstance(value, dict):
+        return None
+    if (
+        value.get("schema_version") != ARTIFACT_SCHEMA_VERSION
+        or value.get("stage") != stage
+        or value.get("signature") != signature
+        or "result" not in value
+    ):
+        return None
+    return value["result"]
+
+
+def set_stage_record(
+    manifest: dict[str, Any],
+    stage: str,
+    signature: str,
+    artifact: str,
+    *,
+    status: str = "completed",
+    reused: bool = False,
+    **metadata: Any,
+) -> None:
+    stages = manifest.setdefault("stages", {})
+    stages[stage] = {
+        "schema_version": ARTIFACT_SCHEMA_VERSION,
+        "signature": signature,
+        "artifact": artifact,
+        "status": status,
+        "reused": reused,
+        "updated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        **metadata,
+    }
+
+
+def validate_transcript(value: Any) -> list[str]:
+    if not isinstance(value, dict):
+        return ["不是 object"]
+    if value.get("status") in {"skipped", "silent"}:
+        return []
+    segments = value.get("segments")
+    if not isinstance(segments, list):
+        return ["segments 不是陣列"]
+    errors: list[str] = []
+    previous_start = -1.0
+    for index, segment in enumerate(segments):
+        if not isinstance(segment, dict):
+            errors.append(f"segments[{index}] 不是 object")
+            continue
+        try:
+            start = float(segment["start"])
+            end = float(segment["end"])
+        except (KeyError, TypeError, ValueError):
+            errors.append(f"segments[{index}] 缺少有效時間")
+            continue
+        if start < 0 or end < start:
+            errors.append(f"segments[{index}] 時間範圍錯誤")
+        if start + 0.001 < previous_start:
+            errors.append(f"segments[{index}] 未依時間排序")
+        if not str(segment.get("text", "")).strip():
+            errors.append(f"segments[{index}] 沒有文字")
+        previous_start = start
+    return errors
+
+
+def validate_visual(value: Any) -> list[str]:
+    if not isinstance(value, list):
+        return ["視覺產物不是陣列"]
+    errors: list[str] = []
+    for index, item in enumerate(value):
+        if not isinstance(item, dict):
+            errors.append(f"visual[{index}] 不是 object")
+            continue
+        try:
+            timestamp = float(item["timestamp"])
+        except (KeyError, TypeError, ValueError):
+            errors.append(f"visual[{index}] 缺少有效 timestamp")
+            continue
+        if timestamp < 0:
+            errors.append(f"visual[{index}] timestamp 小於 0")
+        for key in ("screen_type", "visible_text", "visual_summary", "important_details"):
+            if key not in item:
+                errors.append(f"visual[{index}] 缺少 {key}")
+        confidence = item.get("confidence")
+        if confidence is not None:
+            try:
+                if not 0 <= float(confidence) <= 1:
+                    errors.append(f"visual[{index}] confidence 超出 0 到 1")
+            except (TypeError, ValueError):
+                errors.append(f"visual[{index}] confidence 無效")
+    return errors
+
+
+def validate_timeline(value: Any) -> list[str]:
+    if not isinstance(value, list):
+        return ["時間軸不是陣列"]
+    errors: list[str] = []
+    previous = -1.0
+    for index, event in enumerate(value):
+        if not isinstance(event, dict):
+            errors.append(f"timeline[{index}] 不是 object")
+            continue
+        try:
+            timestamp = float(event["timestamp"])
+        except (KeyError, TypeError, ValueError):
+            errors.append(f"timeline[{index}] 缺少 timestamp")
+            continue
+        if timestamp < previous:
+            errors.append(f"timeline[{index}] 未依時間排序")
+        previous = timestamp
+        if event.get("type") not in {"speech", "visual"}:
+            errors.append(f"timeline[{index}] type 無效")
+    return errors
+
+
+def validate_summary(value: Any, duration: float = 0.0) -> list[str]:
+    if not isinstance(value, dict):
+        return ["摘要不是 object"]
+    errors: list[str] = []
+    if not str(value.get("short_summary", "")).strip():
+        errors.append("缺少 short_summary")
+    for key in ("chapters", "steps", "tools_and_terms", "fact_check", "source_timestamps"):
+        if not isinstance(value.get(key), list):
+            errors.append(f"{key} 不是陣列")
+    tolerance = max(5.0, duration * 0.01)
+    for index, chapter in enumerate(value.get("chapters") or []):
+        if not isinstance(chapter, dict):
+            errors.append(f"chapters[{index}] 不是 object")
+            continue
+        try:
+            start = float(chapter["start"])
+            end = float(chapter["end"])
+        except (KeyError, TypeError, ValueError):
+            errors.append(f"chapters[{index}] 缺少有效時間")
+            continue
+        if start < 0 or end < start or (duration > 0 and end > duration + tolerance):
+            errors.append(f"chapters[{index}] 時間超出影片範圍")
+        if not str(chapter.get("title", "")).strip():
+            errors.append(f"chapters[{index}] 缺少 title")
+    for index, item in enumerate(value.get("fact_check") or []):
+        if not isinstance(item, dict):
+            errors.append(f"fact_check[{index}] 不是 object")
+            continue
+        try:
+            timestamp = float(item["timestamp"])
+        except (KeyError, TypeError, ValueError):
+            errors.append(f"fact_check[{index}] 缺少 timestamp")
+            continue
+        if timestamp < 0 or (duration > 0 and timestamp > duration + tolerance):
+            errors.append(f"fact_check[{index}] timestamp 超出範圍")
+        if not str(item.get("claim", "")).strip() or not str(item.get("reason", "")).strip():
+            errors.append(f"fact_check[{index}] 缺少 claim 或 reason")
+    for index, timestamp in enumerate(value.get("source_timestamps") or []):
+        try:
+            numeric = float(timestamp)
+        except (TypeError, ValueError):
+            errors.append(f"source_timestamps[{index}] 無效")
+            continue
+        if numeric < 0 or (duration > 0 and numeric > duration + tolerance):
+            errors.append(f"source_timestamps[{index}] 超出範圍")
+    return errors
 
 def marker_matches(marker: Path, signature: str) -> bool:
     """完成標記同時記錄當時的設定，設定變了就得重做。
