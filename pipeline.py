@@ -436,6 +436,8 @@ def validate_summary_sources(
     tolerance: float = 5.0,
 ) -> list[str]:
     """確認摘要引用時間附近真的有原始語音或畫面事件。"""
+    if not isinstance(summary, dict):
+        return ["摘要不是 object"]
     ranges: list[tuple[float, float]] = []
     for event in timeline:
         if not isinstance(event, dict):
