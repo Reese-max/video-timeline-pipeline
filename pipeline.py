@@ -1129,6 +1129,191 @@ def groq_transcribe(
         body,
     )
 
+
+def normalize_chunk_specs(chunks: list[Any]) -> list[dict[str, Any]]:
+    specs: list[dict[str, Any]] = []
+    for index, item in enumerate(chunks):
+        if isinstance(item, dict):
+            path = Path(str(item["path"]))
+            start = float(item.get("start", index * 900))
+            end = float(item.get("end", start + 900))
+            actual_index = int(item.get("index", index))
+        else:
+            path = Path(str(item))
+            start = float(index * 900)
+            end = start + 900
+            actual_index = index
+        specs.append({"index": actual_index, "path": path, "start": start, "end": end})
+    return specs
+
+
+def transcription_review_flags(result: dict[str, Any]) -> list[str]:
+    flags: list[str] = []
+    segments = result.get("segments") or []
+    if not isinstance(segments, list):
+        return ["segments_missing"]
+    for segment in segments:
+        if not isinstance(segment, dict):
+            flags.append("malformed_segment")
+            continue
+        text = str(segment.get("text", "")).strip()
+        no_speech = segment.get("no_speech_prob")
+        avg_logprob = segment.get("avg_logprob")
+        compression = segment.get("compression_ratio")
+        if text and is_silence(no_speech):
+            flags.append("text_with_high_no_speech_prob")
+        try:
+            if avg_logprob is not None and float(avg_logprob) < -1.0:
+                flags.append("low_avg_logprob")
+        except (TypeError, ValueError):
+            flags.append("invalid_avg_logprob")
+        try:
+            if compression is not None and float(compression) > 2.4:
+                flags.append("high_compression_ratio")
+        except (TypeError, ValueError):
+            flags.append("invalid_compression_ratio")
+    return sorted(set(flags))
+
+
+def transcription_quality_score(result: dict[str, Any]) -> float:
+    segments = result.get("segments") or []
+    text = " ".join(str(item.get("text", "")) for item in segments if isinstance(item, dict))
+    return float(len(text)) - 25.0 * len(transcription_review_flags(result))
+
+
+def result_segments(
+    result: dict[str, Any],
+    spec: dict[str, Any],
+    *,
+    source_label: str,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    raw_segments = result.get("segments") or []
+    if not raw_segments and result.get("text"):
+        raw_segments = [{"start": 0.0, "end": spec["end"] - spec["start"], "text": result["text"]}]
+    segments: list[dict[str, Any]] = []
+    omitted: list[dict[str, Any]] = []
+    for raw in raw_segments:
+        if not isinstance(raw, dict):
+            continue
+        text = str(raw.get("text", "")).strip()
+        try:
+            relative_start = float(raw.get("start", 0))
+            relative_end = float(raw.get("end", relative_start))
+        except (TypeError, ValueError):
+            continue
+        item = {
+            "start": round(relative_start + spec["start"], 3),
+            "end": round(max(relative_end, relative_start) + spec["start"], 3),
+            "text": text,
+            "chunk": spec["index"],
+            "source_chunk_start": spec["start"],
+            "source_label": source_label,
+        }
+        for key in ("avg_logprob", "compression_ratio", "no_speech_prob"):
+            if key in raw:
+                item[key] = raw[key]
+        if text:
+            flags: list[str] = []
+            if is_silence(raw.get("no_speech_prob")):
+                flags.append("text_with_high_no_speech_prob")
+            try:
+                if raw.get("avg_logprob") is not None and float(raw["avg_logprob"]) < -1.0:
+                    flags.append("low_avg_logprob")
+            except (TypeError, ValueError):
+                flags.append("invalid_avg_logprob")
+            try:
+                if raw.get("compression_ratio") is not None and float(raw["compression_ratio"]) > 2.4:
+                    flags.append("high_compression_ratio")
+            except (TypeError, ValueError):
+                flags.append("invalid_compression_ratio")
+            if flags:
+                item["review_required"] = sorted(set(flags))
+            segments.append(item)
+        elif is_silence(raw.get("no_speech_prob")):
+            omitted.append(
+                {
+                    "start": item["start"],
+                    "end": item["end"],
+                    "chunk": spec["index"],
+                    "no_speech_prob": raw.get("no_speech_prob"),
+                    "reason": "no_text_high_no_speech_probability",
+                }
+            )
+    return segments, omitted
+
+
+def merge_overlapping_segments(segments: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    merged: list[dict[str, Any]] = []
+    for current in sorted(segments, key=lambda item: (float(item["start"]), float(item["end"]))):
+        if not merged:
+            current["source_chunks"] = [current.get("chunk")]
+            merged.append(current)
+            continue
+        previous = merged[-1]
+        overlap = min(float(previous["end"]), float(current["end"])) - float(current["start"])
+        left = " ".join(str(previous.get("text", "")).lower().split())
+        right = " ".join(str(current.get("text", "")).lower().split())
+        similar = (
+            bool(left and right)
+            and (
+                left == right
+                or left in right
+                or right in left
+                or difflib.SequenceMatcher(None, left, right).ratio() >= 0.85
+            )
+        )
+        if overlap > 0 and similar:
+            chosen = current if len(right) > len(left) else previous
+            chosen["start"] = min(float(previous["start"]), float(current["start"]))
+            chosen["end"] = max(float(previous["end"]), float(current["end"]))
+            chosen["source_chunks"] = sorted(
+                set(previous.get("source_chunks", []) + [current.get("chunk")])
+            )
+            if previous.get("review_required") or current.get("review_required"):
+                chosen["review_required"] = sorted(
+                    set(previous.get("review_required", []) + current.get("review_required", []))
+                )
+            merged[-1] = chosen
+        else:
+            current["source_chunks"] = [current.get("chunk")]
+            merged.append(current)
+    return merged
+
+
+def aggregate_transcription_results(
+    results: dict[int, dict[str, Any]],
+    specs: list[dict[str, Any]],
+    model: str,
+    language: str,
+    source_label: str,
+) -> dict[str, Any]:
+    segments: list[dict[str, Any]] = []
+    omitted: list[dict[str, Any]] = []
+    reviews: list[dict[str, Any]] = []
+    detected = language
+    by_index = {int(spec["index"]): spec for spec in specs}
+    for index in sorted(results):
+        payload = results[index]
+        selected = payload.get("selected") or {}
+        detected = selected.get("language") or detected
+        chunk_segments, chunk_omitted = result_segments(
+            selected, by_index[index], source_label=source_label
+        )
+        segments.extend(chunk_segments)
+        omitted.extend(chunk_omitted)
+        flags = payload.get("review") or []
+        if flags:
+            reviews.append({"chunk": index, "flags": flags, "attempts": payload.get("attempts", 1)})
+    return {
+        "schema_version": ARTIFACT_SCHEMA_VERSION,
+        "model": model,
+        "language": detected,
+        "segments": merge_overlapping_segments(segments),
+        "review": reviews,
+        "omitted_segments": omitted,
+        "chunk_count": len(specs),
+    }
+
 def transcribe_all(
     chunks: list[Path],
     api_key: str,
