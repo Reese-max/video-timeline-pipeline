@@ -1447,11 +1447,15 @@ def parse_caption_json3(payload: dict[str, Any]) -> list[dict[str, Any]]:
         text = "".join(part.get("utf8", "") for part in (event.get("segs") or [])).strip()
         if not text:
             continue
-        start = float(event.get("tStartMs", 0)) / 1000
+        try:
+            start = float(event.get("tStartMs", 0)) / 1000
+            duration = max(0.0, float(event.get("dDurationMs", 0)) / 1000)
+        except (TypeError, ValueError):
+            continue
         segments.append(
             {
                 "start": round(start, 3),
-                "end": round(start + float(event.get("dDurationMs", 0)) / 1000, 3),
+                "end": round(start + duration, 3),
                 "text": text,
                 "chunk": 0,
             }
@@ -4048,6 +4052,8 @@ def run_pipeline(args: argparse.Namespace) -> Path:
                     fetched_caption, float(info.get("duration") or 0.0)
                 ):
                     caption_transcript = fetched_caption
+                elif fetched_caption:
+                    caption_error = "字幕完整性驗證未通過，改用音訊轉錄"
         except RuntimeError as exc:
             caption_error = str(exc)
             print(f"! 字幕前置失敗，稍後改走媒體／語音流程：{caption_error}")
