@@ -125,7 +125,7 @@ turbo 不只聽錯關鍵字，還把 "in front of" 縮成 "one of"，整句語�
 
 ```text
 GROQ_MODEL=whisper-large-v3
-GROQ_LANGUAGE=zh
+GROQ_LANGUAGE=auto
 MINIMAX_MODEL=MiniMax-M3
 MINIMAX_BASE_URL=https://api.minimax.io/v1
 ```
