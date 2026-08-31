@@ -4597,7 +4597,7 @@ def run_pipeline(args: argparse.Namespace) -> Path:
                         api_key,
                         os.getenv("MINIMAX_MODEL", "MiniMax-M3"),
                         args.workers,
-                        visual_signature,
+                        frame_signature,
                         job_dir / "visual-parts",
                         args.refresh,
                     )
