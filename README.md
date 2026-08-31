@@ -49,7 +49,7 @@ python pipeline.py --video 'D:\path\to\video.mp4' --dry-run
 python pipeline.py --video 'D:\path\to\video.mp4' --dry-run --slide-extractor steipete
 ```
 
-`--dry-run` 不會下載、不會上傳、不會呼叫雲端 API，但會用本機 `ffprobe`／`ffmpeg` 產生音訊片段與候選截圖。輸出在 `jobs\<12字元雜湊>\`。
+`--dry-run` 不會下載、不會上傳、不會呼叫雲端 API；本機影片仍可用 `ffprobe`／`ffmpeg` 驗證抽取，URL 則只寫入 dry-run manifest。輸出在 `jobs\<12字元雜湊>\`。
 
 ## 批次建立頻道知識庫
 
@@ -94,7 +94,7 @@ MINIMAX_API_KEY=...
 
 `.env` 會覆蓋繼承來的環境變數（只有非空值才覆蓋）。這點很重要：`MINIMAX_BASE_URL` 這種通用名稱常被別的工具設成不相容的值（例如指向 `/anthropic` 相容端點），若讓全域設定贏過專案設定，照著這份 README 建 `.env` 也修不好。`.env` 同時會從**專案目錄**與 `--root` 指定的輸出目錄讀取，後者優先。
 
-逐字稿語言預設 `zh`。處理外語影片要加 `--language auto` 交給 Whisper 自動偵測，否則會把外語音訊硬「翻譯」成中文，產出無意義的逐字稿：
+逐字稿語言預設 `auto`。字幕模式會先依來源提供的語言選擇原文；音訊模式則交給 Whisper 偵測。若已知語言，才指定 `--language zh`、`en` 等：
 
 ```powershell
 python pipeline.py --url '...' --language auto
@@ -124,7 +124,7 @@ turbo 不只聽錯關鍵字，還把 "in front of" 縮成 "one of"，整句語�
 可選環境變數：
 
 ```text
-GROQ_MODEL=whisper-large-v3-turbo
+GROQ_MODEL=whisper-large-v3
 GROQ_LANGUAGE=zh
 MINIMAX_MODEL=MiniMax-M3
 MINIMAX_BASE_URL=https://api.minimax.io/v1
@@ -139,9 +139,9 @@ python pipeline.py --url 'https://www.facebook.com/...' --local-only
 ## 產物
 
 - `manifest.json`：狀態、來源、設定與產物索引。
-- `audio\audio_*.mp3`：單聲道 16 kHz、每段預設 15 分鐘。
-- `frames\frame_*.jpg`：定時截圖；`frame_candidates.json` 記錄去重與 OCR 判斷。
-- `transcript.json`：Groq 帶時間戳逐字稿。
+- `audio\audio_*.mp3`：單聲道 16 kHz、每段預設 5 分鐘，交界重疊 2 秒；每段保存實際 `start/end`。
+- `frames\frame_*.jpg`：場景變化＋定期保底抽取；`timestamps.json` 保存 FFmpeg 原始 `pts_time`，候選畫面另記 OCR／變化原因。
+- `transcript.json`：可靠平台字幕或 Groq／本機 Whisper 帶時間戳逐字稿；疑點片段保留 `review` 標記，不直接丟掉。
 - `visual.json`：MiniMax 結構化畫面觀察。
 - `timeline.json`：語音與畫面事件依時間排序。
 - `summary.json`：MiniMax 摘要、章節、步驟、工具名詞與待查證資訊。
