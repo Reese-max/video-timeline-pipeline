@@ -430,6 +430,39 @@ def validate_summary(value: Any, duration: float = 0.0) -> list[str]:
             errors.append(f"source_timestamps[{index}] 超出範圍")
     return errors
 
+def validate_summary_sources(
+    summary: dict[str, Any],
+    timeline: list[dict[str, Any]],
+    tolerance: float = 5.0,
+) -> list[str]:
+    """確認摘要引用時間附近真的有原始語音或畫面事件。"""
+    ranges: list[tuple[float, float]] = []
+    for event in timeline:
+        if not isinstance(event, dict):
+            continue
+        try:
+            start = float(event["timestamp"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        try:
+            end = float(event.get("end", start) or start)
+        except (TypeError, ValueError):
+            end = start
+        ranges.append((start, max(start, end)))
+    errors: list[str] = []
+    for key in ("source_timestamps", "fact_check"):
+        values = summary.get(key) or []
+        for index, item in enumerate(values):
+            raw_timestamp = item if key == "source_timestamps" else (item.get("timestamp") if isinstance(item, dict) else None)
+            try:
+                timestamp = float(raw_timestamp)
+            except (TypeError, ValueError):
+                continue
+            if not any(start - tolerance <= timestamp <= end + tolerance for start, end in ranges):
+                errors.append(f"{key}[{index}] 沒有對應時間軸事件")
+    return errors
+
+
 def marker_matches(marker: Path, signature: str) -> bool:
     """完成標記同時記錄當時的設定，設定變了就得重做。
 
@@ -2187,7 +2220,7 @@ def generate_summary_for_events(
             thinking="adaptive",
         )
     )
-    errors = validate_summary(summary, duration)
+    errors = validate_summary(summary, duration) + validate_summary_sources(summary, events)
     if errors:
         print(f"! 摘要結構驗證失敗，重試一次：{'; '.join(errors[:4])}")
         summary = parse_json_object(
@@ -2200,7 +2233,7 @@ def generate_summary_for_events(
                 thinking="adaptive",
             )
         )
-        errors = validate_summary(summary, duration)
+        errors = validate_summary(summary, duration) + validate_summary_sources(summary, events)
     if errors:
         raise ArtifactValidationError("摘要未通過驗證：" + "; ".join(errors[:8]))
     return summary
@@ -3518,7 +3551,12 @@ def audit_library(root: Path) -> list[str]:
         if status == "completed":
             completed.add(job.name)
             summary = read_json_file(job / "summary.json")
-            if not isinstance(summary, dict) or validate_summary(summary, float((manifest.get("video") or {}).get("duration_seconds") or 0)):
+            timeline = read_json_file(job / "timeline.json") or []
+            if (
+                not isinstance(summary, dict)
+                or validate_summary(summary, float((manifest.get("video") or {}).get("duration_seconds") or 0))
+                or validate_summary_sources(summary, timeline if isinstance(timeline, list) else [])
+            ):
                 broken_summary.append(job.name)
 
     print(f"  影片：{len(jobs)} 支（completed {len(completed)}、failed {len(failed)}）")
@@ -4786,7 +4824,7 @@ def run_pipeline(args: argparse.Namespace) -> Path:
                 "summary",
                 job_dir / "summary.json",
                 summary_signature,
-                lambda value: validate_summary(value, duration),
+                lambda value: validate_summary(value, duration) + validate_summary_sources(value, timeline),
                 args.refresh,
             )
             if isinstance(cached_summary, dict):
@@ -4833,6 +4871,7 @@ def run_pipeline(args: argparse.Namespace) -> Path:
         if not (args.dry_run or args.local_only):
             errors = validate_transcript(transcript) + validate_visual(observations) + validate_timeline(timeline)
             errors += validate_summary(summary, duration)
+            errors += validate_summary_sources(summary, timeline)
             if errors:
                 raise ArtifactValidationError("完成驗證失敗：" + "; ".join(errors[:12]))
 
