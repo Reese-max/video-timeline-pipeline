@@ -3,12 +3,15 @@
 目前實作的流程：
 
 ```text
-影片 URL（YouTube／Facebook／其他 yt-dlp 支援站台） → yt-dlp → FFmpeg
-                         ├─ 音訊片段 → Groq Whisper
-                         └─ steipete slides／Tesseract → MiniMax M3
+影片 URL → yt-dlp metadata／字幕（先取得）
+             ├─ 可靠字幕 → 文字時間軸
+             └─ 無字幕／字幕疑點 → 重疊音訊片段 → Groq Whisper
+影片媒體 → FFmpeg 原始 PTS＋自適應畫面候選 → MiniMax M3
                                       ↓
-                              時間軸合併 → MiniMax M3 摘要
+                    音畫依原始時間對齊 → 分章節摘要 → 索引／問答
 ```
+
+URL 來源會先讀取 metadata 與可用字幕；字幕可靠時跳過整段音訊轉錄，但完整模式仍可下載媒體做必要的畫面分析。`--no-video` 則只建立字幕索引。
 
 ## 專案邊界
 
