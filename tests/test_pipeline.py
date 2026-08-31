@@ -24,6 +24,50 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual((specs[0]["start"], specs[0]["end"]), (0.0, 300.0))
         self.assertEqual((specs[1]["start"], specs[1]["end"]), (300.0, 600.0))
 
+    def test_audio_resume_reextracts_only_missing_chunk(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            calls = []
+            original_run = pipeline.run_external
+            original_require = pipeline.require_tool
+
+            def fake_run(command, *, cwd=None, stream=False):
+                calls.append(command[-1])
+                Path(command[-1]).write_bytes(b"audio")
+
+            pipeline.run_external = fake_run
+            pipeline.require_tool = lambda name: name
+            try:
+                probe = {"format": {"duration": "11"}, "streams": [{"codec_type": "audio"}]}
+                chunks = pipeline.extract_audio(
+                    root / "video.mp4",
+                    root / "job",
+                    5,
+                    1,
+                    "source",
+                    11,
+                    True,
+                    probe,
+                )
+                calls.clear()
+                Path(chunks[1]["path"]).unlink()
+                resumed = pipeline.extract_audio(
+                    root / "video.mp4",
+                    root / "job",
+                    5,
+                    1,
+                    "source",
+                    11,
+                    False,
+                    probe,
+                )
+            finally:
+                pipeline.run_external = original_run
+                pipeline.require_tool = original_require
+            self.assertEqual(len(resumed), len(chunks))
+            self.assertEqual(len(calls), 1)
+            self.assertTrue(calls[0].endswith("audio_0001.mp3"))
+
     def test_caption_selection_prefers_original_manual_track(self):
         info = {
             "language": "zh-Hant",
