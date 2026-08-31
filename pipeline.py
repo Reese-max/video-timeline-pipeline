@@ -574,20 +574,22 @@ def extract_audio(
     )
     cached = read_json_file(metadata_path)
     cached_chunks = cached.get("chunks") if isinstance(cached, dict) else None
-    if (
+    cache_matches = (
         not refresh
-        and marker_matches(done, signature)
         and isinstance(cached, dict)
         and cached.get("schema_version") == ARTIFACT_SCHEMA_VERSION
         and cached.get("signature") == signature
         and isinstance(cached_chunks, list)
-        and cached_chunks
-        and all(Path(str(item.get("path", ""))).is_file() for item in cached_chunks if isinstance(item, dict))
-    ):
-        return [dict(item) for item in cached_chunks if isinstance(item, dict)]
+        and all(
+            isinstance(item, dict)
+            and item.get("path")
+            and Path(str(item["path"])).is_file()
+            for item in cached_chunks
+        )
+    )
+    if cache_matches and marker_matches(done, signature) and cached_chunks:
+        return [dict(item) for item in cached_chunks]
 
-    for stale in audio_dir.glob("audio_*.mp3"):
-        stale.unlink()
     probe = probe_data or probe_video(video_path)
     streams = probe.get("streams") or []
     if not any(stream.get("codec_type") == "audio" for stream in streams if isinstance(stream, dict)):
@@ -608,59 +610,90 @@ def extract_audio(
     if duration_seconds <= 0:
         raise RuntimeError("無法取得影片時長，無法建立音訊片段。")
 
+    cached_by_index: dict[int, dict[str, Any]] = {}
+    if cache_matches:
+        for item in cached_chunks:
+            try:
+                cached_by_index[int(item["index"])] = dict(item)
+            except (KeyError, TypeError, ValueError):
+                continue
+
     step = float(chunk_seconds) - float(overlap_seconds)
     chunks: list[dict[str, Any]] = []
-    start = 0.0
+    expected_paths: set[Path] = set()
+    logical_start = 0.0
     index = 0
-    while start < duration_seconds - 0.05:
-        end = min(duration_seconds, start + float(chunk_seconds))
-        length = end - start
+    while logical_start < duration_seconds - 0.05:
+        logical_end = min(duration_seconds, logical_start + float(chunk_seconds))
+        length = logical_end - logical_start
         if length <= 0.05:
             break
         output = audio_dir / f"audio_{index:04d}.mp3"
-        run_external(
-            [
-                require_tool("ffmpeg"),
-                "-y",
-                "-hide_banner",
-                "-loglevel",
-                "error",
-                "-ss",
-                f"{start:.3f}",
-                "-i",
-                str(video_path),
-                "-t",
-                f"{length:.3f}",
-                "-map",
-                "0:a:0",
-                "-vn",
-                "-ac",
-                "1",
-                "-ar",
-                "16000",
-                "-c:a",
-                "libmp3lame",
-                "-b:a",
-                "64k",
-                str(output),
-            ],
-            stream=True,
-        )
-        if not output.is_file() or output.stat().st_size == 0:
-            raise RuntimeError(f"FFmpeg 沒有產生音訊片段：{output.name}")
-        chunks.append(
-            {
-                "index": index,
-                "path": str(output),
-                "start": round(start, 3),
-                "end": round(end, 3),
-            }
-        )
+        expected_paths.add(output)
+        cached_item = cached_by_index.get(index)
+        expected_start = round(logical_start, 3)
+        expected_end = round(logical_end, 3)
+        if (
+            cached_item
+            and Path(str(cached_item.get("path", ""))).is_file()
+            and round(float(cached_item.get("start", -1)), 3) == expected_start
+            and round(float(cached_item.get("end", -1)), 3) == expected_end
+        ):
+            chunks.append(
+                {
+                    "index": index,
+                    "path": str(output),
+                    "start": expected_start,
+                    "end": expected_end,
+                }
+            )
+        else:
+            run_external(
+                [
+                    require_tool("ffmpeg"),
+                    "-y",
+                    "-hide_banner",
+                    "-loglevel",
+                    "error",
+                    "-ss",
+                    f"{logical_start:.3f}",
+                    "-i",
+                    str(video_path),
+                    "-t",
+                    f"{length:.3f}",
+                    "-map",
+                    "0:a:0",
+                    "-vn",
+                    "-ac",
+                    "1",
+                    "-ar",
+                    "16000",
+                    "-c:a",
+                    "libmp3lame",
+                    "-b:a",
+                    "64k",
+                    str(output),
+                ],
+                stream=True,
+            )
+            if not output.is_file() or output.stat().st_size == 0:
+                raise RuntimeError(f"FFmpeg 沒有產生音訊片段：{output.name}")
+            chunks.append(
+                {
+                    "index": index,
+                    "path": str(output),
+                    "start": expected_start,
+                    "end": expected_end,
+                }
+            )
         index += 1
-        if end >= duration_seconds - 0.05:
+        if logical_end >= duration_seconds - 0.05:
             break
-        start += step
+        logical_start += step
 
+    for stale in audio_dir.glob("audio_*.mp3"):
+        if stale not in expected_paths:
+            stale.unlink()
     if not chunks:
         raise RuntimeError("FFmpeg 沒有產生音訊片段。")
     write_json(
