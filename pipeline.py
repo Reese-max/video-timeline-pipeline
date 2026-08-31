@@ -2185,16 +2185,152 @@ def local_observations(candidates: list[dict[str, Any]]) -> list[dict[str, Any]]
     ]
 
 
-def summary_input(timeline: list[dict[str, Any]], max_chars: int) -> list[dict[str, Any]]:
-    selected: list[dict[str, Any]] = []
-    size = 0
+
+def timeline_chunks(
+    timeline: list[dict[str, Any]],
+    max_chars: int,
+    overlap_events: int = 2,
+) -> list[list[dict[str, Any]]]:
+    """按事件邊界切分，不遺漏尾端；相鄰片段保留少量上下文重疊。"""
+    if max_chars <= 0:
+        raise ValueError("max_chars 必須大於 0。")
+    if not timeline:
+        return [[]]
+    chunks: list[list[dict[str, Any]]] = []
+    current: list[dict[str, Any]] = []
+    current_size = 0
     for event in timeline:
-        encoded = json.dumps(event, ensure_ascii=False)
-        if selected and size + len(encoded) > max_chars:
-            break
-        selected.append(event)
-        size += len(encoded)
-    return selected
+        event_size = len(json.dumps(event, ensure_ascii=False)) + 1
+        if current and current_size + event_size > max_chars:
+            chunks.append(current)
+            overlap = max(0, min(overlap_events, len(current)))
+            current = current[-overlap:] if overlap else []
+            current_size = sum(len(json.dumps(item, ensure_ascii=False)) + 1 for item in current)
+        current.append(event)
+        current_size += event_size
+    if current:
+        chunks.append(current)
+    return chunks
+
+
+def summary_prompt(events: list[dict[str, Any]], *, strict: bool = False) -> str:
+    instruction = (
+        "你是影片知識整理員。只根據提供的時間軸事件輸出 JSON object。"
+        "欄位必須包含 short_summary、chapters、steps、tools_and_terms、fact_check、source_timestamps。"
+        "chapters 每項必須有 title、start、end、summary；fact_check 每項必須有 timestamp、claim、reason。"
+        "時間一律使用事件中的影片秒數；不要把相對序號當時間。"
+        "不要捏造事件中沒有的內容，不確定的資訊放入 fact_check。"
+        "所有說明文字用繁體中文，專有名詞可保留原文。"
+    )
+    if strict:
+        instruction += (
+            "上一次輸出格式不合格；這次只能輸出完整 JSON，所有陣列即使沒有內容也要保留。"
+            "所有章節與查證時間都必須落在提供事件的時間範圍內。"
+        )
+    return instruction + "\n\n" + json.dumps(events, ensure_ascii=False)
+
+
+def generate_summary_for_events(
+    events: list[dict[str, Any]],
+    api_key: str,
+    model: str,
+    duration: float,
+) -> dict[str, Any]:
+    prompt = summary_prompt(events)
+    summary = parse_json_object(
+        minimax_chat(
+            [{"role": "user", "content": prompt}],
+            api_key,
+            model,
+            timeout=900,
+            thinking="adaptive",
+        )
+    )
+    errors = validate_summary(summary, duration)
+    if errors:
+        print(f"! 摘要結構驗證失敗，重試一次：{'; '.join(errors[:4])}")
+        summary = parse_json_object(
+            minimax_chat(
+                [{"role": "user", "content": summary_prompt(events, strict=True)}],
+                api_key,
+                model,
+                timeout=900,
+                thinking="adaptive",
+            )
+        )
+        errors = validate_summary(summary, duration)
+    if errors:
+        raise ArtifactValidationError("摘要未通過驗證：" + "; ".join(errors[:8]))
+    return summary
+
+
+def merge_summary_parts(
+    parts: list[dict[str, Any]],
+    api_key: str,
+    model: str,
+    duration: float,
+) -> dict[str, Any]:
+    compact_parts = [
+        {
+            "chunk": index,
+            "short_summary": part.get("short_summary", ""),
+            "chapters": part.get("chapters", []),
+            "steps": part.get("steps", []),
+            "tools_and_terms": part.get("tools_and_terms", []),
+            "fact_check": part.get("fact_check", []),
+            "source_timestamps": part.get("source_timestamps", []),
+        }
+        for index, part in enumerate(parts)
+    ]
+    prompt = (
+        "你是影片知識庫總編。請整合下列各章節摘要，輸出完整 JSON object。"
+        "必須包含 short_summary、chapters、steps、tools_and_terms、fact_check、source_timestamps。"
+        "保留所有重要章節與原始時間，不可只保留前面的片段；不可捏造。"
+        "所有說明文字用繁體中文，專有名詞可保留原文。"
+        "\n\n"
+        + json.dumps(compact_parts, ensure_ascii=False)
+    )
+    summary = parse_json_object(
+        minimax_chat(
+            [{"role": "user", "content": prompt}],
+            api_key,
+            model,
+            timeout=900,
+            thinking="adaptive",
+        )
+    )
+    errors = validate_summary(summary, duration)
+    if errors:
+        print(f"! 全片摘要結構驗證失敗，重試一次：{'; '.join(errors[:4])}")
+        summary = parse_json_object(
+            minimax_chat(
+                [{"role": "user", "content": prompt + "\n只能輸出通過欄位與時間驗證的 JSON。"}],
+                api_key,
+                model,
+                timeout=900,
+                thinking="adaptive",
+            )
+        )
+        errors = validate_summary(summary, duration)
+    if errors:
+        raise ArtifactValidationError("全片摘要未通過驗證：" + "; ".join(errors[:8]))
+    source_timestamps = {
+        round(float(timestamp), 3)
+        for part in parts
+        for timestamp in (part.get("source_timestamps") or [])
+        if isinstance(timestamp, (int, float)) and not isinstance(timestamp, bool)
+    }
+    for timestamp in summary.get("source_timestamps") or []:
+        if isinstance(timestamp, (int, float)) and not isinstance(timestamp, bool):
+            source_timestamps.add(round(float(timestamp), 3))
+    summary["source_timestamps"] = sorted(source_timestamps)
+    summary["coverage"] = {"mode": "hierarchical", "chunks": len(parts)}
+    return summary
+
+
+def summary_input(timeline: list[dict[str, Any]], max_chars: int) -> list[dict[str, Any]]:
+    # 舊呼叫端仍可取得第一段；正式摘要流程使用 timeline_chunks，不會靜默捨棄尾端。
+    return timeline_chunks(timeline, max_chars)[0]
 
 
 def create_summary(
@@ -2202,25 +2338,56 @@ def create_summary(
     api_key: str,
     model: str,
     max_chars: int,
+    duration: float = 0.0,
+    stage_signature_value: str = "",
+    cache_dir: Path | None = None,
+    workers: int = 2,
+    refresh: bool = False,
 ) -> dict[str, Any]:
-    compact = summary_input(timeline, max_chars)
-    prompt = (
-        "你是影片知識整理員。根據以下依時間排序的語音與畫面事件，輸出 JSON object。"
-        "欄位：short_summary、chapters（含 title、start、end、summary）、"
-        "steps（字串陣列）、tools_and_terms（字串陣列）、"
-        "fact_check（含 timestamp、claim、reason 的陣列）、source_timestamps（數字陣列）。"
-        "不要捏造事件中沒有的內容；不確定的資訊放入 fact_check。"
-        # 不指定的話模型會跟著逐字稿語言走，外語影片產出外語摘要，中文查詢就搜不到。
-        "所有文字欄位一律用繁體中文書寫，專有名詞可保留原文。\n\n"
-        + json.dumps(compact, ensure_ascii=False)
-    )
-    summary = parse_json_object(minimax_chat([{"role": "user", "content": prompt}], api_key, model))
-    if not summary.get("short_summary"):
-        # 模型偶爾不回 JSON。重試一次通常就好，總比留下一份沒人發現的半成品強。
-        print("! 摘要不是有效 JSON，重試一次")
-        summary = parse_json_object(minimax_chat([{"role": "user", "content": prompt}], api_key, model))
-    return summary
+    if not timeline:
+        return {
+            "schema_version": ARTIFACT_SCHEMA_VERSION,
+            "short_summary": "影片中沒有可用的語音或畫面事件。",
+            "chapters": [],
+            "steps": [],
+            "tools_and_terms": [],
+            "fact_check": [],
+            "source_timestamps": [],
+            "coverage": {"mode": "empty", "chunks": 0},
+        }
+    chunks = timeline_chunks(timeline, max_chars)
+    if len(chunks) == 1:
+        summary = generate_summary_for_events(chunks[0], api_key, model, duration)
+        summary["schema_version"] = ARTIFACT_SCHEMA_VERSION
+        summary["coverage"] = {"mode": "single_pass", "chunks": 1, "event_count": len(timeline)}
+        return summary
 
+    part_dir = cache_dir or Path(tempfile.mkdtemp(prefix="summary-parts-"))
+    part_dir.mkdir(parents=True, exist_ok=True)
+    parts: list[dict[str, Any]] = []
+    for index, events in enumerate(chunks):
+        signature = stage_signature(
+            "summary_chunk",
+            stage_signature_value or model,
+            {
+                "chunk": index,
+                "events": digest_value(events),
+                "prompt": PROMPT_VERSIONS["summary_chunk"],
+            },
+        )
+        path = part_dir / f"summary_{index:04d}.json"
+        cached = None if refresh else read_stage_part(path, "summary_chunk", signature)
+        if isinstance(cached, dict) and not validate_summary(cached, duration):
+            parts.append(cached)
+            continue
+        part = generate_summary_for_events(events, api_key, model, duration)
+        write_stage_part(path, "summary_chunk", signature, part, chunk=index)
+        parts.append(part)
+    summary = merge_summary_parts(parts, api_key, model, duration)
+    summary["schema_version"] = ARTIFACT_SCHEMA_VERSION
+    summary["coverage"]["event_count"] = len(timeline)
+    summary["coverage"]["chunk_sizes"] = [len(events) for events in chunks]
+    return summary
 
 def source_link(url: Any, timestamp: Any) -> str:
     """把來源 URL 加上時間戳，讓每筆結果都能直接跳到影片的那一秒。
