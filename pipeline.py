@@ -1714,22 +1714,22 @@ def transcribe_local(
         "local",
     )
 
-def image_data_url(image_path: Path) -> str:
+
+def image_data_url(image_path: Path, max_long_side: int = 1280, quality: int = 80) -> str:
     try:
         from PIL import Image
 
         with Image.open(image_path) as image:
             image = image.convert("RGB")
-            image.thumbnail((1280, 1280))
+            image.thumbnail((max_long_side, max_long_side))
             buffer = io.BytesIO()
-            image.save(buffer, format="JPEG", quality=80, optimize=True)
+            image.save(buffer, format="JPEG", quality=quality, optimize=True)
             encoded = base64.b64encode(buffer.getvalue()).decode("ascii")
             return f"data:image/jpeg;base64,{encoded}"
     except ImportError:
         encoded = base64.b64encode(image_path.read_bytes()).decode("ascii")
         mime = mimetypes.guess_type(image_path.name)[0] or "image/jpeg"
         return f"data:{mime};base64,{encoded}"
-
 
 def minimax_endpoint() -> str:
     base_url = os.getenv("MINIMAX_BASE_URL", "https://api.minimax.io/v1").rstrip("/")
@@ -1738,18 +1738,22 @@ def minimax_endpoint() -> str:
     return base_url + "/chat/completions"
 
 
+
 def minimax_chat(
     messages: list[dict[str, Any]],
     api_key: str,
     model: str,
     max_tokens: int | None = None,
     timeout: int = 180,
+    thinking: str | None = "adaptive",
 ) -> str:
-    # 預設不設上限：MiniMax-M3 是 reasoning 模型，<think> 會先吃掉配額，
-    # 給定的預算常常在真正的答案輸出前就用完，回傳半截 JSON。
     payload: dict[str, Any] = {"model": model, "messages": messages, "temperature": 0.1}
-    if max_tokens:
+    if max_tokens is not None and max_tokens > 0:
         payload["max_tokens"] = max_tokens
+    if thinking in {"adaptive", "disabled"}:
+        # MiniMax-M3 的 OpenAI 相容介面用 thinking 控制是否真的推理；
+        # reasoning_split 只改輸出格式，不能取代這個欄位。
+        payload["thinking"] = {"type": thinking}
     raw = post_json(
         minimax_endpoint(),
         {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
@@ -1759,13 +1763,17 @@ def minimax_chat(
     choices = raw.get("choices") or []
     if not choices:
         raise RuntimeError(f"MiniMax 回應缺少 choices：{raw}")
-    content = choices[0].get("message", {}).get("content", "")
+    message = choices[0].get("message") or {}
+    content = message.get("content", "")
     if isinstance(content, list):
-        content = "".join(str(part.get("text", "")) for part in content if isinstance(part, dict))
-    # MiniMax-M3 是 reasoning 模型，回覆前面掛著 <think>…</think>。
-    # 走 parse_json_object 的地方剛好會忽略它，純文字回答卻會把推理過程一起印出來。
+        content = "".join(
+            str(part.get("text", ""))
+            for part in content
+            if isinstance(part, dict) and part.get("type") in {None, "text"}
+        )
+    if not content and message.get("reasoning_content"):
+        content = message.get("reasoning_content")
     return re.sub(r"<think>.*?</think>", "", str(content), flags=re.DOTALL).strip()
-
 
 def parse_json_object(text: str) -> dict[str, Any]:
     cleaned = text.strip()
@@ -1908,6 +1916,7 @@ def refine_visual_observations(
     return results
 
 
+
 def analyze_images(
     candidates: list[dict[str, Any]],
     api_key: str,
@@ -1922,31 +1931,27 @@ def analyze_images(
 
     def one(item: tuple[int, dict[str, Any]]) -> tuple[int, dict[str, Any], bool, str]:
         index, candidate = item
-        detail_level = (
-            "high"
-            if any(reason in {"text_change", "low_ocr_confidence"} for reason in candidate.get("reasons", []))
-            else "default"
-        )
-        image_size = 2048 if detail_level == "high" else 1280
-        signature = stage_signature(
+        candidate_signature = stage_signature(
             "visual_frame",
             stage_signature_value or model,
             {
                 "model": model,
-                "prompt_version": PROMPT_VERSIONS["visual"],
-                "candidate": {
-                    "timestamp": candidate.get("timestamp"),
-                    "hash": candidate.get("hash"),
-                    "reasons": candidate.get("reasons", []),
-                },
-                "detail": detail_level,
+                "index": index,
+                "timestamp": candidate.get("timestamp"),
+                "hash": candidate.get("hash"),
+                "ocr_text": candidate.get("ocr_text", ""),
+                "reasons": candidate.get("reasons", []),
             },
         )
-        part_path = part_dir / f"visual_{index:06d}.json"
-        cached = None if refresh else read_stage_part(part_path, "visual_frame", signature)
+        part_path = part_dir / f"visual_{index:04d}.json"
+        cached = None if refresh else read_stage_part(part_path, "visual_frame", candidate_signature)
         if isinstance(cached, dict):
-            return index, cached, True, signature
+            return index, cached, True, candidate_signature
+
         local_ocr = str(candidate.get("ocr_text", "")).strip()
+        high_detail = any(
+            reason in {"text_change", "low_ocr_confidence"} for reason in candidate.get("reasons", [])
+        )
         prompt = (
             "請分析這張影片截圖，只輸出 JSON object，不要 Markdown。"
             "欄位必須包含 screen_type、visible_text（字串陣列）、visual_summary、"
@@ -1955,7 +1960,7 @@ def analyze_images(
             "描述文字一律用繁體中文，畫面上的原文照抄不要翻譯。"
         )
         if local_ocr:
-            prompt += f"\\n本地 OCR 初篩文字（僅供交叉確認）：{local_ocr}"
+            prompt += f"\n本地 OCR 初篩文字（僅供交叉確認）：{local_ocr}"
         response = minimax_chat(
             [
                 {
@@ -1967,10 +1972,10 @@ def analyze_images(
                             "image_url": {
                                 "url": image_data_url(
                                     Path(candidate["path"]),
-                                    image_size,
-                                    90 if detail_level == "high" else 80,
+                                    max_long_side=2048 if high_detail else 1280,
+                                    quality=90 if high_detail else 80,
                                 ),
-                                "detail": detail_level,
+                                "detail": "high" if high_detail else "default",
                             },
                         },
                     ],
@@ -1978,26 +1983,24 @@ def analyze_images(
             ],
             api_key,
             model,
-            max_tokens=1500,
+            max_tokens=1400,
             thinking="disabled",
         )
         observation = parse_json_object(response)
-        observation["timestamp"] = float(candidate["timestamp"])
-        observation["source_image"] = candidate["path"]
-        observation["local_ocr_text"] = local_ocr
-        observation["local_ocr_confidence"] = candidate.get("ocr_confidence")
         observation.setdefault("screen_type", "未知畫面")
         observation.setdefault("visible_text", [])
         observation.setdefault("visual_summary", "")
         observation.setdefault("important_details", [])
-        try:
-            confidence = float(observation.get("confidence", 0.0))
-        except (TypeError, ValueError):
-            confidence = 0.0
-        observation["confidence"] = max(0.0, min(1.0, confidence))
-        if visual_needs_review(observation):
-            observation["review_required"] = True
-        return index, observation, False, signature
+        observation.setdefault("confidence", 0.0)
+        observation["timestamp"] = candidate["timestamp"]
+        observation["source_image"] = candidate["path"]
+        observation["local_ocr_text"] = local_ocr
+        observation["local_ocr_confidence"] = candidate.get("ocr_confidence")
+        if not isinstance(observation.get("visible_text"), list):
+            observation["visible_text"] = [str(observation["visible_text"])]
+        if not isinstance(observation.get("important_details"), list):
+            observation["important_details"] = [str(observation["important_details"])]
+        return index, observation, False, candidate_signature
 
     results: dict[int, dict[str, Any]] = {}
     errors: list[Exception] = []
@@ -2009,7 +2012,7 @@ def analyze_images(
                 results[index] = observation
                 if not cached:
                     write_stage_part(
-                        part_dir / f"visual_{index:06d}.json",
+                        part_dir / f"visual_{index:04d}.json",
                         "visual_frame",
                         signature,
                         observation,
@@ -2020,6 +2023,133 @@ def analyze_images(
     if errors:
         raise errors[0]
     return [results[index] for index in sorted(results)]
+
+
+def visual_needs_review(observation: dict[str, Any]) -> list[str]:
+    errors = validate_visual([observation])
+    reasons = [f"schema:{error}" for error in errors]
+    try:
+        if float(observation.get("confidence", 0.0)) < 0.65:
+            reasons.append("low_confidence")
+    except (TypeError, ValueError):
+        reasons.append("invalid_confidence")
+    if not str(observation.get("visual_summary", "")).strip():
+        reasons.append("empty_summary")
+    return sorted(set(reasons))
+
+
+def refine_visual_observations(
+    candidates: list[dict[str, Any]],
+    observations: list[dict[str, Any]],
+    api_key: str,
+    model: str,
+    workers: int = 1,
+    stage_signature_value: str = "",
+    cache_dir: Path | None = None,
+    refresh: bool = False,
+) -> list[dict[str, Any]]:
+    part_dir = cache_dir or Path(tempfile.mkdtemp(prefix="visual-review-parts-"))
+    part_dir.mkdir(parents=True, exist_ok=True)
+    by_index = {index: item for index, item in enumerate(observations)}
+    suspects = [
+        index
+        for index, observation in by_index.items()
+        if visual_needs_review(observation)
+    ]
+    if not suspects:
+        return observations
+
+    def one(index: int) -> tuple[int, dict[str, Any], bool, str]:
+        candidate = candidates[index]
+        reasons = visual_needs_review(by_index[index])
+        signature = stage_signature(
+            "visual_review",
+            stage_signature_value or model,
+            {
+                "model": model,
+                "index": index,
+                "timestamp": candidate.get("timestamp"),
+                "hash": candidate.get("hash"),
+                "reasons": reasons,
+            },
+        )
+        path = part_dir / f"visual_review_{index:04d}.json"
+        cached = None if refresh else read_stage_part(path, "visual_review", signature)
+        if isinstance(cached, dict):
+            return index, cached, True, signature
+        prompt = (
+            "這是影片畫面的第二次複核。只輸出 JSON object，重新確認可見文字、"
+            "畫面類型、關鍵細節與信心度；不要依常識補齊看不清楚的內容。"
+            f"\n需要複核的原因：{', '.join(reasons)}"
+        )
+        response = minimax_chat(
+            [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": prompt},
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": image_data_url(
+                                    Path(candidate["path"]),
+                                    max_long_side=2048,
+                                    quality=92,
+                                ),
+                                "detail": "high",
+                            },
+                        },
+                    ],
+                }
+            ],
+            api_key,
+            model,
+            max_tokens=1800,
+            thinking="adaptive",
+        )
+        correction = parse_json_object(response)
+        if not isinstance(correction, dict):
+            correction = {}
+        correction["timestamp"] = candidate["timestamp"]
+        correction["source_image"] = candidate["path"]
+        if not correction.get("visual_summary"):
+            correction["visual_summary"] = by_index[index].get("visual_summary", "")
+        return index, correction, False, signature
+
+    corrections: dict[int, dict[str, Any]] = {}
+    errors: list[Exception] = []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, min(workers, 4))) as pool:
+        futures = [pool.submit(one, index) for index in suspects]
+        for future in concurrent.futures.as_completed(futures):
+            try:
+                index, correction, cached, signature = future.result()
+                corrections[index] = correction
+                if not cached:
+                    write_stage_part(
+                        part_dir / f"visual_review_{index:04d}.json",
+                        "visual_review",
+                        signature,
+                        correction,
+                        frame=index,
+                    )
+            except Exception as exc:
+                errors.append(exc)
+    if errors:
+        raise errors[0]
+    refined: list[dict[str, Any]] = []
+    for index, original in enumerate(observations):
+        if index not in corrections:
+            refined.append(original)
+            continue
+        merged = {**original, **corrections[index], "reviewed": True}
+        merged["timestamp"] = original["timestamp"]
+        merged["source_image"] = original.get("source_image")
+        if not isinstance(merged.get("visible_text"), list):
+            merged["visible_text"] = [str(merged["visible_text"])]
+        if not isinstance(merged.get("important_details"), list):
+            merged["important_details"] = [str(merged["important_details"])]
+        refined.append(merged)
+    return refined
 
 def merge_timeline(transcript: dict[str, Any], observations: list[dict[str, Any]]) -> list[dict[str, Any]]:
     events: list[dict[str, Any]] = []
