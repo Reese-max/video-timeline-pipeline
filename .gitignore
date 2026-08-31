@@ -1,6 +1,8 @@
 .env
+.env.bak-*
 jobs/
 batches/
+rss/
 canary/
 library.db
 __pycache__/

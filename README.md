@@ -3,7 +3,7 @@
 目前實作的流程：
 
 ```text
-影片 URL（YouTube／Facebook／其他 yt-dlp 支援站台） → yt-dlp → FFmpeg
+VidBee 完成的本機影音（或影片 URL） → FFmpeg
                          ├─ 音訊片段 → Groq Whisper
                          └─ steipete slides／Tesseract → MiniMax M3
                                       ↓
@@ -12,7 +12,7 @@
 
 ## 專案邊界
 
-目前刻意維持單一可執行入口；`pipeline.py` 內的函式依責任分成五段，避免為了分檔增加部署負擔：
+目前刻意維持單一可執行入口；`pipeline.py` 內的函式依責任分成六段，避免為了分檔增加部署負擔：
 
 ```text
 輸入／工作目錄
@@ -20,24 +20,37 @@
   ├─ FFmpeg：ffprobe、音訊切段、固定間隔截圖
   ├─ native／steipete：畫面候選與 OCR
   ├─ Groq／MiniMax：逐字稿、視覺理解、摘要
-  └─ knowledge.md／Open Notebook：知識來源輸出與同步
+  └─ transcript.srt／notes.md／knowledge.md：可回查輸出與 VidBee sidecar
 ```
 
 每個工作目錄的雜湊同時包含來源與本地抽取設定；調整切段或畫面設定會建立新的工作目錄，不會誤用舊快取。JSON 與 Markdown 產物以暫存檔置換，避免中斷時留下半份索引。
+
+根目錄中受版本控制的內容以入口、設定範例與既有知識庫快照為主；本機執行產物維持在固定位置，方便備份與清理：
+
+| 類型 | 路徑 | Git |
+|---|---|---|
+| 程式與說明 | `pipeline.py`、`README.md`、`requirements.txt`、`.env.example` | 追蹤 |
+| 既有知識庫快照 | `urls.txt`、`categories.json`、`digest.md` | 追蹤 |
+| 每支影片與批次產物 | `jobs/`、`batches/` | 忽略 |
+| RSS 狀態與驗證產物 | `rss/`、`canary/` | 忽略 |
+| 本機索引與秘密 | `library.db`、`.env`、`.env.bak-*` | 忽略 |
+
+`urls.txt`、`categories.json` 與 `digest.md` 已是版本庫的一部分，而且現有 CLI 會在根目錄讀寫這些預設檔名，因此不為了目錄外觀搬移。需要完全獨立的資料集時，使用 `--root <目錄>` 即可，不必複製程式。
 
 三層快取讓中斷的批次可以直接續跑，不會重複付費：
 
 | 產物 | 判準 |
 |---|---|
 | `source.*`、`audio/`、`frames/` | `.complete` sentinel；沒有標記就清掉重做（半份會靜默毀掉時間軸） |
-| `transcript.json`、`visual.json`、`summary.json` | 上次 `manifest.status == "completed"` 才重用 |
+| `transcription-cache/` | 音訊 SHA-256＋模型＋語言＋時間戳參數；失敗只重跑缺少的片段 |
+| `summary-cache/` | 提示詞版本＋模型＋實際輸入；超長內容逐段保存後再整合 |
 
 實測同一支影片重跑：首次 82.6 秒，重跑 1.7 秒且零 API 呼叫。要強制重算加 `--refresh`。
 
 ## 先做本地驗證
 
 ```powershell
-cd 'D:\Users\Administrator\Desktop\04_AI內容與產品\影片知識庫'
+cd 'C:\Users\Administrator\video-timeline-pipeline'
 python pipeline.py --self-test
 python pipeline.py --video 'D:\path\to\video.mp4' --dry-run
 python pipeline.py --video 'D:\path\to\video.mp4' --dry-run --slide-extractor steipete
@@ -55,20 +68,57 @@ yt-dlp --flat-playlist --print '%(webpage_url)s' --skip-download 'https://www.yo
 python pipeline.py --url-file .\urls.txt --slide-extractor steipete --sync-open-notebook --notebook-id 'notebook:abc'
 ```
 
-批次會逐支重用同一條單片管線，輸出 `batches\<雜湊>\batch-manifest.json`；單支失敗會記錄並繼續處理其他 URL。先用 `--dry-run` 或 `--local-only` 可確認本機產物，不會下載或上傳雲端。
+批次會逐支重用同一條單片管線，輸出 `batches\<雜湊>\batch-manifest.json`；單支失敗會記錄並繼續處理其他 URL。先用 `--dry-run` 或 `--local-only` 可確認本機產物，不會下載或上傳雲端。MiniMax 官方說明 Token Plan 超額時，若帳戶有 Credits，會自動用 Credits 補足；本工具無法保證供應商不扣款，因此批次雲端預設停用，只有在主控台確認額度／支出控制後明確加 `--allow-batch-cloud` 才會啟用。
+
+## RSS 自動收件匣
+
+RSS/Atom 訂閱會記住已見項目、避免重複排入，支援標題關鍵字、標籤與 latest-only。新增訂閱會立即刷新；只建立本機佇列，不會因為看見新項目就自動消耗 Groq／MiniMax 額度：
+
+```powershell
+python pipeline.py --rss-add 'https://www.youtube.com/feeds/videos.xml?channel_id=UC...' --rss-latest-only --rss-tags '教學,AI'
+python pipeline.py --rss-list
+python pipeline.py --rss-refresh
+```
+
+處理佇列會直接重用既有的下載、Groq 轉錄、MiniMax 畫面核對與摘要管線；預設一次只處理一筆：
+
+```powershell
+# 只預演，不下載、不呼叫雲端 API，項目仍留在佇列
+python pipeline.py --rss-process --dry-run
+
+# 真實處理；必須明確承擔 Token Plan 超額後可能使用 Credits 的風險
+python pipeline.py --rss-process --allow-batch-cloud
+
+# VidBee 類似的「程式執行期間持續檢查」；這是前景程序，不安裝背景服務
+python pipeline.py --rss-watch 900 --rss-process --allow-batch-cloud
+```
+
+- `--rss-keywords '關鍵字1,關鍵字2'`：標題至少命中一個才排入。
+- `--rss-latest-only`：每次刷新只排入最新一個未見項目，舊項目記為 skipped。
+- `--rss-max-items N`：限制本次實際處理數量；預設 1。
+- `--rss-retry-failed`：明確重試失敗項目；各階段仍沿用既有快取。
+- `--rss-remove <ID>`：移除訂閱與佇列紀錄，但保留已產生的 `jobs\`。
+
+狀態保存在 Git 忽略的 `rss\state.json`。Podcast enclosure 會以音訊模式處理，不會捏造或執行畫面分析。Feed URL 必須是 RSS/Atom XML；一般說明頁或 Podlink HTML 頁面不是 Feed。
 
 ## 完整流程
 
-先安裝下載器：
+本機會優先重用 VidBee 隨附的 `yt-dlp.exe`；只有沒有 VidBee 時才需另裝：
 
 ```powershell
 python -m pip install yt-dlp
 ```
 
-複製 `.env.example` 為 `.env`，填入兩個 API 金鑰，再執行：
+複製 `.env.example` 為 `.env`，填入 Groq 金鑰、MiniMax Token Plan Subscription Key、帳戶平台 Base URL 與已確認可用的模型。`.env` 已由 Git 忽略；Windows 可用下列命令限制 ACL：
 
 ```powershell
-python pipeline.py --url 'https://www.facebook.com/...' --workers 2 --frame-interval 10
+icacls .env /inheritance:r /grant:r "$env:USERNAME:(F)" "SYSTEM:(F)" "Administrators:(F)"
+```
+
+在 VidBee 下載完成後，最短操作方式：
+
+```powershell
+python pipeline.py --video 'D:\path\to\vidbee-download.mp4' --vidbee-sidecar
 ```
 
 畫面抽取器預設是零額外安裝的 `native`；要使用已驗證的場景偵測＋Tesseract OCR，指定：
@@ -83,12 +133,15 @@ python pipeline.py --url 'https://www.facebook.com/...' --slide-extractor steipe
 
 ```text
 GROQ_API_KEY=...
-MINIMAX_API_KEY=...
+GROQ_ASR_MODEL=whisper-large-v3
+MINIMAX_SUBSCRIPTION_KEY=...
+MINIMAX_BASE_URL=https://api.minimax.io/v1  # 中國站改用 https://api.minimaxi.com/v1
+MINIMAX_MODEL=帳戶實際可用模型
 ```
 
 `.env` 會覆蓋繼承來的環境變數（只有非空值才覆蓋）。這點很重要：`MINIMAX_BASE_URL` 這種通用名稱常被別的工具設成不相容的值（例如指向 `/anthropic` 相容端點），若讓全域設定贏過專案設定，照著這份 README 建 `.env` 也修不好。`.env` 同時會從**專案目錄**與 `--root` 指定的輸出目錄讀取，後者優先。
 
-逐字稿語言預設 `zh`。處理外語影片要加 `--language auto` 交給 Whisper 自動偵測，否則會把外語音訊硬「翻譯」成中文，產出無意義的逐字稿：
+逐字稿語言預設 `auto`；已知單一語言時才用 `--language zh` 等 ISO-639-1 值提升準確度。程式固定呼叫 Groq `audio/transcriptions`，不會呼叫會翻成英文的 `translations`：
 
 ```powershell
 python pipeline.py --url '...' --language auto
@@ -96,7 +149,7 @@ python pipeline.py --url '...' --language auto
 
 ### 轉錄後端
 
-`--transcribe-backend local` 走本機 `faster-whisper`：不需要 `GROQ_API_KEY`，也不受 Groq 的地區／VPN 封鎖影響（Groq 會擋資料中心出口 IP，開 VPN 時會回 `403 Access denied`）。
+主要方案固定為 Groq；舊的 `--transcribe-backend local` 僅為相容性保留，不會預設下載本機 Whisper 模型。
 
 ```powershell
 python pipeline.py --url '...' --transcribe-backend local --whisper-model small
@@ -118,10 +171,9 @@ turbo 不只聽錯關鍵字，還把 "in front of" 縮成 "one of"，整句語�
 可選環境變數：
 
 ```text
-GROQ_MODEL=whisper-large-v3-turbo
-GROQ_LANGUAGE=zh
-MINIMAX_MODEL=MiniMax-M3
-MINIMAX_BASE_URL=https://api.minimax.io/v1
+GROQ_ASR_MODEL=whisper-large-v3-turbo  # 只有手動選快速模式時改
+GROQ_LANGUAGE=auto
+GROQ_MAX_UPLOAD_MB=25
 ```
 
 只做下載與本地處理可用：
@@ -132,14 +184,24 @@ python pipeline.py --url 'https://www.facebook.com/...' --local-only
 
 ## 產物
 
-- `manifest.json`：狀態、來源、設定與產物索引。
+- `source.json`：來源、片長、供應商、模型與處理資訊。
+- `manifest.json`：狀態、設定、快取與產物索引。
 - `audio\audio_*.mp3`：單聲道 16 kHz、每段預設 15 分鐘。
 - `frames\frame_*.jpg`：定時截圖；`frame_candidates.json` 記錄去重與 OCR 判斷。
-- `transcript.json`：Groq 帶時間戳逐字稿。
+- `transcript.raw.json`：每個 Groq 片段的完整原始 API 回應與真實來源偏移。
+- `transcript.json`：合併後的結構化逐字稿。
+- `transcript.txt`／`transcript.srt`：含時間戳閱讀版與字幕；`transcript.zh-TW.*` 是另存的繁體版。
 - `visual.json`：MiniMax 結構化畫面觀察。
 - `timeline.json`：語音與畫面事件依時間排序。
 - `summary.json`：MiniMax 摘要、章節、步驟、工具名詞與待查證資訊。
-- `knowledge.md`：單支影片的知識來源（也是匯入 Open Notebook 用的格式）。
+- `notes.md`：繁體中文摘要、重點、五題複習問答與待核對片段。
+- `knowledge.md`：相同內容加完整時間軸，也是匯入 Open Notebook 用的格式。
+
+`--vidbee-sidecar` 另寫 `<影音檔名>.zh-TW.srt` 到影音同目錄。VidBee v2.1.0 會在該下載項目尚無 transcript 時以正式 sidecar captions 匯入，因此可搜尋並點時間跳轉；已有不同檔案時不覆寫。
+
+VidBee 的自訂 OpenAI-compatible Provider 可在介面內對已匯入逐字稿執行提示詞；目前官方沒有文件化的外部 CLI／擴充介面可自動觸發 prompt run 並匯出 `notes.md`。因此本單一指令流程保留原有的 MiniMax 直接呼叫，只負責產生可回查檔案，不修改 VidBee 的內部資料庫。
+
+MiniMax 官方目前標示 MiniMax-M3 為 1,000,000 token context、M2.x 為 204,800；本工具仍用保守的每段 120,000 字元切分並保留 `segment_id`，不會因模型更換而靜默截斷。OpenAI-compatible 呼叫使用非串流 `chat/completions` 與 `reasoning_split=true`，正式筆記只取 `message.content`，不混入 reasoning 欄位。
 
 專案根目錄另有 `library.db`：跨影片的全文索引，所有影片共用一份。
 
@@ -168,7 +230,7 @@ python pipeline.py --search '時間軸'   # 命中 N 筆（索引）
 
 ## 問答與總覽
 
-兩者都需要 `MINIMAX_API_KEY`，不需要額外服務。
+兩者都需要 `MINIMAX_SUBSCRIPTION_KEY`，不需要額外服務。
 
 ```powershell
 python pipeline.py --ask '這些影片有提過怎麼設定 ffmpeg 嗎？'
