@@ -2719,22 +2719,26 @@ def index_job(connection: sqlite3.Connection, job_dir: Path) -> int:
     connection.executemany("INSERT INTO events VALUES (?, ?, ?, ?)", rows)
     return len(rows)
 
+
 def build_index(root: Path) -> tuple[Path, int, int]:
     connection = index_connection(root)
     try:
         job_dirs = sorted(path.parent for path in root.glob("jobs/*/manifest.json"))
+        job_names = {path.name for path in job_dirs}
+        if job_names:
+            placeholders = ",".join("?" for _ in job_names)
+            params = tuple(sorted(job_names))
+            connection.execute(f"DELETE FROM events WHERE job NOT IN ({placeholders})", params)
+            connection.execute(f"DELETE FROM videos WHERE job NOT IN ({placeholders})", params)
+        else:
+            connection.execute("DELETE FROM events")
+            connection.execute("DELETE FROM videos")
         total = sum(index_job(connection, job_dir) for job_dir in job_dirs)
         connection.commit()
-        # 回報實際進索引的支數，不是掃到的目錄數——失敗的 job 有目錄但沒內容。
         indexed = connection.execute("SELECT count(*) FROM videos").fetchone()[0]
     finally:
         connection.close()
     return root / "library.db", indexed, total
-
-
-# 片段合併後每筆約 300 字元，16 個 token 的窗口看不出上下文（只會顯示「…es to 《XState》, whic…」）
-SNIPPET_WIDTH = 40
-
 
 def make_snippet(text: str, query: str, width: int = SNIPPET_WIDTH) -> str:
     """LIKE 掃描沒有 FTS5 的 snippet()，自己截一段並把命中詞框起來。"""
@@ -3437,12 +3441,9 @@ def show_video(root: Path, keyword: str) -> bool:
     return True
 
 
-def audit_library(root: Path) -> list[str]:
-    """健檢：把踩過的坑變成可重複執行的檢查。
 
-    這些問題全是事後靠一次性腳本挖出來的——壞掉的摘要仍標 completed、
-    索引落後於 jobs、向量沒跟上新影片、字幕碎片化。它們不會自己浮出水面。
-    """
+def audit_library(root: Path) -> list[str]:
+    """健檢：檢查 job、階段產物、索引與向量是否一致。"""
     issues: list[str] = []
     jobs = sorted(path.parent for path in root.glob("jobs/*/manifest.json"))
     if not jobs:
@@ -3452,9 +3453,8 @@ def audit_library(root: Path) -> list[str]:
     failed: list[str] = []
     broken_summary: list[str] = []
     for job in jobs:
-        try:
-            manifest = json.loads((job / "manifest.json").read_text(encoding="utf-8"))
-        except (json.JSONDecodeError, OSError):
+        manifest = read_json_file(job / "manifest.json")
+        if not isinstance(manifest, dict):
             issues.append(f"{job.name}：manifest.json 讀不了")
             continue
         status = manifest.get("status") or ""
@@ -3465,8 +3465,8 @@ def audit_library(root: Path) -> list[str]:
             issues.append(f"{job.name}：狀態停在 {status}（可能中途被中斷）")
         if status == "completed":
             completed.add(job.name)
-            summary = reuse_artifact(job / "summary.json", "short_summary")
-            if summary is None:
+            summary = read_json_file(job / "summary.json")
+            if not isinstance(summary, dict) or validate_summary(summary, float((manifest.get("video") or {}).get("duration_seconds") or 0)):
                 broken_summary.append(job.name)
 
     print(f"  影片：{len(jobs)} 支（completed {len(completed)}、failed {len(failed)}）")
@@ -3474,8 +3474,8 @@ def audit_library(root: Path) -> list[str]:
         issues.append(f"{len(failed)} 支處理失敗：{', '.join(failed[:3])}{' …' if len(failed) > 3 else ''}")
     if broken_summary:
         issues.append(
-            f"{len(broken_summary)} 支的摘要缺 short_summary（模型沒回 JSON）"
-            f"；刪掉那幾支的 summary.json 再重跑即可補齊"
+            f"{len(broken_summary)} 支的摘要未通過結構或時間驗證；"
+            "修正來源後重跑即可補齊"
         )
 
     db_path = root / "library.db"
@@ -3488,17 +3488,21 @@ def audit_library(root: Path) -> list[str]:
         indexed = {row[0] for row in connection.execute("SELECT job FROM videos")}
         events = connection.execute("SELECT count(*) FROM events").fetchone()[0]
         lengths = [row[0] for row in connection.execute("SELECT length(text) FROM events WHERE kind='speech'")]
+        event_hashes = {
+            text_hash(str(row[0]))
+            for row in connection.execute("SELECT text FROM events WHERE length(text) > 0")
+        }
         vectors = dict(connection.execute("SELECT model, count(*) FROM vectors GROUP BY model"))
     finally:
         connection.close()
 
     print(f"  索引：{len(indexed)} 支、{events} 筆片段")
     missing = completed - indexed
-    stale = indexed - completed
+    stale = indexed - {path.name for path in jobs}
     if missing:
         issues.append(f"{len(missing)} 支已完成但不在索引裡 → python pipeline.py --index")
     if stale:
-        issues.append(f"索引裡有 {len(stale)} 支已不存在於 jobs\\ → python pipeline.py --index")
+        issues.append(f"索引裡有 {len(stale)} 支已不存在於 jobs/ → python pipeline.py --index")
 
     if lengths:
         lengths.sort()
@@ -3506,29 +3510,19 @@ def audit_library(root: Path) -> list[str]:
         print(f"  片段長度中位數：{median} 字元")
         if median < 60:
             issues.append(
-                f"speech 片段中位數僅 {median} 字元，碎片化會嚴重拖累檢索與問答品質"
-                "（YouTube 字幕是逐行切的，需合併成段落）"
+                f"speech 片段中位數僅 {median} 字元，可能仍有碎片化問題"
             )
 
     if vectors:
         for model, count in vectors.items():
-            print(f"  向量：{count} / {events} 筆（{model}）")
-            if count < events:
-                issues.append(f"{events - count} 筆片段還沒有 {model} 的向量 → python pipeline.py --embed")
-    else:
+            print(f"  向量：{count} / {len(event_hashes)} 個唯一片段（{model}）")
+            if count < len(event_hashes):
+                issues.append(
+                    f"{len(event_hashes) - count} 個唯一片段還沒有 {model} 的向量 → python pipeline.py --embed"
+                )
+    elif event_hashes:
         issues.append("尚未建立向量，--semantic 無法使用 → python pipeline.py --embed")
-
-    digest = root / "digest.md"
-    if digest.is_file():
-        # 比對摘要而不是 library.db：--embed 只動 vectors 表，卻會讓整個 db 的 mtime 前進，
-        # 拿 db 當判準會把「只是重建了向量」誤報成「總覽過期」。
-        newest_summary = max(
-            (path.stat().st_mtime for path in root.glob("jobs/*/summary.json")), default=0.0
-        )
-        if digest.stat().st_mtime < newest_summary:
-            issues.append("有摘要比 digest.md 新 → python pipeline.py --digest")
     return issues
-
 
 def self_test() -> None:
     assert hash_distance("0000", "0000") == 0
@@ -4775,25 +4769,25 @@ def run_pipeline(args: argparse.Namespace) -> Path:
         persist()
         raise
 
+
 def main() -> int:
     args = parse_args()
     if args.self_test:
         self_test()
         return 0
-    if args.list or args.show:  # 純本地查詢，不需要金鑰
+    if args.list or args.show:
         root = args.root.resolve()
         try:
             if args.list:
                 total = list_videos(root, args.category)
                 print(f"\n共 {total} 支" + (f"（分類含「{args.category}」）" if args.category else ""))
-            if args.show:
-                if not show_video(root, args.show):
-                    return 1
+            if args.show and not show_video(root, args.show):
+                return 1
         except (RuntimeError, sqlite3.Error) as exc:
             print(f"錯誤：{exc}", file=sys.stderr)
             return 1
         return 0
-    if args.audit:  # 純本地檢查，不需要任何金鑰
+    if args.audit:
         print("=== 知識庫健檢 ===")
         problems = audit_library(args.root.resolve())
         if problems:
@@ -4803,36 +4797,39 @@ def main() -> int:
             return 1
         print("\n無異常。")
         return 0
-    if args.index or args.search is not None or args.ask or args.digest or args.embed or args.categorize:  # 空字串是 falsy，用 is not None 才攔得住
+    if args.index or args.search is not None or args.ask or args.digest or args.embed or args.categorize:
         root = args.root.resolve()
-        # --ask 要打 MiniMax，同樣需要 .env 覆蓋掉全域的 MINIMAX_BASE_URL
         load_dotenv(Path(__file__).resolve().parent / ".env")
         load_dotenv(root / ".env")
         try:
             if args.index:
                 db_path, video_count, event_count = build_index(root)
                 print(f"索引完成：{db_path}（{video_count} 支影片、{event_count} 筆片段）")
+
             embed_model = args.embed_model or DEFAULT_EMBED_MODEL[args.embed_backend]
             embed_key = os.getenv("OPENROUTER_API_KEY", "")
-            # 本機後端不需要金鑰；只有走 OpenRouter 才擋。
             if (args.embed or args.semantic) and args.embed_backend == "openrouter" and not embed_key:
-                raise RuntimeError("OpenRouter 後端需要 OPENROUTER_API_KEY，或改用 `--embed-backend local`。")
-            semantic_backend = args.embed_backend if args.semantic else ""
+                raise RuntimeError("OpenRouter 後端需要 OPENROUTER_API_KEY，或改用 --embed-backend local。")
             if args.embed:
                 added, total = build_embeddings(root, embed_key, embed_model, args.embed_backend)
-                print(f"向量完成：新增 {added} 筆，索引共 {total} 筆（{args.embed_backend}／{embed_model}）")
+                print(f"向量完成：新增 {added} 筆，索引共 {total} 個唯一片段（{args.embed_backend}／{embed_model}）")
+
             if args.search is not None:
-                if semantic_backend:
-                    hits = semantic_search(
+                if args.semantic:
+                    hits, keywords = hybrid_search(
                         root,
                         args.search,
+                        os.getenv("MINIMAX_API_KEY", ""),
                         embed_key,
                         embed_model,
+                        args.embed_backend,
                         args.search_limit,
-                        semantic_backend,
+                        args.category,
                         args.min_similarity,
                     )
-                    mode = f"語意檢索：{semantic_backend}／{embed_model}"
+                    mode = f"混合檢索：{args.embed_backend}／{embed_model}"
+                    if keywords and keywords != [args.search]:
+                        print(f"輔助關鍵詞：{'、'.join(keywords)}")
                 else:
                     hits = search_index(root, args.search, args.search_limit, args.category)
                     mode = "全表掃描：查詢短於 3 字元" if len(args.search) < 3 else "索引"
@@ -4841,17 +4838,25 @@ def main() -> int:
                 print(f"命中 {len(hits)} 筆（{mode}）：")
                 for hit in hits:
                     label = hit["title"] or hit["job"]
-                    score = f" {hit['score']:.3f}" if "score" in hit else ""
+                    score = (
+                        f" 融合分數={hit['fusion_score']:.4f}"
+                        if "fusion_score" in hit
+                        else f" 相似度={hit['score']:.3f}" if "score" in hit else ""
+                    )
                     print(f"-{score} [{format_timestamp(hit['timestamp'])}] {label}（{hit['kind']}）")
                     print(f"    {hit['snippet']}")
                     print(f"    {source_link(hit['source'], hit['timestamp'])}")
+
             if args.categorize:
                 if not os.getenv("MINIMAX_API_KEY"):
                     raise RuntimeError("--categorize 需要 MINIMAX_API_KEY。")
                 cats, assigned = categorize_library(
-                    root, os.environ["MINIMAX_API_KEY"], os.getenv("MINIMAX_MODEL", "MiniMax-M3")
+                    root,
+                    os.environ["MINIMAX_API_KEY"],
+                    os.getenv("MINIMAX_MODEL", "MiniMax-M3"),
                 )
                 print(f"分類完成：{len(cats)} 個分類，{assigned} 支影片已歸類（記得重跑 --index）")
+
             if args.digest:
                 if not os.getenv("MINIMAX_API_KEY"):
                     raise RuntimeError("--digest 需要 MINIMAX_API_KEY。")
@@ -4861,6 +4866,7 @@ def main() -> int:
                     os.getenv("MINIMAX_MODEL", "MiniMax-M3"),
                 )
                 print(f"總覽已產生：{digest_path}")
+
             if args.ask:
                 if not os.getenv("MINIMAX_API_KEY"):
                     raise RuntimeError("--ask 需要 MINIMAX_API_KEY。")
@@ -4872,7 +4878,8 @@ def main() -> int:
                     args.ask_limit,
                     embed_key,
                     embed_model,
-                    semantic_backend,
+                    args.embed_backend if args.semantic else "",
+                    args.category,
                 )
                 print(f"檢索詞：{'、'.join(result['keywords'])}")
                 print()
@@ -4883,7 +4890,6 @@ def main() -> int:
                         label = hit["title"] or hit["job"]
                         print(f"  [{index}] {label} {format_timestamp(hit['timestamp'])}（{hit['kind']}）")
                         print(f"      {source_link(hit['source'], hit['timestamp'])}")
-                        # 附上原文：不點開影片就能判斷這個引用該不該信
                         excerpt = " ".join(str(hit.get("text") or "").split())
                         if excerpt:
                             print(f"      「{excerpt[:160]}{'…' if len(excerpt) > 160 else ''}」")
@@ -4903,6 +4909,3 @@ def main() -> int:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 1
 
-
-if __name__ == "__main__":
-    raise SystemExit(main())
