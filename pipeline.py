@@ -154,6 +154,7 @@ PROMPT_VERSIONS = {
 }
 SUMMARY_CHUNK_CHARS = 180000
 RRF_K = 60
+SNIPPET_WIDTH = 40
 
 
 class ArtifactValidationError(RuntimeError):
