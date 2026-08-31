@@ -1223,50 +1223,210 @@ def merge_caption_segments(
     return merged
 
 
-def fetch_youtube_transcript(url: str, job_dir: Path, language: str) -> dict[str, Any] | None:
-    """抓 YouTube 自帶字幕。實測與 Groq large-v3 幾乎逐字相同，但免費且不必下載音訊。
 
-    沒有字幕就回 None 讓呼叫端 fallback——不是每支影片都有。
-    """
+def youtube_info(url: str, job_dir: Path, refresh: bool = False) -> dict[str, Any]:
+    """先取得來源 metadata，讓字幕選擇發生在完整影片下載前。"""
     job_dir.mkdir(parents=True, exist_ok=True)
-    wanted = "en-orig,en" if language in ("", "auto") else f"{language}-orig,{language}"
-    run_external(
-        yt_dlp_command()
-        + [
-            "--skip-download",
-            "--write-info-json",  # --no-video 模式下這是標題與時長的唯一來源
-            "--write-subs",
-            "--write-auto-subs",
-            "--sub-langs",
-            wanted,
-            "--sub-format",
-            "json3",
-            "--output",
-            str(job_dir / "source.%(ext)s"),
-            url,
-        ],
-        stream=True,
+    info_path = job_dir / "source.info.json"
+    cached = read_json_file(info_path)
+    if (
+        not refresh
+        and isinstance(cached, dict)
+        and (cached.get("webpage_url") or cached.get("original_url")) == url
+        and ("subtitles" in cached or "automatic_captions" in cached)
+    ):
+        return cached
+    output = run_external(
+        yt_dlp_command() + ["--skip-download", "--dump-single-json", "--no-playlist", url]
     )
-    files = sorted(job_dir.glob("*.json3"))
+    try:
+        info = json.loads(output)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"yt-dlp metadata 不是 JSON：{output[:500]!r}") from exc
+    if not isinstance(info, dict):
+        raise RuntimeError("yt-dlp metadata 不是 object。")
+    write_json(info_path, info)
+    return info
+
+
+def _language_base(value: str) -> str:
+    return value.lower().replace("_", "-").split("-", 1)[0]
+
+
+def choose_caption_tracks(info: dict[str, Any], requested: str) -> list[dict[str, Any]]:
+    manual = info.get("subtitles") or {}
+    automatic = info.get("automatic_captions") or {}
+    original = str(info.get("language") or "")
+    tracks: list[dict[str, Any]] = []
+    for kind, catalog in (("manual", manual), ("automatic", automatic)):
+        if not isinstance(catalog, dict):
+            continue
+        for raw_language in catalog:
+            language = str(raw_language)
+            if "translat" in language.lower():
+                continue
+            tracks.append(
+                {
+                    "language": language,
+                    "kind": kind,
+                    "translation": False,
+                    "original": bool(original and _language_base(language) == _language_base(original)),
+                }
+            )
+    if not tracks:
+        return []
+
+    wanted = str(requested or "auto")
+    if wanted != "auto":
+        exact = [
+            item
+            for item in tracks
+            if item["language"].lower() == wanted.lower()
+            or _language_base(item["language"]) == _language_base(wanted)
+        ]
+        if exact:
+            tracks = exact
+        else:
+            return []
+
+    def rank(item: dict[str, Any]) -> tuple[int, int, int, str]:
+        language = str(item["language"])
+        requested_match = (
+            1
+            if wanted != "auto"
+            and (
+                language.lower() == wanted.lower()
+                or _language_base(language) == _language_base(wanted)
+            )
+            else 0
+        )
+        original_match = 1 if item["original"] else 0
+        manual_match = 1 if item["kind"] == "manual" else 0
+        return (-requested_match, -original_match, -manual_match, language)
+
+    tracks.sort(key=rank)
+    selected: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for item in tracks:
+        language = str(item["language"])
+        if language in seen:
+            continue
+        seen.add(language)
+        selected.append(item)
+        if wanted != "auto" or len(selected) >= 3:
+            break
+    return selected
+
+
+def caption_stage_signature(info: dict[str, Any], requested: str) -> str:
+    tracks = choose_caption_tracks(info, requested)
+    return stage_signature(
+        "captions",
+        source_metadata_fingerprint(info, str(info.get("webpage_url") or info.get("id") or "")),
+        {
+            "extractor": CAPTION_EXTRACTOR_VERSION,
+            "requested_language": requested,
+            "selected_tracks": tracks,
+        },
+    )
+
+
+def caption_is_reliable(transcript: dict[str, Any], duration: float = 0.0) -> bool:
+    segments = transcript.get("segments") or []
+    if not isinstance(segments, list) or len(segments) == 0:
+        return False
+    text_length = sum(len(str(item.get("text", ""))) for item in segments if isinstance(item, dict))
+    if text_length < 20:
+        return False
+    if duration <= 0:
+        return True
+    last_end = max(
+        (float(item.get("end", 0)) for item in segments if isinstance(item, dict)),
+        default=0.0,
+    )
+    return last_end >= min(duration * 0.35, max(30.0, duration - 5.0))
+
+
+def fetch_youtube_transcript(url: str, job_dir: Path, language: str, refresh: bool = False) -> dict[str, Any] | None:
+    """讀取可用字幕清單後選原文／自動字幕，避免 auto 被硬編成英文。"""
+    info = youtube_info(url, job_dir, refresh=refresh)
+    tracks = choose_caption_tracks(info, language)
+    if not tracks:
+        return None
+    for stale in job_dir.glob("source.*.json3"):
+        stale.unlink()
+    requested_languages = ",".join(str(item["language"]) for item in tracks)
+    try:
+        run_external(
+            yt_dlp_command()
+            + [
+                "--skip-download",
+                "--write-info-json",
+                "--write-subs",
+                "--write-auto-subs",
+                "--sub-langs",
+                requested_languages,
+                "--sub-format",
+                "json3",
+                "--output",
+                str(job_dir / "source.%(ext)s"),
+                url,
+            ],
+            stream=True,
+        )
+    except RuntimeError as exc:
+        detail = str(exc).lower()
+        if any(token in detail for token in ("no subtitles", "subtitles are not available", "requested format")):
+            return None
+        raise
+
+    files = sorted(job_dir.glob("source.*.json3"))
     if not files:
         return None
+    by_language = {str(item["language"]): item for item in tracks}
+    selected_file = None
+    selected_track: dict[str, Any] | None = None
+    for path in files:
+        name = path.name
+        language_name = name[len("source.") : -len(".json3")] if name.startswith("source.") else path.stem
+        track = by_language.get(language_name)
+        if track:
+            selected_file = path
+            selected_track = track
+            break
+    if selected_file is None:
+        selected_file = files[0]
+        language_name = selected_file.name[len("source.") : -len(".json3")]
+        selected_track = by_language.get(
+            language_name,
+            {"language": language_name, "kind": "unknown", "translation": False},
+        )
     try:
-        payload = json.loads(files[0].read_text(encoding="utf-8"))
+        payload = json.loads(selected_file.read_text(encoding="utf-8"))
     except (json.JSONDecodeError, OSError):
         return None
-
     segments = merge_caption_segments(parse_caption_json3(payload))
     if not segments:
         return None
-    return {
-        "model": f"youtube-captions/{files[0].name.split('.')[-2]}",
-        "language": language,
+    signature = caption_stage_signature(info, language)
+    result = {
+        "schema_version": ARTIFACT_SCHEMA_VERSION,
+        "model": f"youtube-captions/{selected_track.get('language', language)}",
+        "language": selected_track.get("language") or info.get("language") or language,
+        "caption_source": selected_track,
+        "signature": signature,
         "segments": segments,
     }
-
-
-_WHISPER_MODELS: dict[str, Any] = {}
-
+    write_json(
+        job_dir / "caption-meta.json",
+        {
+            "schema_version": ARTIFACT_SCHEMA_VERSION,
+            "signature": signature,
+            "source": selected_track,
+            "available_tracks": tracks,
+        },
+    )
+    return result
 
 def transcribe_local(
     chunks: list[Path],
