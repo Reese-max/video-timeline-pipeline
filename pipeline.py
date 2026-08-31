@@ -1641,58 +1641,78 @@ def fetch_youtube_transcript(url: str, job_dir: Path, language: str, refresh: bo
     )
     return result
 
+
 def transcribe_local(
-    chunks: list[Path],
+    chunks: list[Any],
     model_size: str,
     language: str,
     chunk_seconds: int,
+    stage_signature_value: str = "",
+    cache_dir: Path | None = None,
+    refresh: bool = False,
 ) -> dict[str, Any]:
-    """本機 faster-whisper：不需要金鑰，也不受 Groq 的地區／VPN 封鎖影響。"""
+    """本機 faster-whisper；每段也寫入可續跑的產物。"""
     try:
         from faster_whisper import WhisperModel
     except ImportError as exc:
         raise RuntimeError(
-            "本機轉錄需要 faster-whisper；或改用 `--transcribe-backend groq`。"
+            "本機轉錄需要 faster-whisper；或改用 transcribe-backend groq。"
         ) from exc
     if model_size not in _WHISPER_MODELS:
-        # 預設 CPU：device="cuda" 在建構時不會報錯，缺 cublas64_12.dll 要等到真的轉錄才炸，
-        # 那時音訊已經切好、時間也花掉了。要用 GPU 就明確指定 WHISPER_DEVICE=cuda。
         device = os.getenv("WHISPER_DEVICE", "cpu")
         compute = os.getenv("WHISPER_COMPUTE", "float16" if device == "cuda" else "int8")
         _WHISPER_MODELS[model_size] = WhisperModel(model_size, device=device, compute_type=compute)
     model = _WHISPER_MODELS[model_size]
-
-    detected = language
-    segments: list[dict[str, Any]] = []
-    for index, path in enumerate(chunks):
-        offset = index * chunk_seconds
-        # language=None 就是自動偵測，跟 Groq 版的 --language auto 對齊
+    specs = normalize_chunk_specs(chunks)
+    part_dir = cache_dir or Path(tempfile.mkdtemp(prefix="transcript-parts-"))
+    part_dir.mkdir(parents=True, exist_ok=True)
+    results: dict[int, dict[str, Any]] = {}
+    for spec in specs:
+        index = int(spec["index"])
+        signature = stage_signature(
+            "transcript_chunk",
+            stage_signature_value or model_size,
+            {
+                "model": f"faster-whisper/{model_size}",
+                "language": language,
+                "chunk": index,
+                "start": spec["start"],
+                "end": spec["end"],
+            },
+        )
+        part_path = part_dir / f"chunk_{index:04d}.json"
+        cached = None if refresh else read_stage_part(part_path, "transcript_chunk", signature)
+        if isinstance(cached, dict) and "selected" in cached:
+            results[index] = cached
+            continue
+        raw_segments: list[dict[str, Any]] = []
         result, info = model.transcribe(
-            str(path),
+            str(spec["path"]),
             language=None if language in ("", "auto") else language,
             vad_filter=True,
         )
-        detected = getattr(info, "language", None) or detected
         for segment in result:
-            text = (segment.text or "").strip()
-            if not text or is_silence(getattr(segment, "no_speech_prob", None)):
-                continue
-            segments.append(
+            raw_segments.append(
                 {
-                    "start": round(segment.start + offset, 3),
-                    "end": round(segment.end + offset, 3),
-                    "text": text,
-                    "chunk": index,
+                    "start": segment.start,
+                    "end": segment.end,
+                    "text": segment.text,
                     "avg_logprob": getattr(segment, "avg_logprob", None),
                     "no_speech_prob": getattr(segment, "no_speech_prob", None),
+                    "compression_ratio": getattr(segment, "compression_ratio", None),
                 }
             )
-    return {
-        "model": f"faster-whisper/{model_size}",
-        "language": detected,
-        "segments": sorted(segments, key=lambda item: item["start"]),
-    }
-
+        raw = {"language": getattr(info, "language", None) or language, "segments": raw_segments}
+        payload = {"raw": raw, "selected": raw, "review": transcription_review_flags(raw), "attempts": 1}
+        write_stage_part(part_path, "transcript_chunk", signature, payload, chunk=index)
+        results[index] = payload
+    return aggregate_transcription_results(
+        results,
+        specs,
+        f"faster-whisper/{model_size}",
+        language,
+        "local",
+    )
 
 def image_data_url(image_path: Path) -> str:
     try:
