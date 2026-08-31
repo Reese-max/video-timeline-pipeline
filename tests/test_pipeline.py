@@ -104,6 +104,20 @@ class PipelineTests(unittest.TestCase):
         self.assertGreater(len(chunks), 1)
         self.assertEqual(chunks[-1][-1]["timestamp"], 7.0)
 
+    def test_summary_source_timestamps_must_match_timeline(self):
+        timeline = [{"timestamp": 10, "end": 12, "type": "speech", "text": "evidence"}]
+        summary = {
+            "short_summary": "摘要",
+            "chapters": [],
+            "steps": [],
+            "tools_and_terms": [],
+            "fact_check": [],
+            "source_timestamps": [11],
+        }
+        self.assertEqual(pipeline.validate_summary_sources(summary, timeline), [])
+        summary["source_timestamps"] = [40]
+        self.assertTrue(pipeline.validate_summary_sources(summary, timeline))
+
     def test_failed_index_cleanup_preserves_shared_vector(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
