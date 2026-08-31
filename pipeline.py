@@ -551,6 +551,7 @@ def extract_audio(
     source_fingerprint: str = "",
     duration_seconds: float = 0.0,
     refresh: bool = False,
+    probe_data: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
     """以可恢復的固定視窗切音訊，保存每個片段的實際來源範圍。"""
     if chunk_seconds <= 0:
@@ -587,7 +588,7 @@ def extract_audio(
 
     for stale in audio_dir.glob("audio_*.mp3"):
         stale.unlink()
-    probe = probe_video(video_path)
+    probe = probe_data or probe_video(video_path)
     streams = probe.get("streams") or []
     if not any(stream.get("codec_type") == "audio" for stream in streams if isinstance(stream, dict)):
         write_json(
@@ -1133,18 +1134,21 @@ def groq_transcribe(
     )
 
 
-def normalize_chunk_specs(chunks: list[Any]) -> list[dict[str, Any]]:
+def normalize_chunk_specs(
+    chunks: list[Any],
+    default_chunk_seconds: int = 900,
+) -> list[dict[str, Any]]:
     specs: list[dict[str, Any]] = []
     for index, item in enumerate(chunks):
         if isinstance(item, dict):
             path = Path(str(item["path"]))
-            start = float(item.get("start", index * 900))
-            end = float(item.get("end", start + 900))
+            start = float(item.get("start", index * default_chunk_seconds))
+            end = float(item.get("end", start + default_chunk_seconds))
             actual_index = int(item.get("index", index))
         else:
             path = Path(str(item))
-            start = float(index * 900)
-            end = start + 900
+            start = float(index * default_chunk_seconds)
+            end = start + default_chunk_seconds
             actual_index = index
         specs.append({"index": actual_index, "path": path, "start": start, "end": end})
     return specs
@@ -1329,7 +1333,7 @@ def transcribe_all(
     cache_dir: Path | None = None,
     refresh: bool = False,
 ) -> dict[str, Any]:
-    specs = normalize_chunk_specs(chunks)
+    specs = normalize_chunk_specs(chunks, chunk_seconds)
     if not specs:
         return {
             "schema_version": ARTIFACT_SCHEMA_VERSION,
@@ -1600,14 +1604,26 @@ def fetch_youtube_transcript(url: str, job_dir: Path, language: str, refresh: bo
     if not files:
         return None
     by_language = {str(item["language"]): item for item in tracks}
-    selected_file = None
-    selected_track: dict[str, Any] | None = None
+    files_by_language: dict[str, Path] = {}
     for path in files:
         name = path.name
         language_name = name[len("source.") : -len(".json3")] if name.startswith("source.") else path.stem
-        track = by_language.get(language_name)
-        if track:
-            selected_file = path
+        files_by_language.setdefault(language_name, path)
+    selected_file = None
+    selected_track: dict[str, Any] | None = None
+    for track in tracks:
+        language_name = str(track["language"])
+        selected_file = files_by_language.get(language_name)
+        if selected_file is None:
+            selected_file = next(
+                (
+                    path
+                    for available_language, path in files_by_language.items()
+                    if _language_base(available_language) == _language_base(language_name)
+                ),
+                None,
+            )
+        if selected_file is not None:
             selected_track = track
             break
     if selected_file is None:
@@ -1666,7 +1682,7 @@ def transcribe_local(
         compute = os.getenv("WHISPER_COMPUTE", "float16" if device == "cuda" else "int8")
         _WHISPER_MODELS[model_size] = WhisperModel(model_size, device=device, compute_type=compute)
     model = _WHISPER_MODELS[model_size]
-    specs = normalize_chunk_specs(chunks)
+    specs = normalize_chunk_specs(chunks, chunk_seconds)
     part_dir = cache_dir or Path(tempfile.mkdtemp(prefix="transcript-parts-"))
     part_dir.mkdir(parents=True, exist_ok=True)
     results: dict[int, dict[str, Any]] = {}
@@ -3411,7 +3427,16 @@ def categorize_library(root: Path, api_key: str, model: str) -> tuple[list[str],
             + '\n\n只輸出 JSON：{"results": [{"job": "...", "categories": ["..."], "level": "入門|中階|進階"}]}\n\n'
             + json.dumps(payload, ensure_ascii=False)
         )
-        data = parse_json_object(minimax_chat([{"role": "user", "content": prompt}], api_key, model, timeout=600))
+        data = parse_json_object(
+            minimax_chat(
+                [{"role": "user", "content": prompt}],
+                api_key,
+                model,
+                max_tokens=2000,
+                timeout=600,
+                thinking="disabled",
+            )
+        )
         by_job = {str(r.get("job")): r for r in (data.get("results") or []) if isinstance(r, dict)}
         for item in batch:
             result = by_job.get(item["job"])
@@ -3932,6 +3957,8 @@ def validate_frame_artifact(value: Any) -> list[str]:
             errors.append(f"frames[{index}] 缺少有效 timestamp")
         if not item.get("path"):
             errors.append(f"frames[{index}] 缺少 path")
+        elif not Path(str(item["path"])).is_file():
+            errors.append(f"frames[{index}] path 不存在")
     return errors
 
 
@@ -3951,6 +3978,8 @@ def validate_audio_artifact(value: Any) -> list[str]:
             continue
         if start < 0 or end <= start or not item.get("path"):
             errors.append(f"chunks[{index}] 時間或路徑錯誤")
+        elif not Path(str(item["path"])).is_file():
+            errors.append(f"chunks[{index}] path 不存在")
     return errors
 
 
@@ -4070,7 +4099,11 @@ def run_pipeline(args: argparse.Namespace) -> Path:
                 validate_transcript,
                 args.refresh,
             )
-            if isinstance(cached_caption, dict) and cached_caption.get("caption_source"):
+            if (
+                isinstance(cached_caption, dict)
+                and cached_caption.get("caption_source")
+                and caption_is_reliable(cached_caption, float(info.get("duration") or 0.0))
+            ):
                 caption_transcript = cached_caption
                 caption_reused = True
             else:
@@ -4086,6 +4119,9 @@ def run_pipeline(args: argparse.Namespace) -> Path:
             print(f"! 字幕前置失敗，稍後改走媒體／語音流程：{caption_error}")
             if args.no_video:
                 raise
+
+    if caption_error:
+        manifest.setdefault("warnings", []).append("字幕前置失敗：" + caption_error)
 
     if args.url and args.dry_run:
         manifest["status"] = "dry-run"
@@ -4141,10 +4177,21 @@ def run_pipeline(args: argparse.Namespace) -> Path:
                 status="skipped",
                 metadata="no-video",
             )
+            audio_metadata_path = job_dir / "audio" / "chunks.json"
+            audio_metadata_path.parent.mkdir(parents=True, exist_ok=True)
+            write_json(
+                audio_metadata_path,
+                {
+                    "schema_version": ARTIFACT_SCHEMA_VERSION,
+                    "signature": audio_signature,
+                    "status": "skipped",
+                    "chunks": [],
+                },
+            )
             record(
                 "audio",
                 audio_signature,
-                job_dir / "audio" / "chunks.json",
+                audio_metadata_path,
                 status="skipped",
                 metadata="no-video",
             )
@@ -4286,6 +4333,7 @@ def run_pipeline(args: argparse.Namespace) -> Path:
                                 media_fp,
                                 duration,
                                 args.refresh,
+                                probe,
                             )
                         futures[future] = name
                     results: dict[str, Any] = {}
@@ -4461,7 +4509,6 @@ def run_pipeline(args: argparse.Namespace) -> Path:
                         "model": os.getenv("MINIMAX_MODEL", "MiniMax-M3"),
                         "prompt": PROMPT_VERSIONS["visual"],
                         "review_prompt": PROMPT_VERSIONS["visual_review"],
-                        "workers": max(1, min(args.workers, 4)),
                     },
                     [frame_signature, digest_value(candidates)],
                 )
