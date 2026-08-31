@@ -1,0 +1,92 @@
+{
+  "generated_at": "2026-08-30T18:38:56.839800+00:00",
+  "source": {
+    "url": "https://www.facebook.com/share/v/1GFg77Fady/?mibextid=wwXIfr",
+    "platform": "Facebook",
+    "reel_id": "2999983460343139",
+    "title": "36K views · 593 reactions | 防套话，六招助你守住底牌 ＃进化 | 进化",
+    "uploader": "进化",
+    "webpage_url": "https://m.facebook.com/watch/?v=2999983460343139&_rdr"
+  },
+  "download": {
+    "extractor": "facebook",
+    "format_id": "1080510207673710v+1080174871040577a",
+    "format_note": "DASH video+DASH audio",
+    "ext": "mp4",
+    "protocol": "https+https",
+    "duration_from_source": 379.647,
+    "width_from_source": 1280,
+    "height_from_source": 720
+  },
+  "media": {
+    "path": "test-input/fb-1GFg77Fady.mp4",
+    "size_bytes": 47464537,
+    "sha256": "20060da2727f7ca1d04ba636a8a60d0c09f7a7a34899061904bc70d7255dc5b3",
+    "format": {
+      "filename": "test-input/fb-1GFg77Fady.mp4",
+      "nb_streams": 2,
+      "nb_programs": 0,
+      "format_name": "mov,mp4,m4a,3gp,3g2,mj2",
+      "format_long_name": "QuickTime / MOV",
+      "start_time": "0.000000",
+      "duration": "379.670998",
+      "size": "47464537",
+      "bit_rate": "1000119",
+      "probe_score": 100,
+      "tags": {
+        "major_brand": "isom",
+        "minor_version": "512",
+        "compatible_brands": "isomav01iso2mp41",
+        "encoder": "Lavf60.16.100"
+      }
+    },
+    "streams": [
+      {
+        "index": 0,
+        "codec_name": "av1",
+        "codec_long_name": "Alliance for Open Media AV1",
+        "codec_type": "video",
+        "width": 1280,
+        "height": 720,
+        "r_frame_rate": "30/1",
+        "avg_frame_rate": "30/1",
+        "duration": "379.633333",
+        "bit_rate": "925206",
+        "nb_frames": "11389"
+      },
+      {
+        "index": 1,
+        "codec_name": "aac",
+        "codec_long_name": "AAC (Advanced Audio Coding)",
+        "codec_type": "audio",
+        "r_frame_rate": "0/0",
+        "avg_frame_rate": "0/0",
+        "sample_rate": "44100",
+        "channels": 2,
+        "channel_layout": "stereo",
+        "duration": "379.670998",
+        "bit_rate": "70294",
+        "nb_frames": "8178"
+      }
+    ]
+  },
+  "analysis": {
+    "sampling_interval_seconds": 0.5,
+    "sampled_frames": 759,
+    "ocr_index": "test-output/fb1GFg77Fady/ocr_index.tsv",
+    "ocr_languages": [
+      "chi_sim",
+      "eng"
+    ],
+    "ocr_modes": {
+      "full_frame": "Tesseract PSM 11",
+      "subtitle_crop": "Tesseract PSM 6"
+    },
+    "speech_to_text": {
+      "engine": "Faster-Whisper",
+      "model": "base",
+      "language": "zh"
+    },
+    "host": "Linux-6.18.35-x86_64-with-glibc2.39"
+  }
+}
