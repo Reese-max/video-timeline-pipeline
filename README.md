@@ -20,7 +20,7 @@ URL 來源會先讀取 metadata 與可用字幕；字幕可靠時跳過整段音
 ```text
 輸入／工作目錄
   ├─ yt-dlp：來源下載
-  ├─ FFmpeg：ffprobe、音訊切段、固定間隔截圖
+  ├─ FFmpeg：ffprobe、重疊音訊切段、場景變化＋定期保底截圖
   ├─ native／steipete：畫面候選與 OCR
   ├─ Groq／MiniMax：逐字稿、視覺理解、摘要
   └─ knowledge.md／Open Notebook：知識來源輸出與同步
