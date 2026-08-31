@@ -2597,9 +2597,9 @@ def flatten_text(value: Any) -> str:
     return ""
 
 
+
 def index_connection(root: Path) -> sqlite3.Connection:
     connection = sqlite3.connect(root / "library.db")
-    # tokenize='trigram'：unicode61 會把整句中文吃成單一 token，中文查詢一律落空。
     connection.executescript(
         """
         CREATE TABLE IF NOT EXISTS videos (
@@ -2620,12 +2620,9 @@ def index_connection(root: Path) -> sqlite3.Connection:
         );
         """
     )
-    # 不同模型的向量不能混用，vectors 必須記住是誰算的，而且主鍵要含 model——
-    # 單以 event_id 當主鍵的話，換模型 embed 會 REPLACE 掉前一顆的向量，兩顆無法共存。
-    # 舊表直接重建：向量重算很便宜，不值得寫欄位搬遷。
-    # videos 加了 categories 欄位；舊表直接重建（--index 幾秒就跑完，不值得寫搬遷）
+    required_video_columns = {"job", "title", "source", "status", "duration", "indexed_at", "categories"}
     video_columns = {row[1] for row in connection.execute("PRAGMA table_info(videos)")}
-    if video_columns and "categories" not in video_columns:
+    if video_columns and not required_video_columns.issubset(video_columns):
         connection.execute("DROP TABLE videos")
         connection.execute(
             """
@@ -2635,12 +2632,9 @@ def index_connection(root: Path) -> sqlite3.Connection:
             )
             """
         )
-    # 以文字內容的 hash 當鍵，不是 events.rowid——
-    # --index 會對每個 job 做 DELETE+INSERT，FTS5 的 rowid 因此全部重新分配，
-    # 綁 rowid 的話每加一支新影片都得把全部向量重算（實測 5,418 筆要 218 秒）。
-    # 主鍵含 model：不同模型的向量要能共存，否則換模型會 REPLACE 掉前一顆。
-    columns = {row[1] for row in connection.execute("PRAGMA table_info(vectors)")}
-    if columns and "text_hash" not in columns:
+    required_vector_columns = {"text_hash", "model", "dim", "vector"}
+    vector_columns = {row[1] for row in connection.execute("PRAGMA table_info(vectors)")}
+    if vector_columns and not required_vector_columns.issubset(vector_columns):
         connection.execute("DROP TABLE vectors")
     connection.execute(
         """
@@ -2655,31 +2649,33 @@ def index_connection(root: Path) -> sqlite3.Connection:
     )
     return connection
 
-
 def text_hash(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
+
 
 
 def index_job(connection: sqlite3.Connection, job_dir: Path) -> int:
     manifest_path = job_dir / "manifest.json"
     if not manifest_path.is_file():
         return 0
-    try:
-        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    except (json.JSONDecodeError, OSError):
+    manifest = read_json_file(manifest_path)
+    if not isinstance(manifest, dict):
         return 0
     job = job_dir.name
     if (manifest.get("status") or "") == "failed":
-        # 失敗的 job 沒有內容，留在索引裡只會讓「共幾支影片」這個數字說謊。
-        # 目錄本身保留（manifest 記著錯誤原因，可用來診斷）。
-        connection.execute(
-            "DELETE FROM vectors WHERE event_id IN (SELECT rowid FROM events WHERE job = ?)", (job,)
-        )
+        old_texts = [
+            str(row[0])
+            for row in connection.execute("SELECT text FROM events WHERE job = ?", (job,)).fetchall()
+        ]
         connection.execute("DELETE FROM events WHERE job = ?", (job,))
         connection.execute("DELETE FROM videos WHERE job = ?", (job,))
+        # 向量由不同 job 共用；只有確認沒有其他事件仍使用同一文字時才刪除。
+        for text in set(old_texts):
+            if connection.execute("SELECT 1 FROM events WHERE text = ? LIMIT 1", (text,)).fetchone() is None:
+                connection.execute("DELETE FROM vectors WHERE text_hash = ?", (text_hash(text),))
         return 0
+
     source = manifest.get("source") or {}
-    # 向量以文字 hash 為鍵，不隨 events 重建而失效，所以這裡只清片段
     connection.execute("DELETE FROM events WHERE job = ?", (job,))
     connection.execute(
         "INSERT OR REPLACE INTO videos VALUES (?, ?, ?, ?, ?, ?, ?)",
@@ -2695,14 +2691,10 @@ def index_job(connection: sqlite3.Connection, job_dir: Path) -> int:
     )
 
     rows: list[tuple[str, Any, str, str]] = []
-    if source.get("title"):  # 用影片名找片是最直覺的查法，標題也得進全文索引
+    if source.get("title"):
         rows.append((job, 0, "title", str(source["title"])))
-    timeline_path = job_dir / "timeline.json"
-    if timeline_path.is_file():
-        try:
-            timeline = json.loads(timeline_path.read_text(encoding="utf-8"))
-        except (json.JSONDecodeError, OSError):
-            timeline = []
+    timeline = read_json_file(job_dir / "timeline.json") or []
+    if isinstance(timeline, list):
         for event in timeline:
             if not isinstance(event, dict):
                 continue
@@ -2713,27 +2705,19 @@ def index_job(connection: sqlite3.Connection, job_dir: Path) -> int:
             if text:
                 rows.append((job, event.get("timestamp"), str(event.get("type", "")), text))
 
-    summary_path = job_dir / "summary.json"
-    if summary_path.is_file():
-        try:
-            summary = json.loads(summary_path.read_text(encoding="utf-8"))
-        except (json.JSONDecodeError, OSError):
-            summary = {}
-        if isinstance(summary, dict) and summary.get("status") != "skipped":
-            text = flatten_text(summary).strip()
-            if text:
-                rows.append((job, 0, "summary", text))
-            # 章節另外建一筆：整份摘要那筆的 timestamp 只能是 0，命中了也跳不回影片；
-            # 章節自帶 start，而且範圍夠窄，向量比整份摘要聚焦得多。
-            for chapter in summary.get("chapters") or []:
-                if not isinstance(chapter, dict) or not chapter.get("title"):
-                    continue
-                detail = f"{chapter['title']}：{chapter.get('summary', '')}".strip("：")
-                rows.append((job, chapter.get("start") or 0, "chapter", detail))
+    summary = read_json_file(job_dir / "summary.json")
+    if isinstance(summary, dict) and summary.get("status") != "skipped":
+        text = flatten_text(summary).strip()
+        if text:
+            rows.append((job, 0, "summary", text))
+        for chapter in summary.get("chapters") or []:
+            if not isinstance(chapter, dict) or not chapter.get("title"):
+                continue
+            detail = f"{chapter['title']}：{chapter.get('summary', '')}".strip("：")
+            rows.append((job, chapter.get("start") or 0, "chapter", detail))
 
     connection.executemany("INSERT INTO events VALUES (?, ?, ?, ?)", rows)
     return len(rows)
-
 
 def build_index(root: Path) -> tuple[Path, int, int]:
     connection = index_connection(root)
