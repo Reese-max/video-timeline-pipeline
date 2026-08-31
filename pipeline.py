@@ -3859,10 +3859,47 @@ def run_batch(args: argparse.Namespace) -> Path:
     return output
 
 
+
+def validate_frame_artifact(value: Any) -> list[str]:
+    if not isinstance(value, dict) or not isinstance(value.get("frames"), list):
+        return ["畫面候選產物格式錯誤"]
+    errors: list[str] = []
+    for index, item in enumerate(value["frames"]):
+        if not isinstance(item, dict):
+            errors.append(f"frames[{index}] 不是 object")
+            continue
+        try:
+            if float(item["timestamp"]) < 0:
+                errors.append(f"frames[{index}] timestamp 小於 0")
+        except (KeyError, TypeError, ValueError):
+            errors.append(f"frames[{index}] 缺少有效 timestamp")
+        if not item.get("path"):
+            errors.append(f"frames[{index}] 缺少 path")
+    return errors
+
+
+def validate_audio_artifact(value: Any) -> list[str]:
+    if not isinstance(value, dict) or not isinstance(value.get("chunks"), list):
+        return ["音訊片段產物格式錯誤"]
+    errors: list[str] = []
+    for index, item in enumerate(value["chunks"]):
+        if not isinstance(item, dict):
+            errors.append(f"chunks[{index}] 不是 object")
+            continue
+        try:
+            start = float(item["start"])
+            end = float(item["end"])
+        except (KeyError, TypeError, ValueError):
+            errors.append(f"chunks[{index}] 缺少有效時間")
+            continue
+        if start < 0 or end <= start or not item.get("path"):
+            errors.append(f"chunks[{index}] 時間或路徑錯誤")
+    return errors
+
+
 def run_pipeline(args: argparse.Namespace) -> Path:
     root = args.root.resolve()
     root.mkdir(parents=True, exist_ok=True)
-    # --root 是輸出目錄，不該綁著設定檔：先讀專案自己的 .env，再讓輸出目錄的 .env 覆蓋。
     load_dotenv(Path(__file__).resolve().parent / ".env")
     load_dotenv(root / ".env")
     args.notebook_id = args.notebook_id or os.getenv("OPEN_NOTEBOOK_NOTEBOOK_ID", "")
@@ -3870,22 +3907,35 @@ def run_pipeline(args: argparse.Namespace) -> Path:
         args.open_notebook_url = os.getenv("OPEN_NOTEBOOK_URL", args.open_notebook_url)
     if args.open_notebook_sources_path == "/api/sources":
         args.open_notebook_sources_path = os.getenv("OPEN_NOTEBOOK_SOURCES_PATH", args.open_notebook_sources_path)
-    language = args.language if args.language is not None else os.getenv("GROQ_LANGUAGE", "zh")
+
+    language = args.language if args.language is not None else os.getenv("GROQ_LANGUAGE", "auto")
     if args.chunk_seconds <= 0 or args.frame_interval <= 0 or args.max_vision_frames <= 0:
         raise ValueError("chunk-seconds、frame-interval 與 max-vision-frames 必須大於 0。")
+    if args.chunk_overlap_seconds < 0 or args.chunk_overlap_seconds >= args.chunk_seconds:
+        raise ValueError("chunk-overlap-seconds 必須介於 0 與 chunk-seconds 之間。")
     if not 0.1 <= args.scene_threshold <= 1.0 or args.min_slide_duration < 0:
         raise ValueError("scene-threshold 必須介於 0.1 到 1.0，min-slide-duration 不可小於 0。")
+    if args.summary_max_chars <= 0:
+        raise ValueError("summary-max-chars 必須大於 0。")
     if args.url is None and args.video is None:
         raise ValueError("請提供 --url 或 --video。")
-    if not args.dry_run and not args.local_only:
-        needs_groq = args.transcribe_backend == "groq"  # 本機轉錄不需要 Groq 金鑰
-        if (needs_groq and not os.getenv("GROQ_API_KEY")) or not os.getenv("MINIMAX_API_KEY"):
-            missing = "GROQ_API_KEY 與 MINIMAX_API_KEY" if needs_groq else "MINIMAX_API_KEY"
-            raise RuntimeError(f"完整流程需要 {missing}；先用 --dry-run 驗證本地流程。")
 
     source_name = args.url or str(Path(args.video).expanduser().resolve())
+    job_dir = root / "jobs" / job_key(source_name)
+    job_dir.mkdir(parents=True, exist_ok=True)
+    manifest_path = job_dir / "manifest.json"
+    previous = read_json_file(manifest_path) or {}
+    previous_stages = previous.get("stages") if isinstance(previous.get("stages"), dict) else {}
+    previous_sync = previous.get("open_notebook") if isinstance(previous.get("open_notebook"), dict) else {}
+    previous_source_id = str(
+        previous_sync.get("source_id")
+        or ((previous_sync.get("response") or {}).get("result") or {}).get("source_id")
+        or ""
+    )
+
     artifact_config = {
         "chunk_seconds": args.chunk_seconds,
+        "chunk_overlap_seconds": args.chunk_overlap_seconds,
         "frame_interval": args.frame_interval,
         "hash_threshold": args.hash_threshold,
         "slide_extractor": args.slide_extractor,
@@ -3893,211 +3943,790 @@ def run_pipeline(args: argparse.Namespace) -> Path:
         "min_slide_duration": args.min_slide_duration,
         "max_vision_frames": args.max_vision_frames,
         "ocr": args.ocr,
+        "summary_max_chars": args.summary_max_chars,
+        "language": language,
+        "transcribe_backend": args.transcribe_backend,
+        "caption_fallback": args.caption_fallback,
+        "ignore_captions": args.ignore_captions,
     }
-    # job 目錄只由來源決定。設定變動由各層的 .complete 簽章判斷要不要重做，
-    # 否則階段一（--no-video）與階段二（補畫面）會落在不同目錄，字幕與已付費的產物全部作廢。
-    job_dir = root / "jobs" / job_key(source_name)
-    job_dir.mkdir(parents=True, exist_ok=True)
-    manifest_path = job_dir / "manifest.json"
-    # manifest 每次重建，但上次同步的 source_id 得留著：忘了它，重跑就會在 notebook 疊出重複條目。
-    previous: dict[str, Any] = {}
-    if manifest_path.is_file():
-        try:
-            previous = json.loads(manifest_path.read_text(encoding="utf-8"))
-        except (json.JSONDecodeError, OSError):
-            previous = {}
-    previous_sync = previous.get("open_notebook") or {}
-    # 只有上次完整跑完才敢重用雲端產物：音訊與截圖有 sentinel，但逐字稿／視覺／摘要
-    # 每次都重新呼叫 API，批次跑到一半中斷就是把前面的錢再花一次。
-    reuse_cloud = previous.get("status") == "completed" and not args.refresh
-    previous_source_id = str(
-        previous_sync.get("source_id")
-        # 早期的 manifest 沒有頂層 source_id，只把它埋在 response.result 裡
-        or ((previous_sync.get("response") or {}).get("result") or {}).get("source_id")
-        or ""
-    )
     manifest: dict[str, Any] = {
-        "schema_version": 1,
+        "schema_version": PIPELINE_SCHEMA_VERSION,
         "status": "running",
         "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "source": {"url": args.url, "video": args.video},
         "job_dir": artifact_path(job_dir, root),
         "config": {
             **artifact_config,
-            "workers": min(max(args.workers, 1), 4),
-            "language": language,
-            "transcribe_backend": args.transcribe_backend,
-            "sync_open_notebook": args.sync_open_notebook,
+            "workers": max(1, min(args.workers, 4)),
             "notebook_id": args.notebook_id or None,
         },
+        "stages": {},
     }
     if previous_source_id:
-        manifest["open_notebook"] = {**previous_sync, "source_id": previous_source_id}  # 這次沒同步也不能弄丟
-    # 後處理階段（--categorize）寫進 manifest 的欄位，也要跟著保留：
-    # manifest 每次重建，重跑一次批次就會把分類全部沖掉，下次 --categorize 又得整批重來。
+        manifest["open_notebook"] = {**previous_sync, "source_id": previous_source_id}
     for preserved in ("categories", "level"):
         if previous.get(preserved):
             manifest[preserved] = previous[preserved]
-    write_json(manifest_path, manifest)
+
+    def persist() -> None:
+        write_json(manifest_path, manifest)
+
+    def record(
+        stage: str,
+        signature: str,
+        artifact: Path,
+        *,
+        status: str = "completed",
+        reused: bool = False,
+        **metadata: Any,
+    ) -> None:
+        set_stage_record(
+            manifest,
+            stage,
+            signature,
+            artifact_path(artifact, root),
+            status=status,
+            reused=reused,
+            **metadata,
+        )
+        persist()
+
+    persist()
+
+    # URL 的字幕 metadata 在完整影片下載前取得；dry-run 則不碰網路。
+    info: dict[str, Any] = {}
+    metadata_fp = digest_value(source_name)
+    caption_transcript: dict[str, Any] | None = None
+    caption_signature = ""
+    caption_reused = False
+    caption_error = ""
+    if args.url and not args.dry_run and not args.ignore_captions:
+        try:
+            info = youtube_info(args.url, job_dir, refresh=args.refresh)
+            metadata_fp = source_metadata_fingerprint(info, args.url)
+            caption_signature = caption_stage_signature(info, language)
+            cached_caption = stage_cache_value(
+                previous_stages,
+                "transcript",
+                job_dir / "transcript.json",
+                caption_signature,
+                validate_transcript,
+                args.refresh,
+            )
+            if isinstance(cached_caption, dict) and cached_caption.get("caption_source"):
+                caption_transcript = cached_caption
+                caption_reused = True
+            else:
+                fetched_caption = fetch_youtube_transcript(
+                    args.url, job_dir, language, refresh=args.refresh
+                )
+                if fetched_caption and caption_is_reliable(
+                    fetched_caption, float(info.get("duration") or 0.0)
+                ):
+                    caption_transcript = fetched_caption
+        except RuntimeError as exc:
+            caption_error = str(exc)
+            print(f"! 字幕前置失敗，稍後改走媒體／語音流程：{caption_error}")
+            if args.no_video:
+                raise
+
+    if args.url and args.dry_run:
+        manifest["status"] = "dry-run"
+        manifest["next"] = "移除 --dry-run 後會先嘗試字幕，再下載必要的媒體。"
+        persist()
+        return manifest_path
+
+    video_path: Path
+    duration = 0.0
+    media_fp = metadata_fp
+    probe: dict[str, Any] = {}
+    audio_chunks: list[dict[str, Any]] = []
+    candidates: list[dict[str, Any]] = []
+    frame_meta: dict[str, Any] = {"method": "not-run", "candidate_count": 0}
+    frame_signature = ""
+    audio_signature = ""
 
     try:
-        captions_only: dict[str, Any] | None = None
         if args.no_video:
-            # 只抓字幕：不下載影片、不切音訊、不抽幀。標題與時長改由 info.json 提供。
             if not args.url:
                 raise ValueError("--no-video 只支援 --url。")
-            captions_only = reuse_artifact(job_dir / "transcript.json") if reuse_cloud else None
-            if captions_only is None:
-                captions_only = fetch_youtube_transcript(args.url, job_dir, language)
-            if captions_only is None:
-                raise RuntimeError("這支影片沒有字幕，--no-video 無法處理；改用完整流程。")
-            info = reuse_artifact(job_dir / "source.info.json") or {}
+            if caption_transcript is None:
+                raise RuntimeError("這支影片沒有可用字幕，--no-video 無法處理；請改用完整流程。")
+            duration = float(info.get("duration") or 0.0)
+            if duration <= 0:
+                duration = max(
+                    (float(item.get("end", 0)) for item in caption_transcript.get("segments", [])),
+                    default=0.0,
+                )
+            video_path = Path("captions-only")
             manifest["source"]["title"] = str(info.get("title") or job_dir.name)
-            manifest["video"] = {"duration_seconds": float(info.get("duration") or 0.0), "streams": []}
-            video_path = Path(str(info.get("title") or job_dir.name))  # 只用於 knowledge.md 的顯示名
-            audio_chunks, candidates, frame_meta = [], [], {"method": "captions-only", "candidate_count": 0}
-        elif args.url:
-            if args.dry_run:
-                manifest["status"] = "dry-run"
-                manifest["next"] = "移除 --dry-run 後才會使用 yt-dlp 下載影片。"
-                write_json(manifest_path, manifest)
-                return manifest_path
-            video_path = download_video(args.url, job_dir)
+            manifest["source"]["metadata_fingerprint"] = metadata_fp
+            manifest["video"] = {"duration_seconds": duration, "streams": []}
+            frame_signature = stage_signature(
+                "frames",
+                metadata_fp,
+                {"extractor": "captions-only", "version": PIPELINE_SCHEMA_VERSION},
+            )
+            audio_signature = stage_signature(
+                "audio",
+                metadata_fp,
+                {"extractor": "captions-only", "version": PIPELINE_SCHEMA_VERSION},
+            )
+            frame_meta = {"method": "captions-only", "candidate_count": 0}
+            write_json(
+                job_dir / "frame_candidates.json",
+                {"frames": [], "meta": frame_meta},
+            )
+            record(
+                "frames",
+                frame_signature,
+                job_dir / "frame_candidates.json",
+                status="skipped",
+                metadata="no-video",
+            )
+            record(
+                "audio",
+                audio_signature,
+                job_dir / "audio" / "chunks.json",
+                status="skipped",
+                metadata="no-video",
+            )
         else:
-            video_path = Path(args.video).expanduser().resolve()
-            if not video_path.is_file():
-                raise FileNotFoundError(video_path)
-
-        if not args.no_video:
+            if args.url:
+                video_path = download_video(args.url, job_dir)
+            else:
+                video_path = Path(args.video).expanduser().resolve()
+                if not video_path.is_file():
+                    raise FileNotFoundError(video_path)
+            probe = probe_video(video_path)
+            duration = video_duration(probe)
+            media_fp = file_fingerprint(video_path, job_dir / "source.fingerprint.json")
             manifest["source"]["resolved_video"] = artifact_path(video_path, root)
             manifest["source"]["title"] = source_title(job_dir, video_path)
-
-            probe = probe_video(video_path)
+            manifest["source"]["metadata_fingerprint"] = metadata_fp
+            manifest["source"]["media_fingerprint"] = media_fp
             manifest["video"] = {
-                "duration_seconds": video_duration(probe),
+                "duration_seconds": duration,
                 "streams": [
-                    {"codec_type": stream.get("codec_type"), "codec_name": stream.get("codec_name")}
+                    {
+                        "codec_type": stream.get("codec_type"),
+                        "codec_name": stream.get("codec_name"),
+                    }
                     for stream in probe.get("streams", [])
                 ],
             }
-            audio_chunks = extract_audio(video_path, job_dir, args.chunk_seconds)
+            if info:
+                manifest["source"]["platform_metadata"] = {
+                    key: info.get(key)
+                    for key in ("id", "webpage_url", "language", "duration", "upload_date")
+                    if info.get(key) is not None
+                }
+
+            frame_settings = {
+                "extractor": FRAME_EXTRACTOR_VERSION if args.slide_extractor == "native" else "steipete",
+                "interval": args.frame_interval,
+                "hash_threshold": args.hash_threshold,
+                "scene_threshold": args.scene_threshold,
+                "min_slide_duration": args.min_slide_duration,
+                "max_frames": args.max_vision_frames,
+                "ocr": args.ocr,
+            }
+            frame_signature = stage_signature("frames", media_fp, frame_settings)
+            audio_signature = stage_signature(
+                "audio",
+                media_fp,
+                {
+                    "extractor": AUDIO_EXTRACTOR_VERSION,
+                    "chunk_seconds": args.chunk_seconds,
+                    "overlap_seconds": args.chunk_overlap_seconds,
+                },
+            )
+            frame_cache = stage_cache_value(
+                previous_stages,
+                "frames",
+                job_dir / "frame_candidates.json",
+                frame_signature,
+                validate_frame_artifact,
+                args.refresh,
+            )
+            audio_cache = (
+                stage_cache_value(
+                    previous_stages,
+                    "audio",
+                    job_dir / "audio" / "chunks.json",
+                    audio_signature,
+                    validate_audio_artifact,
+                    args.refresh,
+                )
+                if not caption_transcript
+                else None
+            )
+            if isinstance(frame_cache, dict):
+                candidates = [dict(item) for item in frame_cache.get("frames") or []]
+                frame_meta = dict(frame_cache.get("meta") or {})
+                record(
+                    "frames",
+                    frame_signature,
+                    job_dir / "frame_candidates.json",
+                    reused=True,
+                    count=len(candidates),
+                )
+            if isinstance(audio_cache, dict):
+                audio_chunks = [dict(item) for item in audio_cache.get("chunks") or []]
+                record(
+                    "audio",
+                    audio_signature,
+                    job_dir / "audio" / "chunks.json",
+                    reused=True,
+                    count=len(audio_chunks),
+                )
+
+            extraction_jobs: dict[str, Any] = {}
+            if not isinstance(frame_cache, dict):
+                extraction_jobs["frames"] = (
+                    (extract_steipete_candidates, ())
+                    if args.slide_extractor == "steipete"
+                    else (extract_candidates, ())
+                )
+            if not caption_transcript and not isinstance(audio_cache, dict):
+                extraction_jobs["audio"] = (extract_audio, ())
+
+            if extraction_jobs:
+                with concurrent.futures.ThreadPoolExecutor(max_workers=min(2, len(extraction_jobs))) as pool:
+                    futures: dict[Any, str] = {}
+                    for name in extraction_jobs:
+                        if name == "frames":
+                            if args.slide_extractor == "steipete":
+                                future = pool.submit(
+                                    extract_steipete_candidates,
+                                    video_path,
+                                    job_dir,
+                                    args.max_vision_frames,
+                                    args.scene_threshold,
+                                    args.min_slide_duration,
+                                )
+                            else:
+                                future = pool.submit(
+                                    extract_candidates,
+                                    video_path,
+                                    job_dir,
+                                    args.frame_interval,
+                                    args.hash_threshold,
+                                    args.max_vision_frames,
+                                    args.ocr,
+                                    0.75,
+                                    args.scene_threshold,
+                                    media_fp,
+                                    args.refresh,
+                                )
+                        else:
+                            future = pool.submit(
+                                extract_audio,
+                                video_path,
+                                job_dir,
+                                args.chunk_seconds,
+                                args.chunk_overlap_seconds,
+                                media_fp,
+                                duration,
+                                args.refresh,
+                            )
+                        futures[future] = name
+                    results: dict[str, Any] = {}
+                    errors: list[Exception] = []
+                    for future in concurrent.futures.as_completed(futures):
+                        name = futures[future]
+                        try:
+                            results[name] = future.result()
+                        except Exception as exc:
+                            errors.append(exc)
+                    if errors:
+                        raise errors[0]
+                    if "frames" in results:
+                        candidates, frame_meta = results["frames"]
+                        write_json(
+                            job_dir / "frame_candidates.json",
+                            {"frames": candidates, "meta": frame_meta},
+                        )
+                        record(
+                            "frames",
+                            frame_signature,
+                            job_dir / "frame_candidates.json",
+                            count=len(candidates),
+                        )
+                    if "audio" in results:
+                        audio_chunks = results["audio"]
+                        record(
+                            "audio",
+                            audio_signature,
+                            job_dir / "audio" / "chunks.json",
+                            count=len(audio_chunks),
+                        )
+            if caption_transcript:
+                record(
+                    "audio",
+                    audio_signature,
+                    job_dir / "audio" / "chunks.json",
+                    status="skipped",
+                    metadata="reliable-captions",
+                )
+            manifest["artifacts"] = {
+                "audio_chunks": [
+                    artifact_path(Path(str(item["path"])), root) for item in audio_chunks
+                ],
+                "frame_candidates": artifact_path(job_dir / "frame_candidates.json", root),
+            }
+
         if args.no_video:
-            pass
-        elif args.slide_extractor == "steipete":
-            candidates, frame_meta = extract_steipete_candidates(
-                video_path,
-                job_dir,
-                args.max_vision_frames,
-                args.scene_threshold,
-                args.min_slide_duration,
-            )
-        else:
-            candidates, frame_meta = extract_candidates(
-                video_path,
-                job_dir,
-                args.frame_interval,
-                args.hash_threshold,
-                args.max_vision_frames,
-                args.ocr,
-                0.75,
-            )
-        write_json(job_dir / "frame_candidates.json", {"frames": candidates, "meta": frame_meta})
-        manifest["artifacts"] = {
-            "audio_chunks": [artifact_path(path, root) for path in audio_chunks],
-            "frame_candidates": artifact_path(job_dir / "frame_candidates.json", root),
-        }
-        if args.slide_extractor == "steipete":
-            manifest["artifacts"]["steipete_slides"] = artifact_path(job_dir / "steipete-slides.json", root)
+            manifest["artifacts"] = {
+                "audio_chunks": [],
+                "frame_candidates": artifact_path(job_dir / "frame_candidates.json", root),
+            }
+        persist()
 
-        reused_observations = False
-        if captions_only is not None:
-            transcript: dict[str, Any] = captions_only
-            observations = []  # 空的：下次不帶 --no-video 重跑時 reuse_artifact 會判定為無、自動補畫面
-            # 這個模式本來就沒有畫面，不算「這次新增了畫面」——否則每次重跑都會白白重算摘要。
-            # 階段二真的補上畫面時，走的是下面的 else 分支，那裡才會讓摘要重算。
-            reused_observations = True
+        # 逐字稿與視覺階段相互獨立，未命中的階段同時執行。
+        transcript: dict[str, Any]
+        observations: list[dict[str, Any]]
+        transcript_signature = ""
+        transcript_reused = False
+        visual_signature = ""
+        visual_reused = False
+
+        if caption_transcript is not None:
+            transcript = caption_transcript
+            transcript_signature = caption_signature or str(caption_transcript.get("signature") or "")
+            transcript_reused = caption_reused
+            if not transcript_signature:
+                transcript_signature = stage_signature(
+                    "transcript",
+                    metadata_fp,
+                    {"backend": "youtube-captions", "language": language},
+                )
+            write_json(job_dir / "transcript.json", transcript)
+            record(
+                "transcript",
+                transcript_signature,
+                job_dir / "transcript.json",
+                reused=transcript_reused,
+                backend="youtube-captions",
+            )
         elif args.dry_run or args.local_only:
-            transcript = {"status": "skipped", "reason": "dry-run" if args.dry_run else "local-only", "segments": []}
-            observations = local_observations(candidates)
+            transcript = {
+                "schema_version": ARTIFACT_SCHEMA_VERSION,
+                "status": "skipped",
+                "reason": "dry-run" if args.dry_run else "local-only",
+                "model": None,
+                "language": language,
+                "segments": [],
+            }
+            transcript_signature = stage_signature(
+                "transcript",
+                media_fp,
+                {"backend": transcript["reason"], "language": language},
+            )
+            write_json(job_dir / "transcript.json", transcript)
+            record(
+                "transcript",
+                transcript_signature,
+                job_dir / "transcript.json",
+                status="skipped",
+            )
         else:
-            transcript = reuse_artifact(job_dir / "transcript.json") if reuse_cloud else None
-            if transcript is None and args.transcribe_backend == "youtube":
-                if not args.url:
-                    raise ValueError("--transcribe-backend youtube 需要 --url。")
-                transcript = fetch_youtube_transcript(args.url, job_dir, language)
-                if transcript is None:
-                    print("! 這支影片沒有字幕，退回 Groq 轉錄")
-            if transcript is None:
-                if args.transcribe_backend == "local":
-                    transcript = transcribe_local(
-                        audio_chunks, args.whisper_model, language, args.chunk_seconds
-                    )
-                else:
-                    transcript = transcribe_all(
-                        audio_chunks,
-                        os.environ["GROQ_API_KEY"],
-                        args.groq_model,
-                        language,
-                        args.chunk_seconds,
-                        args.workers,
-                    )
-            else:
-                print("· 重用既有逐字稿（--refresh 可強制重算）")
-
-            observations = reuse_artifact(job_dir / "visual.json") if reuse_cloud else None
-            if observations is None:
-                observations = analyze_images(
-                    candidates,
-                    os.environ["MINIMAX_API_KEY"],
-                    os.getenv("MINIMAX_MODEL", "MiniMax-M3"),
-                    args.workers,
+            backend = args.transcribe_backend
+            if backend == "youtube":
+                backend = args.caption_fallback
+            model_name = args.groq_model if backend == "groq" else f"faster-whisper/{args.whisper_model}"
+            transcript_signature = stage_signature(
+                "transcript",
+                media_fp,
+                {
+                    "backend": backend,
+                    "model": model_name,
+                    "language": language,
+                    "review_version": "targeted-v1",
+                },
+                [audio_signature],
+            )
+            cached_transcript = stage_cache_value(
+                previous_stages,
+                "transcript",
+                job_dir / "transcript.json",
+                transcript_signature,
+                validate_transcript,
+                args.refresh,
+            )
+            if isinstance(cached_transcript, dict):
+                transcript = cached_transcript
+                transcript_reused = True
+                print("· 重用既有逐字稿")
+                write_json(job_dir / "transcript.json", transcript)
+                record(
+                    "transcript",
+                    transcript_signature,
+                    job_dir / "transcript.json",
+                    reused=True,
+                    backend=backend,
                 )
             else:
-                reused_observations = True
-                print("· 重用既有視覺觀察")
-        # 記下每個階段實際由誰產生：換模型後回頭看產物才知道該不該重跑
-        manifest["models"] = {
-            "transcript": transcript.get("model") if isinstance(transcript, dict) else None,
-            "visual": os.getenv("MINIMAX_MODEL", "MiniMax-M3") if observations else None,
-        }
-        write_json(job_dir / "transcript.json", transcript)
-        write_json(job_dir / "visual.json", observations)
-        timeline = merge_timeline(transcript, observations)
-        write_json(job_dir / "timeline.json", timeline)
+                if not audio_chunks:
+                    transcript = {
+                        "schema_version": ARTIFACT_SCHEMA_VERSION,
+                        "status": "silent",
+                        "model": model_name,
+                        "language": language,
+                        "segments": [],
+                        "review": [],
+                        "omitted_segments": [],
+                    }
+                elif backend == "groq":
+                    if not os.getenv("GROQ_API_KEY"):
+                        raise RuntimeError(
+                            "需要 GROQ_API_KEY；或指定 --caption-fallback local／--transcribe-backend local。"
+                        )
+                    transcript = None  # type: ignore[assignment]
+                else:
+                    transcript = None  # type: ignore[assignment]
+
+                visual_signature = stage_signature(
+                    "visual",
+                    media_fp,
+                    {
+                        "model": os.getenv("MINIMAX_MODEL", "MiniMax-M3"),
+                        "prompt": PROMPT_VERSIONS["visual"],
+                        "review_prompt": PROMPT_VERSIONS["visual_review"],
+                        "workers": max(1, min(args.workers, 4)),
+                    },
+                    [frame_signature, digest_value(candidates)],
+                )
+                cached_visual = (
+                    stage_cache_value(
+                        previous_stages,
+                        "visual",
+                        job_dir / "visual.json",
+                        visual_signature,
+                        validate_visual,
+                        args.refresh,
+                    )
+                    if not args.no_video
+                    else []
+                )
+                if isinstance(cached_visual, list):
+                    observations = cached_visual
+                    visual_reused = True
+                elif args.no_video:
+                    observations = []
+                elif args.dry_run or args.local_only:
+                    observations = local_observations(candidates)
+                elif transcript is None:
+                    observations = None  # type: ignore[assignment]
+                else:
+                    observations = None  # type: ignore[assignment]
+
+                jobs: dict[str, Any] = {}
+                if transcript is None:
+                    if backend == "groq":
+                        jobs["transcript"] = ("groq",)
+                    else:
+                        jobs["transcript"] = ("local",)
+                if not isinstance(cached_visual, list) and not args.no_video and not (args.dry_run or args.local_only):
+                    jobs["visual"] = ("visual",)
+                if jobs:
+                    with concurrent.futures.ThreadPoolExecutor(max_workers=min(2, len(jobs))) as pool:
+                        futures: dict[Any, str] = {}
+                        for name, kind in jobs.items():
+                            if name == "transcript":
+                                if kind[0] == "groq":
+                                    futures[
+                                        pool.submit(
+                                            transcribe_all,
+                                            audio_chunks,
+                                            os.environ["GROQ_API_KEY"],
+                                            args.groq_model,
+                                            language,
+                                            args.chunk_seconds,
+                                            args.workers,
+                                            transcript_signature,
+                                            job_dir / "transcript-parts",
+                                            args.refresh,
+                                        )
+                                    ] = name
+                                else:
+                                    futures[
+                                        pool.submit(
+                                            transcribe_local,
+                                            audio_chunks,
+                                            args.whisper_model,
+                                            language,
+                                            args.chunk_seconds,
+                                            transcript_signature,
+                                            job_dir / "transcript-parts",
+                                            args.refresh,
+                                        )
+                                    ] = name
+                            else:
+                                futures[
+                                    pool.submit(
+                                        analyze_images,
+                                        candidates,
+                                        os.environ["MINIMAX_API_KEY"],
+                                        os.getenv("MINIMAX_MODEL", "MiniMax-M3"),
+                                        args.workers,
+                                        visual_signature,
+                                        job_dir / "visual-parts",
+                                        args.refresh,
+                                    )
+                                ] = name
+                        stage_results: dict[str, Any] = {}
+                        errors: list[Exception] = []
+                        for future in concurrent.futures.as_completed(futures):
+                            name = futures[future]
+                            try:
+                                stage_results[name] = future.result()
+                            except Exception as exc:
+                                errors.append(exc)
+                        if errors:
+                            raise errors[0]
+                        if "transcript" in stage_results:
+                            transcript = stage_results["transcript"]
+                            write_json(job_dir / "transcript.json", transcript)
+                            record(
+                                "transcript",
+                                transcript_signature,
+                                job_dir / "transcript.json",
+                                backend=backend,
+                            )
+                        if "visual" in stage_results:
+                            observations = refine_visual_observations(
+                                candidates,
+                                stage_results["visual"],
+                                os.environ["MINIMAX_API_KEY"],
+                                os.getenv("MINIMAX_MODEL", "MiniMax-M3"),
+                                args.workers,
+                                visual_signature,
+                                job_dir / "visual-review-parts",
+                                args.refresh,
+                            )
+                            write_json(job_dir / "visual.json", observations)
+                            record(
+                                "visual",
+                                visual_signature,
+                                job_dir / "visual.json",
+                                count=len(observations),
+                            )
+                if not isinstance(observations, list):
+                    observations = []
+                if "visual" not in manifest.get("stages", {}):
+                    write_json(job_dir / "visual.json", observations)
+                    if args.no_video:
+                        record(
+                            "visual",
+                            visual_signature or stage_signature("visual", media_fp, {"mode": "no-video"}),
+                            job_dir / "visual.json",
+                            status="skipped",
+                        )
+                    elif args.dry_run or args.local_only:
+                        record(
+                            "visual",
+                            visual_signature or stage_signature("visual", media_fp, {"mode": "local-only"}),
+                            job_dir / "visual.json",
+                            status="skipped",
+                        )
+                    elif isinstance(cached_visual, list):
+                        record(
+                            "visual",
+                            visual_signature,
+                            job_dir / "visual.json",
+                            reused=True,
+                            count=len(observations),
+                        )
+                if transcript is None:
+                    raise RuntimeError("逐字稿階段沒有產生結果。")
+
+        if "visual" not in manifest.get("stages", {}):
+            if args.no_video:
+                observations = []
+                visual_signature = stage_signature("visual", metadata_fp, {"mode": "no-video"})
+                write_json(job_dir / "visual.json", observations)
+                record(
+                    "visual",
+                    visual_signature,
+                    job_dir / "visual.json",
+                    status="skipped",
+                )
+            else:
+                visual_signature = visual_signature or stage_signature(
+                    "visual",
+                    media_fp,
+                    {"model": os.getenv("MINIMAX_MODEL", "MiniMax-M3"), "prompt": PROMPT_VERSIONS["visual"]},
+                    [frame_signature, digest_value(candidates)],
+                )
+                cached_visual = stage_cache_value(
+                    previous_stages,
+                    "visual",
+                    job_dir / "visual.json",
+                    visual_signature,
+                    validate_visual,
+                    args.refresh,
+                )
+                if isinstance(cached_visual, list):
+                    observations = cached_visual
+                    record(
+                        "visual",
+                        visual_signature,
+                        job_dir / "visual.json",
+                        reused=True,
+                        count=len(observations),
+                    )
+                elif args.dry_run or args.local_only:
+                    observations = local_observations(candidates)
+                    write_json(job_dir / "visual.json", observations)
+                    record(
+                        "visual",
+                        visual_signature,
+                        job_dir / "visual.json",
+                        status="skipped",
+                        count=len(observations),
+                    )
+                else:
+                    raise RuntimeError("視覺階段沒有產生結果。")
+
+        if "artifacts" not in manifest:
+            manifest["artifacts"] = {}
         manifest["artifacts"].update(
             {
                 "transcript": artifact_path(job_dir / "transcript.json", root),
                 "visual": artifact_path(job_dir / "visual.json", root),
-                "timeline": artifact_path(job_dir / "timeline.json", root),
             }
         )
-        summary: dict[str, Any]
-        if args.dry_run or args.local_only:
-            summary = {"status": "skipped", "reason": "dry-run" if args.dry_run else "local-only"}
-            write_json(job_dir / "summary.json", summary)
-            manifest["artifacts"]["summary"] = artifact_path(job_dir / "summary.json", root)
-            manifest["status"] = "dry-run" if args.dry_run else "local-only"
-        else:
-            # 只有視覺觀察也是沿用的才敢重用摘要：階段二補上畫面後，
-            # 舊摘要是「只看過語音」的版本，必須重算才會納入程式碼識別字。
-            summary = (
-                reuse_artifact(job_dir / "summary.json", "short_summary")
-                if reuse_cloud and reused_observations
-                else None
+        persist()
+
+        timeline_signature = stage_signature(
+            "timeline",
+            media_fp,
+            {"version": PIPELINE_SCHEMA_VERSION},
+            [digest_value(transcript), digest_value(observations)],
+        )
+        cached_timeline = stage_cache_value(
+            previous_stages,
+            "timeline",
+            job_dir / "timeline.json",
+            timeline_signature,
+            validate_timeline,
+            args.refresh,
+        )
+        if isinstance(cached_timeline, list):
+            timeline = cached_timeline
+            record(
+                "timeline",
+                timeline_signature,
+                job_dir / "timeline.json",
+                reused=True,
+                count=len(timeline),
             )
-            if summary is None:
+        else:
+            timeline = merge_timeline(transcript, observations)
+            write_json(job_dir / "timeline.json", timeline)
+            if validate_timeline(timeline):
+                raise ArtifactValidationError(
+                    "時間軸未通過驗證：" + "; ".join(validate_timeline(timeline)[:8])
+                )
+            record(
+                "timeline",
+                timeline_signature,
+                job_dir / "timeline.json",
+                count=len(timeline),
+            )
+        manifest["artifacts"]["timeline"] = artifact_path(job_dir / "timeline.json", root)
+
+        if args.dry_run or args.local_only:
+            summary = {
+                "schema_version": ARTIFACT_SCHEMA_VERSION,
+                "status": "skipped",
+                "reason": "dry-run" if args.dry_run else "local-only",
+                "chapters": [],
+                "steps": [],
+                "tools_and_terms": [],
+                "fact_check": [],
+                "source_timestamps": [],
+            }
+            summary_signature = stage_signature(
+                "summary",
+                media_fp,
+                {"mode": summary["reason"]},
+                [timeline_signature],
+            )
+            write_json(job_dir / "summary.json", summary)
+            record(
+                "summary",
+                summary_signature,
+                job_dir / "summary.json",
+                status="skipped",
+            )
+        else:
+            summary_signature = stage_signature(
+                "summary",
+                media_fp,
+                {
+                    "model": os.getenv("MINIMAX_MODEL", "MiniMax-M3"),
+                    "prompt": PROMPT_VERSIONS["summary"],
+                    "max_chars": args.summary_max_chars,
+                },
+                [timeline_signature],
+            )
+            cached_summary = stage_cache_value(
+                previous_stages,
+                "summary",
+                job_dir / "summary.json",
+                summary_signature,
+                lambda value: validate_summary(value, duration),
+                args.refresh,
+            )
+            if isinstance(cached_summary, dict):
+                summary = cached_summary
+                record(
+                    "summary",
+                    summary_signature,
+                    job_dir / "summary.json",
+                    reused=True,
+                )
+            else:
+                if not os.getenv("MINIMAX_API_KEY") and timeline:
+                    raise RuntimeError("完整流程需要 MINIMAX_API_KEY。")
                 summary = create_summary(
                     timeline,
-                    os.environ["MINIMAX_API_KEY"],
+                    os.getenv("MINIMAX_API_KEY", ""),
                     os.getenv("MINIMAX_MODEL", "MiniMax-M3"),
-                    800000,
+                    args.summary_max_chars,
+                    duration,
+                    summary_signature,
+                    job_dir / "summary-parts",
+                    args.workers,
+                    args.refresh,
                 )
-                manifest["models"]["summary"] = os.getenv("MINIMAX_MODEL", "MiniMax-M3")
-            else:
-                print("· 重用既有摘要")
-            write_json(job_dir / "summary.json", summary)
-            manifest["artifacts"]["summary"] = artifact_path(job_dir / "summary.json", root)
-            manifest["status"] = "completed"
+                errors = validate_summary(summary, duration)
+                if errors:
+                    raise ArtifactValidationError("摘要未通過驗證：" + "; ".join(errors[:8]))
+                write_json(job_dir / "summary.json", summary)
+                record(
+                    "summary",
+                    summary_signature,
+                    job_dir / "summary.json",
+                    model=os.getenv("MINIMAX_MODEL", "MiniMax-M3"),
+                )
+            manifest["models"] = {
+                "transcript": transcript.get("model"),
+                "visual": os.getenv("MINIMAX_MODEL", "MiniMax-M3") if observations else None,
+                "summary": os.getenv("MINIMAX_MODEL", "MiniMax-M3") if timeline else None,
+            }
+        manifest["artifacts"]["summary"] = artifact_path(job_dir / "summary.json", root)
+        persist()
+
+        # 最終 gate：只有所有結構、時間與來源欄位通過才會宣告完成。
+        if not (args.dry_run or args.local_only):
+            errors = validate_transcript(transcript) + validate_visual(observations) + validate_timeline(timeline)
+            errors += validate_summary(summary, duration)
+            if errors:
+                raise ArtifactValidationError("完成驗證失敗：" + "; ".join(errors[:12]))
+
         knowledge_path = render_knowledge_markdown(
             job_dir,
             manifest["source"],
@@ -4108,6 +4737,7 @@ def run_pipeline(args: argparse.Namespace) -> Path:
             summary,
         )
         manifest["artifacts"]["knowledge_markdown"] = artifact_path(knowledge_path, root)
+
         if args.sync_open_notebook:
             if args.dry_run or args.local_only:
                 manifest["open_notebook"] = {"status": "skipped", "reason": "dry-run/local-only"}
@@ -4125,7 +4755,12 @@ def run_pipeline(args: argparse.Namespace) -> Path:
                     manifest["source"].get("title", ""),
                     previous_source_id,
                 )
-        write_json(manifest_path, manifest)
+        manifest["finished_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        manifest["status"] = "completed" if not args.dry_run and not args.local_only else (
+            "dry-run" if args.dry_run else "local-only"
+        )
+        persist()
+
         connection = index_connection(root)
         try:
             index_job(connection, job_dir)
@@ -4136,9 +4771,9 @@ def run_pipeline(args: argparse.Namespace) -> Path:
     except Exception as exc:
         manifest["status"] = "failed"
         manifest["error"] = str(exc)
-        write_json(manifest_path, manifest)
+        manifest["failed_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        persist()
         raise
-
 
 def main() -> int:
     args = parse_args()
