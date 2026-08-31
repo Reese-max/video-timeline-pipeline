@@ -142,6 +142,8 @@ ARTIFACT_SCHEMA_VERSION = 2
 FRAME_EXTRACTOR_VERSION = "native-pts-scene-v2"
 AUDIO_EXTRACTOR_VERSION = "audio-window-v2"
 CAPTION_EXTRACTOR_VERSION = "youtube-caption-v2"
+CAPTION_MERGE_CHARS = 320
+CAPTION_MERGE_GAP = 2.0
 PROMPT_VERSIONS = {
     "visual": "2026-08-31.visual-v2",
     "visual_review": "2026-08-31.visual-review-v1",
