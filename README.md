@@ -181,11 +181,11 @@ python pipeline.py --ask '這些影片有提過怎麼設定 ffmpeg 嗎？'
 python pipeline.py --digest
 ```
 
-`--ask` 先讓模型把問句拆成檢索詞（整句丟進 FTS5 是 phrase 比對，長問句必定 0 筆），再用檢索到的片段生成答案，並標註 `[1]`、`[2]` 對應到影片標題與時間戳。提示詞限定只能引用片段內容，資訊不足時會直說找不到，不會臆造。
+`--ask` 的無語意模式先做精確全文檢索；開啟 `--semantic` 後，會合併精確詞／關鍵詞與向量結果，再用 RRF 排名融合。回答上下文會補上同片段相鄰的原始語音／畫面事件，並標註 `[1]`、`[2]` 對應到影片標題與時間戳。摘要只負責定位，事實優先回到原始事件；資訊不足時會直說找不到。
 
 `--digest` 把各支影片的摘要合成 `digest.md`：主題分群、跨影片反覆出現的術語、建議觀看順序、涵蓋落差。只吃跑過完整流程的 job，`--local-only`／`--dry-run` 的 job 沒有真摘要會被跳過。
 
-> 呼叫 MiniMax 一律不設 `max_tokens`。MiniMax-M3 是 reasoning 模型，`<think>` 會先吃掉配額，設了上限常常在真正的答案輸出前就用完，回傳半截 JSON。
+MiniMax M3 依任務分流思考：畫面初判、關鍵詞與分類先以 `thinking: {"type": "disabled"}` 測試，疑點複核、跨章節整合與最終問答保留 `adaptive`。所有結構化階段都有輸出上限、結構驗證與必要重試；詳見 [MiniMax 官方 API 參考](https://platform.minimax.io/docs/api-reference/text-openai-api)。
 
 ## 語意檢索
 
@@ -244,7 +244,27 @@ OpenRouter 的 `/embeddings` 與 `/rerank` 端點在模型清單裡查不到、�
 
 輸出會標示相似度分數，低於 `0.35` 的視為不相關直接濾掉（`pipeline.py` 的 `MIN_SIMILARITY`）—— 少了下限，每次查詢都會回傳整個索引，末幾筆只是「最不像的那些」而不是命中。
 
-`--ask --semantic` 會直接拿問句比對語意，跳過「先抽關鍵詞」那一步：少一次 API 呼叫，命中也更準。
+`--semantic` 需要先執行 `--embed`。查詢會以精確詞與語意結果做混合檢索；只有複雜或精確詞沒有命中時才補關鍵詞生成，避免每次查詢固定多一次模型呼叫。
+
+## v2 流程驗收重點
+
+這一輪優化保留 `whisper-large-v3` 與 MiniMax M3 的品質取向，先減少無效工作：
+
+- 字幕先行：可靠字幕可跳過整段音訊轉錄；字幕不可靠時才回到音訊，且保留疑點片段待複核。
+- 音畫並行：音訊以 5 分鐘視窗、2 秒交界重疊切段；畫面用場景變化＋定期保底，所有時間取自原始 PTS。
+- 增量保存：每個音訊片段、候選畫面與摘要章節都有自己的快取；中斷後只恢復缺失部分。
+- 長片完整性：超過每章節上限會分層摘要，保留各章節原始時間與引用位置，不默默截掉後半段。
+- 問答可信度：混合檢索後補同時段原始證據；摘要只當索引，不當未驗證事實。
+- 品質 gate：摘要格式、時間範圍、時間軸排序與來源欄位未通過時，job 不會標記為 `completed`。
+
+本專案沒有用實際影片宣稱固定加速倍數；請用自己的代表影片比較完整處理時間、續跑時間、API 呼叫次數、時間定位誤差與問答引用正確率：
+
+```powershell
+python pipeline.py --self-test
+python -m unittest discover -s tests -v
+python pipeline.py --video 'D:\path\to\video.mp4' --root .\library --local-only
+python pipeline.py --root .\library --audit
+```
 
 ## Open Notebook 知識庫
 
