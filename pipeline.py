@@ -3581,7 +3581,7 @@ def self_test() -> None:
     # 讓越前面的圖睡越久，完成順序必定反轉：沒排序就會被抓到。
     count = 6
     original_chat, original_data_url = minimax_chat, image_data_url
-    globals()["image_data_url"] = lambda path: "data:image/jpeg;base64,x"
+    globals()["image_data_url"] = lambda path, **kwargs: "data:image/jpeg;base64,x"
     globals()["minimax_chat"] = lambda messages, *rest: (
         lambda tag: (time.sleep((count - int(tag[3:])) * 0.02), json.dumps({"tag": tag}))[1]
     )(messages[0]["content"][0]["text"].rsplit("：", 1)[-1])
