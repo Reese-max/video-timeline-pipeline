@@ -3,12 +3,15 @@
 目前實作的流程：
 
 ```text
-影片 URL（YouTube／Facebook／其他 yt-dlp 支援站台） → yt-dlp → FFmpeg
-                         ├─ 音訊片段 → Groq Whisper
-                         └─ steipete slides／Tesseract → MiniMax M3
+影片 URL → yt-dlp metadata／字幕（先取得）
+             ├─ 可靠字幕 → 文字時間軸
+             └─ 無字幕／字幕疑點 → 重疊音訊片段 → Groq Whisper
+影片媒體 → FFmpeg 原始 PTS＋自適應畫面候選 → MiniMax M3
                                       ↓
-                              時間軸合併 → MiniMax M3 摘要
+                    音畫依原始時間對齊 → 分章節摘要 → 索引／問答
 ```
+
+URL 來源會先讀取 metadata 與可用字幕；字幕可靠時跳過整段音訊轉錄，但完整模式仍可下載媒體做必要的畫面分析。`--no-video` 則只建立字幕索引。
 
 ## 專案邊界
 
@@ -17,22 +20,25 @@
 ```text
 輸入／工作目錄
   ├─ yt-dlp：來源下載
-  ├─ FFmpeg：ffprobe、音訊切段、固定間隔截圖
+  ├─ FFmpeg：ffprobe、重疊音訊切段、場景變化＋定期保底截圖
   ├─ native／steipete：畫面候選與 OCR
   ├─ Groq／MiniMax：逐字稿、視覺理解、摘要
   └─ knowledge.md／Open Notebook：知識來源輸出與同步
 ```
 
-每個工作目錄的雜湊同時包含來源與本地抽取設定；調整切段或畫面設定會建立新的工作目錄，不會誤用舊快取。JSON 與 Markdown 產物以暫存檔置換，避免中斷時留下半份索引。
+job 目錄由來源識別；每個階段再用「來源內容指紋＋階段設定＋模型＋提示詞版本＋輸出格式版本」簽章。調整切段只會使音訊／逐字稿相關階段失效，調整畫面設定不會讓已完成的語音重跑。JSON 與 Markdown 產物以暫存檔置換，避免中斷時留下半份索引。
 
-三層快取讓中斷的批次可以直接續跑，不會重複付費：
+階段快取與續跑規則：
 
 | 產物 | 判準 |
 |---|---|
-| `source.*`、`audio/`、`frames/` | `.complete` sentinel；沒有標記就清掉重做（半份會靜默毀掉時間軸） |
-| `transcript.json`、`visual.json`、`summary.json` | 上次 `manifest.status == "completed"` 才重用 |
+| `source.*`、`audio/`、`frames/` | 完整標記、內容指紋與設定簽章都一致；缺檔或半份會失效 |
+| `caption-meta.json`、`transcript.json` | 字幕來源／語音後端、語言、模型、切段與品質版本一致，且結構通過驗證 |
+| `visual-parts/`、`transcript-parts/` | 每張候選畫面／每個音訊片段獨立保存；只重做失敗或疑點部分 |
+| `summary-parts/`、`summary.json` | 每章節獨立保存；摘要提示詞、時間軸與輸出格式變更才重做 |
+| `manifest.json` | 只有結構、時間範圍、來源欄位都通過最後 gate 才標記 `completed` |
 
-實測同一支影片重跑：首次 82.6 秒，重跑 1.7 秒且零 API 呼叫。要強制重算加 `--refresh`。
+失敗狀態不會被當成成功快取；要強制重算加 `--refresh`。
 
 ## 先做本地驗證
 
@@ -43,7 +49,7 @@ python pipeline.py --video 'D:\path\to\video.mp4' --dry-run
 python pipeline.py --video 'D:\path\to\video.mp4' --dry-run --slide-extractor steipete
 ```
 
-`--dry-run` 不會下載、不會上傳、不會呼叫雲端 API，但會用本機 `ffprobe`／`ffmpeg` 產生音訊片段與候選截圖。輸出在 `jobs\<12字元雜湊>\`。
+`--dry-run` 不會下載、不會上傳、不會呼叫雲端 API；本機影片仍可用 `ffprobe`／`ffmpeg` 驗證抽取，URL 則只寫入 dry-run manifest。輸出在 `jobs\<12字元雜湊>\`。
 
 ## 批次建立頻道知識庫
 
@@ -88,7 +94,7 @@ MINIMAX_API_KEY=...
 
 `.env` 會覆蓋繼承來的環境變數（只有非空值才覆蓋）。這點很重要：`MINIMAX_BASE_URL` 這種通用名稱常被別的工具設成不相容的值（例如指向 `/anthropic` 相容端點），若讓全域設定贏過專案設定，照著這份 README 建 `.env` 也修不好。`.env` 同時會從**專案目錄**與 `--root` 指定的輸出目錄讀取，後者優先。
 
-逐字稿語言預設 `zh`。處理外語影片要加 `--language auto` 交給 Whisper 自動偵測，否則會把外語音訊硬「翻譯」成中文，產出無意義的逐字稿：
+逐字稿語言預設 `auto`。字幕模式會先依來源提供的語言選擇原文；音訊模式則交給 Whisper 偵測。若已知語言，才指定 `--language zh`、`en` 等：
 
 ```powershell
 python pipeline.py --url '...' --language auto
@@ -118,8 +124,8 @@ turbo 不只聽錯關鍵字，還把 "in front of" 縮成 "one of"，整句語�
 可選環境變數：
 
 ```text
-GROQ_MODEL=whisper-large-v3-turbo
-GROQ_LANGUAGE=zh
+GROQ_MODEL=whisper-large-v3
+GROQ_LANGUAGE=auto
 MINIMAX_MODEL=MiniMax-M3
 MINIMAX_BASE_URL=https://api.minimax.io/v1
 ```
@@ -133,9 +139,9 @@ python pipeline.py --url 'https://www.facebook.com/...' --local-only
 ## 產物
 
 - `manifest.json`：狀態、來源、設定與產物索引。
-- `audio\audio_*.mp3`：單聲道 16 kHz、每段預設 15 分鐘。
-- `frames\frame_*.jpg`：定時截圖；`frame_candidates.json` 記錄去重與 OCR 判斷。
-- `transcript.json`：Groq 帶時間戳逐字稿。
+- `audio\audio_*.mp3`：單聲道 16 kHz、每段預設 5 分鐘，交界重疊 2 秒；每段保存實際 `start/end`。
+- `frames\frame_*.jpg`：場景變化＋定期保底抽取；`timestamps.json` 保存 FFmpeg 原始 `pts_time`，候選畫面另記 OCR／變化原因。
+- `transcript.json`：可靠平台字幕或 Groq／本機 Whisper 帶時間戳逐字稿；疑點片段保留 `review` 標記，不直接丟掉。
 - `visual.json`：MiniMax 結構化畫面觀察。
 - `timeline.json`：語音與畫面事件依時間排序。
 - `summary.json`：MiniMax 摘要、章節、步驟、工具名詞與待查證資訊。
@@ -175,11 +181,11 @@ python pipeline.py --ask '這些影片有提過怎麼設定 ffmpeg 嗎？'
 python pipeline.py --digest
 ```
 
-`--ask` 先讓模型把問句拆成檢索詞（整句丟進 FTS5 是 phrase 比對，長問句必定 0 筆），再用檢索到的片段生成答案，並標註 `[1]`、`[2]` 對應到影片標題與時間戳。提示詞限定只能引用片段內容，資訊不足時會直說找不到，不會臆造。
+`--ask` 的無語意模式先做精確全文檢索；開啟 `--semantic` 後，會合併精確詞／關鍵詞與向量結果，再用 RRF 排名融合。回答上下文會補上同片段相鄰的原始語音／畫面事件，並標註 `[1]`、`[2]` 對應到影片標題與時間戳。摘要只負責定位，事實優先回到原始事件；資訊不足時會直說找不到。
 
 `--digest` 把各支影片的摘要合成 `digest.md`：主題分群、跨影片反覆出現的術語、建議觀看順序、涵蓋落差。只吃跑過完整流程的 job，`--local-only`／`--dry-run` 的 job 沒有真摘要會被跳過。
 
-> 呼叫 MiniMax 一律不設 `max_tokens`。MiniMax-M3 是 reasoning 模型，`<think>` 會先吃掉配額，設了上限常常在真正的答案輸出前就用完，回傳半截 JSON。
+MiniMax M3 依任務分流思考：畫面初判、關鍵詞與分類先以 `thinking: {"type": "disabled"}` 測試，疑點複核、跨章節整合與最終問答保留 `adaptive`。所有結構化階段都有輸出上限、結構驗證與必要重試；詳見 [MiniMax 官方 API 參考](https://platform.minimax.io/docs/api-reference/text-openai-api)。
 
 ## 語意檢索
 
@@ -238,7 +244,27 @@ OpenRouter 的 `/embeddings` 與 `/rerank` 端點在模型清單裡查不到、�
 
 輸出會標示相似度分數，低於 `0.35` 的視為不相關直接濾掉（`pipeline.py` 的 `MIN_SIMILARITY`）—— 少了下限，每次查詢都會回傳整個索引，末幾筆只是「最不像的那些」而不是命中。
 
-`--ask --semantic` 會直接拿問句比對語意，跳過「先抽關鍵詞」那一步：少一次 API 呼叫，命中也更準。
+`--semantic` 需要先執行 `--embed`。查詢會以精確詞與語意結果做混合檢索；只有複雜或精確詞沒有命中時才補關鍵詞生成，避免每次查詢固定多一次模型呼叫。
+
+## v2 流程驗收重點
+
+這一輪優化保留 `whisper-large-v3` 與 MiniMax M3 的品質取向，先減少無效工作：
+
+- 字幕先行：可靠字幕可跳過整段音訊轉錄；字幕不可靠時才回到音訊，且保留疑點片段待複核。
+- 音畫並行：音訊以 5 分鐘視窗、2 秒交界重疊切段；畫面用場景變化＋定期保底，所有時間取自原始 PTS。
+- 增量保存：每個音訊片段、候選畫面與摘要章節都有自己的快取；中斷後只恢復缺失部分。
+- 長片完整性：超過每章節上限會分層摘要，保留各章節原始時間與引用位置，不默默截掉後半段。
+- 問答可信度：混合檢索後補同時段原始證據；摘要只當索引，不當未驗證事實。
+- 品質 gate：摘要格式、時間範圍、時間軸排序與來源欄位未通過時，job 不會標記為 `completed`。
+
+本專案沒有用實際影片宣稱固定加速倍數；請用自己的代表影片比較完整處理時間、續跑時間、API 呼叫次數、時間定位誤差與問答引用正確率：
+
+```powershell
+python pipeline.py --self-test
+python -m unittest discover -s tests -v
+python pipeline.py --video 'D:\path\to\video.mp4' --root .\library --local-only
+python pipeline.py --root .\library --audit
+```
 
 ## Open Notebook 知識庫
 
