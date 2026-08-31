@@ -1314,58 +1314,86 @@ def aggregate_transcription_results(
         "chunk_count": len(specs),
     }
 
+
 def transcribe_all(
-    chunks: list[Path],
+    chunks: list[Any],
     api_key: str,
     model: str,
     language: str,
     chunk_seconds: int,
     workers: int,
+    stage_signature_value: str = "",
+    cache_dir: Path | None = None,
+    refresh: bool = False,
 ) -> dict[str, Any]:
-    def one(item: tuple[int, Path]) -> tuple[int, dict[str, Any]]:
-        index, path = item
-        return index, groq_transcribe(path, api_key, model, language)
+    specs = normalize_chunk_specs(chunks)
+    if not specs:
+        return {
+            "schema_version": ARTIFACT_SCHEMA_VERSION,
+            "model": model,
+            "language": language,
+            "segments": [],
+            "review": [],
+            "omitted_segments": [],
+            "chunk_count": 0,
+        }
+    part_dir = cache_dir or Path(tempfile.mkdtemp(prefix="transcript-parts-"))
+    part_dir.mkdir(parents=True, exist_ok=True)
+
+    def one(spec: dict[str, Any]) -> tuple[int, dict[str, Any], bool, str]:
+        index = int(spec["index"])
+        signature = stage_signature(
+            "transcript_chunk",
+            stage_signature_value or model,
+            {
+                "model": model,
+                "language": language,
+                "chunk": index,
+                "start": spec["start"],
+                "end": spec["end"],
+            },
+        )
+        part_path = part_dir / f"chunk_{index:04d}.json"
+        cached = None if refresh else read_stage_part(part_path, "transcript_chunk", signature)
+        if isinstance(cached, dict) and "selected" in cached:
+            return index, cached, True, signature
+        raw = groq_transcribe(spec["path"], api_key, model, language)
+        flags = transcription_review_flags(raw)
+        selected = raw
+        attempts = 1
+        if flags:
+            retry_prompt = (
+                "請特別注意專有名詞、數字、版本號、否定詞與句首句尾；"
+                "只根據音訊重新辨識，不要補寫聽不到的內容。"
+            )
+            retry = groq_transcribe(spec["path"], api_key, model, language, retry_prompt)
+            attempts = 2
+            if transcription_quality_score(retry) >= transcription_quality_score(raw):
+                selected = retry
+        payload = {"raw": raw, "selected": selected, "review": flags, "attempts": attempts}
+        return index, payload, False, signature
 
     results: dict[int, dict[str, Any]] = {}
+    errors: list[Exception] = []
     with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, min(workers, 4))) as pool:
-        futures = [pool.submit(one, item) for item in enumerate(chunks)]
+        futures = [pool.submit(one, spec) for spec in specs]
         for future in concurrent.futures.as_completed(futures):
-            index, result = future.result()
-            results[index] = result
-
-    detected = language
-    segments: list[dict[str, Any]] = []
-    for index in sorted(results):
-        result = results[index]
-        # 記下實際偵測到的語言；照抄傳入的 "auto" 會讓產物看不出這支影片到底是什麼語言
-        detected = result.get("language") or detected
-        offset = index * chunk_seconds
-        raw_segments = result.get("segments") or []
-        if not raw_segments and result.get("text"):
-            raw_segments = [{"start": 0, "end": chunk_seconds, "text": result["text"]}]
-        for segment in raw_segments:
-            text = str(segment.get("text", "")).strip()
-            if not text or is_silence(segment.get("no_speech_prob")):
-                continue
-            item = {
-                "start": round(float(segment.get("start", 0)) + offset, 3),
-                "end": round(float(segment.get("end", chunk_seconds)) + offset, 3),
-                "text": text,
-                "chunk": index,
-            }
-            for key in ("avg_logprob", "compression_ratio", "no_speech_prob"):
-                if key in segment:
-                    item[key] = segment[key]
-            segments.append(item)
-    return {"model": model, "language": detected, "segments": sorted(segments, key=lambda x: x["start"])}
-
-
-# YouTube 字幕按「畫面顯示行」切，每行 1–3 秒、中位 37 字元，最長不過 41。
-# 直接進索引等於檢索到的都是半句話（實測命中的 snippet 只有「《XState》,」），
-# RAG 拿到的上下文更是碎的。合併成段落級：34,768 筆 → 4,203 筆，中位 306 字元。
-CAPTION_MERGE_CHARS = 320
-CAPTION_MERGE_GAP = 2.0
-
+            try:
+                index, payload, cached, signature = future.result()
+                results[index] = payload
+                if not cached:
+                    write_stage_part(
+                        part_dir / f"chunk_{index:04d}.json",
+                        "transcript_chunk",
+                        signature,
+                        payload,
+                        chunk=index,
+                    )
+            except Exception as exc:
+                errors.append(exc)
+    if errors:
+        raise errors[0]
+    return aggregate_transcription_results(results, specs, model, language, "groq")
 
 def parse_caption_json3(payload: dict[str, Any]) -> list[dict[str, Any]]:
     segments: list[dict[str, Any]] = []
