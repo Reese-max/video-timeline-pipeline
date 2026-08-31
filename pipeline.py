@@ -574,18 +574,18 @@ def extract_audio(
     )
     cached = read_json_file(metadata_path)
     cached_chunks = cached.get("chunks") if isinstance(cached, dict) else None
-    cache_matches = (
+    metadata_matches = (
         not refresh
         and isinstance(cached, dict)
         and cached.get("schema_version") == ARTIFACT_SCHEMA_VERSION
         and cached.get("signature") == signature
         and isinstance(cached_chunks, list)
-        and all(
-            isinstance(item, dict)
-            and item.get("path")
-            and Path(str(item["path"])).is_file()
-            for item in cached_chunks
-        )
+    )
+    cache_matches = metadata_matches and all(
+        isinstance(item, dict)
+        and item.get("path")
+        and Path(str(item["path"])).is_file()
+        for item in cached_chunks
     )
     if cache_matches and marker_matches(done, signature) and cached_chunks:
         return [dict(item) for item in cached_chunks]
@@ -611,7 +611,7 @@ def extract_audio(
         raise RuntimeError("無法取得影片時長，無法建立音訊片段。")
 
     cached_by_index: dict[int, dict[str, Any]] = {}
-    if cache_matches:
+    if metadata_matches:
         for item in cached_chunks:
             try:
                 cached_by_index[int(item["index"])] = dict(item)
