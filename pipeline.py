@@ -2963,6 +2963,7 @@ def hybrid_search(
     limit: int,
     category: str = "",
     threshold: float | None = None,
+    chat_model: str = "",
 ) -> tuple[list[dict[str, Any]], list[str]]:
     """以 RRF 合併精確詞與語意結果；不同分數尺度不直接相加。"""
     if not query.strip():
@@ -2976,7 +2977,7 @@ def hybrid_search(
             keywords = question_keywords(
                 query,
                 api_key,
-                os.getenv("MINIMAX_MODEL", "MiniMax-M3"),
+                chat_model or os.getenv("MINIMAX_MODEL", "MiniMax-M3"),
             )
         except RuntimeError:
             keywords = []
@@ -3128,6 +3129,7 @@ def answer_question(
             embed_backend,
             limit,
             category,
+            chat_model=model,
         )
     else:
         direct = search_index(root, question, max(limit * 3, 20), category)
@@ -4900,6 +4902,7 @@ def main() -> int:
                         args.search_limit,
                         args.category,
                         args.min_similarity,
+                        chat_model=os.getenv("MINIMAX_MODEL", "MiniMax-M3"),
                     )
                     mode = f"混合檢索：{args.embed_backend}／{embed_model}"
                     if keywords and keywords != [args.search]:
