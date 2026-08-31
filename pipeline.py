@@ -1101,11 +1101,13 @@ def get_json(url: str, headers: dict[str, str]) -> dict[str, Any]:
     return request_json(url, headers, method="GET", timeout=30)
 
 
+
 def groq_transcribe(
     audio_path: Path,
     api_key: str,
     model: str,
     language: str,
+    prompt: str = "",
 ) -> dict[str, Any]:
     fields = {
         "model": model,
@@ -1113,9 +1115,10 @@ def groq_transcribe(
         "temperature": "0",
         "timestamp_granularities[]": "segment",
     }
-    # 不傳 language 就是讓 Whisper 自動偵測；硬指定語言會把外語音訊「翻譯」成垃圾。
     if language and language != "auto":
         fields["language"] = language
+    if prompt:
+        fields["prompt"] = prompt
     body, boundary = multipart_body(fields, "file", audio_path)
     return post_json(
         "https://api.groq.com/openai/v1/audio/transcriptions",
@@ -1125,7 +1128,6 @@ def groq_transcribe(
         },
         body,
     )
-
 
 def transcribe_all(
     chunks: list[Path],
