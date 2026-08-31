@@ -3184,7 +3184,7 @@ def answer_question(
         model,
         thinking="adaptive",
     )
-    return {"question": question, "keywords": keywords, "answer": answer, "citations": hits}
+    return {"question": question, "keywords": keywords, "answer": answer, "citations": context_hits}
 
 def build_digest(root: Path, api_key: str, model: str, max_chars: int = 90000) -> Path:
     """把每支影片的摘要合成一份全頻道總覽。
@@ -4974,7 +4974,9 @@ def main() -> int:
                         label = hit["title"] or hit["job"]
                         print(f"  [{index}] {label} {format_timestamp(hit['timestamp'])}（{hit['kind']}）")
                         print(f"      {source_link(hit['source'], hit['timestamp'])}")
-                        excerpt = " ".join(str(hit.get("text") or "").split())
+                        excerpt = " ".join(
+                            str(hit.get("context_text") or hit.get("text") or "").split()
+                        )
                         if excerpt:
                             print(f"      「{excerpt[:160]}{'…' if len(excerpt) > 160 else ''}」")
         except (RuntimeError, sqlite3.Error) as exc:
