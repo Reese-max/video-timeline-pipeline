@@ -3271,7 +3271,13 @@ def build_digest(root: Path, api_key: str, model: str, max_chars: int = 90000) -
         + json.dumps(entries, ensure_ascii=False, indent=2)
     )
     # 總覽要輸出上百個標題與連結，reasoning 模型會跑很久，180 秒的預設值不夠
-    report = minimax_chat([{"role": "user", "content": prompt}], api_key, model, timeout=900)
+    report = minimax_chat(
+        [{"role": "user", "content": prompt}],
+        api_key,
+        model,
+        max_tokens=6000,
+        timeout=900,
+    )
 
     # 模型會自行取捨，實測 142 支裡漏掉 8 支且毫無提示。與其重跑，不如補在末尾——
     # 「總覽」漏了東西卻不說，比列得不夠漂亮嚴重得多。
