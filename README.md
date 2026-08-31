@@ -26,16 +26,19 @@ URL 來源會先讀取 metadata 與可用字幕；字幕可靠時跳過整段音
   └─ knowledge.md／Open Notebook：知識來源輸出與同步
 ```
 
-每個工作目錄的雜湊同時包含來源與本地抽取設定；調整切段或畫面設定會建立新的工作目錄，不會誤用舊快取。JSON 與 Markdown 產物以暫存檔置換，避免中斷時留下半份索引。
+job 目錄由來源識別；每個階段再用「來源內容指紋＋階段設定＋模型＋提示詞版本＋輸出格式版本」簽章。調整切段只會使音訊／逐字稿相關階段失效，調整畫面設定不會讓已完成的語音重跑。JSON 與 Markdown 產物以暫存檔置換，避免中斷時留下半份索引。
 
-三層快取讓中斷的批次可以直接續跑，不會重複付費：
+階段快取與續跑規則：
 
 | 產物 | 判準 |
 |---|---|
-| `source.*`、`audio/`、`frames/` | `.complete` sentinel；沒有標記就清掉重做（半份會靜默毀掉時間軸） |
-| `transcript.json`、`visual.json`、`summary.json` | 上次 `manifest.status == "completed"` 才重用 |
+| `source.*`、`audio/`、`frames/` | 完整標記、內容指紋與設定簽章都一致；缺檔或半份會失效 |
+| `caption-meta.json`、`transcript.json` | 字幕來源／語音後端、語言、模型、切段與品質版本一致，且結構通過驗證 |
+| `visual-parts/`、`transcript-parts/` | 每張候選畫面／每個音訊片段獨立保存；只重做失敗或疑點部分 |
+| `summary-parts/`、`summary.json` | 每章節獨立保存；摘要提示詞、時間軸與輸出格式變更才重做 |
+| `manifest.json` | 只有結構、時間範圍、來源欄位都通過最後 gate 才標記 `completed` |
 
-實測同一支影片重跑：首次 82.6 秒，重跑 1.7 秒且零 API 呼叫。要強制重算加 `--refresh`。
+失敗狀態不會被當成成功快取；要強制重算加 `--refresh`。
 
 ## 先做本地驗證
 
