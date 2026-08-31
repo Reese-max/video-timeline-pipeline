@@ -3704,6 +3704,7 @@ def self_test() -> None:
     print("self-test: OK")
 
 
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="影片語音＋畫面時間軸摘要管線")
     source = parser.add_mutually_exclusive_group()
@@ -3713,20 +3714,33 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--root", type=Path, default=Path(__file__).resolve().parent)
     parser.add_argument("--dry-run", action="store_true", help="只做本地處理，不下載或呼叫雲端 API")
     parser.add_argument("--local-only", action="store_true", help="下載／本地處理，但跳過所有雲端 API")
-    parser.add_argument("--chunk-seconds", type=int, default=900)
-    parser.add_argument("--workers", type=int, default=2, help="Groq 轉錄併發數，最多 4")
-    parser.add_argument("--language", default=None, help="逐字稿語言；auto 交給 Whisper 自動偵測")
+    parser.add_argument("--chunk-seconds", type=int, default=int(os.getenv("CHUNK_SECONDS", "300")))
+    parser.add_argument(
+        "--chunk-overlap-seconds",
+        type=float,
+        default=float(os.getenv("CHUNK_OVERLAP_SECONDS", "2")),
+        help="相鄰音訊片段的重疊秒數，避免切掉句首句尾",
+    )
+    parser.add_argument("--workers", type=int, default=2, help="每條服務的併發數，單一服務最多 4")
+    parser.add_argument("--language", default=None, help="逐字稿語言；auto 交給字幕／Whisper 自動偵測")
     parser.add_argument(
         "--transcribe-backend",
         choices=("groq", "local", "youtube"),
         default=os.getenv("TRANSCRIBE_BACKEND", "groq"),
-        help="local 走本機 faster-whisper；youtube 直接抓平台字幕（最快、免費，沒字幕時自動退回 groq）",
+        help="優先使用字幕；無字幕時走 groq 或 local",
     )
+    parser.add_argument(
+        "--caption-fallback",
+        choices=("groq", "local"),
+        default=os.getenv("CAPTION_FALLBACK_BACKEND", "groq"),
+        help="youtube／字幕前置失敗時的轉錄後端",
+    )
+    parser.add_argument("--ignore-captions", action="store_true", help="忽略平台字幕，強制走音訊轉錄")
     parser.add_argument("--whisper-model", default=os.getenv("WHISPER_MODEL", "base"), help="本機 whisper 模型大小")
     parser.add_argument(
         "--groq-model",
         default=os.getenv("GROQ_MODEL", "whisper-large-v3"),
-        help="Groq 轉錄模型；turbo 快約一倍但實測會漏字",
+        help="Groq 轉錄模型；保留 whisper-large-v3 以優先完整性",
     )
     parser.add_argument("--frame-interval", type=float, default=10.0)
     parser.add_argument("--hash-threshold", "--phash-threshold", dest="hash_threshold", type=int, default=8)
@@ -3735,19 +3749,29 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--min-slide-duration", type=float, default=2.0)
     parser.add_argument("--max-vision-frames", type=int, default=40)
     parser.add_argument("--ocr", action="store_true", help="若已安裝 PaddleOCR，啟用本地 OCR 初篩")
-    parser.add_argument("--sync-open-notebook", action="store_true", help="將 knowledge.md 匯入 Open Notebook")
+    parser.add_argument(
+        "--summary-max-chars",
+        type=int,
+        default=800000,
+        help="單次摘要可用的時間軸字元上限；超過會自動分章節",
+    )
+    parser.add_argument(
+        "--sync-open-notebook",
+        action="store_true",
+        help="將 knowledge.md 匯入 Open Notebook",
+    )
     parser.add_argument("--notebook-id", default=os.getenv("OPEN_NOTEBOOK_NOTEBOOK_ID", ""))
     parser.add_argument("--open-notebook-url", default=os.getenv("OPEN_NOTEBOOK_URL", "http://127.0.0.1:5055"))
     parser.add_argument("--open-notebook-sources-path", default=os.getenv("OPEN_NOTEBOOK_SOURCES_PATH", "/api/sources"))
     parser.add_argument("--open-notebook-wait-seconds", type=int, default=300)
-    parser.add_argument("--index", action="store_true", help="掃描 jobs\\ 重建本地搜尋索引 library.db")
+    parser.add_argument("--index", action="store_true", help="掃描 jobs/ 重建本地搜尋索引 library.db")
     parser.add_argument("--search", help="在本地索引全文搜尋（跑過的影片會自動入索引）")
     parser.add_argument("--search-limit", type=int, default=20)
     parser.add_argument("--ask", help="用索引內容回答問題並附引用（需要 MINIMAX_API_KEY）")
     parser.add_argument("--ask-limit", type=int, default=12, help="--ask 餵給模型的片段上限")
     parser.add_argument("--digest", action="store_true", help="彙整所有影片摘要成 digest.md 全頻道總覽")
     parser.add_argument("--embed", action="store_true", help="替索引片段補算向量（需 OPENROUTER_API_KEY）")
-    parser.add_argument("--semantic", action="store_true", help="--search／--ask 改走語意檢索（需先 --embed）")
+    parser.add_argument("--semantic", action="store_true", help="--search／--ask 使用混合精確詞＋語意檢索")
     parser.add_argument(
         "--embed-backend",
         choices=("openrouter", "local"),
@@ -3759,7 +3783,7 @@ def parse_args() -> argparse.Namespace:
         "--min-similarity",
         type=float,
         default=None,
-        help="語意檢索的相似度下限；不指定則自動取「最高分的一半」以適應各模型的分數尺度",
+        help="語意檢索的相似度下限；不指定則自動取最高分的一半",
     )
     parser.add_argument(
         "--no-video",
@@ -3768,13 +3792,12 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--list", action="store_true", help="列出所有影片（可搭配 --category 篩選）")
     parser.add_argument("--show", help="依標題關鍵字顯示某支影片的摘要與章節")
-    parser.add_argument("--category", default="", help="限定分類；可搭配 --list 或 --search")
-    parser.add_argument("--categorize", action="store_true", help="產生固定分類並歸類所有影片（讓 --digest 用程式碼分群）")
+    parser.add_argument("--category", default="", help="限定分類；可搭配 --list、--search 或 --ask")
+    parser.add_argument("--categorize", action="store_true", help="產生固定分類並歸類所有影片")
     parser.add_argument("--audit", action="store_true", help="健檢知識庫：找出壞掉的摘要、落後的索引與向量")
-    parser.add_argument("--refresh", action="store_true", help="忽略既有的逐字稿／視覺／摘要，全部重新呼叫 API")
+    parser.add_argument("--refresh", action="store_true", help="忽略既有階段快取，重新呼叫需要更新的工作")
     parser.add_argument("--self-test", action="store_true")
     return parser.parse_args()
-
 
 def read_url_file(path: Path) -> list[str]:
     path = path.expanduser().resolve()
