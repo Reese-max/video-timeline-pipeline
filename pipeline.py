@@ -633,12 +633,17 @@ def extract_audio(
         cached_item = cached_by_index.get(index)
         expected_start = round(logical_start, 3)
         expected_end = round(logical_end, 3)
-        if (
-            cached_item
-            and Path(str(cached_item.get("path", ""))).is_file()
-            and round(float(cached_item.get("start", -1)), 3) == expected_start
-            and round(float(cached_item.get("end", -1)), 3) == expected_end
-        ):
+        reuse_chunk = False
+        if cached_item and str(cached_item.get("path", "")) == str(output):
+            try:
+                reuse_chunk = (
+                    Path(str(cached_item["path"])).is_file()
+                    and round(float(cached_item["start"]), 3) == expected_start
+                    and round(float(cached_item["end"]), 3) == expected_end
+                )
+            except (KeyError, TypeError, ValueError):
+                reuse_chunk = False
+        if reuse_chunk:
             chunks.append(
                 {
                     "index": index,
