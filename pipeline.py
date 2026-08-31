@@ -1813,130 +1813,6 @@ def parse_json_object(text: str) -> dict[str, Any]:
 
 
 
-def visual_needs_review(item: dict[str, Any]) -> bool:
-    try:
-        confidence = float(item.get("confidence", 0.0))
-    except (TypeError, ValueError):
-        return True
-    if confidence < 0.65 or item.get("raw"):
-        return True
-    if not str(item.get("visual_summary", "")).strip():
-        return True
-    return False
-
-
-def refine_visual_observations(
-    candidates: list[dict[str, Any]],
-    observations: list[dict[str, Any]],
-    api_key: str,
-    model: str,
-    workers: int = 1,
-    stage_signature_value: str = "",
-    cache_dir: Path | None = None,
-    refresh: bool = False,
-) -> list[dict[str, Any]]:
-    part_dir = cache_dir or Path(tempfile.mkdtemp(prefix="visual-review-"))
-    part_dir.mkdir(parents=True, exist_ok=True)
-    review_items = [
-        (index, item)
-        for index, item in enumerate(observations)
-        if visual_needs_review(item)
-    ]
-    if not review_items:
-        return observations
-
-    def one(item: tuple[int, dict[str, Any]]) -> tuple[int, dict[str, Any], bool, str]:
-        index, observation = item
-        candidate = candidates[index]
-        signature = stage_signature(
-            "visual_review",
-            stage_signature_value or model,
-            {
-                "model": model,
-                "prompt_version": PROMPT_VERSIONS["visual_review"],
-                "timestamp": candidate.get("timestamp"),
-                "hash": candidate.get("hash"),
-                "previous": digest_value(observation),
-            },
-        )
-        part_path = part_dir / f"visual_review_{index:06d}.json"
-        cached = None if refresh else read_stage_part(part_path, "visual_review", signature)
-        if isinstance(cached, dict):
-            return index, cached, True, signature
-        prompt = (
-            "這是一張需要複核的影片截圖。請重新檢查小字、數字、程式碼、"
-            "否定詞與畫面類型，只輸出 JSON object。"
-            "欄位必須包含 screen_type、visible_text（字串陣列）、visual_summary、"
-            "important_details（字串陣列）、confidence（0 到 1）。"
-            "不要用推測填補看不清楚的內容；看不清楚就明確降低 confidence。"
-            "所有描述用繁體中文，畫面原文照抄。"
-            f"\\n先前觀察：{stable_json(observation)}"
-        )
-        response = minimax_chat(
-            [
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": prompt},
-                        {
-                            "type": "image_url",
-                            "image_url": {
-                                "url": image_data_url(Path(candidate["path"]), 2048, 95),
-                                "detail": "high",
-                            },
-                        },
-                    ],
-                }
-            ],
-            api_key,
-            model,
-            max_tokens=2200,
-            thinking="adaptive",
-        )
-        corrected = parse_json_object(response)
-        corrected["timestamp"] = observation["timestamp"]
-        corrected["source_image"] = observation.get("source_image")
-        corrected["local_ocr_text"] = observation.get("local_ocr_text", "")
-        corrected["local_ocr_confidence"] = observation.get("local_ocr_confidence")
-        corrected.setdefault("screen_type", observation.get("screen_type", "未知畫面"))
-        corrected.setdefault("visible_text", observation.get("visible_text", []))
-        corrected.setdefault("visual_summary", observation.get("visual_summary", ""))
-        corrected.setdefault("important_details", observation.get("important_details", []))
-        try:
-            confidence = float(corrected.get("confidence", observation.get("confidence", 0.0)))
-        except (TypeError, ValueError):
-            confidence = 0.0
-        corrected["confidence"] = max(0.0, min(1.0, confidence))
-        corrected["reviewed"] = True
-        if visual_needs_review(corrected):
-            corrected["review_required"] = True
-        return index, corrected, False, signature
-
-    results = list(observations)
-    errors: list[Exception] = []
-    with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, min(workers, 4))) as pool:
-        futures = [pool.submit(one, item) for item in review_items]
-        for future in concurrent.futures.as_completed(futures):
-            try:
-                index, corrected, cached, signature = future.result()
-                results[index] = corrected
-                if not cached:
-                    write_stage_part(
-                        part_dir / f"visual_review_{index:06d}.json",
-                        "visual_review",
-                        signature,
-                        corrected,
-                        frame=index,
-                    )
-            except Exception as exc:
-                errors.append(exc)
-    if errors:
-        for index, _ in review_items:
-            results[index]["review_pending"] = True
-    return results
-
-
-
 def analyze_images(
     candidates: list[dict[str, Any]],
     api_key: str,
@@ -1961,6 +1837,7 @@ def analyze_images(
                 "hash": candidate.get("hash"),
                 "ocr_text": candidate.get("ocr_text", ""),
                 "reasons": candidate.get("reasons", []),
+                "prompt_version": PROMPT_VERSIONS["visual"],
             },
         )
         part_path = part_dir / f"visual_{index:04d}.json"
@@ -2091,6 +1968,7 @@ def refine_visual_observations(
                 "timestamp": candidate.get("timestamp"),
                 "hash": candidate.get("hash"),
                 "reasons": reasons,
+                "prompt_version": PROMPT_VERSIONS["visual_review"],
             },
         )
         path = part_dir / f"visual_review_{index:04d}.json"
@@ -2387,13 +2265,21 @@ def create_summary(
     part_dir.mkdir(parents=True, exist_ok=True)
     parts: list[dict[str, Any]] = []
     for index, events in enumerate(chunks):
+        chunk_config_signature = stage_signature(
+            "summary_chunk_config",
+            model,
+            {
+                "model": model,
+                "prompt": PROMPT_VERSIONS["summary_chunk"],
+                "duration": round(duration, 3),
+            },
+        )
         signature = stage_signature(
             "summary_chunk",
-            stage_signature_value or model,
+            chunk_config_signature,
             {
                 "chunk": index,
                 "events": digest_value(events),
-                "prompt": PROMPT_VERSIONS["summary_chunk"],
             },
         )
         path = part_dir / f"summary_{index:04d}.json"
@@ -4586,7 +4472,7 @@ def run_pipeline(args: argparse.Namespace) -> Path:
                                         os.environ["MINIMAX_API_KEY"],
                                         os.getenv("MINIMAX_MODEL", "MiniMax-M3"),
                                         args.workers,
-                                        visual_signature,
+                                        frame_signature,
                                         job_dir / "visual-parts",
                                         args.refresh,
                                     )
@@ -4617,7 +4503,7 @@ def run_pipeline(args: argparse.Namespace) -> Path:
                                 os.environ["MINIMAX_API_KEY"],
                                 os.getenv("MINIMAX_MODEL", "MiniMax-M3"),
                                 args.workers,
-                                visual_signature,
+                                frame_signature,
                                 job_dir / "visual-review-parts",
                                 args.refresh,
                             )
@@ -4721,7 +4607,7 @@ def run_pipeline(args: argparse.Namespace) -> Path:
                         api_key,
                         os.getenv("MINIMAX_MODEL", "MiniMax-M3"),
                         args.workers,
-                        visual_signature,
+                        frame_signature,
                         job_dir / "visual-review-parts",
                         args.refresh,
                     )
