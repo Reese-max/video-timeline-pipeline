@@ -2182,6 +2182,7 @@ def generate_summary_for_events(
             [{"role": "user", "content": prompt}],
             api_key,
             model,
+            max_tokens=8000,
             timeout=900,
             thinking="adaptive",
         )
@@ -2194,6 +2195,7 @@ def generate_summary_for_events(
                 [{"role": "user", "content": summary_prompt(events, strict=True)}],
                 api_key,
                 model,
+                max_tokens=8000,
                 timeout=900,
                 thinking="adaptive",
             )
@@ -2235,6 +2237,7 @@ def merge_summary_parts(
             [{"role": "user", "content": prompt}],
             api_key,
             model,
+            max_tokens=8000,
             timeout=900,
             thinking="adaptive",
         )
@@ -2247,6 +2250,7 @@ def merge_summary_parts(
                 [{"role": "user", "content": prompt + "\n只能輸出通過欄位與時間驗證的 JSON。"}],
                 api_key,
                 model,
+                max_tokens=8000,
                 timeout=900,
                 thinking="adaptive",
             )
@@ -3186,6 +3190,7 @@ def answer_question(
         [{"role": "user", "content": prompt}],
         api_key,
         model,
+        max_tokens=4000,
         thinking="adaptive",
     )
     return {"question": question, "keywords": keywords, "answer": answer, "citations": context_hits}
@@ -3233,7 +3238,13 @@ def build_digest(root: Path, api_key: str, model: str, max_chars: int = 90000) -
                 ensure_ascii=False,
             )[:max_chars]
         )
-        report = minimax_chat([{"role": "user", "content": prompt}], api_key, model, timeout=900)
+        report = minimax_chat(
+            [{"role": "user", "content": prompt}],
+            api_key,
+            model,
+            max_tokens=6000,
+            timeout=900,
+        )
         header = f"# 影片知識庫總覽\n\n- 影片數：{len(entries)}\n- 分類數：{len(grouped)}\n\n"
         output = root / "digest.md"
         write_text(output, header + report.rstrip() + "\n\n## 主題分群\n" + grouping + "\n")
@@ -3335,7 +3346,16 @@ def categorize_library(root: Path, api_key: str, model: str) -> tuple[list[str],
             "分類要粒度一致、彼此可區分、合起來能涵蓋全部影片；用繁體中文，技術名詞保留原文。"
             "不要用「其他」「雜項」這種收納類。\n\n" + json.dumps(overview, ensure_ascii=False)
         )
-        data = parse_json_object(minimax_chat([{"role": "user", "content": prompt}], api_key, model, timeout=600))
+        data = parse_json_object(
+            minimax_chat(
+                [{"role": "user", "content": prompt}],
+                api_key,
+                model,
+                max_tokens=1500,
+                timeout=600,
+                thinking="adaptive",
+            )
+        )
         categories = [str(c).strip() for c in (data.get("categories") or []) if str(c).strip()]
         if not categories:
             raise RuntimeError("模型沒有回傳分類清單。")
