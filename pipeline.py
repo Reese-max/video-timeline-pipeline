@@ -2932,6 +2932,7 @@ SIMILARITY_RATIO = 0.5
 DEFAULT_EMBED_MODEL = {"openrouter": "nvidia/nemotron-3-embed-1b:free", "local": "BAAI/bge-m3"}
 
 
+
 def semantic_search(
     root: Path,
     query: str,
@@ -2940,31 +2941,45 @@ def semantic_search(
     limit: int,
     backend: str = "openrouter",
     threshold: float | None = None,
+    category: str = "",
 ) -> list[dict[str, Any]]:
+    if not query.strip():
+        raise RuntimeError("搜尋字串不可為空。")
+    if limit <= 0:
+        raise ValueError("limit 必須大於 0。")
     db_path = root / "library.db"
     if not db_path.is_file():
-        raise RuntimeError(f"索引不存在：{db_path}；先執行 `--index`。")
+        raise RuntimeError(f"索引不存在：{db_path}；先執行 --index。")
     query_vector = embed_texts([query], api_key, model, backend)[0]
     connection = index_connection(root)
     try:
-        # 向量以文字 hash 為鍵，SQLite 沒有內建 sha256，所以在 Python 端對應
-        stored = dict(connection.execute("SELECT text_hash, vector FROM vectors WHERE model = ?", (model,)))
+        stored = dict(
+            connection.execute(
+                "SELECT text_hash, vector FROM vectors WHERE model = ?", (model,)
+            )
+        )
+        clauses = ["events.text IS NOT NULL"]
+        params: list[Any] = []
+        if category:
+            clauses.append("videos.categories LIKE ?")
+            params.append(f"%{category}%")
         rows = [
             (title, source, job, timestamp, kind, text, stored[text_hash(text)])
             for title, source, job, timestamp, kind, text in connection.execute(
-                """
+                f"""
                 SELECT videos.title, videos.source, events.job, events.timestamp,
                        events.kind, events.text
                 FROM events JOIN videos ON videos.job = events.job
-                """
+                WHERE {' AND '.join(clauses)}
+                """,
+                params,
             )
             if text_hash(text) in stored
         ]
     finally:
         connection.close()
     if not rows:
-        raise RuntimeError(f"索引裡沒有 {model} 的向量；先執行 `--embed`。")
-    # ponytail: 純 Python 全掃描。幾千個向量是毫秒級；真的大到會慢再換 sqlite-vec。
+        raise RuntimeError(f"索引裡沒有 {model} 的向量；先執行 --embed。")
     scored = sorted(
         (
             {
@@ -2974,7 +2989,7 @@ def semantic_search(
                 "timestamp": row[3],
                 "kind": row[4],
                 "text": row[5],
-                "snippet": row[5][:120],
+                "snippet": row[5][:160],
                 "score": cosine(query_vector, unpack_vector(row[6])),
                 "mode": "semantic",
             }
@@ -2983,28 +2998,103 @@ def semantic_search(
         key=lambda item: item["score"],
         reverse=True,
     )
-    # 沒有下限的話每次都回傳整個索引，末幾筆只是「最不像的那些」，不是命中。
     if not scored:
         return []
     cutoff = similarity_cutoff(scored[0]["score"], threshold)
     return [item for item in scored if item["score"] >= cutoff][:limit]
 
 
-def question_keywords(question: str, api_key: str, model: str) -> list[str]:
-    """把問句拆成檢索詞。
+def hybrid_search(
+    root: Path,
+    query: str,
+    api_key: str,
+    embed_key: str,
+    embed_model: str,
+    embed_backend: str,
+    limit: int,
+    category: str = "",
+    threshold: float | None = None,
+) -> tuple[list[dict[str, Any]], list[str]]:
+    """以 RRF 合併精確詞與語意結果；不同分數尺度不直接相加。"""
+    if not query.strip():
+        raise RuntimeError("搜尋字串不可為空。")
+    lexical: list[dict[str, Any]] = []
+    keywords: list[str] = []
+    direct = search_index(root, query, max(limit * 4, 20), category)
+    lexical.extend(direct)
+    if not direct or len(query.strip()) > 12 or any(char.isspace() for char in query):
+        try:
+            keywords = question_keywords(query, api_key, embed_model)
+        except RuntimeError:
+            keywords = []
+        for keyword in keywords:
+            if keyword == query:
+                continue
+            try:
+                lexical.extend(search_index(root, keyword, max(limit * 3, 12), category))
+            except RuntimeError:
+                continue
+    if not keywords:
+        keywords = [query]
 
-    整句丟進 FTS5 是 phrase 比對，長問句必定 0 筆；靠標點斷詞對中文又沒用。
-    花一次便宜的呼叫換檢索品質，比自己寫斷詞規則划算。
-    """
+    semantic = semantic_search(
+        root,
+        query,
+        embed_key,
+        embed_model,
+        max(limit * 4, 20),
+        embed_backend,
+        threshold,
+        category,
+    )
+    sources = [lexical, semantic]
+    merged: dict[tuple[Any, ...], dict[str, Any]] = {}
+    for source_rank, results in enumerate(sources):
+        for rank, hit in enumerate(results, 1):
+            key = (hit["job"], round(float(hit.get("timestamp") or 0), 3), hit["kind"])
+            item = merged.setdefault(key, {**hit, "fusion_score": 0.0})
+            item["fusion_score"] += 1.0 / (RRF_K + rank)
+            if source_rank == 0:
+                item["lexical_rank"] = rank
+            else:
+                item["semantic_rank"] = rank
+                if "score" in hit:
+                    item["score"] = hit["score"]
+            item["modes"] = sorted(set(item.get("modes", []) + [hit.get("mode", "")]))
+    ranked = sorted(
+        merged.values(),
+        key=lambda item: (
+            -float(item["fusion_score"]),
+            item.get("lexical_rank", 10**9),
+            item.get("semantic_rank", 10**9),
+        ),
+    )
+    return ranked[:limit], keywords
+
+
+def question_keywords(question: str, api_key: str, model: str) -> list[str]:
     prompt = (
         "從問題抽出 2 到 5 個用於全文檢索的關鍵詞，只輸出 JSON："
         '{"keywords": ["...", "..."]}。'
         "關鍵詞要是會實際出現在影片逐字稿或畫面文字裡的名詞或動詞，"
-        "去掉「請問」「怎麼」「嗎」「如何」這類疑問詞。\n\n問題：" + question
+        "去掉疑問詞與禮貌用語。"
+        "\n\n問題：" + question
     )
     try:
-        data = parse_json_object(minimax_chat([{"role": "user", "content": prompt}], api_key, model))
-        keywords = [str(item).strip() for item in (data.get("keywords") or []) if str(item).strip()]
+        data = parse_json_object(
+            minimax_chat(
+                [{"role": "user", "content": prompt}],
+                api_key,
+                model,
+                max_tokens=300,
+                thinking="disabled",
+            )
+        )
+        keywords = [
+            str(item).strip()
+            for item in (data.get("keywords") or [])
+            if str(item).strip()
+        ]
     except RuntimeError:
         keywords = []
     return keywords or [question]
@@ -3019,33 +3109,43 @@ def answer_question(
     embed_key: str = "",
     embed_model: str = "",
     embed_backend: str = "",
+    category: str = "",
 ) -> dict[str, Any]:
     if embed_backend:
-        # 有向量就直接拿問句比對語意，不必先抽關鍵詞——少一次呼叫，命中也更準。
-        keywords = ["（語意檢索）"]
-        hits = semantic_search(root, question, embed_key, embed_model, limit, embed_backend)
+        hits, keywords = hybrid_search(
+            root,
+            question,
+            api_key,
+            embed_key,
+            embed_model,
+            embed_backend,
+            limit,
+            category,
+        )
     else:
-        keywords = question_keywords(question, api_key, model)
-        # 逐詞取滿再換下一個，等於讓第一個關鍵詞吃光配額——問「TDD 搭配 AI 編碼」時
-        # 抽出的是「Matt、TDD、AI、編碼」，人名 Matt 先塞滿，真正相關的 TDD 一筆都進不來。
-        # 改成輪流取：每個關鍵詞先貢獻第一名，再回頭拿第二名。
-        per_keyword = [search_index(root, keyword, limit) for keyword in keywords]
-        seen: set[tuple[Any, ...]] = set()
-        hits = []
-        for rank in range(limit):
-            for results in per_keyword:
-                if rank >= len(results):
-                    continue
-                hit = results[rank]
-                key = (hit["job"], hit["timestamp"], hit["kind"])
-                if key in seen:
-                    continue
-                seen.add(key)
-                hits.append(hit)
+        direct = search_index(root, question, max(limit * 3, 20), category)
+        if direct:
+            keywords = [question]
+            hits = direct[:limit]
+        else:
+            keywords = question_keywords(question, api_key, model)
+            per_keyword = [search_index(root, keyword, limit, category) for keyword in keywords]
+            seen: set[tuple[Any, ...]] = set()
+            hits = []
+            for rank in range(limit):
+                for results in per_keyword:
+                    if rank >= len(results):
+                        continue
+                    hit = results[rank]
+                    key = (hit["job"], hit["timestamp"], hit["kind"])
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    hits.append(hit)
+                    if len(hits) >= limit:
+                        break
                 if len(hits) >= limit:
                     break
-            if len(hits) >= limit:
-                break
     if not hits:
         return {"question": question, "keywords": keywords, "answer": "索引裡找不到相關片段。", "citations": []}
 
@@ -3057,12 +3157,17 @@ def answer_question(
     prompt = (
         "你是影片知識庫的問答助手。只根據下列片段回答問題，"
         "不要引入片段以外的知識；片段不足以回答就直說找不到。"
-        "回答用繁體中文，並在每個論點後標註引用編號如 [1]、[3]。\n\n"
-        f"問題：{question}\n\n片段：\n{context}"
+        "回答用繁體中文，並在每個論點後標註引用編號如 [1]、[3]。"
+        "摘要或章節只能用來定位，涉及事實時優先引用 speech 或 visual 原始事件。"
+        f"\n\n問題：{question}\n\n片段：\n{context}"
     )
-    answer = minimax_chat([{"role": "user", "content": prompt}], api_key, model)
+    answer = minimax_chat(
+        [{"role": "user", "content": prompt}],
+        api_key,
+        model,
+        thinking="adaptive",
+    )
     return {"question": question, "keywords": keywords, "answer": answer, "citations": hits}
-
 
 def build_digest(root: Path, api_key: str, model: str, max_chars: int = 90000) -> Path:
     """把每支影片的摘要合成一份全頻道總覽。
