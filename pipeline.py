@@ -539,53 +539,138 @@ def video_duration(probe: dict[str, Any]) -> float:
     return 0.0
 
 
-def extract_audio(video_path: Path, job_dir: Path, chunk_seconds: int) -> list[Path]:
+
+def extract_audio(
+    video_path: Path,
+    job_dir: Path,
+    chunk_seconds: int,
+    overlap_seconds: float = 2.0,
+    source_fingerprint: str = "",
+    duration_seconds: float = 0.0,
+    refresh: bool = False,
+) -> list[dict[str, Any]]:
+    """以可恢復的固定視窗切音訊，保存每個片段的實際來源範圍。"""
+    if chunk_seconds <= 0:
+        raise ValueError("chunk_seconds 必須大於 0。")
+    if overlap_seconds < 0 or overlap_seconds >= chunk_seconds:
+        raise ValueError("overlap_seconds 必須介於 0 與 chunk_seconds 之間。")
     audio_dir = job_dir / "audio"
     audio_dir.mkdir(parents=True, exist_ok=True)
     done = audio_dir / ".complete"
-    signature = f"chunk={chunk_seconds}"
-    chunks = sorted(audio_dir.glob("audio_*.mp3"))
-    if chunks and marker_matches(done, signature):
-        return chunks
-    for stale in chunks:  # 半份切段會讓逐字稿無聲缺尾，重切前先清乾淨
-        stale.unlink()
-    run_external(
-        [
-            require_tool("ffmpeg"),
-            "-y",
-            "-hide_banner",
-            "-loglevel",
-            "error",
-            "-stats",  # loglevel error 會連進度一起關掉，長片轉檔需要看得到還在動
-            "-i",
-            str(video_path),
-            "-map",
-            "0:a:0",
-            "-vn",
-            "-ac",
-            "1",
-            "-ar",
-            "16000",
-            "-c:a",
-            "libmp3lame",
-            "-b:a",
-            "64k",
-            "-f",
-            "segment",
-            "-segment_time",
-            str(chunk_seconds),
-            "-reset_timestamps",
-            "1",
-            str(audio_dir / "audio_%04d.mp3"),
-        ],
-        stream=True,
+    metadata_path = audio_dir / "chunks.json"
+    source_fingerprint = source_fingerprint or digest_value(str(video_path))
+    signature = stage_signature(
+        "audio",
+        source_fingerprint,
+        {
+            "extractor": AUDIO_EXTRACTOR_VERSION,
+            "chunk_seconds": chunk_seconds,
+            "overlap_seconds": round(overlap_seconds, 3),
+        },
     )
-    chunks = sorted(audio_dir.glob("audio_*.mp3"))
+    cached = read_json_file(metadata_path)
+    cached_chunks = cached.get("chunks") if isinstance(cached, dict) else None
+    if (
+        not refresh
+        and marker_matches(done, signature)
+        and isinstance(cached, dict)
+        and cached.get("schema_version") == ARTIFACT_SCHEMA_VERSION
+        and cached.get("signature") == signature
+        and isinstance(cached_chunks, list)
+        and cached_chunks
+        and all(Path(str(item.get("path", ""))).is_file() for item in cached_chunks if isinstance(item, dict))
+    ):
+        return [dict(item) for item in cached_chunks if isinstance(item, dict)]
+
+    for stale in audio_dir.glob("audio_*.mp3"):
+        stale.unlink()
+    probe = probe_video(video_path)
+    streams = probe.get("streams") or []
+    if not any(stream.get("codec_type") == "audio" for stream in streams if isinstance(stream, dict)):
+        write_json(
+            metadata_path,
+            {
+                "schema_version": ARTIFACT_SCHEMA_VERSION,
+                "signature": signature,
+                "status": "silent",
+                "chunks": [],
+            },
+        )
+        write_text(done, signature)
+        return []
+
+    if duration_seconds <= 0:
+        duration_seconds = video_duration(probe)
+    if duration_seconds <= 0:
+        raise RuntimeError("無法取得影片時長，無法建立音訊片段。")
+
+    step = float(chunk_seconds) - float(overlap_seconds)
+    chunks: list[dict[str, Any]] = []
+    start = 0.0
+    index = 0
+    while start < duration_seconds - 0.05:
+        end = min(duration_seconds, start + float(chunk_seconds))
+        length = end - start
+        if length <= 0.05:
+            break
+        output = audio_dir / f"audio_{index:04d}.mp3"
+        run_external(
+            [
+                require_tool("ffmpeg"),
+                "-y",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-ss",
+                f"{start:.3f}",
+                "-i",
+                str(video_path),
+                "-t",
+                f"{length:.3f}",
+                "-map",
+                "0:a:0",
+                "-vn",
+                "-ac",
+                "1",
+                "-ar",
+                "16000",
+                "-c:a",
+                "libmp3lame",
+                "-b:a",
+                "64k",
+                str(output),
+            ],
+            stream=True,
+        )
+        if not output.is_file() or output.stat().st_size == 0:
+            raise RuntimeError(f"FFmpeg 沒有產生音訊片段：{output.name}")
+        chunks.append(
+            {
+                "index": index,
+                "path": str(output),
+                "start": round(start, 3),
+                "end": round(end, 3),
+            }
+        )
+        index += 1
+        if end >= duration_seconds - 0.05:
+            break
+        start += step
+
     if not chunks:
         raise RuntimeError("FFmpeg 沒有產生音訊片段。")
+    write_json(
+        metadata_path,
+        {
+            "schema_version": ARTIFACT_SCHEMA_VERSION,
+            "signature": signature,
+            "chunk_seconds": chunk_seconds,
+            "overlap_seconds": overlap_seconds,
+            "chunks": chunks,
+        },
+    )
     write_text(done, signature)
     return chunks
-
 
 def average_hash(image_path: Path) -> str:
     try:
@@ -666,6 +751,52 @@ class OptionalOCR:
         return "\n".join(texts), (sum(scores) / len(scores) if scores else None)
 
 
+
+def parse_showinfo_timestamps(log: str) -> list[float]:
+    """讀取 FFmpeg showinfo 的 pts_time；這是原始畫面時間，不是輸出檔案序號。"""
+    pattern = re.compile(r"showinfo.*?pts_time:([+-]?(?:\d+(?:\.\d*)?|\.\d+))")
+    return [round(float(match.group(1)), 3) for match in pattern.finditer(log)]
+
+
+def select_frame_candidates(candidates: list[dict[str, Any]], max_frames: int) -> list[dict[str, Any]]:
+    """優先保留內容變化，再用時間均勻抽樣補足，避免固定上限吃掉重要畫面。"""
+    if len(candidates) <= max_frames:
+        return candidates
+    priority = {
+        "first_frame": 6,
+        "text_change": 5,
+        "visual_change": 4,
+        "low_ocr_confidence": 3,
+    }
+    ranked = sorted(
+        enumerate(candidates),
+        key=lambda pair: (
+            -max((priority.get(reason, 1) for reason in pair[1].get("reasons", [])), default=0),
+            pair[1].get("timestamp", 0),
+            pair[0],
+        ),
+    )
+    keep_count = max(1, max_frames // 2)
+    kept_indexes = {index for index, _ in ranked[:keep_count]}
+    remaining = [index for index in range(len(candidates)) if index not in kept_indexes]
+    need = max_frames - len(kept_indexes)
+    if need > 0 and remaining:
+        for selected in limit_items(remaining, min(need, len(remaining))):
+            kept_indexes.add(selected)
+    kept_indexes.add(0)
+    kept_indexes.add(len(candidates) - 1)
+    if len(kept_indexes) > max_frames:
+        ordered = sorted(
+            kept_indexes,
+            key=lambda index: (
+                -max((priority.get(reason, 1) for reason in candidates[index].get("reasons", [])), default=0),
+                index,
+            ),
+        )
+        kept_indexes = set(ordered[:max_frames])
+    return [candidates[index] for index in sorted(kept_indexes)]
+
+
 def extract_candidates(
     video_path: Path,
     job_dir: Path,
@@ -674,40 +805,90 @@ def extract_candidates(
     max_frames: int,
     ocr_enabled: bool,
     ocr_threshold: float,
+    scene_threshold: float = 0.3,
+    source_fingerprint: str = "",
+    refresh: bool = False,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    if interval <= 0:
+        raise ValueError("interval 必須大於 0。")
+    if max_frames <= 0:
+        raise ValueError("max_frames 必須大於 0。")
     frames_dir = job_dir / "frames"
     frames_dir.mkdir(parents=True, exist_ok=True)
     done = frames_dir / ".complete"
-    signature = f"interval={interval:g}"
+    timestamps_path = frames_dir / "timestamps.json"
+    source_fingerprint = source_fingerprint or digest_value(str(video_path))
+    signature = stage_signature(
+        "frames",
+        source_fingerprint,
+        {
+            "extractor": FRAME_EXTRACTOR_VERSION,
+            "interval": interval,
+            "hash_threshold": hash_threshold,
+            "scene_threshold": scene_threshold,
+            "max_frames": max_frames,
+            "ocr": ocr_enabled,
+        },
+    )
     all_frames = sorted(frames_dir.glob("frame_*.jpg"))
-    if all_frames and not marker_matches(done, signature):
-        # 半份截圖會讓下面的 index * interval 時間戳整條錯位，寧可重抽
+    timestamp_data = read_json_file(timestamps_path)
+    cached_timestamps = timestamp_data.get("timestamps") if isinstance(timestamp_data, dict) else None
+    cache_valid = (
+        not refresh
+        and bool(all_frames)
+        and marker_matches(done, signature)
+        and isinstance(timestamp_data, dict)
+        and timestamp_data.get("schema_version") == ARTIFACT_SCHEMA_VERSION
+        and timestamp_data.get("signature") == signature
+        and isinstance(cached_timestamps, list)
+        and len(cached_timestamps) == len(all_frames)
+    )
+    if not cache_valid:
         for stale in all_frames:
             stale.unlink()
-        all_frames = []
-    if not all_frames:
-        filter_value = f"fps=1/{interval:g},scale=1280:-2:force_original_aspect_ratio=decrease"
-        run_external(
+        timestamps_path.unlink(missing_ok=True)
+        filter_value = (
+            f"select='eq(n,0)+gt(scene,{scene_threshold:g})+"
+            f"gte(t,prev_selected_t+{interval:g})',"
+            "scale=1280:-2:force_original_aspect_ratio=decrease,showinfo"
+        )
+        _, stderr = run_external_capture(
             [
                 require_tool("ffmpeg"),
                 "-y",
                 "-hide_banner",
                 "-loglevel",
-                "error",
-                "-stats",
+                "info",
                 "-i",
                 str(video_path),
                 "-vf",
                 filter_value,
+                "-fps_mode",
+                "vfr",
                 "-q:v",
                 "3",
                 str(frames_dir / "frame_%06d.jpg"),
-            ],
-            stream=True,
+            ]
         )
         all_frames = sorted(frames_dir.glob("frame_*.jpg"))
-    if not all_frames:
-        raise RuntimeError("FFmpeg 沒有產生截圖。")
+        timestamps = parse_showinfo_timestamps(stderr)
+        if not all_frames:
+            raise RuntimeError("FFmpeg 沒有產生截圖。")
+        if len(timestamps) != len(all_frames):
+            raise RuntimeError(
+                f"FFmpeg 畫面數與 PTS 數量不一致：{len(all_frames)} 張、{len(timestamps)} 個時間戳；"
+                "為避免錯位，本次不產生候選畫面。"
+            )
+        cached_timestamps = timestamps
+        write_json(
+            timestamps_path,
+            {
+                "schema_version": ARTIFACT_SCHEMA_VERSION,
+                "signature": signature,
+                "timestamps": timestamps,
+                "timestamp_source": "ffmpeg-showinfo-pts_time",
+            },
+        )
     write_text(done, signature)
 
     ocr = OptionalOCR(ocr_enabled)
@@ -732,7 +913,7 @@ def extract_candidates(
         if reasons:
             candidates.append(
                 {
-                    "timestamp": round(index * interval, 3),
+                    "timestamp": float(cached_timestamps[index]),
                     "path": str(frame_path),
                     "hash": image_hash,
                     "hash_distance": distance,
@@ -742,17 +923,18 @@ def extract_candidates(
                 }
             )
         previous_hash = image_hash
-        previous_text = text or previous_text
-
-    candidates = limit_items(candidates, max_frames)
+        if text:
+            previous_text = text
+    candidates = select_frame_candidates(candidates, max_frames)
     metadata = {
         "all_frame_count": len(all_frames),
         "candidate_count": len(candidates),
         "ocr": {"enabled": ocr_enabled, "status": ocr.reason},
-        "method": "fixed_interval_plus_average_hash",
+        "method": "adaptive_scene_plus_interval_average_hash",
+        "timestamp_source": "ffmpeg-showinfo-pts_time",
+        "signature": signature,
     }
     return candidates, metadata
-
 
 def steipete_command() -> list[str]:
     executable = shutil.which("summarize")
