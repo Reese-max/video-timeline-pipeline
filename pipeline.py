@@ -863,6 +863,7 @@ def extract_candidates(
                 "-hide_banner",
                 "-loglevel",
                 "info",
+                "-copyts",
                 "-i",
                 str(video_path),
                 "-vf",
