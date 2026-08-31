@@ -2358,7 +2358,8 @@ def create_summary(
             "source_timestamps": [],
             "coverage": {"mode": "empty", "chunks": 0},
         }
-    chunks = timeline_chunks(timeline, max_chars)
+    chunk_limit = min(max_chars, SUMMARY_CHUNK_CHARS)
+    chunks = timeline_chunks(timeline, chunk_limit)
     if len(chunks) == 1:
         summary = generate_summary_for_events(chunks[0], api_key, model, duration)
         summary["schema_version"] = ARTIFACT_SCHEMA_VERSION
@@ -3031,7 +3032,11 @@ def hybrid_search(
     lexical.extend(direct)
     if not direct or len(query.strip()) > 12 or any(char.isspace() for char in query):
         try:
-            keywords = question_keywords(query, api_key, embed_model)
+            keywords = question_keywords(
+                query,
+                api_key,
+                os.getenv("MINIMAX_MODEL", "MiniMax-M3"),
+            )
         except RuntimeError:
             keywords = []
         for keyword in keywords:
@@ -3107,6 +3112,60 @@ def question_keywords(question: str, api_key: str, model: str) -> list[str]:
     return keywords or [question]
 
 
+def expand_hit_context(
+    root: Path,
+    hits: list[dict[str, Any]],
+    window_seconds: float = 20.0,
+) -> list[dict[str, Any]]:
+    """為命中的原始事件補上同片段的相鄰語音與畫面證據。"""
+    if not hits:
+        return hits
+    connection = index_connection(root)
+    expanded: list[dict[str, Any]] = []
+    try:
+        for hit in hits:
+            item = dict(hit)
+            kind = str(item.get("kind") or "")
+            timestamp = item.get("timestamp")
+            try:
+                point = float(timestamp)
+            except (TypeError, ValueError):
+                point = None
+            if point is None or kind not in {"speech", "visual", "chapter"}:
+                expanded.append(item)
+                continue
+            rows = connection.execute(
+                """
+                SELECT timestamp, kind, text
+                FROM events
+                WHERE job = ? AND timestamp BETWEEN ? AND ?
+                  AND kind IN ('speech', 'visual')
+                ORDER BY timestamp, rowid
+                """,
+                (
+                    item.get("job"),
+                    max(0.0, point - window_seconds),
+                    point + window_seconds,
+                ),
+            ).fetchall()
+            seen: set[tuple[Any, ...]] = set()
+            context_rows: list[str] = []
+            for row_timestamp, row_kind, row_text in rows:
+                key = (row_timestamp, row_kind, row_text)
+                if key in seen:
+                    continue
+                seen.add(key)
+                context_rows.append(
+                    f"{format_timestamp(row_timestamp)}（{row_kind}）：{row_text}"
+                )
+            if context_rows:
+                item["context_text"] = " | ".join(context_rows)
+            expanded.append(item)
+    finally:
+        connection.close()
+    return expanded
+
+
 def answer_question(
     root: Path,
     question: str,
@@ -3156,10 +3215,11 @@ def answer_question(
     if not hits:
         return {"question": question, "keywords": keywords, "answer": "索引裡找不到相關片段。", "citations": []}
 
+    context_hits = expand_hit_context(root, hits)
     context = "\n".join(
         f"[{index}] 《{hit['title'] or hit['job']}》 {format_timestamp(hit['timestamp'])} "
-        f"（{hit['kind']}）：{hit['text']}"
-        for index, hit in enumerate(hits, 1)
+        f"（{hit['kind']}）：{hit.get('context_text') or hit['text']}"
+        for index, hit in enumerate(context_hits, 1)
     )
     prompt = (
         "你是影片知識庫的問答助手。只根據下列片段回答問題，"
@@ -4259,10 +4319,21 @@ def run_pipeline(args: argparse.Namespace) -> Path:
                             count=len(audio_chunks),
                         )
             if caption_transcript:
+                audio_metadata_path = job_dir / "audio" / "chunks.json"
+                audio_metadata_path.parent.mkdir(parents=True, exist_ok=True)
+                write_json(
+                    audio_metadata_path,
+                    {
+                        "schema_version": ARTIFACT_SCHEMA_VERSION,
+                        "signature": audio_signature,
+                        "status": "skipped",
+                        "chunks": [],
+                    },
+                )
                 record(
                     "audio",
                     audio_signature,
-                    job_dir / "audio" / "chunks.json",
+                    audio_metadata_path,
                     status="skipped",
                     metadata="reliable-captions",
                 )
@@ -4584,7 +4655,35 @@ def run_pipeline(args: argparse.Namespace) -> Path:
                         count=len(observations),
                     )
                 else:
-                    raise RuntimeError("視覺階段沒有產生結果。")
+                    api_key = os.getenv("MINIMAX_API_KEY", "")
+                    if not api_key:
+                        raise RuntimeError("視覺分析需要 MINIMAX_API_KEY；或使用 --local-only。")
+                    observations = analyze_images(
+                        candidates,
+                        api_key,
+                        os.getenv("MINIMAX_MODEL", "MiniMax-M3"),
+                        args.workers,
+                        visual_signature,
+                        job_dir / "visual-parts",
+                        args.refresh,
+                    )
+                    observations = refine_visual_observations(
+                        candidates,
+                        observations,
+                        api_key,
+                        os.getenv("MINIMAX_MODEL", "MiniMax-M3"),
+                        args.workers,
+                        visual_signature,
+                        job_dir / "visual-review-parts",
+                        args.refresh,
+                    )
+                    write_json(job_dir / "visual.json", observations)
+                    record(
+                        "visual",
+                        visual_signature,
+                        job_dir / "visual.json",
+                        count=len(observations),
+                    )
 
         if "artifacts" not in manifest:
             manifest["artifacts"] = {}
