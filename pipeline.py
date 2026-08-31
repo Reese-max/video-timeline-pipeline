@@ -3582,7 +3582,7 @@ def self_test() -> None:
     count = 6
     original_chat, original_data_url = minimax_chat, image_data_url
     globals()["image_data_url"] = lambda path, **kwargs: "data:image/jpeg;base64,x"
-    globals()["minimax_chat"] = lambda messages, *rest: (
+    globals()["minimax_chat"] = lambda messages, *rest, **kwargs: (
         lambda tag: (time.sleep((count - int(tag[3:])) * 0.02), json.dumps({"tag": tag}))[1]
     )(messages[0]["content"][0]["text"].rsplit("：", 1)[-1])
     try:
