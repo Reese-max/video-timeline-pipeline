@@ -1,0 +1,12 @@
+{
+  "sampling_interval_seconds": 0.5,
+  "frames": 126,
+  "entries": [
+    {"start": 0.0, "end": 13.4, "label": "React Bits", "detail": "165 個以上的動畫 React 元件，可直接複製使用。", "evidence": "語音＋OCR＋畫面核對"},
+    {"start": 13.4, "end": 21.44, "label": "Uiverse", "detail": "大量社群 UI 元件，可複製 HTML、Tailwind、React 程式碼，也展示複製到 Figma。", "evidence": "語音＋OCR＋畫面核對"},
+    {"start": 21.44, "end": 34.12, "label": "Aceternity UI", "detail": "React／Tailwind／Motion 元件與模板；影片主打較強動效與質感，部分 Pro 內容需付費。", "evidence": "語音＋OCR＋畫面核對"},
+    {"start": 34.12, "end": 43.8, "label": "shadcn/ui", "detail": "可複製到自己的專案並自行修改，影片認為適合搭配 AI coding。", "evidence": "語音＋OCR＋畫面核對"},
+    {"start": 43.8, "end": 51.52, "label": "anime.js", "detail": "JavaScript 動畫引擎，適合在頁面完成後補上互動與動態效果。", "evidence": "語音＋OCR＋畫面核對"},
+    {"start": 51.52, "end": 63.28, "label": "結尾與清單引導", "detail": "講者表示五個網站都有可直接使用的免費內容，並引導觀眾留言取得清單。", "evidence": "語音＋字幕 OCR"}
+  ]
+}

@@ -1,0 +1,28 @@
+{
+  "generated_at": "2026-09-01T00:00:00Z",
+  "source": {
+    "url": "https://www.facebook.com/share/r/1BQgfm4gyN/?mibextid=wwXIfr",
+    "platform": "Facebook",
+    "reel_id": "1306081114787410",
+    "title": "拯救你 AI 審美的 5 個免費網站",
+    "uploader": "Twinkle Tan",
+    "webpage_url": "https://m.facebook.com/watch/?v=1306081114787410&_rdr"
+  },
+  "media": {
+    "filename": "fb-1BQgfm4gyN.mp4",
+    "duration_seconds": 63.276009,
+    "width": 1080,
+    "height": 1920,
+    "video_codec": "vp9",
+    "audio_codec": "aac",
+    "size_bytes": 8712258,
+    "sha256": "34e3826d2bd1ceb58c62d09a532a258cf2bfae47ab6d6b7c615f1abeec7885f6"
+  },
+  "analysis": {
+    "sampling_interval_seconds": 0.5,
+    "sampled_frames": 126,
+    "ocr_languages": ["chi_sim", "eng"],
+    "ocr_modes": {"full_frame": "Tesseract PSM 11", "subtitle_crop": "Tesseract PSM 6"},
+    "speech_to_text": {"engine": "Faster-Whisper", "model": "base", "language": "zh"}
+  }
+}

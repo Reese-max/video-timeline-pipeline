@@ -1,0 +1,252 @@
+{
+  "model": "base",
+  "language": "zh",
+  "language_probability": 1.0,
+  "duration": 63.2758125,
+  "duration_after_vad": 63.2758125,
+  "segments": [
+    {
+      "id": 1,
+      "start": 0.0,
+      "end": 3.16,
+      "text": "用AI做網站功能都對於就是看起來不夠好",
+      "avg_logprob": -0.41421643945555026,
+      "compression_ratio": 1.2116564417177915,
+      "no_speech_prob": 0.002785625634714961
+    },
+    {
+      "id": 2,
+      "start": 3.16,
+      "end": 6.24,
+      "text": "這五個網站可以拯救一個READ BIT",
+      "avg_logprob": -0.41421643945555026,
+      "compression_ratio": 1.2116564417177915,
+      "no_speech_prob": 0.002785625634714961
+    },
+    {
+      "id": 3,
+      "start": 6.24,
+      "end": 9.4,
+      "text": "這裡有165個以上的動畫園件",
+      "avg_logprob": -0.41421643945555026,
+      "compression_ratio": 1.2116564417177915,
+      "no_speech_prob": 0.002785625634714961
+    },
+    {
+      "id": 4,
+      "start": 9.4,
+      "end": 13.4,
+      "text": "看到喜歡的直接複製站貼上就可以用第二個UIverse",
+      "avg_logprob": -0.41421643945555026,
+      "compression_ratio": 1.2116564417177915,
+      "no_speech_prob": 0.002785625634714961
+    },
+    {
+      "id": 5,
+      "start": 13.4,
+      "end": 16.72,
+      "text": "現在已經有7400個以上設裙座的園件",
+      "avg_logprob": -0.41421643945555026,
+      "compression_ratio": 1.2116564417177915,
+      "no_speech_prob": 0.002785625634714961
+    },
+    {
+      "id": 6,
+      "start": 16.72,
+      "end": 19.64,
+      "text": "可以直接拿HTML,DEAL WIN, READS",
+      "avg_logprob": -0.41421643945555026,
+      "compression_ratio": 1.2116564417177915,
+      "no_speech_prob": 0.002785625634714961
+    },
+    {
+      "id": 7,
+      "start": 19.64,
+      "end": 21.44,
+      "text": "也可以直接站貼金肌嗎?",
+      "avg_logprob": -0.41421643945555026,
+      "compression_ratio": 1.2116564417177915,
+      "no_speech_prob": 0.002785625634714961
+    },
+    {
+      "id": 8,
+      "start": 21.44,
+      "end": 23.48,
+      "text": "第三個ASITINITY UI",
+      "avg_logprob": -0.41421643945555026,
+      "compression_ratio": 1.2116564417177915,
+      "no_speech_prob": 0.002785625634714961
+    },
+    {
+      "id": 9,
+      "start": 23.48,
+      "end": 25.88,
+      "text": "這裡有大量免費的UI園件",
+      "avg_logprob": -0.41421643945555026,
+      "compression_ratio": 1.2116564417177915,
+      "no_speech_prob": 0.002785625634714961
+    },
+    {
+      "id": 10,
+      "start": 25.88,
+      "end": 28.12,
+      "text": "如果你想要那種東銷比較強",
+      "avg_logprob": -0.41421643945555026,
+      "compression_ratio": 1.2116564417177915,
+      "no_speech_prob": 0.002785625634714961
+    },
+    {
+      "id": 11,
+      "start": 28.12,
+      "end": 30.12,
+      "text": "比較有質感的可以看這裡",
+      "avg_logprob": -0.25091827544103185,
+      "compression_ratio": 1.3121387283236994,
+      "no_speech_prob": 0.0006356018129736185
+    },
+    {
+      "id": 12,
+      "start": 30.12,
+      "end": 31.48,
+      "text": "園件有免費的",
+      "avg_logprob": -0.25091827544103185,
+      "compression_ratio": 1.3121387283236994,
+      "no_speech_prob": 0.0006356018129736185
+    },
+    {
+      "id": 13,
+      "start": 31.48,
+      "end": 34.12,
+      "text": "Pro模板和部分內容才需要付費",
+      "avg_logprob": -0.25091827544103185,
+      "compression_ratio": 1.3121387283236994,
+      "no_speech_prob": 0.0006356018129736185
+    },
+    {
+      "id": 14,
+      "start": 34.12,
+      "end": 35.92,
+      "text": "第四個ShutCNUi",
+      "avg_logprob": -0.25091827544103185,
+      "compression_ratio": 1.3121387283236994,
+      "no_speech_prob": 0.0006356018129736185
+    },
+    {
+      "id": 15,
+      "start": 35.92,
+      "end": 38.44,
+      "text": "現在做AI固定你會很常看到它",
+      "avg_logprob": -0.25091827544103185,
+      "compression_ratio": 1.3121387283236994,
+      "no_speech_prob": 0.0006356018129736185
+    },
+    {
+      "id": 16,
+      "start": 38.44,
+      "end": 41.36,
+      "text": "園件可以直接放進自己的項目裡面改",
+      "avg_logprob": -0.25091827544103185,
+      "compression_ratio": 1.3121387283236994,
+      "no_speech_prob": 0.0006356018129736185
+    },
+    {
+      "id": 17,
+      "start": 41.36,
+      "end": 43.8,
+      "text": "而且有適合直接配合AI來做",
+      "avg_logprob": -0.25091827544103185,
+      "compression_ratio": 1.3121387283236994,
+      "no_speech_prob": 0.0006356018129736185
+    },
+    {
+      "id": 18,
+      "start": 43.8,
+      "end": 44.92,
+      "text": "第五個ANIMAN",
+      "avg_logprob": -0.25091827544103185,
+      "compression_ratio": 1.3121387283236994,
+      "no_speech_prob": 0.0006356018129736185
+    },
+    {
+      "id": 19,
+      "start": 44.92,
+      "end": 46.44,
+      "text": "它是一個動畫的Library",
+      "avg_logprob": -0.25091827544103185,
+      "compression_ratio": 1.3121387283236994,
+      "no_speech_prob": 0.0006356018129736185
+    },
+    {
+      "id": 20,
+      "start": 46.44,
+      "end": 48.32,
+      "text": "如果你的顏面已經做好了",
+      "avg_logprob": -0.25091827544103185,
+      "compression_ratio": 1.3121387283236994,
+      "no_speech_prob": 0.0006356018129736185
+    },
+    {
+      "id": 21,
+      "start": 48.32,
+      "end": 51.52,
+      "text": "你可以用它直接處理讓畫面動起來的那一層",
+      "avg_logprob": -0.25091827544103185,
+      "compression_ratio": 1.3121387283236994,
+      "no_speech_prob": 0.0006356018129736185
+    },
+    {
+      "id": 22,
+      "start": 51.52,
+      "end": 54.48,
+      "text": "這五個網站都有免費的東西可以直接用",
+      "avg_logprob": -0.25091827544103185,
+      "compression_ratio": 1.3121387283236994,
+      "no_speech_prob": 0.0006356018129736185
+    },
+    {
+      "id": 23,
+      "start": 54.48,
+      "end": 56.8,
+      "text": "而且不需要註冊就可以先進去看",
+      "avg_logprob": -0.25091827544103185,
+      "compression_ratio": 1.3121387283236994,
+      "no_speech_prob": 0.0006356018129736185
+    },
+    {
+      "id": 24,
+      "start": 56.84,
+      "end": 58.44,
+      "text": "想要清單留言聲明",
+      "avg_logprob": -0.31922763160296846,
+      "compression_ratio": 0.9473684210526315,
+      "no_speech_prob": 0.029055576771497726
+    },
+    {
+      "id": 25,
+      "start": 58.44,
+      "end": 61.6,
+      "text": "我把五個網站還有各自適合什麼場景發給你",
+      "avg_logprob": -0.31922763160296846,
+      "compression_ratio": 0.9473684210526315,
+      "no_speech_prob": 0.029055576771497726
+    },
+    {
+      "id": 26,
+      "start": 61.6,
+      "end": 62.28,
+      "text": "我是頓宮",
+      "avg_logprob": -0.31922763160296846,
+      "compression_ratio": 0.9473684210526315,
+      "no_speech_prob": 0.029055576771497726
+    },
+    {
+      "id": 27,
+      "start": 62.28,
+      "end": 63.28,
+      "text": "我們明天見",
+      "avg_logprob": -0.31922763160296846,
+      "compression_ratio": 0.9473684210526315,
+      "no_speech_prob": 0.029055576771497726
+    }
+  ]
+}

@@ -1,0 +1,9 @@
+{
+  "duration_seconds": 63.276009,
+  "whisper_segments": 27,
+  "ocr_frames": 126,
+  "nonempty_subtitle_ocr": 116,
+  "nonempty_full_ocr": 119,
+  "sampling_interval_seconds": 0.5,
+  "timeline_entries": 6
+}
