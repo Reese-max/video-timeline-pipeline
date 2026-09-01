@@ -1,0 +1,57 @@
+{
+  "generated_at": "2026-09-01T05:07:03Z",
+  "source": {
+    "url": "https://www.facebook.com/share/v/1JSooDpiph/?mibextid=wwXIfr",
+    "platform": "Facebook",
+    "reel_id": "1002912535487683",
+    "title": "真正厲害的人，說話都是有公式的。當你掌握這5大說話公式 #表達力提升 #情商 #溝通 #表達能力練習 #表達技巧",
+    "uploader": "殷亞敏演講口才",
+    "webpage_url": "https://m.facebook.com/watch/?v=1002912535487683&_rdr",
+    "upload_date": "20260509"
+  },
+  "download": {
+    "extractor": "facebook",
+    "format_id": "2881791862154988v+972560995647316a",
+    "ext": "mp4",
+    "duration_from_source": 291.039,
+    "width_from_source": 1920,
+    "height_from_source": 1080
+  },
+  "media": {
+    "filename": "fb-1JSooDpiph.mp4",
+    "duration_seconds": 291.063991,
+    "width": 1920,
+    "height": 1080,
+    "video_codec": "av1",
+    "audio_codec": "aac",
+    "audio_sample_rate_hz": 44100,
+    "audio_channels": 2,
+    "size_bytes": 45514222,
+    "sha256": "43437685dd61b448a8ded6dcc685086c706b3ae487d932ad96bcdd1ce6db6adc"
+  },
+  "analysis": {
+    "sampling_interval_seconds": 0.5,
+    "sampled_frames": 582,
+    "ocr_languages": ["chi_sim", "eng"],
+    "ocr_modes": {
+      "full_frame": "Tesseract PSM 11",
+      "subtitle_crop": "Tesseract PSM 6"
+    },
+    "speech_to_text": {
+      "engine": "Faster-Whisper",
+      "model": "base",
+      "language": "zh",
+      "segments": 220
+    },
+    "ocr": {
+      "raw_index": "ocr_index_raw.tsv",
+      "clean_index": "ocr_index.tsv",
+      "readable_text": "ocr_readable.txt",
+      "nonempty_subtitle_ocr": 453,
+      "nonempty_full_ocr": 554
+    },
+    "timeline_entries": 9,
+    "representative_contact_frames": 30,
+    "contact_15s_frames": 20
+  }
+}
