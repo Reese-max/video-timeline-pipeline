@@ -4,6 +4,7 @@ import argparse
 import array
 import base64
 import concurrent.futures
+import contextlib
 import csv
 import ctypes
 import datetime
@@ -22,6 +23,7 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -29,12 +31,12 @@ import urllib.request
 import uuid
 import xml.etree.ElementTree as ET
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 
 MEDIA_EXTENSIONS = {
     ".mp4", ".mkv", ".webm", ".mov", ".avi", ".m4v",
-    ".mp3", ".m4a", ".aac", ".wav", ".flac", ".ogg", ".opus",
+    ".mp3", ".m4a", ".aac", ".wav", ".flac", ".ogg", ".opus", ".m3u8",
 }
 
 
@@ -164,6 +166,20 @@ def marker_matches(marker: Path, signature: str) -> bool:
         return False
 
 
+def marker_matches_or_upgradable(
+    marker: Path, signature: str, legacy_signature: str, source: Path
+) -> bool:
+    if marker_matches(marker, signature):
+        return True
+    try:
+        return (
+            marker_matches(marker, legacy_signature)
+            and marker.stat().st_mtime_ns >= source.stat().st_mtime_ns
+        )
+    except OSError:
+        return False
+
+
 def artifact_path(path: Path, root: Path) -> str:
     try:
         return str(path.resolve().relative_to(root.resolve()))
@@ -214,11 +230,32 @@ def source_title(job_dir: Path, video_path: Path) -> str:
     return video_path.stem
 
 
+def sanitize_download_info(path: Path) -> None:
+    """RSS URL 可能含簽名 query；info sidecar 只保留可公開回查的 URL。"""
+    try:
+        info = json.loads(path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return
+
+    def clean(value: Any) -> Any:
+        if isinstance(value, dict):
+            return {key: clean(item) for key, item in value.items()}
+        if isinstance(value, list):
+            return [clean(item) for item in value]
+        if isinstance(value, str) and value.startswith(("http://", "https://")):
+            return public_url(value)
+        return value
+
+    write_json(path, clean(info))
+
+
 def download_video(url: str, job_dir: Path, *, private_url: bool = False) -> Path:
     # 只信任完整標記：中斷會留下 source.f<id>.mp4 之類的分軌檔，
     # 直接復用會拿到無音訊的純視訊軌。重跑 yt-dlp 會自行續傳並清掉分軌。
     done = job_dir / ".download-complete"
     if done.is_file():
+        if private_url:
+            sanitize_download_info(job_dir / "source.info.json")
         return locate_source_video(job_dir)
     job_dir.mkdir(parents=True, exist_ok=True)
     command = yt_dlp_command()
@@ -234,12 +271,28 @@ def download_video(url: str, job_dir: Path, *, private_url: bool = False) -> Pat
         url,
     ]
     run_external(command, stream=not private_url, redact={url} if private_url else None)
+    if private_url:
+        sanitize_download_info(job_dir / "source.info.json")
     video_path = locate_source_video(job_dir)
     done.touch()
     return video_path
 
 
-def probe_video(video_path: Path) -> dict[str, Any]:
+def file_fingerprint(path: Path) -> str:
+    stat = path.stat()
+    return f"{stat.st_size}:{stat.st_mtime_ns}"
+
+
+def probe_video(video_path: Path, cache_path: Path | None = None) -> dict[str, Any]:
+    fingerprint = file_fingerprint(video_path)
+    if cache_path is not None:
+        cached = reuse_artifact(cache_path)
+        if (
+            isinstance(cached, dict)
+            and cached.get("fingerprint") == fingerprint
+            and isinstance(cached.get("probe"), dict)
+        ):
+            return cached["probe"]
     output = run_external(
         [
             require_tool("ffprobe"),
@@ -252,7 +305,10 @@ def probe_video(video_path: Path) -> dict[str, Any]:
             str(video_path),
         ]
     )
-    return json.loads(output)
+    probe = json.loads(output)
+    if cache_path is not None:
+        write_json(cache_path, {"fingerprint": fingerprint, "probe": probe})
+    return probe
 
 
 def video_duration(probe: dict[str, Any]) -> float:
@@ -263,6 +319,12 @@ def video_duration(probe: dict[str, Any]) -> float:
         if stream.get("codec_type") == "video" and stream.get("duration"):
             return float(stream["duration"])
     return 0.0
+
+
+def vision_frame_limit(duration_seconds: float, requested: int | None = None) -> int:
+    if requested is not None:
+        return requested
+    return max(8, min(40, math.ceil(max(0.0, duration_seconds) / 30.0)))
 
 
 def file_sha256(path: Path) -> str:
@@ -279,11 +341,14 @@ def extract_audio(video_path: Path, job_dir: Path, chunk_seconds: int) -> list[d
     done = audio_dir / ".complete"
     chunk_list = audio_dir / "chunks.csv"
     chunk_manifest = audio_dir / "chunks.json"
-    signature = f"v=2;chunk={chunk_seconds};codec=mp3-64k"
+    signature = f"v=3;source={file_fingerprint(video_path)};chunk={chunk_seconds};codec=mp3-64k"
+    legacy_signature = f"v=2;chunk={chunk_seconds};codec=mp3-64k"
     chunks = sorted(audio_dir.glob("audio_*.mp3"))
-    if chunks and marker_matches(done, signature):
+    if chunks and marker_matches_or_upgradable(done, signature, legacy_signature, video_path):
         cached = reuse_artifact(chunk_manifest)
         if isinstance(cached, list) and len(cached) == len(chunks):
+            if not marker_matches(done, signature):
+                write_text(done, signature)
             return cached
     for stale in chunks:  # 半份切段會讓逐字稿無聲缺尾，重切前先清乾淨
         stale.unlink()
@@ -372,10 +437,14 @@ def limit_items(items: list[Any], max_items: int) -> list[Any]:
         return items
     if max_items == 1:
         return [items[0]]
-    selected_indexes = {
-        round(index * (len(items) - 1) / (max_items - 1))
-        for index in range(max_items)
-    }
+    selected_indexes = {0, len(items) - 1}
+    while len(selected_indexes) < max_items:
+        ordered = sorted(selected_indexes)
+        left, right = max(
+            zip(ordered, ordered[1:]),
+            key=lambda pair: (pair[1] - pair[0], -pair[0]),
+        )
+        selected_indexes.add((left + right) // 2)
     return [item for index, item in enumerate(items) if index in selected_indexes]
 
 
@@ -438,9 +507,12 @@ def extract_candidates(
     frames_dir = job_dir / "frames"
     frames_dir.mkdir(parents=True, exist_ok=True)
     done = frames_dir / ".complete"
-    signature = f"interval={interval:g}"
+    signature = f"v=2;source={file_fingerprint(video_path)};interval={interval:g}"
+    legacy_signature = f"interval={interval:g}"
     all_frames = sorted(frames_dir.glob("frame_*.jpg"))
-    if all_frames and not marker_matches(done, signature):
+    if all_frames and not marker_matches_or_upgradable(
+        done, signature, legacy_signature, video_path
+    ):
         # 半份截圖會讓下面的 index * interval 時間戳整條錯位，寧可重抽
         for stale in all_frames:
             stale.unlink()
@@ -468,7 +540,8 @@ def extract_candidates(
         all_frames = sorted(frames_dir.glob("frame_*.jpg"))
     if not all_frames:
         raise RuntimeError("FFmpeg 沒有產生截圖。")
-    write_text(done, signature)
+    if not marker_matches(done, signature):
+        write_text(done, signature)
 
     ocr = OptionalOCR(ocr_enabled)
     candidates: list[dict[str, Any]] = []
@@ -584,6 +657,34 @@ def extract_steipete_candidates(
     }
 
 
+def frame_candidate_cache_key(video_path: Path, config: dict[str, Any]) -> str:
+    material = json.dumps(
+        {"version": 1, "video": file_fingerprint(video_path), "config": config},
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(material.encode("utf-8")).hexdigest()
+
+
+def reuse_frame_candidates(
+    path: Path, cache_key: str
+) -> tuple[list[dict[str, Any]], dict[str, Any]] | None:
+    cached = reuse_artifact(path)
+    if not isinstance(cached, dict) or cached.get("cache_key") != cache_key:
+        return None
+    frames, meta = cached.get("frames"), cached.get("meta")
+    if not isinstance(frames, list) or not isinstance(meta, dict):
+        return None
+    if any(
+        not isinstance(frame, dict)
+        or not Path(str(frame.get("path", ""))).is_file()
+        for frame in frames
+    ):
+        return None
+    return frames, meta
+
+
 # 供應商 API、轉錄與摘要
 
 
@@ -691,13 +792,25 @@ def get_json(url: str, headers: dict[str, str]) -> dict[str, Any]:
 
 
 RSS_MAX_BYTES = 5 * 1024 * 1024
+RSS_MAX_ATTEMPTS = 3
+RSS_RETRY_BASE_SECONDS = 300
+RSS_LEASE_SECONDS = 2 * 60 * 60
 
 
 def public_url(url: str) -> str:
     """顯示 URL 時移除可能含私人權杖的 query/fragment。"""
     parsed = urllib.parse.urlsplit(url)
     netloc = parsed.netloc.rsplit("@", 1)[-1]
-    return urllib.parse.urlunsplit((parsed.scheme, netloc, parsed.path, "", ""))
+    query = ""
+    if (parsed.hostname or "").lower() in {"youtube.com", "www.youtube.com", "m.youtube.com"} and parsed.path == "/watch":
+        video_ids = urllib.parse.parse_qs(parsed.query, max_num_fields=32).get("v") or []
+        if video_ids and re.fullmatch(r"[A-Za-z0-9_-]{11}", video_ids[0]):
+            query = urllib.parse.urlencode({"v": video_ids[0]})
+    return urllib.parse.urlunsplit((parsed.scheme, netloc, parsed.path, query, ""))
+
+
+def sanitize_public_urls(text: str) -> str:
+    return re.sub(r"https?://[^\s]+", lambda match: public_url(match.group(0)), text)
 
 
 def require_http_url(url: str, label: str = "URL") -> str:
@@ -771,6 +884,25 @@ def xml_text(node: ET.Element | None) -> str:
     return " ".join("".join(node.itertext()).split()) if node is not None else ""
 
 
+def supported_feed_media(node: ET.Element, url: str) -> bool:
+    """只把明確的影音 enclosure 當下載來源，避免誤抓封面圖。"""
+    media_type = str(node.attrib.get("type") or "").split(";", 1)[0].strip().lower()
+    medium = str(node.attrib.get("medium") or "").strip().lower()
+    extension_is_media = Path(urllib.parse.urlsplit(url).path).suffix.lower() in MEDIA_EXTENSIONS
+    if media_type:
+        if media_type.startswith(("audio/", "video/")):
+            return True
+        if media_type in {
+            "application/ogg", "application/octet-stream",
+            "application/vnd.apple.mpegurl", "application/x-mpegurl",
+        }:
+            return media_type != "application/octet-stream" or extension_is_media
+        return False
+    if medium:
+        return medium in {"audio", "video"}
+    return extension_is_media
+
+
 def feed_media_url(node: ET.Element, base_url: str) -> str:
     for child in node.iter():
         name = xml_name(child.tag)
@@ -780,9 +912,11 @@ def feed_media_url(node: ET.Element, base_url: str) -> str:
         if candidate:
             joined = urllib.parse.urljoin(base_url, candidate)
             try:
-                return require_http_url(joined, "RSS 媒體 URL")
+                joined = require_http_url(joined, "RSS 媒體 URL")
             except ValueError:
                 continue
+            if supported_feed_media(child, joined):
+                return joined
     return ""
 
 
@@ -836,7 +970,7 @@ def parse_feed_xml(raw: bytes, base_url: str) -> dict[str, Any]:
             for link in (child for child in entry if xml_name(child.tag) == "link"):
                 href = urllib.parse.urljoin(base_url, link.attrib.get("href", ""))
                 rel = link.attrib.get("rel", "alternate").lower()
-                if rel == "enclosure" and href:
+                if rel == "enclosure" and href and supported_feed_media(link, href):
                     enclosure = href
                 elif rel in {"", "alternate"} and href and not page_url:
                     page_url = href
@@ -1181,6 +1315,26 @@ def image_data_url(image_path: Path) -> str:
         return f"data:{mime};base64,{encoded}"
 
 
+def uniform_image_observation(image_path: Path) -> dict[str, Any] | None:
+    try:
+        from PIL import Image, ImageStat
+
+        with Image.open(image_path) as image:
+            deviation = max(ImageStat.Stat(image.convert("RGB").resize((64, 64))).stddev)
+    except (ImportError, OSError):
+        return None
+    if deviation > 1.0:
+        return None
+    return {
+        "screen_type": "uniform_frame",
+        "visible_text": [],
+        "visual_summary": "畫面幾乎為單一顏色，沒有可辨識的文字或物件。",
+        "important_details": [],
+        "confidence": 0.99,
+        "analysis_method": "local_uniformity_check",
+    }
+
+
 def minimax_endpoint() -> str:
     base_url = os.getenv("MINIMAX_BASE_URL", "").rstrip("/")
     allowed = {"https://api.minimax.io/v1", "https://api.minimaxi.com/v1"}
@@ -1214,6 +1368,8 @@ def minimax_chat(
     model: str,
     max_tokens: int | None = None,
     timeout: int = 180,
+    *,
+    thinking: str | None = None,
 ) -> str:
     # 預設不設上限：MiniMax-M3 是 reasoning 模型，<think> 會先吃掉配額，
     # 給定的預算常常在真正的答案輸出前就用完，回傳半截 JSON。
@@ -1223,6 +1379,8 @@ def minimax_chat(
         "temperature": 0.1,
         "reasoning_split": True,
     }
+    if thinking:
+        payload["thinking"] = {"type": thinking}
     if max_tokens:
         payload["max_tokens"] = max_tokens
     started = time.monotonic()
@@ -1269,8 +1427,12 @@ def analyze_images(
     candidates: list[dict[str, Any]],
     api_key: str,
     model: str,
-    workers: int = 1,
+    workers: int = 8,
+    cache_dir: Path | None = None,
 ) -> list[dict[str, Any]]:
+    if cache_dir is not None:
+        cache_dir.mkdir(parents=True, exist_ok=True)
+
     def one(item: tuple[int, dict[str, Any]]) -> tuple[int, dict[str, Any]]:
         index, candidate = item
         local_ocr = str(candidate.get("ocr_text", "")).strip()
@@ -1284,33 +1446,67 @@ def analyze_images(
         )
         if local_ocr:
             prompt += f"\n本地 OCR 初篩文字（僅供交叉確認）：{local_ocr}"
-        response = minimax_chat(
-            [
+        image_path = Path(str(candidate["path"]))
+        cache_path: Path | None = None
+        if cache_dir is not None:
+            material = json.dumps(
                 {
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": prompt},
-                        {"type": "image_url", "image_url": {"url": image_data_url(Path(candidate["path"]))}},
-                    ],
-                }
-            ],
-            api_key,
-            model,
-        )
-        observation = parse_json_object(response)
+                    "version": 3,
+                    "model": model,
+                    "prompt": prompt,
+                    "timestamp": candidate["timestamp"],
+                    "image_sha256": file_sha256(image_path),
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            cache_path = cache_dir / (hashlib.sha256(material.encode("utf-8")).hexdigest() + ".json")
+            cached = reuse_artifact(cache_path, "source_image")
+            if isinstance(cached, dict):
+                cached = dict(cached)
+                cached["source_image"] = str(image_path)
+                return index, cached
+        observation = uniform_image_observation(image_path)
+        if observation is None:
+            response = minimax_chat(
+                [
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": prompt},
+                            {"type": "image_url", "image_url": {"url": image_data_url(image_path)}},
+                        ],
+                    }
+                ],
+                api_key,
+                model,
+            )
+            observation = parse_json_object(response)
         observation["timestamp"] = candidate["timestamp"]
-        observation["source_image"] = candidate["path"]
+        observation["source_image"] = str(image_path)
         observation["local_ocr_text"] = local_ocr
         observation["local_ocr_confidence"] = candidate.get("ocr_confidence")
+        if cache_path is not None:
+            write_json(cache_path, observation)
         return index, observation
 
     results: dict[int, dict[str, Any]] = {}
-    with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, min(workers, 4))) as pool:
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, min(workers, 8))) as pool:
         futures = [pool.submit(one, item) for item in enumerate(candidates)]
         for future in concurrent.futures.as_completed(futures):
             index, observation = future.result()
             results[index] = observation
     return [results[index] for index in sorted(results)]
+
+
+def run_parallel_stages(
+    first_stage: Callable[[], Any], second_stage: Callable[[], Any]
+) -> tuple[Any, Any]:
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+        first = pool.submit(first_stage)
+        second = pool.submit(second_stage)
+        return first.result(), second.result()
 
 
 def merge_timeline(transcript: dict[str, Any], observations: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -1376,14 +1572,22 @@ SUMMARY_SYSTEM = (
 
 def summary_prompt(payload: Any, *, partial: bool) -> str:
     scope = "本片段" if partial else "整支影片"
+    review_rule = (
+        "review_qa 在中間片段固定輸出空陣列，留到最後整合時再產生。"
+        if partial
+        else "review_qa 恰好五題，每題含 question、answer、source_ids，answer 最多 120 字。"
+    )
     return (
         f"整理{scope}，只輸出 JSON object，不要 Markdown。欄位：short_summary、"
         "topic_points（字串陣列）、important_terms（字串陣列）、"
         "numbers_and_limits（字串陣列）、chapters（含 title、start、end、summary、source_ids）、"
-        "steps（字串陣列）、review_qa（恰好五題，每題含 question、answer、source_ids）、"
+        "steps（字串陣列）、review_qa、"
         "speaker_claims（含 claim、source_ids 的陣列）、model_inferences（含 inference、basis_source_ids 的陣列）、"
         "visual_checks（含 reason、source_ids 的陣列）、fact_check（含 timestamp、claim、reason、source_ids 的陣列）、"
         "source_ids（字串陣列）、source_timestamps（數字陣列）。"
+        + review_rule
+        + "short_summary 最多 200 字；topic_points 最多 8 項；important_terms 最多 12 項；"
+        "每項只保留來源中的不同事實，未提及就用空陣列，不要跨欄位重複同一句。"
         "重要結論必須引用實際存在的 segment_id；遇到「這裡、如圖、畫面上」而資料不足時放入 visual_checks；"
         "辨識疑點放入 fact_check，不得改寫為已確認原話。\n\n"
         + json.dumps(payload, ensure_ascii=False)
@@ -1399,26 +1603,51 @@ def cached_minimax_summary(
     *,
     partial: bool,
 ) -> dict[str, Any]:
+    def valid(result: Any) -> bool:
+        if not isinstance(result, dict) or not result.get("short_summary"):
+            return False
+        if partial:
+            return True
+        review = result.get("review_qa")
+        return (
+            isinstance(review, list)
+            and len(review) == 5
+            and all(
+                isinstance(item, dict)
+                and str(item.get("question") or "").strip()
+                and str(item.get("answer") or "").strip()
+                and isinstance(item.get("source_ids"), list)
+                for item in review
+            )
+        )
+
     messages = [
         {"role": "system", "content": SUMMARY_SYSTEM},
         {"role": "user", "content": summary_prompt(payload, partial=partial)},
     ]
     material = json.dumps(
-        {"version": 2, "kind": kind, "model": model, "messages": messages},
+        {
+            "version": 4,
+            "kind": kind,
+            "model": model,
+            "thinking": "disabled",
+            "messages": messages,
+        },
         ensure_ascii=False,
         sort_keys=True,
         separators=(",", ":"),
     )
     cache_path = cache_dir / (hashlib.sha256(material.encode("utf-8")).hexdigest() + ".json")
     cached = reuse_artifact(cache_path, "short_summary")
-    if isinstance(cached, dict):
+    if valid(cached):
         return cached
-    result = parse_json_object(minimax_chat(messages, api_key, model))
-    if not result.get("short_summary"):
-        print("! MiniMax 摘要不是有效 JSON，重試一次")
-        result = parse_json_object(minimax_chat(messages, api_key, model))
-    if result.get("short_summary"):
-        write_json(cache_path, result)
+    result = parse_json_object(minimax_chat(messages, api_key, model, thinking="disabled"))
+    if not valid(result):
+        print("! MiniMax 摘要格式不完整，重試一次")
+        result = parse_json_object(minimax_chat(messages, api_key, model, thinking="disabled"))
+    if not valid(result):
+        raise RuntimeError("MiniMax 摘要重試後仍不符合輸出格式。")
+    write_json(cache_path, result)
     return result
 
 
@@ -1472,6 +1701,7 @@ def create_summary(
     model: str,
     max_chars: int,
     cache_dir: Path,
+    workers: int = 1,
 ) -> dict[str, Any]:
     cache_dir.mkdir(parents=True, exist_ok=True)
     chunks = summary_inputs(timeline, max_chars)
@@ -1480,16 +1710,23 @@ def create_summary(
             cache_dir, "complete", chunks[0], api_key, model, partial=False
         )
     else:
-        partials = [
-            {
+        def summarize_chunk(item: tuple[int, list[dict[str, Any]]]) -> tuple[int, dict[str, Any]]:
+            index, chunk = item
+            return index, {
                 "chunk_id": f"CHUNK-{index:04d}",
                 "source_ids": [event["segment_id"] for event in chunk],
                 "summary": cached_minimax_summary(
                     cache_dir, f"chunk-{index}", chunk, api_key, model, partial=True
                 ),
             }
-            for index, chunk in enumerate(chunks, 1)
-        ]
+
+        results: dict[int, dict[str, Any]] = {}
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, min(workers, 4))) as pool:
+            futures = [pool.submit(summarize_chunk, item) for item in enumerate(chunks, 1)]
+            for future in concurrent.futures.as_completed(futures):
+                index, partial = future.result()
+                results[index] = partial
+        partials = [results[index] for index in sorted(results)]
         summary = cached_minimax_summary(
             cache_dir, "consolidated", partials, api_key, model, partial=False
         )
@@ -1863,6 +2100,11 @@ def index_connection(root: Path) -> sqlite3.Connection:
             text,
             tokenize='trigram'
         );
+        CREATE TABLE IF NOT EXISTS index_state (
+            job TEXT PRIMARY KEY,
+            signature TEXT NOT NULL,
+            row_count INTEGER NOT NULL
+        );
         """
     )
     # 不同模型的向量不能混用，vectors 必須記住是誰算的，而且主鍵要含 model——
@@ -1880,6 +2122,7 @@ def index_connection(root: Path) -> sqlite3.Connection:
             )
             """
         )
+        connection.execute("DELETE FROM index_state")
     # 以文字內容的 hash 當鍵，不是 events.rowid——
     # --index 會對每個 job 做 DELETE+INSERT，FTS5 的 rowid 因此全部重新分配，
     # 綁 rowid 的話每加一支新影片都得把全部向量重算（實測 5,418 筆要 218 秒）。
@@ -1917,13 +2160,38 @@ def index_job(connection: sqlite3.Connection, job_dir: Path) -> int:
     if (manifest.get("status") or "") == "failed":
         # 失敗的 job 沒有內容，留在索引裡只會讓「共幾支影片」這個數字說謊。
         # 目錄本身保留（manifest 記著錯誤原因，可用來診斷）。
-        connection.execute(
-            "DELETE FROM vectors WHERE event_id IN (SELECT rowid FROM events WHERE job = ?)", (job,)
-        )
         connection.execute("DELETE FROM events WHERE job = ?", (job,))
         connection.execute("DELETE FROM videos WHERE job = ?", (job,))
+        connection.execute("DELETE FROM index_state WHERE job = ?", (job,))
         return 0
     source = manifest.get("source") or {}
+    timeline_path = job_dir / "timeline.json"
+    summary_path = job_dir / "summary.json"
+    signature = text_hash(
+        json.dumps(
+            {
+                "version": 1,
+                "source": {
+                    "title": source.get("title"),
+                    "url": source.get("url"),
+                    "video": source.get("video"),
+                },
+                "status": manifest.get("status"),
+                "duration": (manifest.get("video") or {}).get("duration_seconds"),
+                "categories": manifest.get("categories") or [],
+                "timeline": file_fingerprint(timeline_path) if timeline_path.is_file() else None,
+                "summary": file_fingerprint(summary_path) if summary_path.is_file() else None,
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+    )
+    indexed = connection.execute(
+        "SELECT row_count FROM index_state WHERE job = ? AND signature = ?", (job, signature)
+    ).fetchone()
+    if indexed is not None:
+        return int(indexed[0])
     # 向量以文字 hash 為鍵，不隨 events 重建而失效，所以這裡只清片段
     connection.execute("DELETE FROM events WHERE job = ?", (job,))
     connection.execute(
@@ -1942,7 +2210,6 @@ def index_job(connection: sqlite3.Connection, job_dir: Path) -> int:
     rows: list[tuple[str, Any, str, str]] = []
     if source.get("title"):  # 用影片名找片是最直覺的查法，標題也得進全文索引
         rows.append((job, 0, "title", str(source["title"])))
-    timeline_path = job_dir / "timeline.json"
     if timeline_path.is_file():
         try:
             timeline = json.loads(timeline_path.read_text(encoding="utf-8"))
@@ -1958,7 +2225,6 @@ def index_job(connection: sqlite3.Connection, job_dir: Path) -> int:
             if text:
                 rows.append((job, event.get("timestamp"), str(event.get("type", "")), text))
 
-    summary_path = job_dir / "summary.json"
     if summary_path.is_file():
         try:
             summary = json.loads(summary_path.read_text(encoding="utf-8"))
@@ -1977,6 +2243,9 @@ def index_job(connection: sqlite3.Connection, job_dir: Path) -> int:
                 rows.append((job, chapter.get("start") or 0, "chapter", detail))
 
     connection.executemany("INSERT INTO events VALUES (?, ?, ?, ?)", rows)
+    connection.execute(
+        "INSERT OR REPLACE INTO index_state VALUES (?, ?, ?)", (job, signature, len(rows))
+    )
     return len(rows)
 
 
@@ -2693,26 +2962,122 @@ def rss_state_path(root: Path) -> Path:
     return root / "rss" / "state.json"
 
 
+def rss_now() -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
+def secure_rss_directory(root: Path) -> Path:
+    directory = root / "rss"
+    directory.mkdir(parents=True, exist_ok=True)
+    try:
+        os.chmod(directory, 0o700)
+    except OSError:
+        pass
+    marker = directory / ".acl-complete"
+    if os.name == "nt" and not marker.is_file():
+        user = os.getenv("USERNAME", "").strip()
+        if not user:
+            raise RuntimeError("無法識別目前 Windows 使用者，RSS 狀態目錄尚未套用私人 ACL。")
+        completed = subprocess.run(
+            [
+                "icacls.exe",
+                str(directory),
+                "/inheritance:r",
+                "/grant:r",
+                f"{user}:(OI)(CI)(F)",
+                "*S-1-5-18:(OI)(CI)(F)",
+                "*S-1-5-32-544:(OI)(CI)(F)",
+            ],
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        if completed.returncode:
+            raise RuntimeError("RSS 狀態目錄私人 ACL 設定失敗。")
+        write_text(marker, rss_now())
+    return directory
+
+
+@contextlib.contextmanager
+def rss_writer_lock(root: Path, timeout: float = 5.0):
+    """同一個 root 同時只允許一個 RSS 寫入者。"""
+    directory = secure_rss_directory(root)
+    path = directory / ".writer.lock"
+    handle = path.open("a+b")
+    handle.seek(0, os.SEEK_END)
+    if handle.tell() == 0:
+        handle.write(b"0")
+        handle.flush()
+    deadline = time.monotonic() + max(timeout, 0.0)
+    locked = False
+    try:
+        while not locked:
+            try:
+                handle.seek(0)
+                if os.name == "nt":
+                    import msvcrt
+
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+                else:
+                    import fcntl
+
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                locked = True
+            except OSError:
+                if time.monotonic() >= deadline:
+                    raise RuntimeError("另一個 RSS 寫入程序仍在執行；本次未開始。") from None
+                time.sleep(0.1)
+        yield
+    finally:
+        if locked:
+            handle.seek(0)
+            if os.name == "nt":
+                import msvcrt
+
+                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        handle.close()
+
+
 def load_rss_state(root: Path) -> dict[str, Any]:
     path = rss_state_path(root)
     if not path.is_file():
-        return {"schema_version": 1, "subscriptions": [], "items": []}
+        return {"schema_version": 1, "subscriptions": [], "items": [], "scheduler_cursor": 0}
     try:
         state = json.loads(path.read_text(encoding="utf-8"))
     except (json.JSONDecodeError, OSError) as exc:
-        raise RuntimeError(f"RSS 狀態檔無法讀取：{path}") from exc
+        backup = path.with_suffix(".json.bak")
+        hint = f"；可檢查備份 {backup}" if backup.is_file() else ""
+        raise RuntimeError(f"RSS 狀態檔無法讀取：{path}{hint}") from exc
     if not isinstance(state, dict) or state.get("schema_version") != 1:
         raise RuntimeError(f"不支援的 RSS 狀態檔格式：{path}")
     state.setdefault("subscriptions", [])
     state.setdefault("items", [])
+    state.setdefault("scheduler_cursor", 0)
     if not isinstance(state["subscriptions"], list) or not isinstance(state["items"], list):
         raise RuntimeError(f"RSS 狀態檔內容損壞：{path}")
     return state
 
 
 def save_rss_state(root: Path, state: dict[str, Any]) -> Path:
+    secure_rss_directory(root)
     path = rss_state_path(root)
+    if path.is_file():
+        try:
+            json.loads(path.read_text(encoding="utf-8"))
+            shutil.copy2(path, path.with_suffix(".json.bak"))
+        except (json.JSONDecodeError, OSError):
+            pass
     write_json(path, state)
+    try:
+        os.chmod(path, 0o600)
+    except OSError:
+        pass
     return path
 
 
@@ -2724,8 +3089,8 @@ def queue_rss_items(
     state: dict[str, Any], subscription: dict[str, Any], entries: list[dict[str, str]]
 ) -> dict[str, int]:
     subscription_id = str(subscription["id"])
-    known_ids = {
-        str(item.get("entry_id"))
+    known_items = {
+        str(item.get("entry_id")): item
         for item in state["items"]
         if item.get("subscription_id") == subscription_id
     }
@@ -2737,12 +3102,25 @@ def queue_rss_items(
     keywords = [str(word).casefold() for word in subscription.get("keywords", [])]
     latest_only = bool(subscription.get("latest_only"))
     latest_queued = False
-    counts = {"queued": 0, "filtered": 0, "skipped": 0, "duplicate": 0, "existing": 0}
-    now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    counts = {"queued": 0, "filtered": 0, "skipped": 0, "duplicate": 0, "existing": 0, "updated": 0}
+    now = rss_now()
 
     for entry in entries:
         entry_id = str(entry["id"])
-        if entry_id in known_ids:
+        if entry_id in known_items:
+            existing = known_items[entry_id]
+            changed = False
+            if existing.get("status") != "completed":
+                for key in ("title", "url", "source_url", "published"):
+                    value = str(entry.get(key) or (entry.get("url") if key == "source_url" else ""))
+                    if value and existing.get(key) != value:
+                        existing[key] = value
+                        changed = True
+                tags = list(subscription.get("tags", []))
+                if existing.get("tags") != tags:
+                    existing["tags"] = tags
+                    changed = True
+            counts["updated"] += int(changed)
             counts["existing"] += 1
             continue
         title = str(entry.get("title") or entry.get("source_url") or entry["url"])
@@ -2775,7 +3153,7 @@ def queue_rss_items(
                 "attempts": 0,
             }
         )
-        known_ids.add(entry_id)
+        known_items[entry_id] = state["items"][-1]
     return counts
 
 
@@ -2804,7 +3182,7 @@ def add_rss_subscription(
         "tags": tags or [],
         "etag": str(feed.get("etag") or ""),
         "last_modified": str(feed.get("last_modified") or ""),
-        "last_checked": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "last_checked": rss_now(),
         "last_error": "",
     }
     state["subscriptions"].append(subscription)
@@ -2813,22 +3191,32 @@ def add_rss_subscription(
     return subscription, counts
 
 
-def refresh_rss(root: Path) -> dict[str, int]:
+def refresh_rss(root: Path, workers: int = 4) -> dict[str, int]:
     state = load_rss_state(root)
     if not state["subscriptions"]:
         raise RuntimeError("尚未加入 RSS 訂閱；先使用 --rss-add。")
-    totals = {"feeds": 0, "unchanged": 0, "failed": 0, "queued": 0, "filtered": 0, "skipped": 0}
-    for subscription in state["subscriptions"]:
-        if not subscription.get("enabled", True):
-            continue
-        totals["feeds"] += 1
+    enabled = [item for item in state["subscriptions"] if item.get("enabled", True)]
+    totals = {
+        "feeds": len(enabled), "unchanged": 0, "failed": 0,
+        "queued": 0, "filtered": 0, "skipped": 0, "updated": 0,
+    }
+
+    def fetch_one(subscription: dict[str, Any]) -> tuple[dict[str, Any] | None, Exception | None]:
         try:
-            feed = fetch_rss(
+            return fetch_rss(
                 str(subscription["url"]),
                 str(subscription.get("etag") or ""),
                 str(subscription.get("last_modified") or ""),
-            )
-            subscription["last_checked"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+            ), None
+        except Exception as exc:
+            return None, exc
+
+    results: list[tuple[dict[str, Any] | None, Exception | None]] = []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, min(workers, 4, len(enabled) or 1))) as pool:
+        results = list(pool.map(fetch_one, enabled))
+    for subscription, (feed, error) in zip(enabled, results):
+        subscription["last_checked"] = rss_now()
+        if error is None and feed is not None:
             subscription["last_error"] = ""
             if feed.get("not_modified"):
                 totals["unchanged"] += 1
@@ -2838,13 +3226,12 @@ def refresh_rss(root: Path) -> dict[str, int]:
                     feed.get("last_modified") or subscription.get("last_modified") or ""
                 )
                 counts = queue_rss_items(state, subscription, list(feed["items"]))
-                for key in ("queued", "filtered", "skipped"):
+                for key in ("queued", "filtered", "skipped", "updated"):
                     totals[key] += counts[key]
-        except Exception as exc:
+        else:
             totals["failed"] += 1
-            subscription["last_error"] = str(exc)
-        finally:
-            save_rss_state(root, state)
+            subscription["last_error"] = sanitize_public_urls(str(error))
+    save_rss_state(root, state)
     return totals
 
 
@@ -2861,19 +3248,168 @@ def remove_rss_subscription(root: Path, subscription_id: str) -> tuple[str, int]
     return name, before - len(state["items"])
 
 
-def rss_status(root: Path) -> list[str]:
+def update_rss_subscription(
+    root: Path,
+    subscription_id: str,
+    *,
+    name: str | None = None,
+    keywords: list[str] | None = None,
+    tags: list[str] | None = None,
+    latest_only: bool | None = None,
+    enabled: bool | None = None,
+) -> dict[str, Any]:
+    state = load_rss_state(root)
+    subscription = next((item for item in state["subscriptions"] if item.get("id") == subscription_id), None)
+    if subscription is None:
+        raise RuntimeError(f"找不到 RSS 訂閱：{subscription_id}")
+    if name is not None:
+        subscription["name"] = name.strip() or subscription.get("name") or subscription_id
+    if keywords is not None:
+        subscription["keywords"] = keywords
+    if tags is not None:
+        subscription["tags"] = tags
+        for item in state["items"]:
+            if item.get("subscription_id") == subscription_id and item.get("status") != "completed":
+                item["tags"] = tags
+    if latest_only is not None:
+        subscription["latest_only"] = latest_only
+    if enabled is not None:
+        subscription["enabled"] = enabled
+    subscription["updated_at"] = rss_now()
+    save_rss_state(root, state)
+    return subscription
+
+
+def requeue_rss_item(root: Path, item_id: str) -> dict[str, Any]:
+    state = load_rss_state(root)
+    item = next((entry for entry in state["items"] if entry.get("id") == item_id), None)
+    if item is None:
+        raise RuntimeError(f"找不到 RSS 項目：{item_id}")
+    if item.get("status") not in {"failed", "dead-letter", "processing"}:
+        raise RuntimeError(f"RSS 項目 {item_id} 不是可重排的失敗狀態。")
+    item.update({"status": "queued", "attempts": 0, "last_error": "", "next_retry_at": ""})
+    item.pop("processing_started_at", None)
+    save_rss_state(root, state)
+    return item
+
+
+def cleanup_rss_state(root: Path, days: int) -> int:
+    if days <= 0:
+        raise ValueError("--rss-cleanup-days 必須大於 0。")
+    state = load_rss_state(root)
+    cutoff = time.time() - days * 86400
+    disposable = {"completed", "filtered", "skipped-latest-only", "duplicate"}
+    kept: list[dict[str, Any]] = []
+    removed = 0
+    for item in state["items"]:
+        stamp = str(item.get("completed_at") or item.get("discovered_at") or "")
+        if item.get("status") in disposable and feed_timestamp(stamp) and feed_timestamp(stamp) < cutoff:
+            removed += 1
+        else:
+            kept.append(item)
+    state["items"] = kept
+    save_rss_state(root, state)
+    return removed
+
+
+def rss_status(root: Path, item_limit: int = 20, show_items: bool = False) -> list[str]:
     state = load_rss_state(root)
     lines = [f"RSS 訂閱：{len(state['subscriptions'])} 個"]
+    counts_by_feed: dict[str, dict[str, int]] = {}
+    for item in state["items"]:
+        feed_id = str(item.get("subscription_id") or "")
+        status = str(item.get("status") or "unknown")
+        counts = counts_by_feed.setdefault(feed_id, {})
+        counts[status] = counts.get(status, 0) + 1
     for subscription in state["subscriptions"]:
-        statuses: dict[str, int] = {}
-        for item in state["items"]:
-            if item.get("subscription_id") == subscription.get("id"):
-                status = str(item.get("status") or "unknown")
-                statuses[status] = statuses.get(status, 0) + 1
+        statuses = counts_by_feed.get(str(subscription.get("id")), {})
         detail = "、".join(f"{key} {value}" for key, value in sorted(statuses.items())) or "尚無項目"
         error = "；上次失敗" if subscription.get("last_error") else ""
-        lines.append(f"- {subscription['id']}  {subscription.get('name') or '未命名'}：{detail}{error}")
+        enabled = "啟用" if subscription.get("enabled", True) else "暫停"
+        lines.append(f"- {subscription['id']}  {subscription.get('name') or '未命名'}（{enabled}）：{detail}{error}")
+    problem_states = {"failed", "dead-letter", "processing"}
+    details = [item for item in state["items"] if show_items or item.get("status") in problem_states]
+    if details and item_limit > 0:
+        details.sort(
+            key=lambda item: feed_timestamp(str(item.get("published") or item.get("discovered_at") or "")),
+            reverse=True,
+        )
+        lines.append("項目明細：")
+        for item in details[:item_limit]:
+            title = " ".join(str(item.get("title") or "未命名").split())[:80]
+            error = " ".join(str(item.get("last_error") or "").split())[:160]
+            retry = str(item.get("next_retry_at") or "-")
+            suffix = f"；錯誤 {error}" if error else ""
+            lines.append(
+                f"  - {item.get('id')} [{item.get('status')}] {title}；"
+                f"attempts {int(item.get('attempts') or 0)}；next {retry}{suffix}"
+            )
+    if len(state["items"]) > 10000:
+        lines.append("! RSS 項目已超過 10,000 筆；此時才值得評估改用 SQLite。")
     return lines
+
+
+def export_rss_opml(root: Path, output: Path) -> int:
+    state = load_rss_state(root)
+    opml = ET.Element("opml", version="2.0")
+    ET.SubElement(ET.SubElement(opml, "head"), "title").text = "VidBee RSS subscriptions"
+    body = ET.SubElement(opml, "body")
+    for subscription in state["subscriptions"]:
+        ET.SubElement(
+            body,
+            "outline",
+            {
+                "type": "rss",
+                "text": str(subscription.get("name") or subscription["url"]),
+                "title": str(subscription.get("name") or subscription["url"]),
+                "xmlUrl": str(subscription["url"]),
+                "vidbeeKeywords": ",".join(subscription.get("keywords") or []),
+                "vidbeeTags": ",".join(subscription.get("tags") or []),
+                "vidbeeLatestOnly": str(bool(subscription.get("latest_only"))).lower(),
+                "vidbeeEnabled": str(bool(subscription.get("enabled", True))).lower(),
+            },
+        )
+    write_text(output.resolve(), ET.tostring(opml, encoding="unicode", xml_declaration=True))
+    try:
+        os.chmod(output.resolve(), 0o600)
+    except OSError:
+        pass
+    return len(state["subscriptions"])
+
+
+def import_rss_opml(root: Path, source: Path) -> dict[str, int]:
+    raw = source.resolve().read_bytes()
+    if len(raw) > RSS_MAX_BYTES:
+        raise RuntimeError("OPML 超過 5 MB 安全上限。")
+    if b"<!DOCTYPE" in raw[:4096].upper() or b"<!ENTITY" in raw[:4096].upper():
+        raise RuntimeError("OPML 含不允許的 DTD／ENTITY。")
+    try:
+        document = ET.fromstring(raw)
+    except ET.ParseError as exc:
+        raise RuntimeError(f"OPML 不是有效 XML：{exc}") from exc
+    totals = {"added": 0, "existing": 0, "failed": 0}
+    for outline in document.iter("outline"):
+        url = str(outline.attrib.get("xmlUrl") or "").strip()
+        if not url:
+            continue
+        try:
+            subscription, _ = add_rss_subscription(
+                root,
+                url,
+                name=str(outline.attrib.get("title") or outline.attrib.get("text") or ""),
+                keywords=csv_values(str(outline.attrib.get("vidbeeKeywords") or "")),
+                tags=csv_values(str(outline.attrib.get("vidbeeTags") or "")),
+                latest_only=str(outline.attrib.get("vidbeeLatestOnly") or "false").lower() == "true",
+            )
+            if str(outline.attrib.get("vidbeeEnabled") or "true").lower() == "false":
+                update_rss_subscription(root, str(subscription["id"]), enabled=False)
+            totals["added"] += 1
+        except RuntimeError as exc:
+            if "已經訂閱" in str(exc):
+                totals["existing"] += 1
+            else:
+                totals["failed"] += 1
+    return totals
 
 
 def annotate_rss_manifest(root: Path, manifest_path: Path, item: dict[str, Any]) -> None:
@@ -2883,7 +3419,7 @@ def annotate_rss_manifest(root: Path, manifest_path: Path, item: dict[str, Any])
         "item_id": item["id"],
         "title": item["title"],
         "published": item.get("published") or "",
-        "source_url": item.get("source_url") or item["url"],
+        "source_url": public_url(str(item.get("source_url") or item["url"])),
     }
     tags = [str(tag) for tag in item.get("tags", []) if str(tag).strip()]
     if tags:
@@ -2898,6 +3434,100 @@ def annotate_rss_manifest(root: Path, manifest_path: Path, item: dict[str, Any])
             connection.close()
 
 
+def recover_stale_rss_items(state: dict[str, Any], now: float | None = None) -> int:
+    current = time.time() if now is None else now
+    recovered = 0
+    for item in state["items"]:
+        if item.get("status") != "processing":
+            continue
+        started = feed_timestamp(str(item.get("processing_started_at") or ""))
+        if not started or current - started >= RSS_LEASE_SECONDS:
+            item["status"] = "failed"
+            item["last_error"] = "前次程序中斷，processing lease 已逾時。"
+            item["next_retry_at"] = rss_now()
+            item.pop("processing_started_at", None)
+            recovered += 1
+    return recovered
+
+
+def select_rss_pending(
+    state: dict[str, Any], eligible_states: set[str], limit: int, retry_failed: bool, now: float | None = None
+) -> list[dict[str, Any]]:
+    current = time.time() if now is None else now
+    candidates = []
+    for item in state["items"]:
+        status = str(item.get("status") or "")
+        if status not in eligible_states:
+            continue
+        if status == "failed":
+            if not retry_failed or int(item.get("attempts") or 0) >= RSS_MAX_ATTEMPTS:
+                continue
+            due = feed_timestamp(str(item.get("next_retry_at") or ""))
+            if due and due > current:
+                continue
+        candidates.append(item)
+    groups: dict[str, list[dict[str, Any]]] = {}
+    for item in candidates:
+        groups.setdefault(str(item.get("subscription_id") or ""), []).append(item)
+    feeds = list(groups)
+    if not feeds:
+        return []
+    cursor = int(state.get("scheduler_cursor") or 0) % len(feeds)
+    feeds = feeds[cursor:] + feeds[:cursor]
+    selected: list[dict[str, Any]] = []
+    while groups and len(selected) < limit:
+        for feed_id in list(feeds):
+            queue = groups.get(feed_id) or []
+            if queue and len(selected) < limit:
+                selected.append(queue.pop(0))
+            if not queue:
+                groups.pop(feed_id, None)
+                feeds.remove(feed_id)
+    state["scheduler_cursor"] = (cursor + 1) % max(len(set(str(i.get("subscription_id") or "") for i in candidates)), 1)
+    return selected
+
+
+def rss_failure_policy(error: str, attempts: int) -> tuple[str, str, str]:
+    lowered = error.casefold()
+    permanent = any(
+        marker in lowered
+        for marker in ("http 401", "http 403", "invalid api key", "額度不足", "quota", "insufficient")
+    )
+    if permanent or attempts >= RSS_MAX_ATTEMPTS:
+        return "dead-letter", "", "permanent" if permanent else "retry-exhausted"
+    wait = RSS_RETRY_BASE_SECONDS * (2 ** max(attempts - 1, 0))
+    next_retry = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() + wait))
+    return "failed", next_retry, "transient"
+
+
+def send_rss_notification(webhook: str, event: str, item: dict[str, Any]) -> None:
+    url = require_http_url(webhook, "RSS 通知 Webhook")
+    body = json.dumps(
+        {
+            "event": event,
+            "item_id": item.get("id"),
+            "subscription_id": item.get("subscription_id"),
+            "title": item.get("title"),
+            "source_url": public_url(str(item.get("source_url") or item.get("url") or "")),
+            "attempts": int(item.get("attempts") or 0),
+            "error": str(item.get("last_error") or "")[:500],
+        },
+        ensure_ascii=False,
+    ).encode("utf-8")
+    request = urllib.request.Request(
+        url,
+        data=body,
+        headers={"Content-Type": "application/json", "User-Agent": USER_AGENT},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=15) as response:
+            response.read(1024)
+    except Exception as exc:
+        detail = sanitize_public_urls(str(exc))
+        raise RuntimeError(f"RSS 通知失敗（{public_url(url)}）：{detail}") from exc
+
+
 def process_rss_queue(args: argparse.Namespace) -> dict[str, int]:
     if args.rss_max_items <= 0:
         raise ValueError("--rss-max-items 必須大於 0。")
@@ -2908,13 +3538,20 @@ def process_rss_queue(args: argparse.Namespace) -> dict[str, int]:
         )
     root = args.root.resolve()
     state = load_rss_state(root)
+    recovered = recover_stale_rss_items(state)
     eligible = {"queued"}
     if not (args.dry_run or args.local_only):
         eligible.add("local-only")
     if args.rss_retry_failed:
         eligible.add("failed")
-    pending = [item for item in state["items"] if item.get("status") in eligible][: args.rss_max_items]
-    results = {"selected": len(pending), "completed": 0, "local-only": 0, "previewed": 0, "failed": 0}
+    pending = select_rss_pending(state, eligible, args.rss_max_items, bool(args.rss_retry_failed))
+    results = {
+        "selected": len(pending), "completed": 0, "local-only": 0,
+        "previewed": 0, "failed": 0, "dead-letter": 0, "recovered": recovered,
+    }
+    if recovered:
+        save_rss_state(root, state)
+    webhook = str(getattr(args, "rss_webhook", None) or os.getenv("RSS_NOTIFY_WEBHOOK", "")).strip()
     for item in pending:
         item_args = argparse.Namespace(**vars(args))
         item_args.url = item["url"]
@@ -2922,8 +3559,13 @@ def process_rss_queue(args: argparse.Namespace) -> dict[str, int]:
         item_args.url_file = None
         item_args.vidbee_sidecar = True
         item_args.rss_item = True
+        item_args.rss_title = item.get("title") or ""
         item["attempts"] = int(item.get("attempts") or 0) + 1
-        item["last_attempt_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        item["last_attempt_at"] = rss_now()
+        item["processing_started_at"] = item["last_attempt_at"]
+        item["status"] = "processing"
+        save_rss_state(root, state)
+        notify_event = ""
         try:
             manifest_path = run_pipeline(item_args)
             annotate_rss_manifest(root, manifest_path, item)
@@ -2933,68 +3575,179 @@ def process_rss_queue(args: argparse.Namespace) -> dict[str, int]:
             item["last_error"] = ""
             if status == "completed":
                 item["status"] = "completed"
+                item["completed_at"] = rss_now()
                 results["completed"] += 1
+                notify_event = "completed"
             elif status == "local-only":
                 item["status"] = "local-only"
                 results["local-only"] += 1
+                notify_event = "local-only"
             else:
+                item["status"] = "queued"
+                if args.dry_run:
+                    item["attempts"] = max(0, int(item["attempts"]) - 1)
                 item["last_status"] = status
                 results["previewed"] += 1
         except Exception as exc:
-            item["status"] = "failed"
-            item["last_error"] = str(exc).replace(str(item["url"]), public_url(str(item["url"])))
-            results["failed"] += 1
+            error = sanitize_public_urls(str(exc))
+            item["last_error"] = error
+            item["status"], item["next_retry_at"], item["error_class"] = rss_failure_policy(
+                error, int(item["attempts"])
+            )
+            results[item["status"]] += 1
+            notify_event = str(item["status"])
         finally:
+            item.pop("processing_started_at", None)
+            if webhook and notify_event:
+                try:
+                    send_rss_notification(webhook, notify_event, item)
+                    item["notification_error"] = ""
+                except RuntimeError as exc:
+                    item["notification_error"] = str(exc)
             save_rss_state(root, state)
     return results
+
+
+def rss_task_name(root: Path) -> str:
+    return f"VidBee-RSS-{job_key(str(root.resolve()))}"
+
+
+def install_rss_task(root: Path, minutes: int, process: bool) -> str:
+    if os.name != "nt":
+        raise RuntimeError("背景排程安裝目前使用 Windows 工作排程器，只支援 Windows。")
+    if minutes < 5:
+        raise ValueError("RSS 背景排程間隔不得短於 5 分鐘。")
+    script = secure_rss_directory(root) / "scheduled-refresh.cmd"
+    command = [sys.executable, str(Path(__file__).resolve()), "--root", str(root.resolve()), "--rss-refresh"]
+    if process:
+        command.extend(["--rss-process", "--rss-retry-failed", "--allow-batch-cloud"])
+    write_text(script, "@echo off\n" + subprocess.list2cmdline(command) + "\n")
+    run_external(
+        [
+            "schtasks.exe", "/Create", "/F", "/TN", rss_task_name(root),
+            "/SC", "MINUTE", "/MO", str(minutes), "/TR", f'"{script}"',
+        ]
+    )
+    return rss_task_name(root)
+
+
+def remove_rss_task(root: Path) -> str:
+    if os.name != "nt":
+        raise RuntimeError("背景排程移除目前只支援 Windows。")
+    name = rss_task_name(root)
+    run_external(["schtasks.exe", "/Delete", "/F", "/TN", name])
+    return name
 
 
 def rss_requested(args: argparse.Namespace) -> bool:
     return bool(
         args.rss_add
         or args.rss_remove
+        or args.rss_update
+        or args.rss_enable
+        or args.rss_disable
+        or args.rss_requeue
         or args.rss_list
+        or args.rss_list_items
         or args.rss_refresh
         or args.rss_process
         or args.rss_watch is not None
-        or args.rss_name
-        or args.rss_keywords
-        or args.rss_tags
-        or args.rss_latest_only
+        or args.rss_name is not None
+        or args.rss_keywords is not None
+        or args.rss_tags is not None
+        or args.rss_latest_only is not None
         or args.rss_retry_failed
         or args.rss_max_items != 1
+        or args.rss_cleanup_days is not None
+        or args.rss_import_opml
+        or args.rss_export_opml
+        or args.rss_webhook
+        or args.rss_task_install is not None
+        or args.rss_task_process
+        or args.rss_task_remove
     )
 
 
 def run_rss_command(args: argparse.Namespace) -> int:
     if args.url or args.video or args.url_file:
         raise ValueError("RSS 指令不可與 --url、--video 或 --url-file 同時使用。")
-    if (args.rss_name or args.rss_keywords or args.rss_tags or args.rss_latest_only) and not args.rss_add:
-        raise ValueError("--rss-name／--rss-keywords／--rss-tags／--rss-latest-only 只可搭配 --rss-add。")
-    if (args.rss_retry_failed or args.rss_max_items != 1) and not args.rss_process:
+    edits = any(value is not None for value in (args.rss_name, args.rss_keywords, args.rss_tags, args.rss_latest_only))
+    if edits and not (args.rss_add or args.rss_update):
+        raise ValueError("RSS 名稱／關鍵字／標籤／latest-only 設定只可搭配 --rss-add 或 --rss-update。")
+    if args.rss_update and not edits:
+        raise ValueError("--rss-update 至少要搭配一個要修改的設定。")
+    if args.rss_list_items and not args.rss_list:
+        raise ValueError("--rss-list-items 只可搭配 --rss-list。")
+    if args.rss_list and args.rss_item_limit <= 0:
+        raise ValueError("--rss-item-limit 必須大於 0。")
+    if args.rss_refresh_workers <= 0:
+        raise ValueError("--rss-refresh-workers 必須大於 0。")
+    if (args.rss_retry_failed or args.rss_max_items != 1 or args.rss_webhook) and not (args.rss_process or args.rss_watch):
         raise ValueError("--rss-retry-failed／--rss-max-items 只可搭配 --rss-process。")
+    if args.rss_task_process and (args.rss_task_install is None or not args.allow_batch_cloud):
+        raise ValueError("背景雲端處理必須同時使用 --rss-task-install、--rss-task-process 與 --allow-batch-cloud。")
     root = args.root.resolve()
     root.mkdir(parents=True, exist_ok=True)
+    project_env = Path(__file__).resolve().parent / ".env"
+    load_dotenv(project_env)
+    if (root / ".env").resolve() != project_env.resolve():
+        load_dotenv(root / ".env")
     exit_code = 0
 
     if args.rss_remove:
-        name, removed = remove_rss_subscription(root, args.rss_remove)
+        with rss_writer_lock(root):
+            name, removed = remove_rss_subscription(root, args.rss_remove)
         print(f"已移除 RSS 訂閱：{name}（移除 {removed} 筆佇列紀錄；既有 jobs 保留）")
     if args.rss_add:
-        subscription, counts = add_rss_subscription(
-            root,
-            args.rss_add,
-            name=args.rss_name,
-            keywords=csv_values(args.rss_keywords),
-            tags=csv_values(args.rss_tags),
-            latest_only=args.rss_latest_only,
-        )
+        with rss_writer_lock(root):
+            subscription, counts = add_rss_subscription(
+                root,
+                args.rss_add,
+                name=args.rss_name or "",
+                keywords=csv_values(args.rss_keywords or ""),
+                tags=csv_values(args.rss_tags or ""),
+                latest_only=bool(args.rss_latest_only),
+            )
         print(
             f"已加入 RSS：{subscription['name']}（ID {subscription['id']}；"
             f"queued {counts['queued']}、filtered {counts['filtered']}、skipped {counts['skipped']}）"
         )
+    if args.rss_update:
+        with rss_writer_lock(root):
+            subscription = update_rss_subscription(
+                root,
+                args.rss_update,
+                name=args.rss_name,
+                keywords=csv_values(args.rss_keywords) if args.rss_keywords is not None else None,
+                tags=csv_values(args.rss_tags) if args.rss_tags is not None else None,
+                latest_only=args.rss_latest_only,
+            )
+        print(f"已更新 RSS：{subscription['name']}（ID {subscription['id']}）")
+    for subscription_id, enabled in ((args.rss_enable, True), (args.rss_disable, False)):
+        if subscription_id:
+            with rss_writer_lock(root):
+                subscription = update_rss_subscription(root, subscription_id, enabled=enabled)
+            print(f"已{'啟用' if enabled else '暫停'} RSS：{subscription['name']}")
+    if args.rss_requeue:
+        with rss_writer_lock(root):
+            item = requeue_rss_item(root, args.rss_requeue)
+        print(f"已重排 RSS 項目：{item['id']}")
+    if args.rss_import_opml:
+        with rss_writer_lock(root):
+            totals = import_rss_opml(root, args.rss_import_opml)
+        print(f"OPML 匯入：added {totals['added']}、existing {totals['existing']}、failed {totals['failed']}")
+        if totals["failed"]:
+            exit_code = 1
+    if args.rss_export_opml:
+        count = export_rss_opml(root, args.rss_export_opml)
+        print(f"OPML 匯出：{count} 個訂閱 → {args.rss_export_opml.resolve()}")
+    if args.rss_cleanup_days is not None:
+        with rss_writer_lock(root):
+            removed = cleanup_rss_state(root, args.rss_cleanup_days)
+        print(f"RSS 清理：移除 {removed} 筆過期終態紀錄。")
     if args.rss_refresh:
-        totals = refresh_rss(root)
+        with rss_writer_lock(root):
+            totals = refresh_rss(root, args.rss_refresh_workers)
         print(
             f"RSS 刷新：{totals['feeds']} feeds、queued {totals['queued']}、"
             f"filtered {totals['filtered']}、skipped {totals['skipped']}、failed {totals['failed']}"
@@ -3002,12 +3755,14 @@ def run_rss_command(args: argparse.Namespace) -> int:
         if totals["failed"]:
             exit_code = 1
     if args.rss_process and args.rss_watch is None:
-        results = process_rss_queue(args)
+        with rss_writer_lock(root):
+            results = process_rss_queue(args)
         print(
             f"RSS 處理：selected {results['selected']}、completed {results['completed']}、"
-            f"local-only {results['local-only']}、previewed {results['previewed']}、failed {results['failed']}"
+            f"local-only {results['local-only']}、previewed {results['previewed']}、"
+            f"failed {results['failed']}、dead-letter {results['dead-letter']}"
         )
-        if results["failed"]:
+        if results["failed"] or results["dead-letter"]:
             exit_code = 1
     if args.rss_watch is not None:
         if args.rss_watch < 60:
@@ -3015,20 +3770,29 @@ def run_rss_command(args: argparse.Namespace) -> int:
         print(f"RSS 監看中：每 {args.rss_watch} 秒刷新；Ctrl+C 停止。")
         try:
             while True:
-                totals = refresh_rss(root)
+                with rss_writer_lock(root):
+                    totals = refresh_rss(root, args.rss_refresh_workers)
                 print(
                     f"RSS 刷新：queued {totals['queued']}、failed {totals['failed']}"
                 )
                 if args.rss_process:
-                    results = process_rss_queue(args)
+                    with rss_writer_lock(root):
+                        results = process_rss_queue(args)
                     print(
                         f"RSS 處理：completed {results['completed']}、failed {results['failed']}"
                     )
                 time.sleep(args.rss_watch)
         except KeyboardInterrupt:
             print("RSS 監看已停止。")
+    if args.rss_task_install is not None:
+        with rss_writer_lock(root):
+            name = install_rss_task(root, args.rss_task_install, args.rss_task_process)
+        print(f"已安裝背景排程：{name}（{'含雲端處理' if args.rss_task_process else '只刷新本機佇列'}）")
+    if args.rss_task_remove:
+        name = remove_rss_task(root)
+        print(f"已移除背景排程：{name}")
     if args.rss_list:
-        print("\n".join(rss_status(root)))
+        print("\n".join(rss_status(root, args.rss_item_limit, args.rss_list_items)))
     return exit_code
 
 
@@ -3039,7 +3803,32 @@ def self_test() -> None:
     assert hash_distance("0000", "0000") == 0
     assert hash_distance("0000", "1111") == 4
     assert limit_items([1, 2, 3], 1) == [1]
+    eight_frames = limit_items(list(range(100)), 8)
+    twenty_frames = limit_items(list(range(100)), 20)
+    assert set(eight_frames) <= set(twenty_frames)
+    assert twenty_frames == sorted(twenty_frames)
+    assert (twenty_frames[0], twenty_frames[-1]) == (0, 99)
+    assert vision_frame_limit(60) == 8
+    assert vision_frame_limit(656.636) == 22
+    assert vision_frame_limit(3600) == 40
+    assert vision_frame_limit(3600, 20) == 20
     assert parse_json_object("```json\n{\"ok\": true}\n```")["ok"] is True
+    captured_payload: dict[str, Any] = {}
+    original_post_json = post_json
+    original_minimax_endpoint = minimax_endpoint
+
+    def capture_minimax_payload(url: str, headers: dict[str, str], body: bytes, timeout: int) -> dict[str, Any]:
+        captured_payload.update(json.loads(body.decode("utf-8")))
+        return {"choices": [{"message": {"content": "{}"}}]}
+
+    globals()["post_json"] = capture_minimax_payload
+    globals()["minimax_endpoint"] = lambda: "https://example.invalid/v1/chat/completions"
+    try:
+        minimax_chat([{"role": "user", "content": "test"}], "key", "MiniMax-M3", thinking="disabled")
+    finally:
+        globals()["post_json"] = original_post_json
+        globals()["minimax_endpoint"] = original_minimax_endpoint
+    assert captured_payload["thinking"] == {"type": "disabled"}
     timeline = merge_timeline(
         {"segments": [{"start": 3, "end": 4, "text": "語音"}]},
         [{"timestamp": 1, "screen_type": "畫面"}],
@@ -3053,6 +3842,7 @@ def self_test() -> None:
         <pubDate>Mon, 31 Aug 2026 01:00:00 GMT</pubDate></item>
       <item><guid>ep-2</guid><title>Python news</title><link>https://example.com/ep-2</link>
         <pubDate>Tue, 01 Sep 2026 01:00:00 GMT</pubDate>
+        <content url="https://cdn.example.com/cover.jpg" type="image/jpeg" />
         <enclosure url="https://cdn.example.com/ep-2.mp3" type="audio/mpeg" /></item>
     </channel></rss>"""
     parsed_rss = parse_feed_xml(rss_fixture, "https://example.com/feed.xml")
@@ -3068,6 +3858,11 @@ def self_test() -> None:
     parsed_atom = parse_feed_xml(atom_fixture, "https://example.com/atom.xml")
     assert parsed_atom["items"][0]["url"] == "https://cdn.example.com/video.mp4"
     assert parsed_atom["items"][0]["source_url"] == "https://example.com/watch/1"
+    image_fixture = b"""<rss><channel><title>Images</title><item><guid>x</guid><title>x</title>
+      <link>https://example.com/watch/x</link>
+      <enclosure url="https://example.com/cover.jpg" type="image/jpeg" />
+    </item></channel></rss>"""
+    assert parse_feed_xml(image_fixture, "https://example.com/feed")["items"][0]["url"] == "https://example.com/watch/x"
     try:
         parse_feed_xml(b"<!DOCTYPE rss><rss />", "https://example.com/feed")
         raise AssertionError("RSS DTD 必須拒絕")
@@ -3080,6 +3875,9 @@ def self_test() -> None:
         pass
     secret_url = "https://user:pass@example.com/media.mp3?token=secret#part"
     assert public_url(secret_url) == "https://example.com/media.mp3"
+    youtube_url = "https://www.youtube.com/watch?v=abcDEF_1234&token=secret#part"
+    assert public_url(youtube_url) == "https://www.youtube.com/watch?v=abcDEF_1234"
+    assert "secret" not in sanitize_public_urls(f"failed {secret_url}")
     assert "secret" not in redact_values(f"download {secret_url}", {secret_url})
     state = {"schema_version": 1, "subscriptions": [], "items": []}
     subscription = {
@@ -3089,7 +3887,13 @@ def self_test() -> None:
         "latest_only": True,
     }
     queued = queue_rss_items(state, subscription, parsed_rss["items"])
-    assert queued == {"queued": 1, "filtered": 1, "skipped": 0, "duplicate": 0, "existing": 0}
+    assert queued == {
+        "queued": 1, "filtered": 1, "skipped": 0,
+        "duplicate": 0, "existing": 0, "updated": 0,
+    }
+    changed = [dict(parsed_rss["items"][0], title="Python news revised")]
+    assert queue_rss_items(state, subscription, changed)["updated"] == 1
+    assert next(item for item in state["items"] if item["entry_id"] == "ep-2")["title"] == "Python news revised"
     extra = [
         {"id": "ep-3", "title": "Python older", "url": "https://example.com/ep-3", "source_url": "https://example.com/ep-3", "published": ""},
         {"id": "ep-4", "title": "Python oldest", "url": "https://example.com/ep-4", "source_url": "https://example.com/ep-4", "published": ""},
@@ -3098,6 +3902,184 @@ def self_test() -> None:
     assert queued["queued"] == 1 and queued["skipped"] == 1
     assert queue_rss_items(state, subscription, extra)["existing"] == 2
     assert state["items"][0]["tags"] == ["技術"] and ".mp3" in MEDIA_EXTENSIONS
+    fair_state = {
+        "schema_version": 1,
+        "scheduler_cursor": 0,
+        "subscriptions": [],
+        "items": [
+            {"id": "a1", "subscription_id": "a", "status": "queued"},
+            {"id": "a2", "subscription_id": "a", "status": "queued"},
+            {"id": "b1", "subscription_id": "b", "status": "queued"},
+        ],
+    }
+    assert [item["id"] for item in select_rss_pending(fair_state, {"queued"}, 2, False)] == ["a1", "b1"]
+    stale_state = {
+        "items": [{
+            "status": "processing",
+            "processing_started_at": time.strftime(
+                "%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - RSS_LEASE_SECONDS - 1)
+            ),
+        }]
+    }
+    assert recover_stale_rss_items(stale_state) == 1 and stale_state["items"][0]["status"] == "failed"
+    assert rss_failure_policy("temporary", 1)[0] == "failed"
+    assert rss_failure_policy("API HTTP 401", 1)[0] == "dead-letter"
+    assert rss_failure_policy("temporary", RSS_MAX_ATTEMPTS)[0] == "dead-letter"
+
+    with tempfile.TemporaryDirectory() as rss_temp:
+        rss_root = Path(rss_temp)
+        saved_state = {
+            "schema_version": 1,
+            "scheduler_cursor": 0,
+            "subscriptions": [{
+                "id": "feed", "url": "https://example.com/feed?token=private",
+                "name": "Feed", "enabled": True, "keywords": [], "tags": [], "latest_only": False,
+            }],
+            "items": [{
+                "id": "old", "subscription_id": "feed", "status": "completed",
+                "discovered_at": "2020-01-01T00:00:00Z",
+            }, {
+                "id": "keep", "subscription_id": "feed", "status": "failed",
+                "discovered_at": "2020-01-01T00:00:00Z",
+            }],
+        }
+        save_rss_state(rss_root, saved_state)
+        assert cleanup_rss_state(rss_root, 90) == 1
+        opml_path = rss_root / "subscriptions.opml"
+        assert export_rss_opml(rss_root, opml_path) == 1 and "xmlUrl" in opml_path.read_text(encoding="utf-8")
+        original_fetch_rss = fetch_rss
+        globals()["fetch_rss"] = lambda *args, **kwargs: {
+            "title": "Feed", "items": parsed_rss["items"], "etag": "", "last_modified": "",
+        }
+        try:
+            imported = import_rss_opml(rss_root / "imported", opml_path)
+        finally:
+            globals()["fetch_rss"] = original_fetch_rss
+        assert imported == {"added": 1, "existing": 0, "failed": 0}
+        with rss_writer_lock(rss_root):
+            try:
+                with rss_writer_lock(rss_root, timeout=0):
+                    raise AssertionError("RSS lock 不可重入")
+            except RuntimeError as exc:
+                assert "寫入程序" in str(exc)
+        rss_state_path(rss_root).write_text("{", encoding="utf-8")
+        try:
+            load_rss_state(rss_root)
+            raise AssertionError("損壞的 RSS 狀態不可靜默接受")
+        except RuntimeError as exc:
+            assert "備份" in str(exc)
+
+        captured_task: list[list[str]] = []
+        original_run_external = run_external
+        globals()["run_external"] = lambda command, **kwargs: captured_task.append(command) or ""
+        try:
+            assert install_rss_task(rss_root / "task", 15, False).startswith("VidBee-RSS-")
+        finally:
+            globals()["run_external"] = original_run_external
+        task_script = rss_root / "task" / "rss" / "scheduled-refresh.cmd"
+        assert captured_task and "--rss-process" not in task_script.read_text(encoding="utf-8")
+
+    with tempfile.TemporaryDirectory() as failure_temp:
+        failure_root = Path(failure_temp)
+        failure_state = {
+            "schema_version": 1,
+            "scheduler_cursor": 0,
+            "subscriptions": [{"id": "feed", "url": "https://example.com/feed", "name": "Feed"}],
+            "items": [{
+                "id": "item", "subscription_id": "feed", "entry_id": "entry", "title": "Item",
+                "url": "https://example.com/media.mp3", "source_url": "https://example.com/item",
+                "status": "queued", "attempts": 0,
+            }],
+        }
+        save_rss_state(failure_root, failure_state)
+        original_run_pipeline = run_pipeline
+
+        def fail_after_claim(args: argparse.Namespace) -> Path:
+            assert load_rss_state(failure_root)["items"][0]["status"] == "processing"
+            raise RuntimeError("API HTTP 500")
+
+        globals()["run_pipeline"] = fail_after_claim
+        failure_args = argparse.Namespace(
+            rss_max_items=1, dry_run=False, local_only=False, allow_batch_cloud=True,
+            root=failure_root, rss_retry_failed=False, rss_webhook=None,
+        )
+        try:
+            failure_result = process_rss_queue(failure_args)
+            failure_args.rss_retry_failed = True
+            cooldown_result = process_rss_queue(failure_args)
+        finally:
+            globals()["run_pipeline"] = original_run_pipeline
+        failed_item = load_rss_state(failure_root)["items"][0]
+        assert failure_result["failed"] == 1 and failed_item["status"] == "failed"
+        assert failed_item["next_retry_at"] and cooldown_result["selected"] == 0
+
+    captured_webhook: dict[str, Any] = {}
+
+    class WebhookResponse:
+        def __enter__(self) -> "WebhookResponse":
+            return self
+
+        def __exit__(self, *args: Any) -> None:
+            return None
+
+        def read(self, size: int = -1) -> bytes:
+            return b"ok"
+
+    original_urlopen = urllib.request.urlopen
+
+    def capture_webhook(request: urllib.request.Request, timeout: int) -> WebhookResponse:
+        captured_webhook.update(json.loads(bytes(request.data or b"{}").decode("utf-8")))
+        return WebhookResponse()
+
+    urllib.request.urlopen = capture_webhook
+    try:
+        send_rss_notification(
+            "https://hooks.example.com/incoming?token=private",
+            "completed",
+            {"id": "item", "subscription_id": "feed", "title": "ok", "url": "https://x.test/a?token=private"},
+        )
+    finally:
+        urllib.request.urlopen = original_urlopen
+    assert captured_webhook["event"] == "completed" and "token=" not in captured_webhook["source_url"]
+
+    class FeedResponse:
+        headers = {"ETag": '"v2"', "Last-Modified": "Tue, 01 Sep 2026 01:00:00 GMT"}
+
+        def __enter__(self) -> "FeedResponse":
+            return self
+
+        def __exit__(self, *args: Any) -> None:
+            return None
+
+        def geturl(self) -> str:
+            return "https://example.com/feed.xml"
+
+        def read(self, size: int = -1) -> bytes:
+            return rss_fixture
+
+    fetch_calls = 0
+    fetch_headers: list[dict[str, str]] = []
+    waits: list[float] = []
+    original_sleep = time.sleep
+
+    def fetch_rate_limited(request: urllib.request.Request, timeout: int) -> FeedResponse:
+        nonlocal fetch_calls
+        fetch_calls += 1
+        fetch_headers.append(dict(request.header_items()))
+        if fetch_calls == 1:
+            raise urllib.error.HTTPError(
+                request.full_url, 429, "rate", {"Retry-After": "0"}, io.BytesIO(b"")
+            )
+        return FeedResponse()
+
+    urllib.request.urlopen = fetch_rate_limited
+    time.sleep = waits.append
+    try:
+        fetched = fetch_rss("https://example.com/feed.xml", etag='"v1"')
+    finally:
+        urllib.request.urlopen, time.sleep = original_urlopen, original_sleep
+    assert fetch_calls == 2 and waits == [0.0] and fetched["etag"] == '"v2"'
+    assert any(key.casefold() == "if-none-match" and value == '"v1"' for key, value in fetch_headers[0].items())
     try:
         process_rss_queue(
             argparse.Namespace(rss_max_items=1, dry_run=False, local_only=False, allow_batch_cloud=False)
@@ -3297,6 +4279,57 @@ def self_test() -> None:
     )
     assert checked["source_ids"] == ["SEG-000001"] and checked["source_timestamps"] == [1.0]
 
+    # 完整摘要少於五題時不能寫入快取或假裝完成；只重試一次。
+    original_chat = minimax_chat
+    summary_responses = iter(
+        [
+            {"short_summary": "bad", "review_qa": []},
+            {
+                "short_summary": "ok",
+                "review_qa": [
+                    {"question": f"q{i}", "answer": f"a{i}", "source_ids": []}
+                    for i in range(5)
+                ],
+            },
+        ]
+    )
+    globals()["minimax_chat"] = lambda *args, **kwargs: json.dumps(next(summary_responses))
+    try:
+        with tempfile.TemporaryDirectory() as temporary:
+            retried_summary = cached_minimax_summary(
+                Path(temporary), "contract", [], "key", "model", partial=False
+            )
+    finally:
+        globals()["minimax_chat"] = original_chat
+    assert len(retried_summary["review_qa"]) == 5
+
+    # 超長逐字稿的分段摘要必須真的並行；Barrier 在串行實作會逾時。
+    original_summary = cached_minimax_summary
+    summary_barrier = threading.Barrier(2)
+
+    def fake_summary(*args: Any, partial: bool, **kwargs: Any) -> dict[str, Any]:
+        if partial:
+            summary_barrier.wait(timeout=1)
+        return {"short_summary": str(args[1])}
+
+    globals()["cached_minimax_summary"] = fake_summary
+    try:
+        with tempfile.TemporaryDirectory() as temporary:
+            parallel_summary = create_summary(
+                [
+                    {"timestamp": 1, "type": "speech", "text": "a"},
+                    {"timestamp": 2, "type": "speech", "text": "b"},
+                ],
+                "key",
+                "model",
+                1,
+                Path(temporary),
+                workers=2,
+            )
+    finally:
+        globals()["cached_minimax_summary"] = original_summary
+    assert parallel_summary["processing"]["summary_chunk_count"] == 2
+
     try:
         run_batch(argparse.Namespace(dry_run=False, local_only=False, allow_batch_cloud=False))
         raise AssertionError("批次雲端必須要求明確旗標")
@@ -3305,33 +4338,136 @@ def self_test() -> None:
 
     # 併發回收後必須還原輸入順序，否則時間軸會跟錯圖。
     # 讓越前面的圖睡越久，完成順序必定反轉：沒排序就會被抓到。
-    count = 6
+    count = 8
+    vision_barrier = threading.Barrier(count)
     original_chat, original_data_url = minimax_chat, image_data_url
     globals()["image_data_url"] = lambda path: "data:image/jpeg;base64,x"
-    globals()["minimax_chat"] = lambda messages, *rest: (
-        lambda tag: (time.sleep((count - int(tag[3:])) * 0.02), json.dumps({"tag": tag}))[1]
-    )(messages[0]["content"][0]["text"].rsplit("：", 1)[-1])
+
+    def parallel_vision_chat(messages: list[dict[str, Any]], *args: Any, **kwargs: Any) -> str:
+        tag = messages[0]["content"][0]["text"].rsplit("：", 1)[-1]
+        vision_barrier.wait(timeout=5)
+        time.sleep((count - int(tag[3:])) * 0.02)
+        return json.dumps({"tag": tag})
+
+    globals()["minimax_chat"] = parallel_vision_chat
     try:
         observations = analyze_images(
             [{"timestamp": i, "path": f"f{i}.jpg", "ocr_text": f"OCR{i}"} for i in range(count)],
             "key",
             "model",
-            workers=4,
+            workers=8,
         )
     finally:
         globals()["minimax_chat"], globals()["image_data_url"] = original_chat, original_data_url
     assert [item["tag"] for item in observations] == [f"OCR{i}" for i in range(count)]
     assert [item["timestamp"] for item in observations] == list(range(count))
 
+    # Groq 與 MiniMax 是不同供應商，兩個階段應同時啟動。
+    cloud_barrier = threading.Barrier(2)
+
+    def cloud_stage(value: str) -> str:
+        cloud_barrier.wait(timeout=1)
+        return value
+
+    assert run_parallel_stages(
+        lambda: cloud_stage("transcript"), lambda: cloud_stage("visual")
+    ) == ("transcript", "visual")
+
+    # 純色轉場沒有可分析內容，不應交給視覺模型自由補故事。
+    with tempfile.TemporaryDirectory() as temporary:
+        from PIL import Image
+
+        uniform = Path(temporary) / "uniform.png"
+        varied = Path(temporary) / "varied.png"
+        Image.new("RGB", (16, 16), (0, 1, 127)).save(uniform)
+        varied_image = Image.new("RGB", (16, 16), "black")
+        varied_image.paste("white", (8, 0, 16, 16))
+        varied_image.save(varied)
+        assert uniform_image_observation(uniform)["screen_type"] == "uniform_frame"
+        assert uniform_image_observation(varied) is None
+
+    # 每張圖的 MiniMax 結果各自落盤；重跑不再呼叫已成功的圖片。
+    with tempfile.TemporaryDirectory() as temporary:
+        vision_root = Path(temporary)
+        image = vision_root / "frame.jpg"
+        image.write_bytes(b"frame")
+        original_chat, original_data_url = minimax_chat, image_data_url
+        globals()["image_data_url"] = lambda path: "data:image/jpeg;base64,x"
+        globals()["minimax_chat"] = lambda *args, **kwargs: json.dumps({"screen_type": "slide"})
+        try:
+            first = analyze_images(
+                [{"timestamp": 1, "path": str(image), "ocr_text": "OCR"}],
+                "key",
+                "model",
+                cache_dir=vision_root / "cache",
+            )
+
+            def unexpected_chat(*args: Any, **kwargs: Any) -> str:
+                raise AssertionError("視覺快取命中時不應呼叫 MiniMax")
+
+            globals()["minimax_chat"] = unexpected_chat
+            second = analyze_images(
+                [{"timestamp": 1, "path": str(image), "ocr_text": "OCR"}],
+                "key",
+                "model",
+                cache_dir=vision_root / "cache",
+            )
+        finally:
+            globals()["minimax_chat"], globals()["image_data_url"] = original_chat, original_data_url
+        assert first == second
+
     assert flatten_text({"a": ["x", {"b": "y"}]}) == "x y"
 
     # 完成標記要綁設定：換了 --frame-interval 就必須重抽，沿用舊截圖會讓時間戳錯位
     with tempfile.TemporaryDirectory() as temporary:
         marker = Path(temporary) / ".complete"
+        source = Path(temporary) / "source.mp4"
+        source.write_bytes(b"source")
         assert not marker_matches(marker, "interval=10")  # 還沒有標記
         write_text(marker, "interval=10")
         assert marker_matches(marker, "interval=10")
         assert not marker_matches(marker, "interval=15")  # 設定變了
+        assert marker_matches_or_upgradable(marker, "new", "interval=10", source)
+        newer = marker.stat().st_mtime_ns + 1_000_000_000
+        os.utime(source, ns=(newer, newer))
+        assert not marker_matches_or_upgradable(marker, "new", "interval=10", source)
+
+    # ffprobe 與畫面候選都綁來源指紋／設定；沒變就重用，檔案改了就失效。
+    with tempfile.TemporaryDirectory() as temporary:
+        cache_root = Path(temporary)
+        video = cache_root / "video.bin"
+        video.write_bytes(b"a")
+        probe_cache = cache_root / "probe.json"
+        original_run, original_require = run_external, require_tool
+        probe_calls = 0
+
+        def fake_probe(*args: Any, **kwargs: Any) -> str:
+            nonlocal probe_calls
+            probe_calls += 1
+            return json.dumps({"format": {"duration": "1"}, "streams": []})
+
+        globals()["run_external"], globals()["require_tool"] = fake_probe, lambda name: name
+        try:
+            assert probe_video(video, probe_cache)["format"]["duration"] == "1"
+            assert probe_video(video, probe_cache)["format"]["duration"] == "1"
+            video.write_bytes(b"changed")
+            assert probe_video(video, probe_cache)["format"]["duration"] == "1"
+        finally:
+            globals()["run_external"], globals()["require_tool"] = original_run, original_require
+        assert probe_calls == 2
+
+        frame = cache_root / "frame.jpg"
+        frame.write_bytes(b"frame")
+        config = {"frame_interval": 10, "ocr": False}
+        key = frame_candidate_cache_key(video, config)
+        frame_cache = cache_root / "frames.json"
+        write_json(
+            frame_cache,
+            {"cache_key": key, "frames": [{"path": str(frame)}], "meta": {"method": "test"}},
+        )
+        assert reuse_frame_candidates(frame_cache, key) is not None
+        frame.unlink()
+        assert reuse_frame_candidates(frame_cache, key) is None
 
     assert unpack_vector(pack_vector([1.0, -0.5, 0.25])).tolist() == [1.0, -0.5, 0.25]
     assert abs(cosine([1.0, 0.0], [1.0, 0.0]) - 1.0) < 1e-6
@@ -3378,6 +4514,28 @@ def self_test() -> None:
                 assert migrated.execute("SELECT count(*) FROM vectors").fetchone()[0] == 2
             finally:
                 migrated.close()
+
+    # 現行 vectors 以文字 hash 共用；清理失敗工作不可再使用舊 event_id 欄位。
+    with tempfile.TemporaryDirectory() as temporary:
+        failed_root = Path(temporary)
+        failed_job = failed_root / "jobs" / "failed-job"
+        failed_job.mkdir(parents=True)
+        write_json(failed_job / "manifest.json", {"status": "failed"})
+        connection = index_connection(failed_root)
+        try:
+            connection.execute(
+                "INSERT INTO videos VALUES ('failed-job', '', '', 'failed', 0, '', '[]')"
+            )
+            connection.execute("INSERT INTO events VALUES ('failed-job', 0, 'speech', 'x')")
+            connection.execute("INSERT INTO index_state VALUES ('failed-job', 'x', 1)")
+            connection.execute("INSERT INTO vectors VALUES ('h1', 'm', 1, x'00')")
+            assert index_job(connection, failed_job) == 0
+            assert connection.execute("SELECT count(*) FROM videos").fetchone()[0] == 0
+            assert connection.execute("SELECT count(*) FROM events").fetchone()[0] == 0
+            assert connection.execute("SELECT count(*) FROM index_state").fetchone()[0] == 0
+            assert connection.execute("SELECT count(*) FROM vectors").fetchone()[0] == 1
+        finally:
+            connection.close()
     with tempfile.TemporaryDirectory() as temporary:
         index_root = Path(temporary)
         fake_job = index_root / "jobs" / "abc123456789"
@@ -3404,6 +4562,13 @@ def self_test() -> None:
         assert search_index(index_root, "完全不相干的字串", 10) == []
         assert search_index(index_root, 'a-b "c OR d', 10) == []  # FTS5 運算子不可炸
         assert build_index(index_root)[1:] == (1, 4)  # 重跑不重複灌
+        indexed = index_connection(index_root)
+        try:
+            changes = indexed.total_changes
+            assert index_job(indexed, fake_job) == 4
+            assert indexed.total_changes == changes  # 內容沒變時不可 DELETE + INSERT
+        finally:
+            indexed.close()
 
         # 短於 3 字元的查詢 trigram 一定落空，必須自動回退全表掃描
         short = search_index(index_root, "畫面", 10)
@@ -3444,18 +4609,51 @@ def parse_args() -> argparse.Namespace:
     rss = parser.add_argument_group("RSS 訂閱")
     rss.add_argument("--rss-add", metavar="FEED_URL", help="加入 RSS/Atom Feed，並立即把新項目排入本機佇列")
     rss.add_argument("--rss-remove", metavar="ID", help="移除訂閱與佇列紀錄；不刪除既有 jobs")
+    rss.add_argument("--rss-update", metavar="ID", help="修改既有訂閱的名稱、關鍵字、標籤或 latest-only")
+    rss.add_argument("--rss-enable", metavar="ID", help="啟用既有訂閱")
+    rss.add_argument("--rss-disable", metavar="ID", help="暫停既有訂閱")
+    rss.add_argument("--rss-requeue", metavar="ITEM_ID", help="將 failed/dead-letter 項目重排並清除嘗試次數")
     rss.add_argument("--rss-list", action="store_true", help="列出訂閱與佇列狀態")
+    rss.add_argument("--rss-list-items", action="store_true", help="--rss-list 額外列出一般項目明細")
+    rss.add_argument("--rss-item-limit", type=int, default=20, help="項目明細筆數上限；預設 20")
     rss.add_argument("--rss-refresh", action="store_true", help="立即刷新所有已啟用訂閱")
+    rss.add_argument("--rss-refresh-workers", type=int, default=4, help="Feed 抓取併發數，最多 4")
     rss.add_argument("--rss-process", action="store_true", help="將佇列交給既有 Groq→MiniMax 管線")
     rss.add_argument("--rss-watch", type=int, metavar="SECONDS", help="前景持續監看；間隔至少 60 秒")
-    rss.add_argument("--rss-name", default="", help="新增訂閱時指定顯示名稱")
-    rss.add_argument("--rss-keywords", default="", help="新增訂閱時設定逗號分隔標題關鍵字")
-    rss.add_argument("--rss-tags", default="", help="新增訂閱時設定逗號分隔標籤；完成後寫入分類")
-    rss.add_argument("--rss-latest-only", action="store_true", help="每次刷新只排入最新一個未見項目")
+    rss.add_argument("--rss-name", default=None, help="新增／修改訂閱顯示名稱")
+    rss.add_argument("--rss-keywords", default=None, help="新增／修改逗號分隔標題關鍵字；空字串可清除")
+    rss.add_argument("--rss-tags", default=None, help="新增／修改逗號分隔標籤；空字串可清除")
+    latest = rss.add_mutually_exclusive_group()
+    latest.add_argument(
+        "--rss-latest-only", dest="rss_latest_only", action="store_true", default=None,
+        help="每次刷新只排入最新一個未見項目",
+    )
+    latest.add_argument(
+        "--rss-all-items", dest="rss_latest_only", action="store_false",
+        help="關閉 latest-only，所有新項目都可排入",
+    )
     rss.add_argument("--rss-max-items", type=int, default=1, help="每次最多處理幾筆佇列；預設 1")
-    rss.add_argument("--rss-retry-failed", action="store_true", help="本次明確重試先前失敗項目")
+    rss.add_argument("--rss-retry-failed", action="store_true", help="重試已到冷卻時間的失敗項目；最多 3 次")
+    rss.add_argument("--rss-cleanup-days", type=int, metavar="DAYS", help="清除超過指定天數的完成／過濾紀錄")
+    rss.add_argument("--rss-import-opml", type=Path, metavar="FILE", help="從 OPML 匯入訂閱")
+    rss.add_argument("--rss-export-opml", type=Path, metavar="FILE", help="將訂閱匯出為 OPML")
+    rss.add_argument("--rss-webhook", default=None, help="完成或失敗時 POST 通知；也可用 RSS_NOTIFY_WEBHOOK")
+    rss.add_argument("--rss-task-install", type=int, metavar="MINUTES", help="安裝 Windows 背景刷新排程")
+    rss.add_argument("--rss-task-process", action="store_true", help="背景排程也跑雲端處理；需 --allow-batch-cloud")
+    rss.add_argument("--rss-task-remove", action="store_true", help="移除本專案的 Windows 背景排程")
     parser.add_argument("--chunk-seconds", type=int, default=900)
-    parser.add_argument("--workers", type=int, default=2, help="Groq 轉錄併發數，最多 4")
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=4,
+        help="Groq 與摘要的併發數，預設／最多 4；Groq 與 MiniMax 可同時執行",
+    )
+    parser.add_argument(
+        "--vision-workers",
+        type=int,
+        default=8,
+        help="MiniMax 畫面分析併發數，預設／最多 8",
+    )
     parser.add_argument("--language", default=None, help="逐字稿語言；auto 交給 Whisper 自動偵測")
     parser.add_argument(
         "--transcribe-backend",
@@ -3486,7 +4684,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--slide-extractor", choices=("native", "steipete"), default="native")
     parser.add_argument("--scene-threshold", type=float, default=0.3)
     parser.add_argument("--min-slide-duration", type=float, default=2.0)
-    parser.add_argument("--max-vision-frames", type=int, default=40)
+    parser.add_argument(
+        "--max-vision-frames",
+        type=int,
+        default=None,
+        help="畫面分析張數上限；預設依片長每 30 秒 1 張，最少 8、最多 40",
+    )
     parser.add_argument("--ocr", action="store_true", help="若已安裝 PaddleOCR，啟用本地 OCR 初篩")
     parser.add_argument("--sync-open-notebook", action="store_true", help="將 knowledge.md 匯入 Open Notebook")
     parser.add_argument("--notebook-id", default=os.getenv("OPEN_NOTEBOOK_NOTEBOOK_ID", ""))
@@ -3598,8 +4801,10 @@ def run_pipeline(args: argparse.Namespace) -> Path:
     root = args.root.resolve()
     root.mkdir(parents=True, exist_ok=True)
     # --root 是輸出目錄，不該綁著設定檔：先讀專案自己的 .env，再讓輸出目錄的 .env 覆蓋。
-    load_dotenv(Path(__file__).resolve().parent / ".env")
-    load_dotenv(root / ".env")
+    project_env = Path(__file__).resolve().parent / ".env"
+    load_dotenv(project_env)
+    if (root / ".env").resolve() != project_env.resolve():
+        load_dotenv(root / ".env")
     args.notebook_id = args.notebook_id or os.getenv("OPEN_NOTEBOOK_NOTEBOOK_ID", "")
     if args.open_notebook_url == "http://127.0.0.1:5055":
         args.open_notebook_url = os.getenv("OPEN_NOTEBOOK_URL", args.open_notebook_url)
@@ -3607,7 +4812,12 @@ def run_pipeline(args: argparse.Namespace) -> Path:
         args.open_notebook_sources_path = os.getenv("OPEN_NOTEBOOK_SOURCES_PATH", args.open_notebook_sources_path)
     language = args.language if args.language is not None else os.getenv("GROQ_LANGUAGE", "auto")
     args.groq_model = args.groq_model or os.getenv("GROQ_ASR_MODEL", "whisper-large-v3")
-    if args.chunk_seconds <= 0 or args.frame_interval <= 0 or args.max_vision_frames <= 0 or args.summary_chars <= 0:
+    if (
+        args.chunk_seconds <= 0
+        or args.frame_interval <= 0
+        or (args.max_vision_frames is not None and args.max_vision_frames <= 0)
+        or args.summary_chars <= 0
+    ):
         raise ValueError("chunk-seconds、frame-interval、max-vision-frames 與 summary-chars 必須大於 0。")
     if not 0.1 <= args.scene_threshold <= 1.0 or args.min_slide_duration < 0:
         raise ValueError("scene-threshold 必須介於 0.1 到 1.0，min-slide-duration 不可小於 0。")
@@ -3662,11 +4872,15 @@ def run_pipeline(args: argparse.Namespace) -> Path:
         "schema_version": 1,
         "status": "running",
         "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-        "source": {"url": args.url, "video": args.video},
+        "source": {
+            "url": public_url(args.url) if args.url and getattr(args, "rss_item", False) else args.url,
+            "video": args.video,
+        },
         "job_dir": artifact_path(job_dir, root),
         "config": {
             **artifact_config,
             "workers": min(max(args.workers, 1), 4),
+            "vision_workers": min(max(args.vision_workers, 1), 8),
             "language": language,
             "groq_model": args.groq_model,
             "word_timestamps": args.word_timestamps,
@@ -3718,45 +4932,69 @@ def run_pipeline(args: argparse.Namespace) -> Path:
         has_video = False
         if not args.no_video:
             manifest["source"]["resolved_video"] = artifact_path(video_path, root)
-            manifest["source"]["title"] = source_title(job_dir, video_path)
+            manifest["source"]["title"] = str(getattr(args, "rss_title", "") or source_title(job_dir, video_path))
 
-            probe = probe_video(video_path)
+            probe = probe_video(video_path, job_dir / "source.probe.json")
             has_video = any(stream.get("codec_type") == "video" for stream in probe.get("streams", []))
+            duration_seconds = video_duration(probe)
+            resolved_max_vision_frames = vision_frame_limit(duration_seconds, args.max_vision_frames)
+            artifact_config["max_vision_frames"] = resolved_max_vision_frames
+            artifact_config["vision_frame_policy"] = (
+                "manual" if args.max_vision_frames is not None else "auto:1-per-30s,min-8,max-40"
+            )
+            manifest["config"].update(artifact_config)
             manifest["video"] = {
-                "duration_seconds": video_duration(probe),
+                "duration_seconds": duration_seconds,
                 "streams": [
                     {"codec_type": stream.get("codec_type"), "codec_name": stream.get("codec_name")}
                     for stream in probe.get("streams", [])
                 ],
             }
-            audio_chunks = extract_audio(video_path, job_dir, args.chunk_seconds)
-        if args.no_video:
-            pass
-        elif not has_video:
-            candidates, frame_meta = [], {
-                "method": "audio-only",
-                "candidate_count": 0,
-                "ocr": {"enabled": False, "status": "not-applicable"},
-            }
-        elif args.slide_extractor == "steipete":
-            candidates, frame_meta = extract_steipete_candidates(
-                video_path,
-                job_dir,
-                args.max_vision_frames,
-                args.scene_threshold,
-                args.min_slide_duration,
+
+            def frame_stage() -> tuple[list[dict[str, Any]], dict[str, Any], str]:
+                cache_key = frame_candidate_cache_key(video_path, artifact_config)
+                cached_frames = reuse_frame_candidates(
+                    job_dir / "frame_candidates.json", cache_key
+                )
+                if cached_frames is not None:
+                    print("· 重用既有畫面候選")
+                    return cached_frames[0], cached_frames[1], cache_key
+                if not has_video:
+                    return [], {
+                        "method": "audio-only",
+                        "candidate_count": 0,
+                        "ocr": {"enabled": False, "status": "not-applicable"},
+                    }, cache_key
+                if args.slide_extractor == "steipete":
+                    frames, meta = extract_steipete_candidates(
+                        video_path,
+                        job_dir,
+                        resolved_max_vision_frames,
+                        args.scene_threshold,
+                        args.min_slide_duration,
+                    )
+                else:
+                    frames, meta = extract_candidates(
+                        video_path,
+                        job_dir,
+                        args.frame_interval,
+                        args.hash_threshold,
+                        resolved_max_vision_frames,
+                        args.ocr,
+                        0.75,
+                    )
+                return frames, meta, cache_key
+
+            local_started = time.monotonic()
+            audio_chunks, (candidates, frame_meta, frame_cache_key) = run_parallel_stages(
+                lambda: extract_audio(video_path, job_dir, args.chunk_seconds), frame_stage
             )
-        else:
-            candidates, frame_meta = extract_candidates(
-                video_path,
-                job_dir,
-                args.frame_interval,
-                args.hash_threshold,
-                args.max_vision_frames,
-                args.ocr,
-                0.75,
+            write_json(
+                job_dir / "frame_candidates.json",
+                {"cache_key": frame_cache_key, "frames": candidates, "meta": frame_meta},
             )
-        write_json(job_dir / "frame_candidates.json", {"frames": candidates, "meta": frame_meta})
+            manifest["frame_candidate_cache_key"] = frame_cache_key
+            print(f"· 音訊與畫面抽取並行階段：{time.monotonic() - local_started:.1f} 秒")
         manifest["artifacts"] = {
             "audio_chunks": [artifact_path(Path(str(chunk["path"])), root) for chunk in audio_chunks],
             "audio_chunk_manifest": artifact_path(job_dir / "audio" / "chunks.json", root)
@@ -3767,7 +5005,6 @@ def run_pipeline(args: argparse.Namespace) -> Path:
         if args.slide_extractor == "steipete":
             manifest["artifacts"]["steipete_slides"] = artifact_path(job_dir / "steipete-slides.json", root)
 
-        reused_observations = False
         transcript_raw: dict[str, Any]
         if captions_only is not None:
             transcript: dict[str, Any] = captions_only
@@ -3775,27 +5012,33 @@ def run_pipeline(args: argparse.Namespace) -> Path:
             observations = []  # 空的：下次不帶 --no-video 重跑時 reuse_artifact 會判定為無、自動補畫面
             # 這個模式本來就沒有畫面，不算「這次新增了畫面」——否則每次重跑都會白白重算摘要。
             # 階段二真的補上畫面時，走的是下面的 else 分支，那裡才會讓摘要重算。
-            reused_observations = True
         elif args.dry_run or args.local_only:
             transcript = {"status": "skipped", "reason": "dry-run" if args.dry_run else "local-only", "segments": []}
             transcript_raw = {"provider": "skipped", "reason": transcript["reason"]}
             observations = local_observations(candidates)
         else:
-            transcript = None
-            if transcript is None and args.transcribe_backend == "youtube":
-                if not args.url:
-                    raise ValueError("--transcribe-backend youtube 需要 --url。")
-                transcript = fetch_youtube_transcript(args.url, job_dir, language)
-                if transcript is None:
-                    print("! 這支影片沒有字幕，退回 Groq 轉錄")
-                else:
-                    transcript_raw = {"provider": "source-captions", "response": transcript}
-            if transcript is None:
+            model = minimax_model()
+
+            def transcribe_stage() -> tuple[dict[str, Any], dict[str, Any]]:
+                stage_transcript = None
+                if args.transcribe_backend == "youtube":
+                    if not args.url:
+                        raise ValueError("--transcribe-backend youtube 需要 --url。")
+                    stage_transcript = fetch_youtube_transcript(args.url, job_dir, language)
+                    if stage_transcript is None:
+                        print("! 這支影片沒有字幕，退回 Groq 轉錄")
+                    else:
+                        return stage_transcript, {
+                            "provider": "source-captions",
+                            "response": stage_transcript,
+                        }
                 if args.transcribe_backend == "local":
-                    transcript = transcribe_local(audio_chunks, args.whisper_model, language)
-                    transcript_raw = {"provider": "faster-whisper", "response": transcript}
-                else:
-                    transcript, transcript_raw = transcribe_all(
+                    stage_transcript = transcribe_local(audio_chunks, args.whisper_model, language)
+                    return stage_transcript, {
+                        "provider": "faster-whisper",
+                        "response": stage_transcript,
+                    }
+                return transcribe_all(
                         audio_chunks,
                         os.environ["GROQ_API_KEY"],
                         args.groq_model,
@@ -3805,22 +5048,45 @@ def run_pipeline(args: argparse.Namespace) -> Path:
                         args.word_timestamps,
                     )
 
-            model = minimax_model()
-            observations = (
-                reuse_artifact(job_dir / "visual.json")
-                if reuse_cloud and previous.get("models", {}).get("visual") == model
-                else None
-            )
-            if observations is None:
-                observations = analyze_images(
+            def visual_stage() -> list[dict[str, Any]]:
+                previous_config = previous.get("config") or {}
+                previous_frames_match = previous.get("frame_candidate_cache_key") == frame_cache_key
+                if not previous.get("frame_candidate_cache_key"):
+                    previous_frames_match = all(
+                        previous_config.get(key) == artifact_config.get(key)
+                        for key in (
+                            "frame_interval",
+                            "hash_threshold",
+                            "slide_extractor",
+                            "scene_threshold",
+                            "min_slide_duration",
+                            "max_vision_frames",
+                            "ocr",
+                        )
+                    )
+                cached = (
+                    reuse_artifact(job_dir / "visual.json")
+                    if reuse_cloud
+                    and previous_frames_match
+                    and previous.get("models", {}).get("visual") == model
+                    else None
+                )
+                if isinstance(cached, list):
+                    print("· 重用既有視覺觀察")
+                    return cached
+                return analyze_images(
                     candidates,
                     minimax_subscription_key(),
                     model,
-                    args.workers,
+                    args.vision_workers,
+                    None if args.refresh else job_dir / "vision-cache",
                 )
-            else:
-                reused_observations = True
-                print("· 重用既有視覺觀察")
+
+            cloud_started = time.monotonic()
+            (transcript, transcript_raw), observations = run_parallel_stages(
+                transcribe_stage, visual_stage
+            )
+            print(f"· 轉錄與畫面分析並行階段：{time.monotonic() - cloud_started:.1f} 秒")
         # 記下每個階段實際由誰產生：換模型後回頭看產物才知道該不該重跑
         manifest["models"] = {
             "transcript": transcript.get("model") if isinstance(transcript, dict) else None,
@@ -3854,6 +5120,7 @@ def run_pipeline(args: argparse.Namespace) -> Path:
                 minimax_model(),
                 args.summary_chars,
                 job_dir / "summary-cache",
+                args.workers,
             )
             manifest["models"]["summary"] = minimax_model()
             write_json(job_dir / "summary.json", summary)
@@ -3870,7 +5137,7 @@ def run_pipeline(args: argparse.Namespace) -> Path:
         )
         manifest["artifacts"]["knowledge_markdown"] = artifact_path(knowledge_path, root)
         manifest["artifacts"]["notes"] = artifact_path(job_dir / "notes.md", root)
-        if args.vidbee_sidecar and not args.no_video:
+        if args.vidbee_sidecar and not args.no_video and transcript.get("segments"):
             manifest["vidbee_sidecar"] = write_vidbee_sidecar(
                 video_path, transcript_files["transcript_zh_tw_srt"]
             )

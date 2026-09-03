@@ -23,7 +23,7 @@ VidBee 完成的本機影音（或影片 URL） → FFmpeg
   └─ transcript.srt／notes.md／knowledge.md：可回查輸出與 VidBee sidecar
 ```
 
-每個工作目錄的雜湊同時包含來源與本地抽取設定；調整切段或畫面設定會建立新的工作目錄，不會誤用舊快取。JSON 與 Markdown 產物以暫存檔置換，避免中斷時留下半份索引。
+每個工作目錄的雜湊只綁來源，讓同一支影片能在原工作目錄續跑；音訊、畫面與雲端產物各自用來源指紋、設定、模型及實際輸入判斷是否失效。JSON 與 Markdown 產物以暫存檔置換，避免中斷時留下半份索引。
 
 根目錄中受版本控制的內容以入口、設定範例與既有知識庫快照為主；本機執行產物維持在固定位置，方便備份與清理：
 
@@ -37,15 +37,22 @@ VidBee 完成的本機影音（或影片 URL） → FFmpeg
 
 `urls.txt`、`categories.json` 與 `digest.md` 已是版本庫的一部分，而且現有 CLI 會在根目錄讀寫這些預設檔名，因此不為了目錄外觀搬移。需要完全獨立的資料集時，使用 `--root <目錄>` 即可，不必複製程式。
 
-三層快取讓中斷的批次可以直接續跑，不會重複付費：
+多層快取讓中斷的批次可以直接續跑，不會重複付費：
 
 | 產物 | 判準 |
 |---|---|
-| `source.*`、`audio/`、`frames/` | `.complete` sentinel；沒有標記就清掉重做（半份會靜默毀掉時間軸） |
+| `source.probe.json` | 來源大小＋最後修改時間；未變就不重跑 `ffprobe` |
+| `audio/`、`frames/`、`frame_candidates.json` | 來源指紋＋抽取設定；半份產物沒有 `.complete` 就清掉重做 |
 | `transcription-cache/` | 音訊 SHA-256＋模型＋語言＋時間戳參數；失敗只重跑缺少的片段 |
+| `vision-cache/` | 圖片 SHA-256＋時間戳＋OCR＋模型＋提示詞；失敗只重跑缺少的圖片 |
 | `summary-cache/` | 提示詞版本＋模型＋實際輸入；超長內容逐段保存後再整合 |
+| `library.db` 的 `index_state` | 時間軸、摘要與分類未變時，不再刪除並重建全文索引 |
 
-實測同一支影片重跑：首次 82.6 秒，重跑 1.7 秒且零 API 呼叫。要強制重算加 `--refresh`。
+Groq 轉錄與 MiniMax 畫面分析會同時執行；超長逐字稿的 MiniMax 分段摘要也會受限並行。`--workers` 預設／最多 4；畫面分析另由 `--vision-workers` 控制，預設／最多 8。畫面張數預設依片長每 30 秒約 1 張、最少 8、最多 40；`--max-vision-frames N` 可手動覆寫。抽樣點會保持穩定，增加張數時可沿用已分析畫面的快取。不會為了速度切換到較不精確的 Whisper turbo。純色／空白畫面會先由 Pillow 判定，避免視覺模型捏造內容；MiniMax-M3 摘要使用官方 `thinking: {"type":"disabled"}` 直接回答，畫面分析仍保留 adaptive thinking。`reasoning_split` 只改回傳格式，不能關閉推理。
+
+2026-09-01 以同一支 8 秒公開合成影片、全新輸出目錄與真實 Groq／MiniMax API 實測：調整前兩次首跑為 17.003、23.049 秒；調整後為 14.352、18.732 秒，兩次平均約縮短 17%。Groq 轉錄僅 0.438–0.484 秒，剩餘波動主要在 MiniMax；這是小樣本觀察值，不是供應商延遲保證。兩次輸出皆有 2 段逐字稿、5 題問答、有效引用、`notes.md` 與 `transcript.srt`。
+
+暖快取仍可避免重複付費：隔離的 10.2 秒本機樣本重跑由 1.383 秒降到 0.667 秒，不掛 profiler 為 0.380 秒。要強制重算雲端產物加 `--refresh`。
 
 ## 先做本地驗證
 
@@ -72,13 +79,24 @@ python pipeline.py --url-file .\urls.txt --slide-extractor steipete --sync-open-
 
 ## RSS 自動收件匣
 
-RSS/Atom 訂閱會記住已見項目、避免重複排入，支援標題關鍵字、標籤與 latest-only。新增訂閱會立即刷新；只建立本機佇列，不會因為看見新項目就自動消耗 Groq／MiniMax 額度：
+RSS、Atom 與 Podcast Feed 會記住 GUID、避免重複排入，支援標題關鍵字、標籤與 latest-only。Podcast 只接受影音 MIME、`medium=audio/video` 或已知影音副檔名的 enclosure；封面圖不會被當成節目。新增訂閱會立即刷新，但只建立本機佇列，不會自動消耗 Groq／MiniMax 額度：
 
 ```powershell
 python pipeline.py --rss-add 'https://www.youtube.com/feeds/videos.xml?channel_id=UC...' --rss-latest-only --rss-tags '教學,AI'
 python pipeline.py --rss-list
 python pipeline.py --rss-refresh
 ```
+
+訂閱可修改、暫停、恢復，也可顯示逐筆狀態：
+
+```powershell
+python pipeline.py --rss-update <ID> --rss-name '新名稱' --rss-keywords 'AI,Python' --rss-tags '技術' --rss-all-items
+python pipeline.py --rss-disable <ID>
+python pipeline.py --rss-enable <ID>
+python pipeline.py --rss-list --rss-list-items --rss-item-limit 20
+```
+
+設定修改套用到後續刷新；既有 GUID 若尚未完成，標題、媒體 URL、來源頁、發佈時間與標籤會跟著 Feed 更新。
 
 處理佇列會直接重用既有的下載、Groq 轉錄、MiniMax 畫面核對與摘要管線；預設一次只處理一筆：
 
@@ -89,17 +107,42 @@ python pipeline.py --rss-process --dry-run
 # 真實處理；必須明確承擔 Token Plan 超額後可能使用 Credits 的風險
 python pipeline.py --rss-process --allow-batch-cloud
 
-# VidBee 類似的「程式執行期間持續檢查」；這是前景程序，不安裝背景服務
-python pipeline.py --rss-watch 900 --rss-process --allow-batch-cloud
+# 前景監看；失敗項目到冷卻時間後再重試
+python pipeline.py --rss-watch 900 --rss-process --rss-retry-failed --allow-batch-cloud
 ```
 
 - `--rss-keywords '關鍵字1,關鍵字2'`：標題至少命中一個才排入。
 - `--rss-latest-only`：每次刷新只排入最新一個未見項目，舊項目記為 skipped。
 - `--rss-max-items N`：限制本次實際處理數量；預設 1。
-- `--rss-retry-failed`：明確重試失敗項目；各階段仍沿用既有快取。
+- `--rss-retry-failed`：只重試已到冷卻時間的失敗項目；最多三次，401／403、額度不足或三次耗盡會進 `dead-letter`。
+- `--rss-requeue <ITEM_ID>`：人工確認問題已解除後，明確重排 dead-letter。
 - `--rss-remove <ID>`：移除訂閱與佇列紀錄，但保留已產生的 `jobs\`。
 
-狀態保存在 Git 忽略的 `rss\state.json`。Podcast enclosure 會以音訊模式處理，不會捏造或執行畫面分析。Feed URL 必須是 RSS/Atom XML；一般說明頁或 Podlink HTML 頁面不是 Feed。
+每個 `--root` 有單一寫入鎖；項目在 API 前先持久化為 `processing`，程序中斷超過兩小時會復原成 failed。排程跨 Feed 輪流取一筆，不會讓單一大量 Feed 長期壓住其他來源；Feed 抓取最多四路並行，Groq／MiniMax 項目仍依額度限制逐筆啟動。
+
+匯入／匯出、通知、清理與 Windows 背景排程：
+
+```powershell
+python pipeline.py --rss-import-opml .\subscriptions.opml
+python pipeline.py --rss-export-opml .\subscriptions.opml
+python pipeline.py --rss-cleanup-days 90
+
+# 可選通知；JSON 只含項目狀態與已移除 query 的來源 URL
+python pipeline.py --rss-process --allow-batch-cloud --rss-webhook 'https://example.com/hook'
+
+# 預設背景排程只刷新本機佇列，不呼叫雲端
+python pipeline.py --rss-task-install 15
+
+# 必須三個旗標同時出現才會建立含雲端處理的排程
+python pipeline.py --rss-task-install 15 --rss-task-process --allow-batch-cloud
+python pipeline.py --rss-task-remove
+```
+
+狀態保存在 Git 忽略的 `rss\state.json`，並在 Windows 將 `rss\` ACL 限制為目前使用者、SYSTEM 與 Administrators；上一版狀態另存 `state.json.bak`。媒體 URL 的 query／userinfo 只保留在受保護狀態檔供下載，終端、manifest、通知與 yt-dlp info sidecar 只留公開 URL。Podcast 音訊模式不執行畫面分析；遇到語音提及「如圖」只會標示需核對畫面。一般說明頁或 Podlink HTML 頁面不是 Feed。
+
+JSON 狀態仍是最短且可備份的方案；`--rss-cleanup-days` 會清掉舊的完成／過濾紀錄。只有實際超過 10,000 筆時 `--rss-list` 才提示評估 SQLite，本次沒有為空狀態引入不必要的資料庫遷移。背景排程與 Webhook 都是 opt-in；安裝專案不會自動啟用它們。
+
+2026-09-01 真實 canary 使用公開的 1 Minute Podcast Feed，只處理 `#85 - New York Minute` 一筆：121.304 秒音訊由 Groq `whisper-large-v3` 產生 18 段時間戳，再由 MiniMax `MiniMax-M3` 產生 5 題複習問答與有效片段引用。輸出具備 `source.json`、原始／閱讀版逐字稿、SRT 與 `notes.md`；音訊 Feed 的畫面事件為 0，筆記只把畫面相關語句列為待核對。相同佇列重跑為 `selected 0`，沒有再次呼叫供應商。
 
 ## 完整流程
 
