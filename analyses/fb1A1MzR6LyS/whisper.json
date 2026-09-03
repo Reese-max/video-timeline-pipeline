@@ -1,0 +1,7 @@
+{
+  "status": "unavailable",
+  "reason": "Faster-Whisper base model weight file was incomplete and the mirror endpoint was blocked by the current network allowlist.",
+  "language": "zh",
+  "duration": 212.115,
+  "segments": []
+}
