@@ -1,5 +1,7 @@
 # 影片資料庫時間軸管線
 
+目前版本 `0.2.0`，採 [MIT License](LICENSE)；版本變更見 [CHANGELOG.md](CHANGELOG.md)。
+
 目前實作的流程：
 
 ```text
@@ -58,6 +60,7 @@ Groq 轉錄與 MiniMax 畫面分析會同時執行；超長逐字稿的 MiniMax 
 
 ```powershell
 cd 'C:\Users\Administrator\video-timeline-pipeline'
+python -m unittest discover -s tests -v
 python pipeline.py --self-test
 python pipeline.py --video 'D:\path\to\video.mp4' --dry-run
 python pipeline.py --video 'D:\path\to\video.mp4' --dry-run --slide-extractor steipete
@@ -75,7 +78,7 @@ yt-dlp --flat-playlist --print '%(webpage_url)s' --skip-download 'https://www.yo
 python pipeline.py --url-file .\urls.txt --slide-extractor steipete --sync-open-notebook --notebook-id 'notebook:abc'
 ```
 
-批次會逐支重用同一條單片管線，輸出 `batches\<雜湊>\batch-manifest.json`；單支失敗會記錄並繼續處理其他 URL。先用 `--dry-run` 或 `--local-only` 可確認本機產物，不會下載或上傳雲端。MiniMax 官方說明 Token Plan 超額時，若帳戶有 Credits，會自動用 Credits 補足；本工具無法保證供應商不扣款，因此批次雲端預設停用，只有在主控台確認額度／支出控制後明確加 `--allow-batch-cloud` 才會啟用。
+批次會逐支重用同一條單片管線，輸出 `batches\<雜湊>\batch-manifest.json`；單支失敗會記錄並繼續處理其他 URL。先用 `--dry-run` 或 `--local-only` 可確認本機產物，不會下載或上傳雲端。[MiniMax 官方說明](https://platform.minimax.io/docs/token-plan/intro#after-reaching-the-usage-limit) Token Plan 超額時，若帳戶有 Credits，可能自動用 Credits 補足；本工具無法保證供應商不扣款，因此批次雲端預設停用，只有在主控台確認額度／支出控制後明確加 `--allow-batch-cloud` 才會啟用。
 
 ## RSS 自動收件匣
 
@@ -86,6 +89,48 @@ python pipeline.py --rss-add 'https://www.youtube.com/feeds/videos.xml?channel_i
 python pipeline.py --rss-list
 python pipeline.py --rss-refresh
 ```
+
+### Facebook 作者影片追蹤
+
+Meta Graph API 可盤點你有權管理的 Facebook Page，會同時讀取 `videos` 與 `video_reels`，用 cursor 持續分頁，沒有歷史總數硬上限。先將 Page Access Token 與目前 API 版本填入專案 `.env`，不要把 Token 貼進命令或提交到 Git：
+
+```dotenv
+FACEBOOK_PAGE_ACCESS_TOKEN=
+FACEBOOK_GRAPH_API_VERSION=v26.0
+```
+
+先只盤點最近一年；這一步只呼叫 Meta metadata API，不下載影片，也不呼叫 Groq／MiniMax：
+
+```powershell
+python pipeline.py --facebook-author 'https://www.facebook.com/<PAGE>/videos' --facebook-since 365d --facebook-discover-only
+```
+
+確認結果後加入既有佇列；`--facebook-since all` 可回溯 API 實際仍可存取的全部歷史：
+
+```powershell
+python pipeline.py --facebook-author 'https://www.facebook.com/<PAGE>/videos' --facebook-since 365d --rss-all-items
+python pipeline.py --rss-refresh
+python pipeline.py --rss-process --rss-max-items 4 --allow-batch-cloud
+```
+
+盤點快照保存在受 ACL 保護且 Git 忽略的 `rss\facebook-<雜湊>-latest.json`。後續刷新從最新已見發佈時間繼續，穩定影片 ID 會交給既有去重、關鍵字、標籤、重試與 dead-letter 流程。Graph API 只涵蓋 Token 權限可讀的 Page 內容；已刪除、私人、過期、權限外內容及一般個人帳號不保證可取得。任意公開作者若有 RSS／Atom／RSSHub Feed，應直接使用 `--rss-add`；本工具不以脆弱的 Facebook HTML 爬蟲假裝完整。
+
+非自管的公開 Facebook Page 可選 Apify 官方維護的 Facebook Posts Scraper；它會產生額度費用，所以除了專案 `.env` 的 Token，還必須設定單次供應商費用上限並明確加 `--allow-batch-cloud`：
+
+```dotenv
+APIFY_API_TOKEN=
+APIFY_FACEBOOK_ACTOR=apify~facebook-posts-scraper
+APIFY_FACEBOOK_RESULTS_LIMIT=1000000
+APIFY_MAX_TOTAL_CHARGE_USD=1.00
+APIFY_RUN_TIMEOUT_SECONDS=1800
+```
+
+```powershell
+python pipeline.py --facebook-author 'https://www.facebook.com/<PUBLIC_PAGE>/' --facebook-provider apify --facebook-since 365d --facebook-discover-only --allow-batch-cloud
+python pipeline.py --facebook-author 'https://www.facebook.com/<PUBLIC_PAGE>/' --facebook-provider apify --facebook-since 365d --rss-all-items --allow-batch-cloud
+```
+
+Apify Token 一律放在 `Authorization` header，不放 URL、輸出或 Git。Actor 只負責發現公開貼文，`captionText=false`，實際影音仍由 yt-dlp 下載並交給 Groq 轉錄、MiniMax 整理。官方目前的輸入 schema 明載此 Actor 只支援公開 Page、不支援 personal profile，因此個人帳號仍列為未保證支援；私人／登入限定內容不處理。`APIFY_FACEBOOK_RESULTS_LIMIT` 是 Actor 必填的單次結果預算，本工具取回資料集時會持續分頁、不另行截斷；Actor 的結果完整性仍受 Facebook 可見性與供應商能力限制。請參考 [Actor 輸入](https://apify.com/apify/facebook-posts-scraper/input-schema)、[API](https://apify.com/apify/facebook-posts-scraper/api) 與 [計價](https://apify.com/apify/facebook-posts-scraper/pricing)。
 
 訂閱可修改、暫停、恢復，也可顯示逐筆狀態：
 
@@ -240,9 +285,9 @@ python pipeline.py --url 'https://www.facebook.com/...' --local-only
 - `notes.md`：繁體中文摘要、重點、五題複習問答與待核對片段。
 - `knowledge.md`：相同內容加完整時間軸，也是匯入 Open Notebook 用的格式。
 
-`--vidbee-sidecar` 另寫 `<影音檔名>.zh-TW.srt` 到影音同目錄。VidBee v2.1.0 會在該下載項目尚無 transcript 時以正式 sidecar captions 匯入，因此可搜尋並點時間跳轉；已有不同檔案時不覆寫。
+`--vidbee-sidecar` 另寫 `<影音檔名>.zh-TW.srt` 與 `<影音檔名>.notes.md` 到影音同目錄。字幕可供 VidBee 正式 sidecar captions 匯入並搜尋、跳轉；筆記是方便與原片一起保存的外部檔案，VidBee 不會自動將它顯示成 Prompt 結果。已有不同檔案時不覆寫。
 
-VidBee 的自訂 OpenAI-compatible Provider 可在介面內對已匯入逐字稿執行提示詞；目前官方沒有文件化的外部 CLI／擴充介面可自動觸發 prompt run 並匯出 `notes.md`。因此本單一指令流程保留原有的 MiniMax 直接呼叫，只負責產生可回查檔案，不修改 VidBee 的內部資料庫。
+[VidBee AI Prompts](https://vidbee.org/docs/ai-prompts/) 可在介面內用自訂 OpenAI-compatible Provider 處理已存在的逐字稿；[原生轉錄文件](https://vidbee.org/docs/transcribe/) 仍只描述本機 ASR。目前官方沒有文件化的外部 CLI／擴充介面可自動觸發 prompt run 並匯出 `notes.md`。因此本單一指令流程保留原有的 MiniMax 直接呼叫，只負責產生可回查檔案，不修改 VidBee 的內部資料庫。
 
 MiniMax 官方目前標示 MiniMax-M3 為 1,000,000 token context、M2.x 為 204,800；本工具仍用保守的每段 120,000 字元切分並保留 `segment_id`，不會因模型更換而靜默截斷。OpenAI-compatible 呼叫使用非串流 `chat/completions` 與 `reasoning_split=true`，正式筆記只取 `message.content`，不混入 reasoning 欄位。
 

@@ -34,6 +34,8 @@ from pathlib import Path
 from typing import Any, Callable
 
 
+__version__ = "0.2.0"
+
 MEDIA_EXTENSIONS = {
     ".mp4", ".mkv", ".webm", ".mov", ".avi", ".m4v",
     ".mp3", ".m4a", ".aac", ".wav", ".flac", ".ogg", ".opus", ".m3u8",
@@ -795,6 +797,10 @@ RSS_MAX_BYTES = 5 * 1024 * 1024
 RSS_MAX_ATTEMPTS = 3
 RSS_RETRY_BASE_SECONDS = 300
 RSS_LEASE_SECONDS = 2 * 60 * 60
+FACEBOOK_GRAPH_DEFAULT_VERSION = "v26.0"
+FACEBOOK_GRAPH_EDGES = ("videos", "video_reels")
+APIFY_FACEBOOK_DEFAULT_ACTOR = "apify~facebook-posts-scraper"
+APIFY_TERMINAL_STATUSES = {"SUCCEEDED", "FAILED", "ABORTED", "TIMED-OUT"}
 
 
 def public_url(url: str) -> str:
@@ -802,9 +808,14 @@ def public_url(url: str) -> str:
     parsed = urllib.parse.urlsplit(url)
     netloc = parsed.netloc.rsplit("@", 1)[-1]
     query = ""
-    if (parsed.hostname or "").lower() in {"youtube.com", "www.youtube.com", "m.youtube.com"} and parsed.path == "/watch":
+    hostname = (parsed.hostname or "").lower()
+    if hostname in {"youtube.com", "www.youtube.com", "m.youtube.com"} and parsed.path == "/watch":
         video_ids = urllib.parse.parse_qs(parsed.query, max_num_fields=32).get("v") or []
         if video_ids and re.fullmatch(r"[A-Za-z0-9_-]{11}", video_ids[0]):
+            query = urllib.parse.urlencode({"v": video_ids[0]})
+    elif hostname in {"facebook.com", "www.facebook.com", "web.facebook.com", "m.facebook.com"} and parsed.path in {"/watch", "/watch/"}:
+        video_ids = urllib.parse.parse_qs(parsed.query, max_num_fields=32).get("v") or []
+        if video_ids and re.fullmatch(r"\d+", video_ids[0]):
             query = urllib.parse.urlencode({"v": video_ids[0]})
     return urllib.parse.urlunsplit((parsed.scheme, netloc, parsed.path, query, ""))
 
@@ -1827,15 +1838,20 @@ def write_transcript_files(job_dir: Path, transcript: dict[str, Any]) -> dict[st
     return outputs
 
 
-def write_vidbee_sidecar(video_path: Path, srt_path: Path) -> dict[str, Any]:
-    target = video_path.with_name(f"{video_path.stem}.zh-TW.srt")
-    content = srt_path.read_text(encoding="utf-8")
-    if target.is_file():
-        if target.read_text(encoding="utf-8") == content:
-            return {"status": "reused", "path": str(target)}
-        return {"status": "conflict", "path": str(target), "reason": "既有 sidecar 不同，未覆寫"}
-    write_text(target, content)
-    return {"status": "written", "path": str(target)}
+def write_vidbee_sidecar(video_path: Path, srt_path: Path, notes_path: Path | None = None) -> dict[str, Any]:
+    def store(source: Path, target: Path) -> dict[str, str]:
+        content = source.read_text(encoding="utf-8")
+        if target.is_file():
+            if target.read_text(encoding="utf-8") == content:
+                return {"status": "reused", "path": str(target)}
+            return {"status": "conflict", "path": str(target), "reason": "既有 sidecar 不同，未覆寫"}
+        write_text(target, content)
+        return {"status": "written", "path": str(target)}
+
+    captions = store(srt_path, video_path.with_name(f"{video_path.stem}.zh-TW.srt"))
+    if notes_path is not None:
+        captions["notes"] = store(notes_path, video_path.with_name(f"{video_path.stem}.notes.md"))
+    return captions
 
 
 def render_knowledge_markdown(
@@ -3085,6 +3101,342 @@ def csv_values(value: str) -> list[str]:
     return list(dict.fromkeys(part.strip() for part in value.split(",") if part.strip()))
 
 
+def facebook_page_identifier(value: str) -> str:
+    """接受 Page ID、使用者名稱或 Facebook Page 網址；拒絕單篇影片網址。"""
+    raw = value.strip()
+    if not raw:
+        raise ValueError("Facebook 作者不可留白。")
+    candidate = raw
+    if "://" in raw:
+        parsed = urllib.parse.urlsplit(require_http_url(raw, "Facebook 作者 URL"))
+        if (parsed.hostname or "").lower() not in {
+            "facebook.com", "www.facebook.com", "web.facebook.com", "m.facebook.com",
+        }:
+            raise ValueError("Facebook 作者 URL 必須位於 facebook.com。")
+        parts = [urllib.parse.unquote(part) for part in parsed.path.split("/") if part]
+        if parts and parts[0].lower() == "profile.php":
+            ids = urllib.parse.parse_qs(parsed.query, max_num_fields=32).get("id") or []
+            candidate = ids[0] if ids else ""
+        else:
+            if parts and parts[-1].lower() in {"videos", "reels"}:
+                parts.pop()
+            candidate = parts[0] if len(parts) == 1 else ""
+    candidate = candidate.strip().lstrip("@").rstrip("/")
+    if not re.fullmatch(r"[A-Za-z0-9._-]{1,200}", candidate) or candidate.lower() in {
+        "groups", "reel", "reels", "share", "videos", "watch",
+    }:
+        raise ValueError("請提供 Facebook Page ID、使用者名稱或作者首頁；不可使用單篇影片／分享網址。")
+    return candidate
+
+
+def facebook_author_url(value: str) -> str:
+    identifier = facebook_page_identifier(value)
+    return f"https://www.facebook.com/{urllib.parse.quote(identifier, safe='._-')}"
+
+
+def parse_facebook_since(value: str, now: float | None = None) -> int | None:
+    """將 365d、52w 或 ISO 日期轉成 Graph API 的 since 時間戳；all 表示完整歷史。"""
+    raw = value.strip().lower()
+    if raw == "all":
+        return None
+    duration = re.fullmatch(r"(\d+)([dw])", raw)
+    if duration:
+        amount = int(duration.group(1))
+        if amount <= 0:
+            raise ValueError("--facebook-since 的期間必須大於 0。")
+        seconds = amount * (86400 if duration.group(2) == "d" else 7 * 86400)
+        return max(0, int((time.time() if now is None else now) - seconds))
+    try:
+        parsed = datetime.datetime.fromisoformat(raw.replace("z", "+00:00"))
+    except ValueError as exc:
+        raise ValueError("--facebook-since 必須是 365d、52w、YYYY-MM-DD／ISO 時間或 all。") from exc
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=datetime.timezone.utc)
+    return max(0, int(parsed.timestamp()))
+
+
+def facebook_graph_version() -> str:
+    version = os.getenv("FACEBOOK_GRAPH_API_VERSION", FACEBOOK_GRAPH_DEFAULT_VERSION).strip()
+    if not re.fullmatch(r"v\d+\.\d+", version):
+        raise ValueError("FACEBOOK_GRAPH_API_VERSION 必須是 v26.0 這類版本字串。")
+    return version
+
+
+def facebook_graph_payload(url: str, token: str) -> dict[str, Any]:
+    try:
+        payload = get_json(url, {"Authorization": f"Bearer {token}"})
+    except RuntimeError as exc:
+        raise RuntimeError(str(exc).replace(url, public_url(url))) from exc
+    if not isinstance(payload, dict):
+        raise RuntimeError("Facebook Graph API 回應不是 JSON 物件。")
+    error = payload.get("error")
+    if isinstance(error, dict):
+        code = str(error.get("code") or "unknown")
+        message = " ".join(str(error.get("message") or "未知錯誤").split())[:500]
+        raise RuntimeError(f"Facebook Graph API {code}：{message}")
+    return payload
+
+
+def facebook_graph_edge(
+    page_id: str, edge: str, token: str, version: str, since: int | None
+) -> tuple[list[dict[str, Any]], int]:
+    records: list[dict[str, Any]] = []
+    after = ""
+    seen_cursors: set[str] = set()
+    pages = 0
+    while True:
+        query = {
+            "fields": "id,title,description,permalink_url,created_time",
+            "limit": "100",
+        }
+        if since is not None:
+            query["since"] = str(max(0, since - 1))
+        if after:
+            query["after"] = after
+        url = (
+            f"https://graph.facebook.com/{version}/"
+            f"{urllib.parse.quote(page_id, safe='')}/{edge}?{urllib.parse.urlencode(query)}"
+        )
+        payload = facebook_graph_payload(url, token)
+        data = payload.get("data", [])
+        if not isinstance(data, list):
+            raise RuntimeError(f"Facebook Graph API {edge} 的 data 不是陣列。")
+        pages += 1
+        records.extend(dict(item, _edge=edge) for item in data if isinstance(item, dict))
+        paging = payload.get("paging") if isinstance(payload.get("paging"), dict) else {}
+        cursors = paging.get("cursors") if isinstance(paging.get("cursors"), dict) else {}
+        next_cursor = str(cursors.get("after") or "")
+        if paging.get("next") and not next_cursor:
+            raise RuntimeError(f"Facebook Graph API {edge} 表示仍有下一頁，但沒有 cursor；拒絕回報不完整結果。")
+        if not next_cursor:
+            break
+        if next_cursor in seen_cursors:
+            raise RuntimeError(f"Facebook Graph API {edge} 回傳重複分頁 cursor；已停止以免無限迴圈。")
+        seen_cursors.add(next_cursor)
+        after = next_cursor
+    return records, pages
+
+
+def facebook_feed_item(record: dict[str, Any]) -> dict[str, str] | None:
+    video_id = str(record.get("id") or "").strip()
+    if not video_id:
+        return None
+    edge = str(record.get("_edge") or "videos")
+    fallback = (
+        f"https://www.facebook.com/reel/{urllib.parse.quote(video_id, safe='')}"
+        if edge == "video_reels"
+        else f"https://www.facebook.com/watch/?v={urllib.parse.quote(video_id, safe='')}"
+    )
+    permalink = str(record.get("permalink_url") or "").strip()
+    try:
+        url = require_http_url(permalink, "Facebook 影片 URL") if permalink else fallback
+    except ValueError:
+        url = fallback
+    description = " ".join(str(record.get("description") or "").split())
+    title = " ".join(str(record.get("title") or "").split()) or description[:160]
+    return {
+        "id": video_id,
+        "title": title or f"Facebook video {video_id}",
+        "url": url,
+        "source_url": url,
+        "published": str(record.get("created_time") or ""),
+    }
+
+
+def apify_setting(name: str, default: str = "") -> str:
+    value = os.getenv(name, default).strip()
+    if not value:
+        raise RuntimeError(f"缺少 {name}；請在專案 .env 本機填入。")
+    return value
+
+
+def apify_facebook_item(record: dict[str, Any]) -> dict[str, str] | None:
+    media = record.get("media") if isinstance(record.get("media"), list) else []
+    media_text = json.dumps(media, ensure_ascii=False).casefold()
+    if record.get("isVideo") is not True and '"video' not in media_text:
+        return None
+    raw_url = str(record.get("url") or "").strip()
+    try:
+        parsed = urllib.parse.urlsplit(require_http_url(raw_url, "Apify Facebook 貼文 URL"))
+    except ValueError:
+        return None
+    if (parsed.hostname or "").lower() not in {
+        "facebook.com", "www.facebook.com", "web.facebook.com", "m.facebook.com",
+    }:
+        return None
+    url = public_url(raw_url)
+    post_id = str(record.get("postId") or record.get("id") or "").strip() or job_key(url)
+    text = " ".join(str(record.get("text") or "").split())
+    return {
+        "id": post_id,
+        "title": text[:160] or f"Facebook video {post_id}",
+        "url": url,
+        "source_url": url,
+        "published": str(record.get("time") or record.get("timeCreated") or ""),
+    }
+
+
+def fetch_facebook_author_apify(author: str, since: str) -> dict[str, Any]:
+    token = apify_setting("APIFY_API_TOKEN")
+    actor = os.getenv("APIFY_FACEBOOK_ACTOR", APIFY_FACEBOOK_DEFAULT_ACTOR).strip().replace("/", "~")
+    if not re.fullmatch(r"[A-Za-z0-9_-]+~[A-Za-z0-9._-]+", actor):
+        raise ValueError("APIFY_FACEBOOK_ACTOR 必須是 username~actor-name。")
+    try:
+        results_limit = int(os.getenv("APIFY_FACEBOOK_RESULTS_LIMIT", "1000000"))
+        max_charge = float(apify_setting("APIFY_MAX_TOTAL_CHARGE_USD"))
+        timeout_seconds = int(os.getenv("APIFY_RUN_TIMEOUT_SECONDS", "1800"))
+    except ValueError as exc:
+        raise ValueError("Apify 數值設定格式錯誤。") from exc
+    if results_limit <= 0 or not math.isfinite(max_charge) or max_charge <= 0 or timeout_seconds <= 0:
+        raise ValueError("Apify results limit、費用上限與 timeout 都必須大於 0。")
+
+    page_id = facebook_page_identifier(author)
+    author_url = facebook_author_url(author)
+    since_timestamp = parse_facebook_since(since)
+    actor_input: dict[str, Any] = {
+        "startUrls": [{"url": author_url}],
+        "resultsLimit": results_limit,
+        "captionText": False,
+    }
+    if since_timestamp is not None:
+        actor_input["onlyPostsNewerThan"] = datetime.datetime.fromtimestamp(
+            since_timestamp, datetime.timezone.utc
+        ).isoformat().replace("+00:00", "Z")
+    headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+    query = urllib.parse.urlencode({"waitForFinish": 60, "maxTotalChargeUsd": max_charge})
+    run_url = f"https://api.apify.com/v2/actors/{urllib.parse.quote(actor, safe='~')}/runs?{query}"
+    try:
+        payload = post_json(run_url, headers, json.dumps(actor_input).encode("utf-8"), timeout=70)
+        run = payload.get("data") if isinstance(payload, dict) else None
+        if not isinstance(run, dict) or not run.get("id"):
+            raise RuntimeError("Apify 啟動回應缺少 run ID。")
+        deadline = time.monotonic() + timeout_seconds
+        while str(run.get("status") or "") not in APIFY_TERMINAL_STATUSES:
+            if time.monotonic() >= deadline:
+                raise RuntimeError(f"Apify run {run['id']} 等待逾時；遠端工作可能仍在執行。")
+            status_url = f"https://api.apify.com/v2/actor-runs/{urllib.parse.quote(str(run['id']), safe='')}?waitForFinish=60"
+            status_payload = get_json(status_url, headers)
+            run = status_payload.get("data") if isinstance(status_payload, dict) else None
+            if not isinstance(run, dict):
+                raise RuntimeError("Apify run 狀態回應格式錯誤。")
+        if run.get("status") != "SUCCEEDED":
+            raise RuntimeError(f"Apify run {run.get('id')} 結束狀態：{run.get('status')}。")
+        dataset_id = str(run.get("defaultDatasetId") or "")
+        if not dataset_id:
+            raise RuntimeError("Apify 完成但沒有 defaultDatasetId。")
+
+        raw_items: list[dict[str, Any]] = []
+        offset = 0
+        page_size = 1000
+        while True:
+            dataset_query = urllib.parse.urlencode({"format": "json", "clean": "true", "offset": offset, "limit": page_size})
+            dataset_url = f"https://api.apify.com/v2/datasets/{urllib.parse.quote(dataset_id, safe='')}/items?{dataset_query}"
+            page = get_json(dataset_url, headers)
+            if not isinstance(page, list):
+                raise RuntimeError("Apify dataset items 回應不是 JSON 陣列。")
+            records = [item for item in page if isinstance(item, dict)]
+            raw_items.extend(records)
+            if len(page) < page_size:
+                break
+            offset += len(page)
+    except RuntimeError as exc:
+        raise RuntimeError(str(exc).replace(token, "<redacted>")) from exc
+
+    by_id: dict[str, dict[str, str]] = {}
+    for record in raw_items:
+        item = apify_facebook_item(record)
+        if item is not None:
+            by_id[item["id"]] = item
+    items = sorted(by_id.values(), key=lambda item: feed_timestamp(item["published"]), reverse=True)
+    return {
+        "title": f"Facebook {page_id}",
+        "items": items,
+        "raw_items": raw_items,
+        "facebook": {
+            "provider": "apify",
+            "page_id": page_id,
+            "author_url": author_url,
+            "since": since,
+            "actor": actor,
+            "run_id": str(run["id"]),
+            "dataset_id": dataset_id,
+            "raw_count": len(raw_items),
+            "results_limit": results_limit,
+            "results_limit_reached": len(raw_items) >= results_limit,
+            "max_total_charge_usd": max_charge,
+            "usage_total_usd": run.get("usageTotalUsd"),
+            "charged_event_counts": run.get("chargedEventCounts") or {},
+            "status_message": str(run.get("statusMessage") or "")[:500],
+            "fetched_at": rss_now(),
+        },
+        "not_modified": False,
+    }
+
+
+def fetch_facebook_author(
+    author: str, since: str = "365d", provider: str = "meta", *, allow_paid: bool = False
+) -> dict[str, Any]:
+    if provider == "apify":
+        if not allow_paid:
+            raise RuntimeError("Apify Actor 可能計費；確認額度與支出上限後加上 --allow-batch-cloud。")
+        return fetch_facebook_author_apify(author, since)
+    if provider != "meta":
+        raise ValueError("Facebook provider 必須是 meta 或 apify。")
+    page_id = facebook_page_identifier(author)
+    token = os.getenv("FACEBOOK_PAGE_ACCESS_TOKEN", "").strip()
+    if not token:
+        raise RuntimeError("缺少 FACEBOOK_PAGE_ACCESS_TOKEN；請在專案 .env 本機填入 Page Access Token。")
+    version = facebook_graph_version()
+    since_timestamp = parse_facebook_since(since)
+    raw_items: list[dict[str, Any]] = []
+    pages = 0
+    for edge in FACEBOOK_GRAPH_EDGES:
+        edge_items, edge_pages = facebook_graph_edge(page_id, edge, token, version, since_timestamp)
+        raw_items.extend(edge_items)
+        pages += edge_pages
+
+    by_id: dict[str, dict[str, str]] = {}
+    for record in raw_items:
+        item = facebook_feed_item(record)
+        if item is None:
+            continue
+        published = feed_timestamp(item["published"])
+        if since_timestamp is not None and published and published < since_timestamp:
+            continue
+        existing = by_id.get(item["id"])
+        if existing is None or (item["url"].find("/reel/") >= 0 and existing["url"].find("/reel/") < 0):
+            by_id[item["id"]] = item
+    items = sorted(by_id.values(), key=lambda item: feed_timestamp(item["published"]), reverse=True)
+    return {
+        "title": f"Facebook {page_id}",
+        "items": items,
+        "raw_items": raw_items,
+        "facebook": {
+            "provider": "meta",
+            "page_id": page_id,
+            "author_url": f"https://www.facebook.com/{urllib.parse.quote(page_id, safe='._-')}",
+            "since": since,
+            "graph_api_version": version,
+            "edges": list(FACEBOOK_GRAPH_EDGES),
+            "pages": pages,
+            "fetched_at": rss_now(),
+        },
+        "not_modified": False,
+    }
+
+
+def write_facebook_discovery(root: Path, feed: dict[str, Any]) -> Path:
+    metadata = dict(feed.get("facebook") or {})
+    page_id = str(metadata.get("page_id") or "unknown")
+    path = secure_rss_directory(root) / f"facebook-{job_key(page_id)}-latest.json"
+    write_json(path, feed)
+    try:
+        os.chmod(path, 0o600)
+    except OSError:
+        pass
+    return path
+
+
 def queue_rss_items(
     state: dict[str, Any], subscription: dict[str, Any], entries: list[dict[str, str]]
 ) -> dict[str, int]:
@@ -3174,6 +3526,7 @@ def add_rss_subscription(
     feed = fetch_rss(url)
     subscription = {
         "id": job_key(url),
+        "kind": "rss",
         "url": url,
         "name": name.strip() or str(feed["title"]),
         "enabled": True,
@@ -3191,7 +3544,54 @@ def add_rss_subscription(
     return subscription, counts
 
 
-def refresh_rss(root: Path, workers: int = 4) -> dict[str, int]:
+def add_facebook_subscription(
+    root: Path,
+    author: str,
+    *,
+    since: str = "365d",
+    provider: str = "meta",
+    allow_paid: bool = False,
+    name: str = "",
+    keywords: list[str] | None = None,
+    tags: list[str] | None = None,
+    latest_only: bool = False,
+) -> tuple[dict[str, Any], dict[str, int], Path]:
+    root.mkdir(parents=True, exist_ok=True)
+    page_id = facebook_page_identifier(author)
+    state = load_rss_state(root)
+    if any(
+        str(item.get("kind") or "rss") == "facebook-author"
+        and str(item.get("facebook_page_id") or "") == page_id
+        for item in state["subscriptions"]
+    ):
+        raise RuntimeError("這個 Facebook 作者已經訂閱。")
+    feed = fetch_facebook_author(page_id, since, provider, allow_paid=allow_paid)
+    newest = next((item["published"] for item in feed["items"] if item.get("published")), "")
+    snapshot = write_facebook_discovery(root, feed)
+    subscription = {
+        "id": job_key("facebook-author", page_id),
+        "kind": "facebook-author",
+        "url": str(feed["facebook"]["author_url"]),
+        "facebook_page_id": page_id,
+        "facebook_since": since,
+        "facebook_provider": provider,
+        "facebook_last_published": newest,
+        "facebook_last_discovery": snapshot.name,
+        "name": name.strip() or str(feed["title"]),
+        "enabled": True,
+        "latest_only": latest_only,
+        "keywords": keywords or [],
+        "tags": tags or [],
+        "last_checked": rss_now(),
+        "last_error": "",
+    }
+    state["subscriptions"].append(subscription)
+    counts = queue_rss_items(state, subscription, list(feed["items"]))
+    save_rss_state(root, state)
+    return subscription, counts, snapshot
+
+
+def refresh_rss(root: Path, workers: int = 4, allow_paid: bool = False) -> dict[str, int]:
     state = load_rss_state(root)
     if not state["subscriptions"]:
         raise RuntimeError("尚未加入 RSS 訂閱；先使用 --rss-add。")
@@ -3203,6 +3603,18 @@ def refresh_rss(root: Path, workers: int = 4) -> dict[str, int]:
 
     def fetch_one(subscription: dict[str, Any]) -> tuple[dict[str, Any] | None, Exception | None]:
         try:
+            if str(subscription.get("kind") or "rss") == "facebook-author":
+                since = str(
+                    subscription.get("facebook_last_published")
+                    or subscription.get("facebook_since")
+                    or "365d"
+                )
+                return fetch_facebook_author(
+                    str(subscription.get("facebook_page_id") or subscription["url"]),
+                    since,
+                    str(subscription.get("facebook_provider") or "meta"),
+                    allow_paid=allow_paid,
+                ), None
             return fetch_rss(
                 str(subscription["url"]),
                 str(subscription.get("etag") or ""),
@@ -3225,6 +3637,12 @@ def refresh_rss(root: Path, workers: int = 4) -> dict[str, int]:
                 subscription["last_modified"] = str(
                     feed.get("last_modified") or subscription.get("last_modified") or ""
                 )
+                if str(subscription.get("kind") or "rss") == "facebook-author":
+                    snapshot = write_facebook_discovery(root, feed)
+                    subscription["facebook_last_discovery"] = snapshot.name
+                    newest = next((item["published"] for item in feed["items"] if item.get("published")), "")
+                    if newest:
+                        subscription["facebook_last_published"] = newest
                 counts = queue_rss_items(state, subscription, list(feed["items"]))
                 for key in ("queued", "filtered", "skipped", "updated"):
                     totals[key] += counts[key]
@@ -3314,7 +3732,7 @@ def cleanup_rss_state(root: Path, days: int) -> int:
 
 def rss_status(root: Path, item_limit: int = 20, show_items: bool = False) -> list[str]:
     state = load_rss_state(root)
-    lines = [f"RSS 訂閱：{len(state['subscriptions'])} 個"]
+    lines = [f"來源訂閱：{len(state['subscriptions'])} 個"]
     counts_by_feed: dict[str, dict[str, int]] = {}
     for item in state["items"]:
         feed_id = str(item.get("subscription_id") or "")
@@ -3326,7 +3744,13 @@ def rss_status(root: Path, item_limit: int = 20, show_items: bool = False) -> li
         detail = "、".join(f"{key} {value}" for key, value in sorted(statuses.items())) or "尚無項目"
         error = "；上次失敗" if subscription.get("last_error") else ""
         enabled = "啟用" if subscription.get("enabled", True) else "暫停"
-        lines.append(f"- {subscription['id']}  {subscription.get('name') or '未命名'}（{enabled}）：{detail}{error}")
+        kind = "RSS"
+        if str(subscription.get("kind") or "rss") == "facebook-author":
+            kind = f"Facebook/{subscription.get('facebook_provider') or 'meta'}"
+        lines.append(
+            f"- {subscription['id']} [{kind}] {subscription.get('name') or '未命名'}"
+            f"（{enabled}）：{detail}{error}"
+        )
     problem_states = {"failed", "dead-letter", "processing"}
     details = [item for item in state["items"] if show_items or item.get("status") in problem_states]
     if details and item_limit > 0:
@@ -3355,19 +3779,26 @@ def export_rss_opml(root: Path, output: Path) -> int:
     ET.SubElement(ET.SubElement(opml, "head"), "title").text = "VidBee RSS subscriptions"
     body = ET.SubElement(opml, "body")
     for subscription in state["subscriptions"]:
+        kind = str(subscription.get("kind") or "rss")
+        attributes = {
+            "type": "rss" if kind == "rss" else kind,
+            "text": str(subscription.get("name") or subscription["url"]),
+            "title": str(subscription.get("name") or subscription["url"]),
+            "xmlUrl": str(subscription["url"]),
+            "vidbeeKind": kind,
+            "vidbeeKeywords": ",".join(subscription.get("keywords") or []),
+            "vidbeeTags": ",".join(subscription.get("tags") or []),
+            "vidbeeLatestOnly": str(bool(subscription.get("latest_only"))).lower(),
+            "vidbeeEnabled": str(bool(subscription.get("enabled", True))).lower(),
+        }
+        if kind == "facebook-author":
+            attributes["vidbeeFacebookPageId"] = str(subscription.get("facebook_page_id") or "")
+            attributes["vidbeeFacebookSince"] = str(subscription.get("facebook_since") or "365d")
+            attributes["vidbeeFacebookProvider"] = str(subscription.get("facebook_provider") or "meta")
         ET.SubElement(
             body,
             "outline",
-            {
-                "type": "rss",
-                "text": str(subscription.get("name") or subscription["url"]),
-                "title": str(subscription.get("name") or subscription["url"]),
-                "xmlUrl": str(subscription["url"]),
-                "vidbeeKeywords": ",".join(subscription.get("keywords") or []),
-                "vidbeeTags": ",".join(subscription.get("tags") or []),
-                "vidbeeLatestOnly": str(bool(subscription.get("latest_only"))).lower(),
-                "vidbeeEnabled": str(bool(subscription.get("enabled", True))).lower(),
-            },
+            attributes,
         )
     write_text(output.resolve(), ET.tostring(opml, encoding="unicode", xml_declaration=True))
     try:
@@ -3377,7 +3808,7 @@ def export_rss_opml(root: Path, output: Path) -> int:
     return len(state["subscriptions"])
 
 
-def import_rss_opml(root: Path, source: Path) -> dict[str, int]:
+def import_rss_opml(root: Path, source: Path, allow_paid: bool = False) -> dict[str, int]:
     raw = source.resolve().read_bytes()
     if len(raw) > RSS_MAX_BYTES:
         raise RuntimeError("OPML 超過 5 MB 安全上限。")
@@ -3393,18 +3824,27 @@ def import_rss_opml(root: Path, source: Path) -> dict[str, int]:
         if not url:
             continue
         try:
-            subscription, _ = add_rss_subscription(
-                root,
-                url,
-                name=str(outline.attrib.get("title") or outline.attrib.get("text") or ""),
-                keywords=csv_values(str(outline.attrib.get("vidbeeKeywords") or "")),
-                tags=csv_values(str(outline.attrib.get("vidbeeTags") or "")),
-                latest_only=str(outline.attrib.get("vidbeeLatestOnly") or "false").lower() == "true",
-            )
+            options = {
+                "name": str(outline.attrib.get("title") or outline.attrib.get("text") or ""),
+                "keywords": csv_values(str(outline.attrib.get("vidbeeKeywords") or "")),
+                "tags": csv_values(str(outline.attrib.get("vidbeeTags") or "")),
+                "latest_only": str(outline.attrib.get("vidbeeLatestOnly") or "false").lower() == "true",
+            }
+            if str(outline.attrib.get("vidbeeKind") or "rss") == "facebook-author":
+                subscription, _, _ = add_facebook_subscription(
+                    root,
+                    str(outline.attrib.get("vidbeeFacebookPageId") or url),
+                    since=str(outline.attrib.get("vidbeeFacebookSince") or "365d"),
+                    provider=str(outline.attrib.get("vidbeeFacebookProvider") or "meta"),
+                    allow_paid=allow_paid,
+                    **options,
+                )
+            else:
+                subscription, _ = add_rss_subscription(root, url, **options)
             if str(outline.attrib.get("vidbeeEnabled") or "true").lower() == "false":
                 update_rss_subscription(root, str(subscription["id"]), enabled=False)
             totals["added"] += 1
-        except RuntimeError as exc:
+        except (RuntimeError, ValueError) as exc:
             if "已經訂閱" in str(exc):
                 totals["existing"] += 1
             else:
@@ -3612,7 +4052,7 @@ def rss_task_name(root: Path) -> str:
     return f"VidBee-RSS-{job_key(str(root.resolve()))}"
 
 
-def install_rss_task(root: Path, minutes: int, process: bool) -> str:
+def install_rss_task(root: Path, minutes: int, process: bool, allow_paid: bool = False) -> str:
     if os.name != "nt":
         raise RuntimeError("背景排程安裝目前使用 Windows 工作排程器，只支援 Windows。")
     if minutes < 5:
@@ -3620,7 +4060,9 @@ def install_rss_task(root: Path, minutes: int, process: bool) -> str:
     script = secure_rss_directory(root) / "scheduled-refresh.cmd"
     command = [sys.executable, str(Path(__file__).resolve()), "--root", str(root.resolve()), "--rss-refresh"]
     if process:
-        command.extend(["--rss-process", "--rss-retry-failed", "--allow-batch-cloud"])
+        command.extend(["--rss-process", "--rss-retry-failed"])
+    if process or allow_paid:
+        command.append("--allow-batch-cloud")
     write_text(script, "@echo off\n" + subprocess.list2cmdline(command) + "\n")
     run_external(
         [
@@ -3665,15 +4107,23 @@ def rss_requested(args: argparse.Namespace) -> bool:
         or args.rss_task_install is not None
         or args.rss_task_process
         or args.rss_task_remove
+        or args.facebook_author
+        or args.facebook_since is not None
+        or args.facebook_provider is not None
+        or args.facebook_discover_only
     )
 
 
 def run_rss_command(args: argparse.Namespace) -> int:
     if args.url or args.video or args.url_file:
-        raise ValueError("RSS 指令不可與 --url、--video 或 --url-file 同時使用。")
+        raise ValueError("訂閱指令不可與 --url、--video 或 --url-file 同時使用。")
+    if args.facebook_author and args.rss_add:
+        raise ValueError("--facebook-author 與 --rss-add 一次只能使用一個。")
+    if (args.facebook_since is not None or args.facebook_provider is not None or args.facebook_discover_only) and not args.facebook_author:
+        raise ValueError("--facebook-since／--facebook-provider／--facebook-discover-only 必須搭配 --facebook-author。")
     edits = any(value is not None for value in (args.rss_name, args.rss_keywords, args.rss_tags, args.rss_latest_only))
-    if edits and not (args.rss_add or args.rss_update):
-        raise ValueError("RSS 名稱／關鍵字／標籤／latest-only 設定只可搭配 --rss-add 或 --rss-update。")
+    if edits and not (args.rss_add or args.rss_update or args.facebook_author):
+        raise ValueError("名稱／關鍵字／標籤／latest-only 設定只可搭配新增或更新訂閱。")
     if args.rss_update and not edits:
         raise ValueError("--rss-update 至少要搭配一個要修改的設定。")
     if args.rss_list_items and not args.rss_list:
@@ -3712,6 +4162,41 @@ def run_rss_command(args: argparse.Namespace) -> int:
             f"已加入 RSS：{subscription['name']}（ID {subscription['id']}；"
             f"queued {counts['queued']}、filtered {counts['filtered']}、skipped {counts['skipped']}）"
         )
+    if args.facebook_author:
+        since = args.facebook_since or "365d"
+        provider = args.facebook_provider or "meta"
+        if args.facebook_discover_only:
+            feed = fetch_facebook_author(
+                args.facebook_author, since, provider, allow_paid=bool(args.allow_batch_cloud)
+            )
+            snapshot = write_facebook_discovery(root, feed)
+            detail = (
+                f"{feed['facebook']['pages']} 個 API 分頁"
+                if provider == "meta"
+                else f"{feed['facebook']['raw_count']} 筆公開貼文"
+            )
+            print(
+                f"Facebook/{provider} 盤點：{feed['facebook']['page_id']}，找到 {len(feed['items'])} 支影片；"
+                f"{detail} → {snapshot}"
+            )
+        else:
+            with rss_writer_lock(root):
+                subscription, counts, snapshot = add_facebook_subscription(
+                    root,
+                    args.facebook_author,
+                    since=since,
+                    provider=provider,
+                    allow_paid=bool(args.allow_batch_cloud),
+                    name=args.rss_name or "",
+                    keywords=csv_values(args.rss_keywords or ""),
+                    tags=csv_values(args.rss_tags or ""),
+                    latest_only=bool(args.rss_latest_only),
+                )
+            print(
+                f"已加入 Facebook 作者：{subscription['name']}（ID {subscription['id']}；"
+                f"queued {counts['queued']}、filtered {counts['filtered']}、"
+                f"skipped {counts['skipped']}；盤點 {snapshot}）"
+            )
     if args.rss_update:
         with rss_writer_lock(root):
             subscription = update_rss_subscription(
@@ -3734,7 +4219,7 @@ def run_rss_command(args: argparse.Namespace) -> int:
         print(f"已重排 RSS 項目：{item['id']}")
     if args.rss_import_opml:
         with rss_writer_lock(root):
-            totals = import_rss_opml(root, args.rss_import_opml)
+            totals = import_rss_opml(root, args.rss_import_opml, bool(args.allow_batch_cloud))
         print(f"OPML 匯入：added {totals['added']}、existing {totals['existing']}、failed {totals['failed']}")
         if totals["failed"]:
             exit_code = 1
@@ -3747,7 +4232,7 @@ def run_rss_command(args: argparse.Namespace) -> int:
         print(f"RSS 清理：移除 {removed} 筆過期終態紀錄。")
     if args.rss_refresh:
         with rss_writer_lock(root):
-            totals = refresh_rss(root, args.rss_refresh_workers)
+            totals = refresh_rss(root, args.rss_refresh_workers, bool(args.allow_batch_cloud))
         print(
             f"RSS 刷新：{totals['feeds']} feeds、queued {totals['queued']}、"
             f"filtered {totals['filtered']}、skipped {totals['skipped']}、failed {totals['failed']}"
@@ -3771,7 +4256,7 @@ def run_rss_command(args: argparse.Namespace) -> int:
         try:
             while True:
                 with rss_writer_lock(root):
-                    totals = refresh_rss(root, args.rss_refresh_workers)
+                    totals = refresh_rss(root, args.rss_refresh_workers, bool(args.allow_batch_cloud))
                 print(
                     f"RSS 刷新：queued {totals['queued']}、failed {totals['failed']}"
                 )
@@ -3786,7 +4271,9 @@ def run_rss_command(args: argparse.Namespace) -> int:
             print("RSS 監看已停止。")
     if args.rss_task_install is not None:
         with rss_writer_lock(root):
-            name = install_rss_task(root, args.rss_task_install, args.rss_task_process)
+            name = install_rss_task(
+                root, args.rss_task_install, args.rss_task_process, bool(args.allow_batch_cloud)
+            )
         print(f"已安裝背景排程：{name}（{'含雲端處理' if args.rss_task_process else '只刷新本機佇列'}）")
     if args.rss_task_remove:
         name = remove_rss_task(root)
@@ -4594,6 +5081,7 @@ def self_test() -> None:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="影片語音＋畫面時間軸摘要管線")
+    parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     source = parser.add_mutually_exclusive_group()
     source.add_argument("--url", help="YouTube／Facebook 等 yt-dlp 支援的影片 URL")
     source.add_argument("--video", help="本機影片路徑")
@@ -4604,7 +5092,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--allow-batch-cloud",
         action="store_true",
-        help="明確允許批次雲端處理；MiniMax Token Plan 超額可能自動使用 Credits",
+        help="明確允許批次雲端處理與 Apify Actor；供應商可能使用帳戶額度或 Credits",
     )
     rss = parser.add_argument_group("RSS 訂閱")
     rss.add_argument("--rss-add", metavar="FEED_URL", help="加入 RSS/Atom Feed，並立即把新項目排入本機佇列")
@@ -4641,6 +5129,28 @@ def parse_args() -> argparse.Namespace:
     rss.add_argument("--rss-task-install", type=int, metavar="MINUTES", help="安裝 Windows 背景刷新排程")
     rss.add_argument("--rss-task-process", action="store_true", help="背景排程也跑雲端處理；需 --allow-batch-cloud")
     rss.add_argument("--rss-task-remove", action="store_true", help="移除本專案的 Windows 背景排程")
+    rss.add_argument(
+        "--facebook-author",
+        metavar="PAGE_ID_OR_URL",
+        help="加入 Facebook 作者的影片訂閱；Meta 適用自管 Page，Apify 適用公開 Page",
+    )
+    rss.add_argument(
+        "--facebook-provider",
+        choices=("meta", "apify"),
+        default=None,
+        help="作者發現方式；預設 meta，非自管公開 Page 可選 apify（可能計費）",
+    )
+    rss.add_argument(
+        "--facebook-since",
+        metavar="WHEN",
+        default=None,
+        help="Facebook 回溯範圍：365d、52w、ISO 日期或 all；預設 365d",
+    )
+    rss.add_argument(
+        "--facebook-discover-only",
+        action="store_true",
+        help="只盤點作者並保存結果；Apify 仍會啟動可能計費的 Actor",
+    )
     parser.add_argument("--chunk-seconds", type=int, default=900)
     parser.add_argument(
         "--workers",
@@ -5139,7 +5649,7 @@ def run_pipeline(args: argparse.Namespace) -> Path:
         manifest["artifacts"]["notes"] = artifact_path(job_dir / "notes.md", root)
         if args.vidbee_sidecar and not args.no_video and transcript.get("segments"):
             manifest["vidbee_sidecar"] = write_vidbee_sidecar(
-                video_path, transcript_files["transcript_zh_tw_srt"]
+                video_path, transcript_files["transcript_zh_tw_srt"], job_dir / "notes.md"
             )
         if args.sync_open_notebook:
             if args.dry_run or args.local_only:
@@ -5201,7 +5711,7 @@ def main() -> int:
         try:
             return run_rss_command(args)
         except (RuntimeError, ValueError, OSError) as exc:
-            print(f"RSS ERROR: {exc}", file=sys.stderr)
+            print(f"訂閱 ERROR: {exc}", file=sys.stderr)
             return 1
     if args.list or args.show:  # 純本地查詢，不需要金鑰
         root = args.root.resolve()
