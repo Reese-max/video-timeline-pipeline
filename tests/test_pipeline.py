@@ -161,5 +161,74 @@ class FacebookAuthorTests(unittest.TestCase):
         self.assertTrue(all("test-apify-token" not in url for url, _ in calls))
 
 
+class InstagramAuthorTests(unittest.TestCase):
+    def test_brightdata_discovery_is_opt_in_and_filters_known_dates(self) -> None:
+        with self.assertRaisesRegex(RuntimeError, "--allow-batch-cloud"):
+            pipeline.fetch_instagram_author("example")
+
+        calls: list[tuple[str, dict[str, str]]] = []
+
+        def fake_get(url: str, headers: dict[str, str]):
+            calls.append((url, headers))
+            if "/progress/" in url:
+                return {"snapshot_id": "s_test", "status": "ready"}
+            return [
+                {
+                    "post_id": "video-1",
+                    "shortcode": "CURRENT",
+                    "url": "https://www.instagram.com/reel/CURRENT/?tracking=secret",
+                    "description": "近期 Reel",
+                    "date_posted": "2026-08-01T00:00:00.000Z",
+                },
+                {
+                    "post_id": "old-video",
+                    "shortcode": "OLD",
+                    "url": "https://www.instagram.com/reel/OLD/",
+                    "date_posted": "2024-01-01T00:00:00.000Z",
+                },
+                {
+                    "post_id": "missing-date",
+                    "shortcode": "NODATE",
+                    "url": "https://www.instagram.com/reel/NODATE/",
+                    "description": "缺日期仍保留待核對",
+                },
+            ]
+
+        environment = {
+            "BRIGHTDATA_API_TOKEN": "test-brightdata-token",
+            "BRIGHTDATA_RUN_TIMEOUT_SECONDS": "60",
+        }
+        with mock.patch.object(
+            pipeline, "post_json", return_value={"snapshot_id": "s_test"}
+        ) as post, mock.patch.object(
+            pipeline, "get_json", side_effect=fake_get
+        ), mock.patch.dict(pipeline.os.environ, environment, clear=True):
+            feed = pipeline.fetch_instagram_author(
+                "https://www.instagram.com/example/",
+                "2025-01-01",
+                max_items=20,
+                exclude_ids=["already-seen"],
+                allow_paid=True,
+            )
+
+        self.assertEqual([item["id"] for item in feed["items"]], ["video-1", "missing-date"])
+        self.assertEqual(feed["items"][0]["url"], "https://www.instagram.com/reel/CURRENT/")
+        self.assertFalse(feed["instagram"]["date_filter_complete"])
+        self.assertEqual(feed["instagram"]["missing_date_count"], 1)
+        trigger_url, headers, body = post.call_args.args[:3]
+        self.assertNotIn("test-brightdata-token", trigger_url)
+        self.assertIn("dataset_id=gd_lyclm20il4r5helnj", trigger_url)
+        self.assertIn("type=discover_new", trigger_url)
+        self.assertEqual(headers["Authorization"], "Bearer test-brightdata-token")
+        request_input = pipeline.json.loads(body)["input"][0]
+        self.assertEqual(request_input["url"], "https://www.instagram.com/example/")
+        self.assertEqual(request_input["num_of_posts"], 20)
+        self.assertEqual(request_input["posts_to_not_include"], ["already-seen"])
+        self.assertTrue(all("test-brightdata-token" not in url for url, _ in calls))
+        self.assertTrue(all(headers["Authorization"] == "Bearer test-brightdata-token" for _, headers in calls))
+        with self.assertRaisesRegex(ValueError, "不可使用單篇"):
+            pipeline.instagram_username("https://www.instagram.com/reel/CURRENT/")
+
+
 if __name__ == "__main__":
     unittest.main()

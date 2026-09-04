@@ -801,6 +801,8 @@ FACEBOOK_GRAPH_DEFAULT_VERSION = "v26.0"
 FACEBOOK_GRAPH_EDGES = ("videos", "video_reels")
 APIFY_FACEBOOK_DEFAULT_ACTOR = "apify~facebook-posts-scraper"
 APIFY_TERMINAL_STATUSES = {"SUCCEEDED", "FAILED", "ABORTED", "TIMED-OUT"}
+BRIGHTDATA_INSTAGRAM_REELS_DATASET_ID = "gd_lyclm20il4r5helnj"
+BRIGHTDATA_API_ROOT = "https://api.brightdata.com/datasets/v3"
 
 
 def public_url(url: str) -> str:
@@ -3134,8 +3136,8 @@ def facebook_author_url(value: str) -> str:
     return f"https://www.facebook.com/{urllib.parse.quote(identifier, safe='._-')}"
 
 
-def parse_facebook_since(value: str, now: float | None = None) -> int | None:
-    """將 365d、52w 或 ISO 日期轉成 Graph API 的 since 時間戳；all 表示完整歷史。"""
+def parse_since(value: str, option: str, now: float | None = None) -> int | None:
+    """將 365d、52w 或 ISO 日期轉成 UTC 時間戳；all 表示完整歷史。"""
     raw = value.strip().lower()
     if raw == "all":
         return None
@@ -3143,16 +3145,24 @@ def parse_facebook_since(value: str, now: float | None = None) -> int | None:
     if duration:
         amount = int(duration.group(1))
         if amount <= 0:
-            raise ValueError("--facebook-since 的期間必須大於 0。")
+            raise ValueError(f"{option} 的期間必須大於 0。")
         seconds = amount * (86400 if duration.group(2) == "d" else 7 * 86400)
         return max(0, int((time.time() if now is None else now) - seconds))
     try:
         parsed = datetime.datetime.fromisoformat(raw.replace("z", "+00:00"))
     except ValueError as exc:
-        raise ValueError("--facebook-since 必須是 365d、52w、YYYY-MM-DD／ISO 時間或 all。") from exc
+        raise ValueError(f"{option} 必須是 365d、52w、YYYY-MM-DD／ISO 時間或 all。") from exc
     if parsed.tzinfo is None:
         parsed = parsed.replace(tzinfo=datetime.timezone.utc)
     return max(0, int(parsed.timestamp()))
+
+
+def parse_facebook_since(value: str, now: float | None = None) -> int | None:
+    return parse_since(value, "--facebook-since", now)
+
+
+def parse_instagram_since(value: str, now: float | None = None) -> int | None:
+    return parse_since(value, "--instagram-since", now)
 
 
 def facebook_graph_version() -> str:
@@ -3437,6 +3447,179 @@ def write_facebook_discovery(root: Path, feed: dict[str, Any]) -> Path:
     return path
 
 
+def instagram_username(value: str) -> str:
+    raw = value.strip()
+    if not raw:
+        raise ValueError("Instagram 作者不可留白。")
+    candidate = raw
+    if "://" in raw:
+        parsed = urllib.parse.urlsplit(require_http_url(raw, "Instagram 作者 URL"))
+        if (parsed.hostname or "").lower() not in {"instagram.com", "www.instagram.com"}:
+            raise ValueError("Instagram 作者 URL 必須位於 instagram.com。")
+        parts = [urllib.parse.unquote(part) for part in parsed.path.split("/") if part]
+        candidate = parts[0] if len(parts) == 1 else ""
+    candidate = candidate.strip().lstrip("@").rstrip("/")
+    if not re.fullmatch(r"[A-Za-z0-9._]{1,30}", candidate) or candidate.lower() in {
+        "explore", "p", "reel", "reels", "stories", "tv",
+    }:
+        raise ValueError("請提供 Instagram 使用者名稱或作者首頁；不可使用單篇貼文／Reel 網址。")
+    return candidate
+
+
+def instagram_author_url(value: str) -> str:
+    return f"https://www.instagram.com/{urllib.parse.quote(instagram_username(value), safe='._')}/"
+
+
+def instagram_feed_item(record: dict[str, Any]) -> dict[str, str] | None:
+    raw_url = str(record.get("url") or "").strip()
+    try:
+        parsed = urllib.parse.urlsplit(require_http_url(raw_url, "Bright Data Instagram Reel URL"))
+    except ValueError:
+        return None
+    if (parsed.hostname or "").lower() not in {"instagram.com", "www.instagram.com"}:
+        return None
+    parts = [part for part in parsed.path.split("/") if part]
+    is_reel = bool(parts and parts[0].lower() in {"reel", "reels"})
+    if not is_reel and not record.get("video_url"):
+        return None
+    shortcode = str(record.get("shortcode") or (parts[1] if len(parts) > 1 else "")).strip()
+    reel_id = str(record.get("post_id") or record.get("content_id") or shortcode).strip()
+    if not reel_id:
+        reel_id = job_key(public_url(raw_url))
+    description = " ".join(str(record.get("description") or "").split())
+    return {
+        "id": reel_id,
+        "title": description[:160] or f"Instagram Reel {shortcode or reel_id}",
+        "url": public_url(raw_url),
+        "source_url": public_url(raw_url),
+        "published": str(record.get("date_posted") or ""),
+    }
+
+
+def fetch_instagram_author(
+    author: str,
+    since: str = "365d",
+    *,
+    max_items: int | None = None,
+    exclude_ids: list[str] | None = None,
+    allow_paid: bool = False,
+) -> dict[str, Any]:
+    if not allow_paid:
+        raise RuntimeError("Bright Data 可能計費；確認帳戶額度後加上 --allow-batch-cloud。")
+    token = os.getenv("BRIGHTDATA_API_TOKEN", "").strip()
+    if not token:
+        raise RuntimeError("缺少 BRIGHTDATA_API_TOKEN；請在專案 .env 本機填入。")
+    try:
+        timeout_seconds = int(os.getenv("BRIGHTDATA_RUN_TIMEOUT_SECONDS", "1800"))
+    except ValueError as exc:
+        raise ValueError("BRIGHTDATA_RUN_TIMEOUT_SECONDS 必須是整數。") from exc
+    if timeout_seconds <= 0 or (max_items is not None and max_items <= 0):
+        raise ValueError("Bright Data timeout 與 --instagram-max-items 必須大於 0。")
+
+    username = instagram_username(author)
+    author_url = instagram_author_url(username)
+    since_timestamp = parse_instagram_since(since)
+    discovery_input: dict[str, Any] = {"url": author_url}
+    if max_items is not None:
+        discovery_input["num_of_posts"] = max_items
+    excluded = list(dict.fromkeys(str(item).strip() for item in (exclude_ids or []) if str(item).strip()))
+    if excluded:
+        discovery_input["posts_to_not_include"] = excluded
+
+    headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+    query = urllib.parse.urlencode(
+        {
+            "dataset_id": BRIGHTDATA_INSTAGRAM_REELS_DATASET_ID,
+            "type": "discover_new",
+            "discover_by": "url",
+            "include_errors": "true",
+            "format": "json",
+        }
+    )
+    trigger_url = f"{BRIGHTDATA_API_ROOT}/trigger?{query}"
+    try:
+        payload = post_json(
+            trigger_url,
+            headers,
+            json.dumps({"input": [discovery_input]}).encode("utf-8"),
+            timeout=60,
+        )
+        snapshot_id = str(payload.get("snapshot_id") or "") if isinstance(payload, dict) else ""
+        if not re.fullmatch(r"s_[A-Za-z0-9_-]+", snapshot_id):
+            raise RuntimeError("Bright Data 啟動回應缺少有效 snapshot_id。")
+        deadline = time.monotonic() + timeout_seconds
+        status = ""
+        while status != "ready":
+            progress_url = f"{BRIGHTDATA_API_ROOT}/progress/{urllib.parse.quote(snapshot_id, safe='')}"
+            progress = get_json(progress_url, headers)
+            status = str(progress.get("status") or "").lower() if isinstance(progress, dict) else ""
+            if status == "failed":
+                raise RuntimeError(f"Bright Data snapshot {snapshot_id} 執行失敗。")
+            if status == "ready":
+                break
+            if time.monotonic() >= deadline:
+                raise RuntimeError(f"Bright Data snapshot {snapshot_id} 等待逾時；遠端工作可能仍在執行。")
+            time.sleep(min(10.0, max(0.1, deadline - time.monotonic())))
+        snapshot_url = (
+            f"{BRIGHTDATA_API_ROOT}/snapshot/{urllib.parse.quote(snapshot_id, safe='')}?format=json"
+        )
+        result = get_json(snapshot_url, headers)
+    except RuntimeError as exc:
+        raise RuntimeError(str(exc).replace(token, "<redacted>")) from exc
+
+    if isinstance(result, list):
+        raw_items = [item for item in result if isinstance(item, dict)]
+    elif isinstance(result, dict) and isinstance(result.get("data"), list):
+        raw_items = [item for item in result["data"] if isinstance(item, dict)]
+    else:
+        raise RuntimeError("Bright Data snapshot 回應不是 JSON 陣列。")
+
+    by_id: dict[str, dict[str, str]] = {}
+    missing_dates = 0
+    for record in raw_items:
+        item = instagram_feed_item(record)
+        if item is None:
+            continue
+        published = feed_timestamp(item["published"])
+        if not published:
+            missing_dates += 1
+        elif since_timestamp is not None and published < since_timestamp:
+            continue
+        by_id[item["id"]] = item
+    items = sorted(by_id.values(), key=lambda item: feed_timestamp(item["published"]), reverse=True)
+    return {
+        "title": f"Instagram @{username}",
+        "items": items,
+        "raw_items": raw_items,
+        "instagram": {
+            "provider": "brightdata",
+            "username": username,
+            "author_url": author_url,
+            "since": since,
+            "max_items": max_items,
+            "snapshot_id": snapshot_id,
+            "dataset_id": BRIGHTDATA_INSTAGRAM_REELS_DATASET_ID,
+            "raw_count": len(raw_items),
+            "missing_date_count": missing_dates,
+            "date_filter_complete": missing_dates == 0,
+            "fetched_at": rss_now(),
+        },
+        "not_modified": False,
+    }
+
+
+def write_instagram_discovery(root: Path, feed: dict[str, Any]) -> Path:
+    metadata = dict(feed.get("instagram") or {})
+    username = str(metadata.get("username") or "unknown")
+    path = secure_rss_directory(root) / f"instagram-{job_key(username)}-latest.json"
+    write_json(path, feed)
+    try:
+        os.chmod(path, 0o600)
+    except OSError:
+        pass
+    return path
+
+
 def queue_rss_items(
     state: dict[str, Any], subscription: dict[str, Any], entries: list[dict[str, str]]
 ) -> dict[str, int]:
@@ -3591,6 +3774,55 @@ def add_facebook_subscription(
     return subscription, counts, snapshot
 
 
+def add_instagram_subscription(
+    root: Path,
+    author: str,
+    *,
+    since: str = "365d",
+    max_items: int | None = None,
+    allow_paid: bool = False,
+    name: str = "",
+    keywords: list[str] | None = None,
+    tags: list[str] | None = None,
+    latest_only: bool = False,
+) -> tuple[dict[str, Any], dict[str, int], Path]:
+    root.mkdir(parents=True, exist_ok=True)
+    username = instagram_username(author)
+    state = load_rss_state(root)
+    if any(
+        str(item.get("kind") or "rss") == "instagram-author"
+        and str(item.get("instagram_username") or "").casefold() == username.casefold()
+        for item in state["subscriptions"]
+    ):
+        raise RuntimeError("這個 Instagram 作者已經訂閱。")
+    feed = fetch_instagram_author(
+        username, since, max_items=max_items, allow_paid=allow_paid
+    )
+    newest = next((item["published"] for item in feed["items"] if item.get("published")), "")
+    snapshot = write_instagram_discovery(root, feed)
+    subscription = {
+        "id": job_key("instagram-author", username.casefold()),
+        "kind": "instagram-author",
+        "url": str(feed["instagram"]["author_url"]),
+        "instagram_username": username,
+        "instagram_since": since,
+        "instagram_max_items": max_items,
+        "instagram_last_published": newest,
+        "instagram_last_discovery": snapshot.name,
+        "name": name.strip() or str(feed["title"]),
+        "enabled": True,
+        "latest_only": latest_only,
+        "keywords": keywords or [],
+        "tags": tags or [],
+        "last_checked": rss_now(),
+        "last_error": "",
+    }
+    state["subscriptions"].append(subscription)
+    counts = queue_rss_items(state, subscription, list(feed["items"]))
+    save_rss_state(root, state)
+    return subscription, counts, snapshot
+
+
 def refresh_rss(root: Path, workers: int = 4, allow_paid: bool = False) -> dict[str, int]:
     state = load_rss_state(root)
     if not state["subscriptions"]:
@@ -3603,7 +3835,8 @@ def refresh_rss(root: Path, workers: int = 4, allow_paid: bool = False) -> dict[
 
     def fetch_one(subscription: dict[str, Any]) -> tuple[dict[str, Any] | None, Exception | None]:
         try:
-            if str(subscription.get("kind") or "rss") == "facebook-author":
+            kind = str(subscription.get("kind") or "rss")
+            if kind == "facebook-author":
                 since = str(
                     subscription.get("facebook_last_published")
                     or subscription.get("facebook_since")
@@ -3613,6 +3846,24 @@ def refresh_rss(root: Path, workers: int = 4, allow_paid: bool = False) -> dict[
                     str(subscription.get("facebook_page_id") or subscription["url"]),
                     since,
                     str(subscription.get("facebook_provider") or "meta"),
+                    allow_paid=allow_paid,
+                ), None
+            if kind == "instagram-author":
+                since = str(
+                    subscription.get("instagram_last_published")
+                    or subscription.get("instagram_since")
+                    or "365d"
+                )
+                known_ids = [
+                    str(item.get("entry_id") or "")
+                    for item in state["items"]
+                    if item.get("subscription_id") == subscription.get("id") and item.get("entry_id")
+                ]
+                return fetch_instagram_author(
+                    str(subscription.get("instagram_username") or subscription["url"]),
+                    since,
+                    max_items=subscription.get("instagram_max_items"),
+                    exclude_ids=known_ids,
                     allow_paid=allow_paid,
                 ), None
             return fetch_rss(
@@ -3637,12 +3888,19 @@ def refresh_rss(root: Path, workers: int = 4, allow_paid: bool = False) -> dict[
                 subscription["last_modified"] = str(
                     feed.get("last_modified") or subscription.get("last_modified") or ""
                 )
-                if str(subscription.get("kind") or "rss") == "facebook-author":
+                kind = str(subscription.get("kind") or "rss")
+                if kind == "facebook-author":
                     snapshot = write_facebook_discovery(root, feed)
                     subscription["facebook_last_discovery"] = snapshot.name
                     newest = next((item["published"] for item in feed["items"] if item.get("published")), "")
                     if newest:
                         subscription["facebook_last_published"] = newest
+                elif kind == "instagram-author":
+                    snapshot = write_instagram_discovery(root, feed)
+                    subscription["instagram_last_discovery"] = snapshot.name
+                    newest = next((item["published"] for item in feed["items"] if item.get("published")), "")
+                    if newest:
+                        subscription["instagram_last_published"] = newest
                 counts = queue_rss_items(state, subscription, list(feed["items"]))
                 for key in ("queued", "filtered", "skipped", "updated"):
                     totals[key] += counts[key]
@@ -3747,6 +4005,8 @@ def rss_status(root: Path, item_limit: int = 20, show_items: bool = False) -> li
         kind = "RSS"
         if str(subscription.get("kind") or "rss") == "facebook-author":
             kind = f"Facebook/{subscription.get('facebook_provider') or 'meta'}"
+        elif str(subscription.get("kind") or "rss") == "instagram-author":
+            kind = "Instagram/Bright Data"
         lines.append(
             f"- {subscription['id']} [{kind}] {subscription.get('name') or '未命名'}"
             f"（{enabled}）：{detail}{error}"
@@ -3795,6 +4055,11 @@ def export_rss_opml(root: Path, output: Path) -> int:
             attributes["vidbeeFacebookPageId"] = str(subscription.get("facebook_page_id") or "")
             attributes["vidbeeFacebookSince"] = str(subscription.get("facebook_since") or "365d")
             attributes["vidbeeFacebookProvider"] = str(subscription.get("facebook_provider") or "meta")
+        elif kind == "instagram-author":
+            attributes["vidbeeInstagramUsername"] = str(subscription.get("instagram_username") or "")
+            attributes["vidbeeInstagramSince"] = str(subscription.get("instagram_since") or "365d")
+            if subscription.get("instagram_max_items") is not None:
+                attributes["vidbeeInstagramMaxItems"] = str(subscription["instagram_max_items"])
         ET.SubElement(
             body,
             "outline",
@@ -3830,12 +4095,23 @@ def import_rss_opml(root: Path, source: Path, allow_paid: bool = False) -> dict[
                 "tags": csv_values(str(outline.attrib.get("vidbeeTags") or "")),
                 "latest_only": str(outline.attrib.get("vidbeeLatestOnly") or "false").lower() == "true",
             }
-            if str(outline.attrib.get("vidbeeKind") or "rss") == "facebook-author":
+            kind = str(outline.attrib.get("vidbeeKind") or "rss")
+            if kind == "facebook-author":
                 subscription, _, _ = add_facebook_subscription(
                     root,
                     str(outline.attrib.get("vidbeeFacebookPageId") or url),
                     since=str(outline.attrib.get("vidbeeFacebookSince") or "365d"),
                     provider=str(outline.attrib.get("vidbeeFacebookProvider") or "meta"),
+                    allow_paid=allow_paid,
+                    **options,
+                )
+            elif kind == "instagram-author":
+                raw_max_items = str(outline.attrib.get("vidbeeInstagramMaxItems") or "").strip()
+                subscription, _, _ = add_instagram_subscription(
+                    root,
+                    str(outline.attrib.get("vidbeeInstagramUsername") or url),
+                    since=str(outline.attrib.get("vidbeeInstagramSince") or "365d"),
+                    max_items=int(raw_max_items) if raw_max_items else None,
                     allow_paid=allow_paid,
                     **options,
                 )
@@ -4111,18 +4387,30 @@ def rss_requested(args: argparse.Namespace) -> bool:
         or args.facebook_since is not None
         or args.facebook_provider is not None
         or args.facebook_discover_only
+        or args.instagram_author
+        or args.instagram_since is not None
+        or args.instagram_max_items is not None
+        or args.instagram_discover_only
     )
 
 
 def run_rss_command(args: argparse.Namespace) -> int:
     if args.url or args.video or args.url_file:
         raise ValueError("訂閱指令不可與 --url、--video 或 --url-file 同時使用。")
-    if args.facebook_author and args.rss_add:
-        raise ValueError("--facebook-author 與 --rss-add 一次只能使用一個。")
+    if sum(bool(value) for value in (args.rss_add, args.facebook_author, args.instagram_author)) > 1:
+        raise ValueError("--rss-add、--facebook-author 與 --instagram-author 一次只能使用一個。")
     if (args.facebook_since is not None or args.facebook_provider is not None or args.facebook_discover_only) and not args.facebook_author:
         raise ValueError("--facebook-since／--facebook-provider／--facebook-discover-only 必須搭配 --facebook-author。")
+    if (
+        args.instagram_since is not None
+        or args.instagram_max_items is not None
+        or args.instagram_discover_only
+    ) and not args.instagram_author:
+        raise ValueError("--instagram-since／--instagram-max-items／--instagram-discover-only 必須搭配 --instagram-author。")
+    if args.instagram_max_items is not None and args.instagram_max_items <= 0:
+        raise ValueError("--instagram-max-items 必須大於 0。")
     edits = any(value is not None for value in (args.rss_name, args.rss_keywords, args.rss_tags, args.rss_latest_only))
-    if edits and not (args.rss_add or args.rss_update or args.facebook_author):
+    if edits and not (args.rss_add or args.rss_update or args.facebook_author or args.instagram_author):
         raise ValueError("名稱／關鍵字／標籤／latest-only 設定只可搭配新增或更新訂閱。")
     if args.rss_update and not edits:
         raise ValueError("--rss-update 至少要搭配一個要修改的設定。")
@@ -4194,6 +4482,44 @@ def run_rss_command(args: argparse.Namespace) -> int:
                 )
             print(
                 f"已加入 Facebook 作者：{subscription['name']}（ID {subscription['id']}；"
+                f"queued {counts['queued']}、filtered {counts['filtered']}、"
+                f"skipped {counts['skipped']}；盤點 {snapshot}）"
+            )
+    if args.instagram_author:
+        since = args.instagram_since or "365d"
+        if args.instagram_discover_only:
+            feed = fetch_instagram_author(
+                args.instagram_author,
+                since,
+                max_items=args.instagram_max_items,
+                allow_paid=bool(args.allow_batch_cloud),
+            )
+            snapshot = write_instagram_discovery(root, feed)
+            incomplete = (
+                f"；{feed['instagram']['missing_date_count']} 筆缺發佈日期，無法驗證回溯範圍"
+                if feed["instagram"]["missing_date_count"]
+                else ""
+            )
+            print(
+                f"Instagram/Bright Data 盤點：@{feed['instagram']['username']}，"
+                f"找到 {len(feed['items'])} 支 Reel；{feed['instagram']['raw_count']} 筆原始結果"
+                f"{incomplete} → {snapshot}"
+            )
+        else:
+            with rss_writer_lock(root):
+                subscription, counts, snapshot = add_instagram_subscription(
+                    root,
+                    args.instagram_author,
+                    since=since,
+                    max_items=args.instagram_max_items,
+                    allow_paid=bool(args.allow_batch_cloud),
+                    name=args.rss_name or "",
+                    keywords=csv_values(args.rss_keywords or ""),
+                    tags=csv_values(args.rss_tags or ""),
+                    latest_only=bool(args.rss_latest_only),
+                )
+            print(
+                f"已加入 Instagram 作者：{subscription['name']}（ID {subscription['id']}；"
                 f"queued {counts['queued']}、filtered {counts['filtered']}、"
                 f"skipped {counts['skipped']}；盤點 {snapshot}）"
             )
@@ -5092,7 +5418,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--allow-batch-cloud",
         action="store_true",
-        help="明確允許批次雲端處理與 Apify Actor；供應商可能使用帳戶額度或 Credits",
+        help="明確允許批次雲端處理、Apify 與 Bright Data；供應商可能使用帳戶額度或 Credits",
     )
     rss = parser.add_argument_group("RSS 訂閱")
     rss.add_argument("--rss-add", metavar="FEED_URL", help="加入 RSS/Atom Feed，並立即把新項目排入本機佇列")
@@ -5150,6 +5476,28 @@ def parse_args() -> argparse.Namespace:
         "--facebook-discover-only",
         action="store_true",
         help="只盤點作者並保存結果；Apify 仍會啟動可能計費的 Actor",
+    )
+    rss.add_argument(
+        "--instagram-author",
+        metavar="USERNAME_OR_URL",
+        help="用 Bright Data 盤點並訂閱公開 Instagram 作者的 Reels",
+    )
+    rss.add_argument(
+        "--instagram-since",
+        metavar="WHEN",
+        default=None,
+        help="Instagram 本機回溯篩選：365d、52w、ISO 日期或 all；預設 365d",
+    )
+    rss.add_argument(
+        "--instagram-max-items",
+        type=int,
+        default=None,
+        help="手動限制本次發現的近期 Reels 數；預設不設上限",
+    )
+    rss.add_argument(
+        "--instagram-discover-only",
+        action="store_true",
+        help="只盤點 IG 作者並保存結果；仍會呼叫可能計費的 Bright Data API",
     )
     parser.add_argument("--chunk-seconds", type=int, default=900)
     parser.add_argument(

@@ -132,6 +132,39 @@ python pipeline.py --facebook-author 'https://www.facebook.com/<PUBLIC_PAGE>/' -
 
 Apify Token 一律放在 `Authorization` header，不放 URL、輸出或 Git。Actor 只負責發現公開貼文，`captionText=false`，實際影音仍由 yt-dlp 下載並交給 Groq 轉錄、MiniMax 整理。官方目前的輸入 schema 明載此 Actor 只支援公開 Page、不支援 personal profile，因此個人帳號仍列為未保證支援；私人／登入限定內容不處理。`APIFY_FACEBOOK_RESULTS_LIMIT` 是 Actor 必填的單次結果預算，本工具取回資料集時會持續分頁、不另行截斷；Actor 的結果完整性仍受 Facebook 可見性與供應商能力限制。請參考 [Actor 輸入](https://apify.com/apify/facebook-posts-scraper/input-schema)、[API](https://apify.com/apify/facebook-posts-scraper/api) 與 [計價](https://apify.com/apify/facebook-posts-scraper/pricing)。
 
+### Instagram 作者 Reel 追蹤
+
+公開 Instagram 作者使用 Bright Data Instagram Scraper API 發現 Reels；API Key 只放在 Bearer header，不寫入 URL、輸出或 Git：
+
+```dotenv
+BRIGHTDATA_API_TOKEN=
+BRIGHTDATA_RUN_TIMEOUT_SECONDS=1800
+```
+
+先用少量結果盤點；這只取得公開 Reel metadata，不下載影片，也不呼叫 Groq／MiniMax：
+
+```powershell
+python pipeline.py --instagram-author 'https://www.instagram.com/<USERNAME>/' --instagram-max-items 3 --instagram-discover-only --allow-batch-cloud
+```
+
+確認後加入佇列。預設不設結果筆數上限；`--instagram-since 365d` 會在本機依供應商實際回傳的發佈時間保留近一年結果：
+
+```powershell
+python pipeline.py --instagram-author '<USERNAME>' --instagram-since 365d --rss-all-items --allow-batch-cloud
+python pipeline.py --rss-refresh --allow-batch-cloud
+python pipeline.py --rss-process --rss-max-items 4 --allow-batch-cloud
+```
+
+盤點快照保存在 Git 忽略且受 ACL 保護的 `rss\instagram-<雜湊>-latest.json`，包含原始 Bright Data 結果與 snapshot provenance。刷新時會把已見 Post ID 傳入 `posts_to_not_include`，本機佇列仍以穩定 ID 去重。Bright Data 的 Reel discovery 目前不支援伺服器端日期篩選；若某筆沒有 `date_posted`，工具會保留並在快照及盤點訊息標示「無法驗證回溯範圍」，不會假裝近一年盤點完整。私人／登入限定內容不處理，平台可見性與供應商回傳仍可能造成缺漏。請參考 [Instagram Scraper API](https://docs.brightdata.com/datasets/scrapers/instagram/introduction)、[Reel discovery](https://docs.brightdata.com/api-reference/scrapers/social-media-apis/instagram-reels-discover-by-url) 與 [非同步 snapshot 流程](https://docs.brightdata.com/api-reference/rest-api/scraper/asynchronous-requests)。
+
+單篇公開 Reel／影片貼文不需要先建立作者訂閱，可直接走既有入口：
+
+```powershell
+python pipeline.py --url 'https://www.instagram.com/reel/<SHORTCODE>/'
+```
+
+Bright Data 只負責作者內容發現；實際下載仍由 yt-dlp 完成，之後才是 Groq 時間戳轉錄與 MiniMax 摘要。免費額度與餘額續用行為依帳戶主控台為準，程式無法保證不扣款，因此所有 Bright Data 盤點都要求明確加上 `--allow-batch-cloud`。
+
 訂閱可修改、暫停、恢復，也可顯示逐筆狀態：
 
 ```powershell
