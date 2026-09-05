@@ -39,3 +39,31 @@ No new reproducible P0/P1/P2 finding was confirmed from the static evidence revi
 ## Runtime status
 
 **Pending for Round 1.** Historical real-provider performance evidence exists in README, but no new provider call was made during this audit.
+
+---
+
+# Round 2 continuation — 2026-09-06
+
+> Static/code/documentation review only. No claim is made that a Bright Data charge actually occurred.
+
+## Result
+
+Status: **NOT CLEAN — NEW P2**
+
+### P2 — Bright Data Instagram discovery is cloud-opt-in but unbounded by default
+
+The Instagram author path correctly requires `--allow-batch-cloud`, but `--instagram-max-items` defaults to `None` and both CLI help and README state that the normal default has no result-count ceiling. The documented `--instagram-since 365d` filter is applied locally to returned publication times, so it is not a provider-side billing bound.
+
+This differs from the Apify Facebook path, which has an explicit `APIFY_MAX_TOTAL_CHARGE_USD` value and sends `maxTotalChargeUsd` to the provider. For Bright Data, an operator who has opted into cloud use can still start a provider-consuming discovery with no finite work/cost ceiling.
+
+Tracking: `#8 — [P2][50-persona audit] Bound Bright Data Instagram discovery cost instead of defaulting to an unlimited result set`.
+
+Affected fixed personas: D04, C05, H05, J01, J03, I04, I05.
+
+## Regression requirement
+
+With a valid Bright Data token, invoke Instagram discovery with `--allow-batch-cloud` but without a finite result/cost budget. The process must stop before the outbound provider request. A bounded run must report and enforce its maximum provider work without exposing the API token, and retry/resume must not silently create a second billable snapshot.
+
+## Updated CLEAN gate
+
+Issue #8 must be resolved or explicitly justified `not_planned`; then run the fresh provider/resume/concurrency scenarios from Round 1 and require two consecutive fixed-persona rounds without new P0/P1/P2 before CLEAN.
