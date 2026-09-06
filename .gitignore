@@ -5,5 +5,8 @@ batches/
 rss/
 canary/
 library.db
+operations.db
+operations.db-*
+digest_preview_*.md
 __pycache__/
 *.tmp

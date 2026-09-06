@@ -5586,6 +5586,21 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--categorize", action="store_true", help="產生固定分類並歸類所有影片（讓 --digest 用程式碼分群）")
     parser.add_argument("--audit", action="store_true", help="健檢知識庫：找出壞掉的摘要、落後的索引與向量")
     parser.add_argument("--refresh", action="store_true", help="忽略既有的逐字稿／視覺／摘要，全部重新呼叫 API")
+    parser.add_argument(
+        "--digest-preview",
+        choices=("daily", "weekly"),
+        default=None,
+        help="產生每日或每週摘要的本地 Markdown/HTML 預覽草稿（零付費）",
+    )
+    parser.add_argument(
+        "--digest-send",
+        choices=("daily", "weekly"),
+        default=None,
+        help="產出並寄送每日或每週精選摘要郵件／通知",
+    )
+    parser.add_argument("--digest-date", default=None, help="指定摘要基準日期（YYYY-MM-DD）；預設今天")
+    parser.add_argument("--notify-test", action="store_true", help="發送一封測試通知以檢驗通道連線狀態")
+    parser.add_argument("--notification-retry", action="store_true", help="重試 operations.db 中處於 retry_wait 狀態的通知")
     parser.add_argument("--self-test", action="store_true")
     return parser.parse_args()
 
@@ -6042,6 +6057,12 @@ def run_pipeline(args: argparse.Namespace) -> Path:
             connection.commit()
         finally:
             connection.close()
+        try:
+            from notifications import record_pipeline_completed_event
+
+            record_pipeline_completed_event(root, job_dir, manifest)
+        except Exception:
+            pass
         return manifest_path
     except Exception as exc:
         manifest["status"] = "failed"
@@ -6054,6 +6075,36 @@ def main() -> int:
     args = parse_args()
     if args.self_test:
         self_test()
+        return 0
+    if getattr(args, "digest_preview", None):
+        from notifications import run_digest_preview
+
+        out_path = run_digest_preview(args.root.resolve(), args.digest_preview, args.digest_date)
+        print(f"摘要預覽已產生：{out_path}")
+        return 0
+    if getattr(args, "digest_send", None):
+        from notifications import run_digest_send
+
+        res = run_digest_send(
+            args.root.resolve(),
+            args.digest_send,
+            args.digest_date,
+            dry_run=args.dry_run,
+            local_only=args.local_only,
+        )
+        print(f"摘要寄送狀態：{res}")
+        return 0 if res.get("status") in ("accepted", "skipped", "preview_only") else 1
+    if getattr(args, "notify_test", False):
+        from notifications import run_notify_test
+
+        res = run_notify_test(args.root.resolve())
+        print(f"通知測試結果：{res}")
+        return 0 if res.get("status") == "accepted" else 1
+    if getattr(args, "notification_retry", False):
+        from notifications import run_notification_retry
+
+        res = run_notification_retry(args.root.resolve())
+        print(f"重試處理結果：{res}")
         return 0
     if rss_requested(args):
         try:
