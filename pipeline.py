@@ -5601,6 +5601,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--digest-date", default=None, help="指定摘要基準日期（YYYY-MM-DD）；預設今天")
     parser.add_argument("--notify-test", action="store_true", help="發送一封測試通知以檢驗通道連線狀態")
     parser.add_argument("--notification-retry", action="store_true", help="重試 operations.db 中處於 retry_wait 狀態的通知")
+    parser.add_argument("--score-video", metavar="JOB", default=None, help="評估指定影片的 Importance/Novelty/Relevance 分數")
+    parser.add_argument("--rescore", metavar="JOB", default=None, help="以最新規則重新計算指定影片的分數與決策")
+    parser.add_argument("--score-explain", metavar="JOB", default=None, help="純讀取並解釋已評分影片的決策依據（零付費）")
+    parser.add_argument("--score-report", default=None, help="統計並印出影片評分與排名摘要（可傳 daily 或 all）")
     parser.add_argument("--self-test", action="store_true")
     return parser.parse_args()
 
@@ -6105,6 +6109,30 @@ def main() -> int:
 
         res = run_notification_retry(args.root.resolve())
         print(f"重試處理結果：{res}")
+        return 0
+    if getattr(args, "score_video", None):
+        from scoring import score_video
+
+        res = score_video(args.root.resolve(), args.score_video, force_rescore=False)
+        print(f"影片評分結果：{json.dumps(res, ensure_ascii=False, indent=2)}")
+        return 0
+    if getattr(args, "rescore", None):
+        from scoring import score_video
+
+        res = score_video(args.root.resolve(), args.rescore, force_rescore=True)
+        print(f"影片重新評分：{json.dumps(res, ensure_ascii=False, indent=2)}")
+        return 0
+    if getattr(args, "score_explain", None):
+        from scoring import explain_score
+
+        res = explain_score(args.root.resolve(), args.score_explain)
+        print(f"評分決策解釋：{json.dumps(res, ensure_ascii=False, indent=2)}")
+        return 0
+    if getattr(args, "score_report", None) is not None:
+        from scoring import generate_score_report
+
+        res = generate_score_report(args.root.resolve())
+        print(f"評分總覽報告：{json.dumps(res, ensure_ascii=False, indent=2)}")
         return 0
     if rss_requested(args):
         try:
