@@ -5605,6 +5605,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--rescore", metavar="JOB", default=None, help="以最新規則重新計算指定影片的分數與決策")
     parser.add_argument("--score-explain", metavar="JOB", default=None, help="純讀取並解釋已評分影片的決策依據（零付費）")
     parser.add_argument("--score-report", default=None, help="統計並印出影片評分與排名摘要（可傳 daily 或 all）")
+    parser.add_argument("--cost-report", choices=("daily", "monthly"), default=None, help="統計並印出 API 費用與 Token 用量報表")
+    parser.add_argument("--budget-status", action="store_true", help="檢視目前已用預算與配額上限狀態")
+    parser.add_argument("--provider-health", action="store_true", help="檢查各供應商成功率與延遲統計")
+    parser.add_argument("--failed-list", action="store_true", help="列出近期失敗或遭預算阻斷的操作紀錄")
     parser.add_argument("--self-test", action="store_true")
     return parser.parse_args()
 
@@ -6133,6 +6137,30 @@ def main() -> int:
 
         res = generate_score_report(args.root.resolve())
         print(f"評分總覽報告：{json.dumps(res, ensure_ascii=False, indent=2)}")
+        return 0
+    if getattr(args, "cost_report", None) is not None:
+        from cost_tracker import get_cost_report
+
+        res = get_cost_report(args.root.resolve(), period_type=args.cost_report)
+        print(f"成本與用量報告：\n{json.dumps(res, ensure_ascii=False, indent=2)}")
+        return 0
+    if getattr(args, "budget_status", False):
+        from cost_tracker import get_budget_status
+
+        res = get_budget_status(args.root.resolve())
+        print(f"預算狀態：\n{json.dumps(res, ensure_ascii=False, indent=2)}")
+        return 0
+    if getattr(args, "provider_health", False):
+        from cost_tracker import get_provider_health
+
+        res = get_provider_health(args.root.resolve())
+        print(f"供應商健康度：\n{json.dumps(res, ensure_ascii=False, indent=2)}")
+        return 0
+    if getattr(args, "failed_list", False):
+        from cost_tracker import get_failed_list
+
+        res = get_failed_list(args.root.resolve())
+        print(f"失敗與阻斷紀錄：\n{json.dumps(res, ensure_ascii=False, indent=2)}")
         return 0
     if rss_requested(args):
         try:
