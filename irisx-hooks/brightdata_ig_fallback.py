@@ -1,30 +1,28 @@
 #!/usr/bin/env python3
-"""Fetch Instagram / X / Threads via Bright Data — MCP HTTP first; Datasets REST IG-only fallback."""
+"""IRISX Bright Data L2 hook — source assembled from staged base64 parts (exact bytes)."""
 from __future__ import annotations
 
-import json
-import os
-import re
-import sys
-import time
-import urllib.error
-import urllib.parse
-import urllib.request
+import base64
+import hashlib
 from pathlib import Path
-from urllib.parse import urlparse
 
-JOBS = Path("/workspace/video-timeline-pipeline/jobs")
-DATASET_ID = "gd_lyclm20il4r5helnj"
-API_ROOT = "https://api.brightdata.com/datasets/v3"
-MCP_HOST = "https://mcp.brightdata.com/mcp"
-SECRETS = (
-    Path("/home/box/agent-data/box-secrets.json"),
-    Path("/home/box/sand-data/box-secrets.json"),
-)
-SNAPSHOT_RE = re.compile(r"^s[a-z]*_[A-Za-z0-9_-]+$")
+_EXPECTED_SHA256 = "5b37e9b03a688185844707d6778d184a53f05904f65b9c0a5be90e78002e344e"
+_STAGING = Path(__file__).resolve().parent.parent / ".staging-irisx-bd"
 
 
-def redact(tok: str, text: str) -> str:
-    if not tok:
-        return text
-    return text.replace(tok, tok[:4] + "…")
+def _load_source() -> str:
+    parts = []
+    for i in range(7):
+        p = _STAGING / f"part{i:02d}.b64"
+        if not p.is_file():
+            raise FileNotFoundError(f"missing staged part: {p}")
+        parts.append(p.read_text(encoding="ascii").strip())
+    raw = base64.b64decode("".join(parts))
+    digest = hashlib.sha256(raw).hexdigest()
+    if digest != _EXPECTED_SHA256:
+        raise RuntimeError(f"brightdata source sha256 mismatch: {digest}")
+    return raw.decode("utf-8")
+
+
+_SRC = _load_source()
+exec(compile(_SRC, str(Path(__file__).resolve()), "exec"), globals())
