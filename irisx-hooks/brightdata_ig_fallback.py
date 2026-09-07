@@ -1,1 +1,1 @@
-file:///workspace/bd_content_verified.txt
+@/workspace/bd_content_verified.txt
