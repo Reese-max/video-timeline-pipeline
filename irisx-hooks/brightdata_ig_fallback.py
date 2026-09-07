@@ -1,1 +1,1 @@
-@/workspace/bd_content_verified.txt
+PLACEHOLDER_REPLACE_WITH_FILE
