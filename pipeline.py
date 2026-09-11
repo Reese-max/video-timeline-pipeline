@@ -5581,6 +5581,9 @@ def parse_args() -> argparse.Namespace:
         help="不下載影片、不抽幀，只靠字幕建索引；之後重跑同一支會自動補上畫面分析",
     )
     parser.add_argument("--list", action="store_true", help="列出所有影片（可搭配 --category 篩選）")
+    parser.add_argument("--serve", action="store_true", help="啟動唯讀本機 dashboard（預設 127.0.0.1；只查本機索引，不觸發付費 API）")
+    parser.add_argument("--host", default="127.0.0.1", help="--serve 綁定位址（預設 loopback）")
+    parser.add_argument("--port", type=int, default=8080, help="--serve port")
     parser.add_argument("--show", help="依標題關鍵字顯示某支影片的摘要與章節")
     parser.add_argument("--category", default="", help="限定分類；可搭配 --list 或 --search")
     parser.add_argument("--categorize", action="store_true", help="產生固定分類並歸類所有影片（讓 --digest 用程式碼分群）")
@@ -6168,6 +6171,18 @@ def main() -> int:
         except (RuntimeError, ValueError, OSError) as exc:
             print(f"訂閱 ERROR: {exc}", file=sys.stderr)
             return 1
+    if args.serve:  # 唯讀 dashboard：loopback、唯讀 DB、無付費 API
+        import webapp
+
+        root = args.root.resolve()
+        if args.host not in webapp.LOCAL_HOSTS and args.host != "[::1]":
+            print(
+                f"警告：--host {args.host} 不是 loopback；dashboard 會暴露在本機網段。"
+                "Host 白名單仍只允許 localhost 名稱，但請確認這是你要的。",
+                file=sys.stderr,
+            )
+        webapp.serve(root, args.host, args.port)
+        return 0
     if args.list or args.show:  # 純本地查詢，不需要金鑰
         root = args.root.resolve()
         try:
