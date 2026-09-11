@@ -2302,6 +2302,19 @@ def like_pattern(query: str) -> str:
     return f"%{escaped}%"
 
 
+def category_filter(category: str) -> tuple[str, tuple[Any, ...]]:
+    """categories 是 JSON 陣列：LIKE 打在整段 JSON 文字上，會誤匹配
+    JSON 語法（引號、逗號）與 category 字串裡的 %／_ 萬用字元。
+    改成 json_each 逐元素比對，並轉義 LIKE 萬用字元。"""
+    if not category:
+        return "", ()
+    escaped = category.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+    return (
+        " AND EXISTS (SELECT 1 FROM json_each(videos.categories) AS jc WHERE jc.value LIKE ? ESCAPE '\\')",
+        (f"%{escaped}%",),
+    )
+
+
 def search_index(root: Path, query: str, limit: int, category: str = "") -> list[dict[str, Any]]:
     db_path = root / "library.db"
     if not db_path.is_file():
@@ -2310,8 +2323,7 @@ def search_index(root: Path, query: str, limit: int, category: str = "") -> list
     if not query.strip():
         raise RuntimeError("搜尋字串不可為空。")
 
-    # categories 存成 JSON 陣列，用 LIKE 比對就夠——分類名是固定清單，不會誤匹配
-    category_clause = " AND videos.categories LIKE ?" if category else ""
+    category_clause, category_params = category_filter(category)
     scan = len(query) < 3
     if scan:
         # ponytail: trigram 索引窗口是 3 字元，「AI」「影片」這種兩字詞 MATCH 一定落空，
@@ -2327,14 +2339,12 @@ def search_index(root: Path, query: str, limit: int, category: str = "") -> list
         )
         snippet_column = "events.text"
         # 參數順序必須跟 SQL 中出現的順序一致：WHERE → 分類 → ORDER BY → LIMIT
-        category_params: tuple[Any, ...] = (f"%{category}%",) if category else ()
         params: tuple[Any, ...] = (like_pattern(query),) + category_params + (query.lower(), limit)
     else:
         # 整段當 phrase 查，否則使用者輸入的 - 或 " 會被當成 FTS5 運算子而語法錯誤。
         where = "events.text MATCH ?"
         order = "rank"
         snippet_column = f"snippet(events, 3, '《', '》', ' … ', {SNIPPET_WIDTH})"
-        category_params = (f"%{category}%",) if category else ()
         params = ('"' + query.replace('"', '""') + '"',) + category_params + (limit,)
 
     connection = index_connection(root)
@@ -2488,11 +2498,13 @@ def semantic_search(
     limit: int,
     backend: str = "openrouter",
     threshold: float | None = None,
+    category: str = "",
 ) -> list[dict[str, Any]]:
     db_path = root / "library.db"
     if not db_path.is_file():
         raise RuntimeError(f"索引不存在：{db_path}；先執行 `--index`。")
     query_vector = embed_texts([query], api_key, model, backend)[0]
+    category_clause, category_params = category_filter(category)
     connection = index_connection(root)
     try:
         # 向量以文字 hash 為鍵，SQLite 沒有內建 sha256，所以在 Python 端對應
@@ -2500,11 +2512,13 @@ def semantic_search(
         rows = [
             (title, source, job, timestamp, kind, text, stored[text_hash(text)])
             for title, source, job, timestamp, kind, text in connection.execute(
-                """
+                f"""
                 SELECT videos.title, videos.source, events.job, events.timestamp,
                        events.kind, events.text
                 FROM events JOIN videos ON videos.job = events.job
-                """
+                WHERE 1=1{category_clause}
+                """,
+                category_params,
             )
             if text_hash(text) in stored
         ]
@@ -2567,17 +2581,18 @@ def answer_question(
     embed_key: str = "",
     embed_model: str = "",
     embed_backend: str = "",
+    category: str = "",
 ) -> dict[str, Any]:
     if embed_backend:
         # 有向量就直接拿問句比對語意，不必先抽關鍵詞——少一次呼叫，命中也更準。
         keywords = ["（語意檢索）"]
-        hits = semantic_search(root, question, embed_key, embed_model, limit, embed_backend)
+        hits = semantic_search(root, question, embed_key, embed_model, limit, embed_backend, category=category)
     else:
         keywords = question_keywords(question, api_key, model)
         # 逐詞取滿再換下一個，等於讓第一個關鍵詞吃光配額——問「TDD 搭配 AI 編碼」時
         # 抽出的是「Matt、TDD、AI、編碼」，人名 Matt 先塞滿，真正相關的 TDD 一筆都進不來。
         # 改成輪流取：每個關鍵詞先貢獻第一名，再回頭拿第二名。
-        per_keyword = [search_index(root, keyword, limit) for keyword in keywords]
+        per_keyword = [search_index(root, keyword, limit, category) for keyword in keywords]
         seen: set[tuple[Any, ...]] = set()
         hits = []
         for rank in range(limit):
@@ -6219,8 +6234,11 @@ def main() -> int:
                         args.search_limit,
                         semantic_backend,
                         args.min_similarity,
+                        args.category,
                     )
                     mode = f"語意檢索：{semantic_backend}／{embed_model}"
+                    if args.category:
+                        mode += f"，限定「{args.category}」"
                 else:
                     hits = search_index(root, args.search, args.search_limit, args.category)
                     mode = "全表掃描：查詢短於 3 字元" if len(args.search) < 3 else "索引"
@@ -6249,6 +6267,7 @@ def main() -> int:
                     embed_key,
                     embed_model,
                     semantic_backend,
+                    args.category,
                 )
                 print(f"檢索詞：{'、'.join(result['keywords'])}")
                 print()
