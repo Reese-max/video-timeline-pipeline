@@ -3506,6 +3506,12 @@ def fetch_instagram_author(
 ) -> dict[str, Any]:
     if not allow_paid:
         raise RuntimeError("Bright Data 可能計費；確認帳戶額度後加上 --allow-batch-cloud。")
+    # fail-closed 預算閘：opt-in 不代表無上限；--instagram-since 是本機日期過濾，不構成成本上限
+    if max_items is None:
+        raise ValueError(
+            "Bright Data 付費盤點必須帶有限結果預算：請以 --instagram-max-items <正整數> 設定上限"
+            "（--instagram-since 僅為本機日期過濾，不構成成本上限）。"
+        )
     token = os.getenv("BRIGHTDATA_API_TOKEN", "").strip()
     if not token:
         raise RuntimeError("缺少 BRIGHTDATA_API_TOKEN；請在專案 .env 本機填入。")
@@ -3513,15 +3519,15 @@ def fetch_instagram_author(
         timeout_seconds = int(os.getenv("BRIGHTDATA_RUN_TIMEOUT_SECONDS", "1800"))
     except ValueError as exc:
         raise ValueError("BRIGHTDATA_RUN_TIMEOUT_SECONDS 必須是整數。") from exc
-    if timeout_seconds <= 0 or (max_items is not None and max_items <= 0):
+    if timeout_seconds <= 0 or max_items <= 0:
         raise ValueError("Bright Data timeout 與 --instagram-max-items 必須大於 0。")
+    # 觸發前先印出有效上限（不印 token）——讓 operator 在計費前看到實際工作量界線
+    print(f"Bright Data Instagram 盤點上限：num_of_posts={max_items}（每筆結果可能計費）", file=sys.stderr)
 
     username = instagram_username(author)
     author_url = instagram_author_url(username)
     since_timestamp = parse_instagram_since(since)
-    discovery_input: dict[str, Any] = {"url": author_url}
-    if max_items is not None:
-        discovery_input["num_of_posts"] = max_items
+    discovery_input: dict[str, Any] = {"url": author_url, "num_of_posts": max_items}
     excluded = list(dict.fromkeys(str(item).strip() for item in (exclude_ids or []) if str(item).strip()))
     if excluded:
         discovery_input["posts_to_not_include"] = excluded
