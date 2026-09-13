@@ -147,8 +147,18 @@ def _utc_now_iso() -> str:
 
 
 def _current_period_id(period_type: str = "daily") -> str:
+    # COST_TIMEZONE is part of the budget safety contract: daily/monthly
+    # buckets must reset on the configured local calendar boundary, not UTC.
     tz_name = os.getenv("COST_TIMEZONE", "Asia/Taipei")
-    now = datetime.datetime.now(datetime.timezone.utc)
+    try:
+        from zoneinfo import ZoneInfo
+
+        tz = ZoneInfo(tz_name)
+    except Exception:
+        # Unknown/broken tz name: fail to UTC rather than silently picking a
+        # different local day than the operator configured.
+        tz = datetime.timezone.utc
+    now = datetime.datetime.now(tz)
     if period_type == "monthly":
         return now.strftime("%Y-%m")
     return now.strftime("%Y-%m-%d")

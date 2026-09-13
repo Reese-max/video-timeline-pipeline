@@ -180,5 +180,49 @@ class ReportingAndHealthTests(unittest.TestCase):
         self.assertEqual(failed_list[0]["safe_error"], "Rate limited by Apify")
 
 
+class PeriodIdTimezoneTests(unittest.TestCase):
+    """Issue #18: COST_TIMEZONE must drive the daily/monthly bucket boundary."""
+
+    def _period_at(self, tz_name: str, utc_iso: str, period_type: str = "daily") -> str:
+        import datetime as _dt
+
+        fixed_utc = _dt.datetime.fromisoformat(utc_iso).replace(
+            tzinfo=_dt.timezone.utc
+        )
+
+        class _FrozenDateTime(_dt.datetime):
+            @classmethod
+            def now(cls, tz=None):  # noqa: D102 - mock signature
+                return fixed_utc.astimezone(tz) if tz else fixed_utc
+
+        with patch.dict(os.environ, {"COST_TIMEZONE": tz_name}):
+            with patch.object(cost_tracker.datetime, "datetime", _FrozenDateTime):
+                return cost_tracker._current_period_id(period_type)
+
+    def test_daily_bucket_uses_configured_timezone(self) -> None:
+        # 2026-01-15 16:30 UTC == 2026-01-16 00:30 Asia/Taipei
+        self.assertEqual(
+            self._period_at("Asia/Taipei", "2026-01-15T16:30:00"), "2026-01-16"
+        )
+        self.assertEqual(
+            self._period_at("UTC", "2026-01-15T16:30:00"), "2026-01-15"
+        )
+
+    def test_monthly_bucket_uses_configured_timezone(self) -> None:
+        # 2026-01-31 20:00 UTC == 2026-02-01 04:00 Asia/Taipei
+        self.assertEqual(
+            self._period_at("Asia/Taipei", "2026-01-31T20:00:00", "monthly"),
+            "2026-02",
+        )
+        self.assertEqual(
+            self._period_at("UTC", "2026-01-31T20:00:00", "monthly"), "2026-01"
+        )
+
+    def test_unknown_timezone_falls_back_to_utc(self) -> None:
+        self.assertEqual(
+            self._period_at("Not/AZone", "2026-01-15T16:30:00"), "2026-01-15"
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
