@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- 新增 `irisx-hooks/`：LINE／Hermes 影片「可帶走」cascade（L1 pipeline → L2 Bright Data IG/X/Threads → L3 Apify → L4 OG → L5 fail）。
+- 文件：`docs/video-takeaway-cascade.md`；`.env.example` 補 `BRIGHTDATA_MCP_TOKEN`／`APIFY_TOKEN`。
 - 新增 Facebook Page 作者盤點與追蹤，透過 Meta Graph API 分頁取得影片及 Reels，再沿用既有 RSS 佇列與影音摘要管線。
 - 新增可選 Apify 公開 Page 發現器，含 Bearer Token、Actor 費用上限、非同步輪詢、資料集分頁與影片貼文過濾。
 - 新增 Bright Data 公開 Instagram 作者 Reel 盤點與訂閱，沿用既有去重、重試及 Groq→MiniMax 處理流程。
