@@ -360,6 +360,8 @@ python pipeline.py --digest
 
 `--ask` 先讓模型把問句拆成檢索詞（整句丟進 FTS5 是 phrase 比對，長問句必定 0 筆），再用檢索到的片段生成答案，並標註 `[1]`、`[2]` 對應到影片標題與時間戳。提示詞限定只能引用片段內容，資訊不足時會直說找不到，不會臆造。
 
+每個片段都有穩定的 `occurrence_id`（由 job、類型、起點與內容雜湊決定），重建索引不會改變它——引用不會因 `--index` 重跑而指到別的片段。模型只能回引用編號：不在這次 evidence 內的編號會被剔除並計數（`dropped_citations`），影片裡的注入文字也只是一段資料，提示詞明確宣告片段內容不可信。查無證據時回傳 `insufficient_evidence`，不拿模型常識補洞。
+
 `--digest` 把各支影片的摘要合成 `digest.md`：主題分群、跨影片反覆出現的術語、建議觀看順序、涵蓋落差。只吃跑過完整流程的 job，`--local-only`／`--dry-run` 的 job 沒有真摘要會被跳過。
 
 > 呼叫 MiniMax 一律不設 `max_tokens`。MiniMax-M3 是 reasoning 模型，`<think>` 會先吃掉配額，設了上限常常在真正的答案輸出前就用完，回傳半截 JSON。
@@ -388,11 +390,11 @@ python pipeline.py --embed --embed-backend local  # 本機
 
 其他可用模型：`baai/bge-m3`、`qwen/qwen3-embedding-8b`（皆 US$0.01/M）、`nvidia/llama-nemotron-embed-vl-1b-v2:free`。
 
-OpenRouter 的 `/embeddings` 與 `/rerank` 端點在模型清單裡查不到、官方文件也沒寫，但實測可用。要注意 chat 的 `:free` 清單與 embedding 的模型池是分開的：chat 那些 id 打 embeddings 會回 `does not exist`；而 NVIDIA 那幾顆**必須加 `:free` 後綴**才有 provider，不加會回 `No endpoints found`。
+OpenRouter 有官方的 [embeddings](https://openrouter.ai/docs/api/reference/embeddings/overview) 與 [rerank](https://openrouter.ai/docs/guides/features/reranking) 端點文件。要注意 chat 的 `:free` 清單與 embedding 的模型池是分開的：chat 那些 id 打 embeddings 會回 `does not exist`；而 NVIDIA 那幾顆**必須加 `:free` 後綴**才有 provider，不加會回 `No endpoints found`。
 
 本機後端首次使用要下載約 2.2 GB 模型。CPU 實測約 94 筆/秒；裝的若是 `torch+cpu` 就吃不到 GPU，要 GPU 得另外裝 CUDA 版。
 
-`--embed` 只補算「這個模型還沒算過」的片段：重跑不重複付費，換模型則自動重算。`vectors` 表記錄了模型名稱，查詢時只用相符的向量——混用不同模型的向量算出來的相似度沒有意義。
+`--embed` 只補算「這個 embedding 契約還沒算過」的片段：重跑不重複付費，換契約才重算。契約是 `backend::model`（例如 `openrouter::nvidia/nemotron-3-embed-1b:free`）；舊版以裸模型名存的向量仍可沿用，會在無歧義時自動改名，不為換名字重算付費向量。查詢與文件向量契約不同（含維度）會明確拒絕比較，不會靜默混算。`--embed-plan` 可先列「可重用／待計費」筆數，`--rebuild-embeddings` 會刪除該契約向量再重算（雲端後端要加 `--allow-batch-cloud` 授權）。
 
 ### 為什麼不直接嵌入截圖
 
@@ -417,11 +419,24 @@ OpenRouter 的 `/embeddings` 與 `/rerank` 端點在模型清單裡查不到、�
 | `baai/bge-m3` | 0.61–0.75 | **0.34** |
 | `nvidia/nemotron-3-embed-1b:free` | 0.29–0.77 | **0.004** |
 
-寫死絕對門檻必定誤殺其中一種，所以預設取「最高分的一半」再加一個很低的地板（`SIMILARITY_FLOOR`）。要固定值就用 `--min-similarity`。
-
-輸出會標示相似度分數，低於 `0.35` 的視為不相關直接濾掉（`pipeline.py` 的 `MIN_SIMILARITY`）—— 少了下限，每次查詢都會回傳整個索引，末幾筆只是「最不像的那些」而不是命中。
+寫死絕對門檻必定誤殺其中一種，所以預設取「最高分的一半」（`SIMILARITY_RATIO = 0.5`）再加一個很低的地板（`SIMILARITY_FLOOR = 0.10`）。要固定值就用 `--min-similarity`。少了下限，每次查詢都會回傳整個索引，末幾筆只是「最不像的那些」而不是命中。
 
 `--ask --semantic` 會直接拿問句比對語意，跳過「先抽關鍵詞」那一步：少一次 API 呼叫，命中也更準。
+
+## 混合檢索與篩選
+
+`--hybrid` 把兩條路併起來：先用篩選條件劃出 eligible-set，全文檢索與向量各取候選，按 occurrence 去重後用 RRF（Reciprocal Rank Fusion）依名次融合——不直接相加異質分數。向量路不可用時明確降級為全文檢索（`degraded_reason`），`--strict-retrieval` 可改成直接失敗。
+
+```powershell
+python pipeline.py --search '時間軸' --hybrid
+python pipeline.py --ask '哪支影片提到密碼外洩？' --hybrid
+python pipeline.py --search '資安' --category '資安新聞' --since 2026-05-01
+python pipeline.py --search '合併' --hybrid --rerank --explain --json
+```
+
+篩選旗標（`--search`／`--ask` 共用）：`--kind speech,visual`、`--job`、`--platform`、`--author`、`--since/--until`（欄位由 `--date-field` 選 `published_at`／`first_completed_at`／`indexed_at`，預設 `published_at`）、`--include-unknown-dates`。日期未知的影片預設排除並提示筆數——發布日不會拿索引日冒充。分類是 JSON 精確比對，「資安」不會誤命中「資安新聞」。platform／author／published_at 由 manifest 與 yt-dlp `source.info.json` 可追溯回填，沒有證據就是 NULL。
+
+`--rerank` 是可選的 provider 重排（預設關閉，需 `OPENROUTER_API_KEY`，失效時保留原排序）。`--explain` 顯示每筆的 RRF／各路名次，只讀已存資料、不額外呼叫模型。`--json` 輸出完整結構（含 `occurrence_id`、`rank_detail`、`retrieval_mode`）。
 
 ## Open Notebook 知識庫
 
