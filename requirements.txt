@@ -1,3 +1,5 @@
 # FFmpeg 與 ffprobe 需另行安裝或由系統提供。
 yt-dlp
 Pillow
+# 可選：cutspec.py 的 OTIO round-trip 驗證用真 parser；缺裝時退化為內部 JSON 解析並在 receipt 標記。
+opentimelineio

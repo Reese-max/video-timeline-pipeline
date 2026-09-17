@@ -328,6 +328,23 @@ MiniMax 官方目前標示 MiniMax-M3 為 1,000,000 token context、M2.x 為 204
 
 PaddleOCR 與 PySceneDetect 暫不列為必要依賴：`native` 模式提供本地 fallback；`steipete` 模式提供場景偵測與 Tesseract OCR。兩者都只把候選畫面交給後續 MiniMax 視覺階段。
 
+### CutSpec / NLE handoff（research spike，issue #11）
+
+`cutspec.py` 把有證據的片段變成可交給 Premiere/Resolve 等 NLE 的 rough-cut
+規格：版本化 `CutSpec`（deterministic `specHash`）、唯讀 preview、
+CSV + OTIO 匯出、`verify` 產生 `CutReceipt`（OTIO parser round-trip +
+ffprobe source-range coverage）。全程 0 外部 API call、不修改來源影音、
+source revision 漂移即 `STALE_SOURCE` 不自動重綁；匯出預設只留
+basename（`--full-paths` 才保留完整路徑）。設計與實測 receipt 見
+`docs/research/issue-11-paper-cut.md` 與 `docs/research/issue-11-receipts/`。
+
+```powershell
+python cutspec.py build --video source.mp4 --segments segs.json --out spec.json
+python cutspec.py preview --spec spec.json --video source.mp4
+python cutspec.py export --spec spec.json --format otio --out cut.otio
+python cutspec.py verify --spec spec.json --video source.mp4 --export-file cut.otio --format otio --receipt receipt.json
+```
+
 ## 本地搜尋索引（本專案的資料庫）
 
 跑過的影片會自動寫進專案根目錄的 `library.db`（SQLite FTS5，標準函式庫，無額外安裝，不需要任何服務或 port）。這一個檔就是整個知識庫，複製走即完整搬移。要重掃既有的 `jobs\`：
