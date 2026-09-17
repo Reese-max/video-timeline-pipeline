@@ -10,7 +10,7 @@
 
 ## Discovery and deltas
 
-The repository is owned by Reese-max, private, unarchived and non-empty. The current default HEAD adds only the fixed-persona audit; it does not invalidate the last product SHA. All-state Issues and PRs, recent commits, relevant source/tests, and available workflow/status receipts were rechecked.
+The connected owner inventory returned 39 Reese-max repositories on 2026-09-17: 38 unarchived and one archived (`obsidian-vault`). `travel-planning-mcp` is unarchived but empty and is excluded from product-surface findings; absence of content is not treated as a defect. The remaining 37 unarchived, non-empty repositories stay in the fairness rotation. `video-timeline-pipeline` is owned by Reese-max, private, unarchived and non-empty. Its current default HEAD adds only the fixed-persona audit; it does not invalidate the last product SHA. All-state Issues and PRs, recent commits, relevant source/tests, and available workflow/status receipts were rechecked.
 
 Three actionable root causes passed the quality gate:
 
