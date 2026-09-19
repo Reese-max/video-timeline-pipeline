@@ -68,6 +68,31 @@ python pipeline.py --video 'D:\path\to\video.mp4' --dry-run --slide-extractor st
 
 `--dry-run` 不會下載、不會上傳、不會呼叫雲端 API，但會用本機 `ffprobe`／`ffmpeg` 產生音訊片段與候選截圖。輸出在 `jobs\<12字元雜湊>\`。
 
+## ChatGPT 網頁 MCP 影片摘要
+
+`mcp_server.py` 是最小的 ChatGPT Apps/MCP 入口：工具接受公開影片 URL，沿用本管線的 `yt-dlp` 下載，再用 FFmpeg 切成 MP4；ChatGPT widget 會把分段上傳到目前對話，並送出後續摘要要求。影片分段與代表影格放在 Git 忽略的 `mcp_jobs\`。
+
+先在隔離環境安裝依賴（FFmpeg／ffprobe 仍需在 PATH）：
+
+```powershell
+cd 'C:\Users\Administrator\video-timeline-pipeline'
+python -m venv .venv
+.\.venv\Scripts\python -m pip install -r requirements.txt
+```
+
+啟動本機 MCP：
+
+```powershell
+$env:MCP_PUBLIC_BASE_URL = 'https://你的 HTTPS tunnel 網址'
+$env:MCP_HOST = '127.0.0.1'
+$env:MCP_PORT = '8787'
+.\.venv\Scripts\python mcp_server.py
+```
+
+本機檢查：`Invoke-RestMethod http://127.0.0.1:8787/health`；ChatGPT Developer Mode 則新增 MCP app，填入 tunnel 網址加 `/mcp`。工具完成後按 widget 的「上傳影片片段並摘要」。影片檔上傳與模型實際讀取是獨立驗收 gate；若 host 不支援影片上傳，widget 會嘗試改傳每段代表影格。
+
+可用環境變數：`MCP_MAX_SOURCE_MB`（預設 512）、`MCP_MAX_SEGMENT_SECONDS`（預設 600）、`MCP_MAX_SEGMENTS`（預設 0，不限段數；設為正整數可加硬上限）、`MCP_ROOT`（預設 repo 根目錄）。工具的 `max_segments` 預設不設上限；仍受來源大小與每段最長時間限制。目前是同步下載／切段，適合開發者模式與中短片；長片佇列、OAuth 與自動清理留待有實際使用量再加。
+
 ## 批次建立頻道知識庫
 
 先建立 URL 清單；每行一個影片 URL，空白行與 `#` 開頭的註解會忽略，重複 URL 會去除：

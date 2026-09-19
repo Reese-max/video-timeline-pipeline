@@ -251,7 +251,14 @@ def sanitize_download_info(path: Path) -> None:
     write_json(path, clean(info))
 
 
-def download_video(url: str, job_dir: Path, *, private_url: bool = False) -> Path:
+def download_video(
+    url: str,
+    job_dir: Path,
+    *,
+    private_url: bool = False,
+    max_filesize: int | None = None,
+    max_duration: int | None = None,
+) -> Path:
     # 只信任完整標記：中斷會留下 source.f<id>.mp4 之類的分軌檔，
     # 直接復用會拿到無音訊的純視訊軌。重跑 yt-dlp 會自行續傳並清掉分軌。
     done = job_dir / ".download-complete"
@@ -270,8 +277,12 @@ def download_video(url: str, job_dir: Path, *, private_url: bool = False) -> Pat
         "mp4",
         "--output",
         str(job_dir / "source.%(ext)s"),
-        url,
     ]
+    if max_filesize is not None:
+        command += ["--max-filesize", str(max_filesize)]
+    if max_duration is not None:
+        command += ["--match-filter", f"duration <= {max_duration}"]
+    command.append(url)
     run_external(command, stream=not private_url, redact={url} if private_url else None)
     if private_url:
         sanitize_download_info(job_dir / "source.info.json")

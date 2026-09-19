@@ -1,3 +1,4 @@
 # FFmpeg 與 ffprobe 需另行安裝或由系統提供。
+mcp>=1.20,<2
 yt-dlp
 Pillow

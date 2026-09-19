@@ -1,6 +1,7 @@
 .env
 .env.bak-*
 jobs/
+mcp_jobs/
 batches/
 rss/
 canary/
@@ -9,4 +10,5 @@ operations.db
 operations.db-*
 digest_preview_*.md
 __pycache__/
+.venv/
 *.tmp
