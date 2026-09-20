@@ -50,7 +50,6 @@ process_matches() {
 exec 9>"${lockfile}"
 flock -n 9 || exit 0
 
-registered="$(find /tmp/sand-desktop -path '*/video-timeline-mcp.json' -print -quit 2>/dev/null || true)"
 pid=""
 if [ -r "${pidfile}" ]; then
 	candidate="$(tr -dc '0-9' <"${pidfile}" 2>/dev/null || true)"
@@ -69,7 +68,5 @@ if [ -z "${pid}" ]; then
 	printf '%s\n' "${pid}" >"${pidfile}"
 fi
 
-if [ -z "${registered}" ] || [ ! -e "${registered}" ]; then
-	sand_desktop_register "${group}" video-timeline-mcp 6 "${log}" "${pid}" "${pidfile}" \
-		-- "${run_command[@]}"
-fi
+sand_desktop_register "${group}" video-timeline-mcp 6 "${log}" "${pid}" "${pidfile}" \
+	-- "${run_command[@]}"
