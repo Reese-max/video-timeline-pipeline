@@ -66,6 +66,18 @@ class MCPValidationTests(unittest.TestCase):
         self.assertEqual(result.files[0].file_id, "file_1")
         self.assertEqual(result.files[0].file_name, "segment_000.mp4")
 
+    def test_file_handoff_accepts_approved_resource_link_url(self) -> None:
+        result = asyncio.run(
+            mcp_server.mcp._tool_manager.call_tool(
+                "ingest_video_segments",
+                {"files": ["https://files.example/segment_000.mp4"]},
+                convert_result=True,
+            )
+        )
+        self.assertEqual(result[1]["status"], "files_received")
+        self.assertEqual(result[1]["files_received"], 1)
+        self.assertTrue(result[1]["files"][0]["file_id"].startswith("url_"))
+
     def test_file_handoff_declares_complete_openai_file_schema(self) -> None:
         tools = asyncio.run(mcp_server.mcp.list_tools())
         tool = next(item for item in tools if item.name == "ingest_video_segments")
