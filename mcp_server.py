@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import base64
 import ipaddress
 import json
 import math
@@ -11,12 +10,14 @@ import re
 import socket
 import threading
 from pathlib import Path
+from typing import Annotated, Literal
 from urllib.parse import urlsplit
 
 import pipeline
 from mcp import types
 from mcp.server.fastmcp import FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
+from pydantic import BaseModel, ConfigDict
 from starlette.requests import Request
 from starlette.responses import FileResponse, JSONResponse, PlainTextResponse
 
@@ -104,6 +105,89 @@ TOOL_META = {
     "openai/toolInvocation/invoking": "正在下載並切割影片…",
     "openai/toolInvocation/invoked": "影片分段已準備好",
 }
+FILE_HANDOFF_META = {
+    "ui": {"visibility": ["model", "app"]},
+    "openai/widgetAccessible": True,
+    "openai/fileParams": ["files"],
+    "openai/toolInvocation/invoking": "正在接收影片檔案…",
+    "openai/toolInvocation/invoked": "影片檔案已交接",
+}
+
+
+class OpenAIFileReference(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    download_url: str
+    file_id: str
+    mime_type: str = ""
+    file_name: str = ""
+
+
+class VerifiedFileSummary(BaseModel):
+    file_id: str
+    mime_type: str | None = None
+    file_name: str | None = None
+
+
+class FileHandoffResult(BaseModel):
+    status: Literal["files_received"]
+    files_received: int
+    files: list[VerifiedFileSummary]
+
+
+class PreparedVideoSegment(BaseModel):
+    index: int
+    filename: str
+    preview_filename: str | None = None
+    start_seconds: float
+    end_seconds: float
+    size_bytes: int
+    mime_type: str
+    url: str
+    preview_url: str | None = None
+
+
+class PreparedVideoResult(BaseModel):
+    status: Literal["ready", "error"]
+    job_id: str | None = None
+    title: str | None = None
+    source_url: str | None = None
+    duration_seconds: float | None = None
+    segment_seconds: int | None = None
+    segments: list[PreparedVideoSegment] | None = None
+    error: str | None = None
+
+
+def normalize_file_references(files: list[dict]) -> list[dict]:
+    if not files:
+        raise ValueError("至少需要一個影片檔案引用。")
+
+    normalized = []
+    seen_ids = set()
+    for index, item in enumerate(files):
+        if not isinstance(item, dict):
+            raise ValueError(f"files[{index}] 必須是檔案引用物件。")
+        file_id = str(item.get("file_id") or "").strip()
+        if not file_id:
+            raise ValueError(f"files[{index}].file_id 必填。")
+        if file_id in seen_ids:
+            raise ValueError(f"files[{index}].file_id 重複。")
+        download_url = str(item.get("download_url") or "").strip()
+        parsed = urlsplit(download_url)
+        if parsed.scheme.lower() != "https" or not parsed.netloc:
+            raise ValueError(f"files[{index}].download_url 必須是 HTTPS URL。")
+        if parsed.username or parsed.password:
+            raise ValueError(f"files[{index}].download_url 不可包含帳號或密碼。")
+        seen_ids.add(file_id)
+        normalized.append(
+            {
+                "file_id": file_id,
+                "download_url": download_url,
+                "mime_type": item.get("mime_type"),
+                "file_name": item.get("file_name"),
+            }
+        )
+    return normalized
 
 
 def validate_source_url(value: str) -> str:
@@ -376,6 +460,7 @@ def tool_payload(manifest: dict) -> dict:
             row["preview_url"] = media_url(job_id, f"previews/{item['preview_filename']}")
         segments.append(row)
     return {
+        "status": "ready",
         "job_id": job_id,
         "title": source["title"],
         "source_url": source["url"],
@@ -412,20 +497,6 @@ def tool_result(manifest: dict) -> types.CallToolResult:
                     mimeType="image/jpeg",
                 )
             )
-            preview_name = segment.get("preview_filename")
-            preview_path = (
-                MCP_JOBS_ROOT / payload["job_id"] / "previews" / preview_name
-                if preview_name
-                else None
-            )
-            if preview_path and preview_path.is_file():
-                links.append(
-                    types.ImageContent(
-                        type="image",
-                        data=base64.b64encode(preview_path.read_bytes()).decode("ascii"),
-                        mimeType="image/jpeg",
-                    )
-                )
     return types.CallToolResult(
         structuredContent=payload,
         content=[
@@ -433,7 +504,7 @@ def tool_result(manifest: dict) -> types.CallToolResult:
                 type="text",
                 text=(
                     f"已準備 {len(payload['segments'])} 個影片分段（{payload['duration_seconds']:.1f} 秒）。"
-                    "請使用 widget 的「上傳影片片段並摘要」；若 host 不支援影片上傳，請改用代表影格並標示分析限制。"
+                    "請先完成檔案交接，再開始摘要；若 host 不支援檔案上傳，請回報尚未分析，不要只根據 metadata 宣稱完成。"
                 ),
             ),
             *links,
@@ -539,76 +610,64 @@ WIDGET_HTML = r"""<!doctype html>
       if (!response.ok) throw new Error(`下載 ${name} 失敗（HTTP ${response.status}）`);
       const blob = await response.blob();
       const result = await openai.uploadFile(new File([blob], name, { type }), { library: false });
-      return result?.fileId || result?.file_id;
+      const fileId = result?.fileId || result?.file_id;
+      if (!fileId) throw new Error(`${name} 沒有取得 file_id`);
+      const download = await openai.getFileDownloadUrl({ fileId });
+      const downloadUrl = download?.downloadUrl || download?.download_url;
+      if (!downloadUrl) throw new Error(`${name} 沒有取得 download_url`);
+      return { file_id: fileId, download_url: downloadUrl, mime_type: type, file_name: name };
     }
 
     async function uploadAndAsk() {
       if (!data?.segments?.length) return;
-      if (!openai?.uploadFile) {
-        const prompt = [
-          `ChatGPT host 未提供 uploadFile；工具已回傳 ${data.segments.length} 個公開 MP4 resource link 與代表影格附件。`,
-          "請直接使用已核准的 resource link／代表影格做可驗證的內容分析；如果 MP4 不能解碼，只能根據代表影格回答，並明確標示無法逐秒分析。",
-        ].join("\n");
-        if (openai?.sendFollowUpMessage) {
-          await openai.sendFollowUpMessage({ prompt });
-          setStatus("此 host 沒有 uploadFile，已請 ChatGPT 使用已回傳的 MP4／代表影格附件驗證。\n");
-        } else {
-          setStatus("此 host 沒有 uploadFile 或自動追問功能；請直接使用已回傳的 MP4／代表影格附件。\n");
-        }
+      if (!openai?.uploadFile || !openai?.getFileDownloadUrl || !openai?.callTool) {
+        setStatus("此 host 不支援完整檔案交接（需要 uploadFile、getFileDownloadUrl、callTool）；尚未開始摘要。\n");
         return;
       }
       $("upload").disabled = true;
-      const videoIds = [];
-      const imageIds = [];
+      const files = [];
       const failures = [];
       for (let index = 0; index < data.segments.length; index += 1) {
         const segment = data.segments[index];
         setStatus(`上傳影片片段 ${index + 1}/${data.segments.length}…`);
         try {
-          const fileId = await upload(segment.url, segment.filename, segment.mime_type || "video/mp4");
-          if (fileId) videoIds.push(fileId);
+          files.push(await upload(segment.url, segment.filename, segment.mime_type || "video/mp4"));
         } catch (error) {
           failures.push(`${segment.filename}: ${error.message}`);
         }
       }
       if (failures.length) {
-        for (const segment of data.segments) {
-          if (!segment.preview_url) continue;
-          try {
-            setStatus(`影片上傳受限，補傳代表影格 ${imageIds.length + 1}…`);
-            const fileId = await upload(segment.preview_url, `preview-${segment.index}.jpg`, "image/jpeg");
-            if (fileId) imageIds.push(fileId);
-          } catch (_) { /* 代表影格只是 fallback，保留影片上傳結果。 */ }
-        }
-      }
-      const ids = videoIds.length + imageIds.length;
-      if (!ids) {
-        setStatus(`上傳失敗：${failures.join("；")}`);
+        setStatus(`檔案交接失敗：${failures.join("；")}；尚未開始摘要。`);
         $("upload").disabled = false;
         return;
       }
+      setStatus(`正在確認 ${files.length} 個 ChatGPT 檔案引用…`);
+      const handoff = normalize(await openai.callTool("ingest_video_segments", { files }));
+      if (handoff.status !== "files_received" || Number(handoff.files_received) !== files.length) {
+        throw new Error("MCP 未確認所有影片檔案引用");
+      }
+      const videoIds = files.map((file) => file.file_id);
       const modelContent = [
         `影片「${data.title || "未命名"}」已由 video-timeline-pipeline 分成 ${data.segments.length} 段。`,
-        `已上傳 ${videoIds.length} 個影片檔與 ${imageIds.length} 個代表影格。`,
-        "請依每段的時間範圍整理重點、關鍵數字、結論與不確定處；不要把未讀取的內容猜成事實。",
+        `檔案交接工具已確認 ${files.length} 個影片檔案。`,
+        "請先讀取所有影片附件，再依每段的時間範圍整理重點、關鍵數字、結論與不確定處；不要把未讀取的內容猜成事實。",
       ].join("\n");
       openai.setWidgetState?.({
         modelContent,
         privateContent: { jobId: data.job_id, videoIds },
-        imageIds,
       });
-      const prompt = `${modelContent}\n請現在直接讀取我剛上傳的影片分段並以繁體中文摘要。每個重點附上影片時間範圍；若某段無法讀取，明確標示。`;
+      const prompt = `${modelContent}\n請現在直接讀取檔案交接工具提供的影片分段，並以繁體中文摘要。每個重點附上影片時間範圍；若某段無法讀取，明確標示。`;
       if (openai.sendFollowUpMessage) {
         await openai.sendFollowUpMessage({ prompt });
-        setStatus(`已上傳 ${ids} 個檔案，已請 ChatGPT 開始摘要。`);
+        setStatus(`已確認 ${files.length} 個檔案，已請 ChatGPT 讀取影片並開始摘要。`);
       } else {
-        setStatus(`已上傳 ${ids} 個檔案；此 host 沒有自動追問功能，請在輸入框要求摘要。`);
+        setStatus(`已確認 ${files.length} 個檔案；此 host 沒有自動追問功能，尚未開始摘要。`);
       }
       $("upload").disabled = false;
     }
 
     $("upload").addEventListener("click", () => uploadAndAsk().catch((error) => {
-      setStatus(`處理失敗：${error.message}`);
+      setStatus(`處理失敗：${error.message}；尚未開始摘要。`);
       $("upload").disabled = false;
     }));
     render(openai?.toolOutput);
@@ -666,17 +725,54 @@ def video_timeline_widget() -> str:
         openWorldHint=True,
     ),
     meta=TOOL_META,
+    structured_output=True,
 )
 async def prepare_video_for_chatgpt(
     url: str,
     segment_seconds: int = 120,
     max_segments: int | None = None,
-) -> types.CallToolResult:
+) -> Annotated[types.CallToolResult, PreparedVideoResult]:
     try:
         manifest = await asyncio.to_thread(prepare_video_locked, url, segment_seconds, max_segments)
     except Exception as error:
         return tool_error_result(error)
     return tool_result(manifest)
+
+
+@mcp.tool(
+    name="ingest_video_segments",
+    title="Receive video segments for analysis",
+    description=(
+        "Call this after prepare_video_for_chatgpt when ChatGPT has uploaded the MP4 segments. "
+        "Pass the files in the same order as the prepared segment list. "
+        "This tool only confirms file references; read the attached files before making any visual "
+        "or audio claims, and fail closed when the references are missing."
+    ),
+    annotations=types.ToolAnnotations(
+        readOnlyHint=True,
+        destructiveHint=False,
+        idempotentHint=True,
+        openWorldHint=False,
+    ),
+    meta=FILE_HANDOFF_META,
+    structured_output=True,
+)
+async def ingest_video_segments(files: list[OpenAIFileReference]) -> FileHandoffResult:
+    references = normalize_file_references(
+        [item.model_dump() if isinstance(item, OpenAIFileReference) else item for item in files]
+    )
+    return FileHandoffResult(
+        status="files_received",
+        files_received=len(references),
+        files=[
+            VerifiedFileSummary(
+                file_id=item["file_id"],
+                mime_type=item.get("mime_type"),
+                file_name=item.get("file_name"),
+            )
+            for item in references
+        ],
+    )
 
 
 @mcp.custom_route("/health", methods=["GET"], include_in_schema=False)

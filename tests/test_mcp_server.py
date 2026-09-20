@@ -1,7 +1,5 @@
-import base64
-import tempfile
+import asyncio
 import unittest
-from pathlib import Path
 from unittest.mock import patch
 
 import mcp_server
@@ -40,21 +38,72 @@ class MCPValidationTests(unittest.TestCase):
         self.assertTrue(result.isError)
         self.assertIn("download failed", result.content[0].text)
 
-    def test_tool_result_embeds_preview_frame(self) -> None:
+    def test_file_references_require_verified_ids_and_https_urls(self) -> None:
+        with self.assertRaisesRegex(ValueError, "file_id"):
+            mcp_server.normalize_file_references(
+                [{"download_url": "https://files.example/video.mp4"}]
+            )
+        with self.assertRaisesRegex(ValueError, "HTTPS"):
+            mcp_server.normalize_file_references(
+                [{"file_id": "file_1", "download_url": "http://files.example/video.mp4"}]
+            )
+
+    def test_file_handoff_returns_verified_file_summary(self) -> None:
+        result = asyncio.run(
+            mcp_server.ingest_video_segments(
+                [
+                    {
+                        "file_id": "file_1",
+                        "download_url": "https://files.example/video.mp4",
+                        "mime_type": "video/mp4",
+                        "file_name": "segment_000.mp4",
+                    }
+                ]
+            )
+        )
+        self.assertEqual(result.status, "files_received")
+        self.assertEqual(result.files_received, 1)
+        self.assertEqual(result.files[0].file_id, "file_1")
+        self.assertEqual(result.files[0].file_name, "segment_000.mp4")
+
+    def test_file_handoff_declares_complete_openai_file_schema(self) -> None:
+        tools = asyncio.run(mcp_server.mcp.list_tools())
+        tool = next(item for item in tools if item.name == "ingest_video_segments")
+        self.assertEqual(tool.meta["openai/fileParams"], ["files"])
+        file_schema = tool.inputSchema["$defs"]["OpenAIFileReference"]
+        self.assertEqual(
+            set(file_schema["properties"]),
+            {"download_url", "file_id", "mime_type", "file_name"},
+        )
+        self.assertEqual(file_schema["required"], ["download_url", "file_id"])
+
+    def test_file_handoff_protocol_returns_structured_content(self) -> None:
+        result = asyncio.run(
+            mcp_server.mcp._tool_manager.call_tool(
+                "ingest_video_segments",
+                {"files": [{"file_id": "file_1", "download_url": "https://files.example/video.mp4"}]},
+                convert_result=True,
+            )
+        )
+        self.assertEqual(result[1]["status"], "files_received")
+        self.assertEqual(result[1]["files_received"], 1)
+
+    def test_prepare_tool_exposes_output_schema(self) -> None:
+        tools = asyncio.run(mcp_server.mcp.list_tools())
+        tool = next(item for item in tools if item.name == "prepare_video_for_chatgpt")
+        self.assertIsNotNone(tool.outputSchema)
+
+    def test_prepare_tool_structured_result_matches_schema(self) -> None:
         manifest = {
-            "job_id": "preview-job",
-            "source": {
-                "title": "demo",
-                "url": "https://example.com/video",
-                "duration_seconds": 1.0,
-            },
+            "job_id": "job-1",
+            "source": {"title": "demo", "url": "https://example.com/video", "duration_seconds": 1.0},
             "duration_seconds": 1.0,
             "segment_seconds": 60,
             "segments": [
                 {
                     "index": 0,
                     "filename": "segment_000.mp4",
-                    "preview_filename": "preview_000.jpg",
+                    "preview_filename": None,
                     "start_seconds": 0,
                     "end_seconds": 1,
                     "size_bytes": 10,
@@ -62,16 +111,16 @@ class MCPValidationTests(unittest.TestCase):
                 }
             ],
         }
-        with tempfile.TemporaryDirectory() as temp_dir:
-            preview = Path(temp_dir) / "preview-job" / "previews" / "preview_000.jpg"
-            preview.parent.mkdir(parents=True)
-            preview.write_bytes(b"jpeg")
-            with patch.object(mcp_server, "MCP_JOBS_ROOT", Path(temp_dir)):
-                result = mcp_server.tool_result(manifest)
-
-        images = [item for item in result.content if item.type == "image"]
-        self.assertEqual(len(images), 1)
-        self.assertEqual(images[0].data, base64.b64encode(b"jpeg").decode("ascii"))
+        with patch.object(mcp_server, "prepare_video_locked", return_value=manifest):
+            result = asyncio.run(
+                mcp_server.mcp._tool_manager.call_tool(
+                    "prepare_video_for_chatgpt",
+                    {"url": "https://example.com/video"},
+                    convert_result=True,
+                )
+            )
+        self.assertEqual(result.structuredContent["status"], "ready")
+        self.assertEqual(result.structuredContent["segments"][0]["filename"], "segment_000.mp4")
 
 
 if __name__ == "__main__":
