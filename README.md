@@ -90,9 +90,9 @@ $env:MCP_PORT = '8787'
 .\.venv\Scripts\python mcp_server.py
 ```
 
-本機檢查：`Invoke-RestMethod http://127.0.0.1:8787/health`；ChatGPT Developer Mode 則新增 MCP app，填入 MCP tunnel 網址加 `/mcp`。若 MCP 入口是 Tailscale 或其他 ChatGPT 分析環境無法解析的網域，另設 `MCP_MEDIA_BASE_URL` 指向公開 HTTPS 媒體出口；工具完成後按 widget 的「上傳影片片段並摘要」。影片檔上傳、檔案引用交接與模型實際讀取是獨立驗收 gate；若 host 不支援完整檔案 API，widget 會停止並明確標示尚未分析，不以代表影格或 metadata 冒充影片摘要。
+本機檢查：`Invoke-RestMethod http://127.0.0.1:8787/health`；ChatGPT Developer Mode 則新增 MCP app，填入 MCP tunnel 網址加 `/mcp`。若 MCP 入口是 Tailscale 或其他 ChatGPT 分析環境無法解析的網域，另設 `MCP_MEDIA_BASE_URL` 指向公開 HTTPS 媒體出口；工具完成後按 widget 的「上傳影片片段並摘要」。影片檔上傳、檔案引用交接與模型實際讀取是獨立驗收 gate；host 支援 `uploadFile`／`getFileDownloadUrl` 時走 ChatGPT 原生附件讀取，只有 `callTool` 時改呼叫 `analyze_prepared_video`，由 MCP 主機實際讀取本地 MP4 bytes，再用 FFmpeg、Groq／faster-whisper 與 MiniMax（可設 MiniMax-M3）完成伺服器端摘要，並明確標示這不是 ChatGPT 直接讀取附件。
 
-可用環境變數：`MCP_MAX_SOURCE_MB`（預設 512）、`MCP_MAX_SEGMENT_SECONDS`（預設 600）、`MCP_MAX_SEGMENTS`（預設 0，不限段數；設為正整數可加硬上限）、`MCP_ROOT`（預設 repo 根目錄）。工具的 `max_segments` 預設不設上限；仍受來源大小與每段最長時間限制。目前是同步下載／切段，適合開發者模式與中短片；長片佇列、OAuth 與自動清理留待有實際使用量再加。
+可用環境變數：`MCP_MAX_SOURCE_MB`（預設 512）、`MCP_MAX_SEGMENT_SECONDS`（預設 600）、`MCP_MAX_SEGMENTS`（預設 0，不限段數；設為正整數可加硬上限）、`MCP_ROOT`（預設 repo 根目錄）、`TRANSCRIBE_BACKEND`（`groq` 或 `local`）、`GROQ_ASR_MODEL`、`MINIMAX_MODEL`。工具的 `max_segments` 預設不設上限；仍受來源大小與每段最長時間限制。目前是同步下載／切段，適合開發者模式與中短片；長片佇列、OAuth 與自動清理留待有實際使用量再加。Google Drive OAuth 仍由 ChatGPT 連接器處理，遠端 MCP 不保存 Google 憑證；Drive connector 讀到的檔案若要交給遠端 MCP，必須另外提供它可連線的 HTTPS 檔案 URL。
 
 ## 批次建立頻道知識庫
 

@@ -11,7 +11,7 @@ import socket
 import threading
 from hashlib import sha256
 from pathlib import Path
-from typing import Annotated, Literal
+from typing import Annotated, Any, Literal
 from urllib.parse import urlsplit
 
 import pipeline
@@ -47,7 +47,7 @@ MCP_PUBLIC_BASE_URL = (
 MCP_MEDIA_BASE_URL = (
     os.getenv("MCP_MEDIA_BASE_URL", "") or MCP_PUBLIC_BASE_URL
 ).rstrip("/")
-UI_URI = "ui://video-timeline-pipeline/v2.html"
+UI_URI = "ui://video-timeline-pipeline/v3.html"
 PUBLIC_URL = urlsplit(MCP_PUBLIC_BASE_URL)
 MEDIA_URL = urlsplit(MCP_MEDIA_BASE_URL)
 UI_ORIGIN = f"{PUBLIC_URL.scheme}://{PUBLIC_URL.netloc}"
@@ -113,6 +113,12 @@ FILE_HANDOFF_META = {
     "openai/toolInvocation/invoking": "正在接收影片檔案…",
     "openai/toolInvocation/invoked": "影片檔案已交接",
 }
+ANALYSIS_META = {
+    "ui": {"visibility": ["model", "app"]},
+    "openai/widgetAccessible": True,
+    "openai/toolInvocation/invoking": "正在用 FFmpeg、Groq 與 MiniMax 分析影片…",
+    "openai/toolInvocation/invoked": "影片分析完成",
+}
 
 
 class OpenAIFileReference(BaseModel):
@@ -144,6 +150,22 @@ class FileHandoffResult(BaseModel):
     status: Literal["files_received"]
     files_received: int
     files: list[VerifiedFileSummary]
+
+
+class PreparedVideoAnalysisResult(BaseModel):
+    status: Literal["complete", "partial", "error"]
+    job_id: str
+    title: str
+    source_url: str
+    duration_seconds: float
+    source_size_bytes: int
+    source_sha256: str
+    audio_status: str
+    visual_status: str
+    summary: dict[str, Any]
+    transcript: dict[str, Any]
+    timeline: list[dict[str, Any]]
+    errors: list[str]
 
 
 class PreparedVideoSegment(BaseModel):
@@ -542,6 +564,210 @@ def tool_error_result(error: Exception) -> types.CallToolResult:
     )
 
 
+def analysis_error(error: Exception) -> str:
+    detail = str(error).strip() or error.__class__.__name__
+    for secret_name in ("GROQ_API_KEY", "MINIMAX_SUBSCRIPTION_KEY"):
+        secret = os.getenv(secret_name, "").strip()
+        if secret:
+            detail = detail.replace(secret, "[redacted]")
+    return detail
+
+
+def prepared_job_dir(job_id: str) -> Path:
+    if not re.fullmatch(r"[0-9a-f]{12}", job_id):
+        raise ValueError("job_id 格式無效。")
+    job_dir = (MCP_JOBS_ROOT / job_id).resolve()
+    try:
+        job_dir.relative_to(MCP_JOBS_ROOT.resolve())
+    except ValueError as exc:
+        raise ValueError("job_id 不在 MCP 工作目錄內。") from exc
+    if not job_dir.is_dir():
+        raise FileNotFoundError(f"找不到 MCP 工作：{job_id}")
+    return job_dir
+
+
+def analyze_prepared_sync(job_id: str) -> dict[str, Any]:
+    job_dir = prepared_job_dir(job_id)
+    manifest = read_manifest(job_dir)
+    if not manifest:
+        raise RuntimeError("影片尚未準備完成，請先呼叫 prepare_video_for_chatgpt。")
+    video_path = pipeline.locate_source_video(job_dir)
+    source_fingerprint = pipeline.file_fingerprint(video_path)
+    analysis_dir = job_dir / "analysis"
+    analysis_dir.mkdir(parents=True, exist_ok=True)
+    result_path = analysis_dir / "result.json"
+    cached = pipeline.reuse_artifact(result_path)
+    if (
+        isinstance(cached, dict)
+        and cached.get("status") == "complete"
+        and cached.get("source_fingerprint") == source_fingerprint
+    ):
+        return cached
+
+    probe = pipeline.probe_video(video_path, analysis_dir / "source.probe.json")
+    duration = pipeline.video_duration(probe)
+    has_audio = any(stream.get("codec_type") == "audio" for stream in probe.get("streams", []))
+    model = pipeline.minimax_model()
+    minimax_key = pipeline.minimax_subscription_key()
+    max_frames = pipeline.vision_frame_limit(duration)
+    transcript: dict[str, Any] = {
+        "provider": "none",
+        "language": "",
+        "segments": [],
+    }
+    errors: list[str] = []
+    audio_status = "skipped" if not has_audio else "pending"
+    visual_status = "pending"
+
+    def visual_stage() -> list[dict[str, Any]]:
+        candidates, _ = pipeline.extract_candidates(
+            video_path,
+            analysis_dir,
+            1.0,
+            8,
+            max_frames,
+            False,
+            0.75,
+        )
+        return pipeline.analyze_images(
+            candidates,
+            minimax_key,
+            model,
+            workers=4,
+            cache_dir=analysis_dir / "vision-cache",
+        )
+
+    def transcript_stage() -> dict[str, Any]:
+        chunks = pipeline.extract_audio(
+            video_path,
+            analysis_dir,
+            max(15, int(manifest.get("segment_seconds") or 120)),
+        )
+        backend = os.getenv("TRANSCRIBE_BACKEND", "groq").strip().lower()
+        language = os.getenv("GROQ_LANGUAGE", "auto")
+        if backend == "local":
+            return pipeline.transcribe_local(chunks, os.getenv("WHISPER_MODEL", "base"), language)
+        groq_key = os.getenv("GROQ_API_KEY", "").strip()
+        if not groq_key:
+            raise RuntimeError("音訊存在但未設定 GROQ_API_KEY。")
+        transcript_result, _ = pipeline.transcribe_all(
+            chunks,
+            groq_key,
+            os.getenv("GROQ_ASR_MODEL", "whisper-large-v3"),
+            language,
+            2,
+            analysis_dir / "transcription-cache",
+        )
+        return transcript_result
+
+    if has_audio:
+        transcript_box: dict[str, Any] = {}
+
+        def safe_transcript() -> None:
+            try:
+                transcript_box["value"] = transcript_stage()
+            except Exception as error:
+                transcript_box["error"] = analysis_error(error)
+
+        visual_box: dict[str, Any] = {}
+
+        def safe_visual() -> None:
+            try:
+                visual_box["value"] = visual_stage()
+            except Exception as error:
+                visual_box["error"] = analysis_error(error)
+
+        pipeline.run_parallel_stages(safe_transcript, safe_visual)
+        if "value" in transcript_box:
+            transcript = transcript_box["value"]
+            audio_status = "complete"
+        else:
+            audio_status = "error"
+            errors.append(f"音訊：{transcript_box.get('error', '未知錯誤')}")
+        observations = visual_box.get("value") or []
+        if "value" in visual_box:
+            visual_status = "complete"
+        else:
+            visual_status = "error"
+            errors.append(f"畫面：{visual_box.get('error', '未知錯誤')}")
+    else:
+        try:
+            observations = visual_stage()
+            visual_status = "complete"
+        except Exception as error:
+            observations = []
+            visual_status = "error"
+            errors.append(f"畫面：{analysis_error(error)}")
+
+    timeline = pipeline.merge_timeline(transcript, observations)
+    if timeline:
+        try:
+            summary = pipeline.create_summary(
+                timeline,
+                minimax_key,
+                model,
+                120000,
+                analysis_dir / "summary-cache",
+                2,
+            )
+            summary_status = "complete"
+        except Exception as error:
+            summary = {"status": "error", "reason": analysis_error(error)}
+            summary_status = "error"
+            errors.append(f"摘要：{analysis_error(error)}")
+    else:
+        summary = {"status": "skipped", "reason": "沒有可供摘要的音訊或畫面事件。"}
+        summary_status = "skipped"
+
+    overall = (
+        "complete"
+        if visual_status == "complete"
+        and audio_status in {"complete", "skipped"}
+        and summary_status == "complete"
+        else "partial"
+        if timeline
+        else "error"
+    )
+    result = {
+        "status": overall,
+        "job_id": job_id,
+        "title": str((manifest.get("source") or {}).get("title") or video_path.stem),
+        "source_url": str((manifest.get("source") or {}).get("url") or ""),
+        "duration_seconds": round(duration, 3),
+        "source_size_bytes": video_path.stat().st_size,
+        "source_sha256": pipeline.file_sha256(video_path),
+        "source_fingerprint": source_fingerprint,
+        "audio_status": audio_status,
+        "visual_status": visual_status,
+        "summary": summary,
+        "transcript": transcript,
+        "timeline": timeline,
+        "errors": errors,
+    }
+    if overall == "complete":
+        pipeline.write_json(result_path, result)
+    return result
+
+
+def analysis_tool_result(result: dict[str, Any]) -> types.CallToolResult:
+    status = str(result.get("status") or "error")
+    summary = result.get("summary") or {}
+    headline = str(summary.get("short_summary") or "沒有產生摘要。")
+    text = (
+        f"MCP 已實際讀取準備好的 MP4（{result.get('source_size_bytes', 0)} bytes；"
+        f"SHA-256 {result.get('source_sha256', '')}）。"
+        f"伺服器端畫面={result.get('visual_status')}、音訊={result.get('audio_status')}、"
+        f"摘要={status}。\n{headline}"
+    )
+    if result.get("errors"):
+        text += "\n" + "；".join(str(item) for item in result["errors"])
+    return types.CallToolResult(
+        isError=status == "error",
+        structuredContent=result,
+        content=[types.TextContent(type="text", text=text)],
+    )
+
+
 WIDGET_HTML = r"""<!doctype html>
 <html lang="zh-Hant">
 <head>
@@ -629,10 +855,63 @@ WIDGET_HTML = r"""<!doctype html>
       return { file_id: fileId, download_url: downloadUrl, mime_type: type, file_name: name };
     }
 
+    function analysisContext(result) {
+      const summary = result?.summary || {};
+      return {
+        status: result?.status,
+        title: result?.title,
+        duration_seconds: result?.duration_seconds,
+        audio_status: result?.audio_status,
+        visual_status: result?.visual_status,
+        short_summary: summary.short_summary || "",
+        topic_points: summary.topic_points || [],
+        chapters: summary.chapters || [],
+        timeline: result?.timeline || [],
+        errors: result?.errors || [],
+      };
+    }
+
+    async function analyzeWithMcp() {
+      if (!openai?.callTool) {
+        setStatus("此 host 沒有 callTool，無法啟動伺服器端影片分析；尚未開始摘要。\n");
+        return;
+      }
+      $("upload").disabled = true;
+      try {
+        setStatus("此 host 不支援 MP4 上傳，改由 MCP 主機實際讀取並用 M3 分析…");
+        const result = normalize(await openai.callTool("analyze_prepared_video", { job_id: data.job_id }));
+        if (!["complete", "partial"].includes(result.status)) {
+          throw new Error(result.error || "MCP 伺服器端分析失敗");
+        }
+        const context = analysisContext(result);
+        const modelContent = [
+          `影片「${data.title || result.title || "未命名"}」已由 MCP 主機實際讀取 MP4 bytes，並完成伺服器端 FFmpeg／ASR／MiniMax 分析。`,
+          "這不是 ChatGPT 直接讀取附件；請依下列已完成的伺服器分析整理繁體中文摘要，保留時間範圍與不確定處。",
+          JSON.stringify(context),
+        ].join("\n");
+        openai.setWidgetState?.({
+          modelContent,
+          privateContent: { jobId: data.job_id, analysisStatus: result.status },
+        });
+        if (openai.sendFollowUpMessage) {
+          await openai.sendFollowUpMessage({ prompt: `${modelContent}\n請現在輸出時間軸重點摘要。` });
+          setStatus(`伺服器端影片分析完成（${result.status}），已請 ChatGPT 整理摘要。`);
+        } else {
+          setStatus(`伺服器端影片分析完成（${result.status}）；此 host 沒有自動追問功能。`);
+        }
+      } finally {
+        $("upload").disabled = false;
+      }
+    }
+
     async function uploadAndAsk() {
       if (!data?.segments?.length) return;
-      if (!openai?.uploadFile || !openai?.getFileDownloadUrl || !openai?.callTool) {
-        setStatus("此 host 不支援完整檔案交接（需要 uploadFile、getFileDownloadUrl、callTool）；尚未開始摘要。\n");
+      if (!openai?.callTool) {
+        setStatus("此 host 不支援 callTool，無法完成檔案交接或伺服器端分析；尚未開始摘要。\n");
+        return;
+      }
+      if (!openai?.uploadFile || !openai?.getFileDownloadUrl) {
+        await analyzeWithMcp();
         return;
       }
       $("upload").disabled = true;
@@ -699,7 +978,9 @@ mcp = FastMCP(
     instructions=(
         "Use prepare_video_for_chatgpt when the user gives a public video URL and wants a summary. "
         "The tool downloads and segments the video; the ChatGPT widget then uploads the segments. "
-        "Do not claim that a video was analyzed until the widget upload and model response succeed."
+        "If the host does not expose file upload APIs, use analyze_prepared_video for a server-side "
+        "FFmpeg/Groq/MiniMax-M3 fallback. Do not claim that ChatGPT itself read the MP4 unless the "
+        "file handoff and model response succeed."
     ),
     host=MCP_HOST,
     port=MCP_PORT,
@@ -748,6 +1029,35 @@ async def prepare_video_for_chatgpt(
     except Exception as error:
         return tool_error_result(error)
     return tool_result(manifest)
+
+
+@mcp.tool(
+    name="analyze_prepared_video",
+    title="Analyze prepared video",
+    description=(
+        "Use this after prepare_video_for_chatgpt when the ChatGPT host cannot upload MP4 files. "
+        "It reads the prepared local MP4 bytes on the MCP host, uses FFmpeg to extract audio and "
+        "frames, Groq or faster-whisper for speech, and MiniMax (including MiniMax-M3 when configured) "
+        "for visual analysis and the final timeline summary. The result is a server-side analysis; "
+        "do not describe it as ChatGPT directly reading the video attachment."
+    ),
+    annotations=types.ToolAnnotations(
+        readOnlyHint=False,
+        destructiveHint=False,
+        idempotentHint=True,
+        openWorldHint=True,
+    ),
+    meta=ANALYSIS_META,
+    structured_output=True,
+)
+async def analyze_prepared_video(
+    job_id: str,
+) -> Annotated[types.CallToolResult, PreparedVideoAnalysisResult]:
+    try:
+        result = await asyncio.to_thread(analyze_prepared_sync, job_id)
+    except Exception as error:
+        return tool_error_result(error)
+    return analysis_tool_result(result)
 
 
 @mcp.tool(

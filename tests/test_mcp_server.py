@@ -1,5 +1,7 @@
 import asyncio
+import tempfile
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 
 import mcp_server
@@ -109,6 +111,85 @@ class MCPValidationTests(unittest.TestCase):
         tools = asyncio.run(mcp_server.mcp.list_tools())
         tool = next(item for item in tools if item.name == "prepare_video_for_chatgpt")
         self.assertIsNotNone(tool.outputSchema)
+
+    def test_analysis_tool_exposes_output_schema_and_widget_fallback(self) -> None:
+        tools = asyncio.run(mcp_server.mcp.list_tools())
+        tool = next(item for item in tools if item.name == "analyze_prepared_video")
+        self.assertIsNotNone(tool.outputSchema)
+        self.assertTrue(tool.meta["openai/widgetAccessible"])
+        self.assertIn("analyze_prepared_video", mcp_server.WIDGET_HTML)
+
+    def test_prepared_analysis_reuses_pipeline_stages(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_dir:
+            video_path = Path(raw_dir) / "source.mp4"
+            video_path.write_bytes(b"fake-mp4")
+            manifest = {
+                "status": "ready",
+                "segment_seconds": 120,
+                "source": {"title": "demo", "url": "https://example.com/video"},
+            }
+            with (
+                patch.object(mcp_server, "prepared_job_dir", return_value=Path(raw_dir)),
+                patch.object(mcp_server, "read_manifest", return_value=manifest),
+                patch.object(mcp_server.pipeline, "locate_source_video", return_value=video_path),
+                patch.object(mcp_server.pipeline, "file_fingerprint", return_value="7:1"),
+                patch.object(mcp_server.pipeline, "reuse_artifact", return_value=None),
+                patch.object(
+                    mcp_server.pipeline,
+                    "probe_video",
+                    return_value={
+                        "format": {"duration": "2"},
+                        "streams": [{"codec_type": "video"}, {"codec_type": "audio"}],
+                    },
+                ),
+                patch.object(mcp_server.pipeline, "minimax_model", return_value="MiniMax-M3"),
+                patch.object(mcp_server.pipeline, "minimax_subscription_key", return_value="key"),
+                patch.object(mcp_server.pipeline, "vision_frame_limit", return_value=8),
+                patch.object(
+                    mcp_server.pipeline,
+                    "extract_candidates",
+                    return_value=(
+                        [{"timestamp": 0, "path": str(video_path), "ocr_text": ""}],
+                        {},
+                    ),
+                ),
+                patch.object(mcp_server.pipeline, "analyze_images", return_value=[{"timestamp": 0}]),
+                patch.object(
+                    mcp_server.pipeline,
+                    "extract_audio",
+                    return_value=[
+                        {
+                            "index": 0,
+                            "path": str(video_path),
+                            "source_start": 0,
+                            "source_end": 2,
+                            "sha256": "audio",
+                        }
+                    ],
+                ),
+                patch.object(
+                    mcp_server.pipeline,
+                    "transcribe_all",
+                    return_value=(
+                        {
+                            "provider": "groq",
+                            "segments": [{"start": 0, "end": 1, "text": "hello"}],
+                        },
+                        {},
+                    ),
+                ),
+                patch.object(mcp_server.pipeline, "create_summary", return_value={"short_summary": "ok"}),
+                patch.object(mcp_server.pipeline, "file_sha256", return_value="sha"),
+                patch.object(mcp_server.pipeline, "write_json"),
+                patch.dict(mcp_server.os.environ, {"GROQ_API_KEY": "groq"}, clear=False),
+            ):
+                result = mcp_server.analyze_prepared_sync("0123456789ab")
+
+        self.assertEqual(result["status"], "complete")
+        self.assertEqual(result["source_sha256"], "sha")
+        self.assertEqual(result["audio_status"], "complete")
+        self.assertEqual(result["visual_status"], "complete")
+        self.assertEqual(result["summary"]["short_summary"], "ok")
 
     def test_prepare_tool_structured_result_matches_schema(self) -> None:
         manifest = {
