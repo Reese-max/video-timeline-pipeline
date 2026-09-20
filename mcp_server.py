@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import ipaddress
 import json
 import math
@@ -364,6 +365,7 @@ def tool_payload(manifest: dict) -> dict:
         row = {
             "index": item["index"],
             "filename": item["filename"],
+            "preview_filename": item.get("preview_filename"),
             "start_seconds": item["start_seconds"],
             "end_seconds": item["end_seconds"],
             "size_bytes": item["size_bytes"],
@@ -410,6 +412,20 @@ def tool_result(manifest: dict) -> types.CallToolResult:
                     mimeType="image/jpeg",
                 )
             )
+            preview_name = segment.get("preview_filename")
+            preview_path = (
+                MCP_JOBS_ROOT / payload["job_id"] / "previews" / preview_name
+                if preview_name
+                else None
+            )
+            if preview_path and preview_path.is_file():
+                links.append(
+                    types.ImageContent(
+                        type="image",
+                        data=base64.b64encode(preview_path.read_bytes()).decode("ascii"),
+                        mimeType="image/jpeg",
+                    )
+                )
     return types.CallToolResult(
         structuredContent=payload,
         content=[

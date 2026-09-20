@@ -1,4 +1,8 @@
+import base64
+import tempfile
 import unittest
+from pathlib import Path
+from unittest.mock import patch
 
 import mcp_server
 
@@ -35,6 +39,39 @@ class MCPValidationTests(unittest.TestCase):
         result = mcp_server.tool_error_result(RuntimeError("download failed"))
         self.assertTrue(result.isError)
         self.assertIn("download failed", result.content[0].text)
+
+    def test_tool_result_embeds_preview_frame(self) -> None:
+        manifest = {
+            "job_id": "preview-job",
+            "source": {
+                "title": "demo",
+                "url": "https://example.com/video",
+                "duration_seconds": 1.0,
+            },
+            "duration_seconds": 1.0,
+            "segment_seconds": 60,
+            "segments": [
+                {
+                    "index": 0,
+                    "filename": "segment_000.mp4",
+                    "preview_filename": "preview_000.jpg",
+                    "start_seconds": 0,
+                    "end_seconds": 1,
+                    "size_bytes": 10,
+                    "mime_type": "video/mp4",
+                }
+            ],
+        }
+        with tempfile.TemporaryDirectory() as temp_dir:
+            preview = Path(temp_dir) / "preview-job" / "previews" / "preview_000.jpg"
+            preview.parent.mkdir(parents=True)
+            preview.write_bytes(b"jpeg")
+            with patch.object(mcp_server, "MCP_JOBS_ROOT", Path(temp_dir)):
+                result = mcp_server.tool_result(manifest)
+
+        images = [item for item in result.content if item.type == "image"]
+        self.assertEqual(len(images), 1)
+        self.assertEqual(images[0].data, base64.b64encode(b"jpeg").decode("ascii"))
 
 
 if __name__ == "__main__":
