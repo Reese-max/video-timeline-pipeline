@@ -770,9 +770,11 @@ async def prepare_video_for_chatgpt(
     meta=FILE_HANDOFF_META,
     structured_output=True,
 )
-async def ingest_video_segments(files: list[OpenAIFileReference]) -> FileHandoffResult:
+async def ingest_video_segments(
+    files: list[OpenAIFileReference | str],
+) -> FileHandoffResult:
     references = normalize_file_references(
-        [item.model_dump() if isinstance(item, OpenAIFileReference) else item for item in files]
+        [OpenAIFileReference.model_validate(item).model_dump() for item in files]
     )
     return FileHandoffResult(
         status="files_received",

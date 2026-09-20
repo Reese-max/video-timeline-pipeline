@@ -88,6 +88,11 @@ class MCPValidationTests(unittest.TestCase):
             {"download_url", "file_id", "mime_type", "file_name"},
         )
         self.assertEqual(file_schema["required"], ["download_url", "file_id"])
+        item_schema = tool.inputSchema["properties"]["files"]["items"]
+        self.assertEqual(
+            {variant.get("type", "object") for variant in item_schema["anyOf"]},
+            {"object", "string"},
+        )
 
     def test_file_handoff_protocol_returns_structured_content(self) -> None:
         result = asyncio.run(
