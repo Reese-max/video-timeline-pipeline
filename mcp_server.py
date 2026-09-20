@@ -612,6 +612,7 @@ def analyze_prepared_sync(job_id: str) -> dict[str, Any]:
     minimax_key = pipeline.minimax_subscription_key()
     # 短片常用快速卡片切換；長片仍 capped at 40，避免每秒抽幀無界增長。
     max_frames = min(40, max(8, math.ceil(max(0.0, duration))))
+    hash_threshold = 0 if duration <= 40 else 1
     transcript: dict[str, Any] = {
         "provider": "none",
         "language": "",
@@ -626,7 +627,7 @@ def analyze_prepared_sync(job_id: str) -> dict[str, Any]:
             video_path,
             analysis_dir,
             1.0,
-            1,
+            hash_threshold,
             max_frames,
             False,
             0.75,

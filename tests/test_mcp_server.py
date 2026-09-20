@@ -158,7 +158,7 @@ class MCPValidationTests(unittest.TestCase):
                         [{"timestamp": 0, "path": str(video_path), "ocr_text": ""}],
                         {},
                     ),
-                ),
+                ) as extract_candidates_mock,
                 patch.object(mcp_server.pipeline, "analyze_images", return_value=[{"timestamp": 0}]),
                 patch.object(
                     mcp_server.pipeline,
@@ -196,6 +196,7 @@ class MCPValidationTests(unittest.TestCase):
         self.assertEqual(result["audio_status"], "complete")
         self.assertEqual(result["visual_status"], "complete")
         self.assertEqual(result["summary"]["short_summary"], "ok")
+        self.assertEqual(extract_candidates_mock.call_args.args[3], 0)
 
     def test_prepare_tool_structured_result_matches_schema(self) -> None:
         manifest = {
