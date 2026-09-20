@@ -757,7 +757,9 @@ async def prepare_video_for_chatgpt(
         "Call this after prepare_video_for_chatgpt when ChatGPT has uploaded the MP4 segments. "
         "Pass the files in the same order as the prepared segment list. "
         "Some ChatGPT web hosts pass an approved MCP resource-link URL string instead of the full "
-        "OpenAI file object; accept that URL as the file reference and do not reject it only for its type. "
+        "OpenAI file object. If uploadFile/getFileDownloadUrl is unavailable, pass each prepared "
+        "segment's public HTTPS URL string directly; accept that URL as the file reference and do not "
+        "reject it only for its type. "
         "This tool only confirms file references; read the attached files before making any visual "
         "or audio claims, and fail closed when the references are missing."
     ),
