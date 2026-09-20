@@ -7,10 +7,12 @@ log="${MCP_LOG_FILE:-${base}/mcp-server.log}"
 pidfile="${MCP_PID_FILE:-${base}/mcp-server.pid}"
 lockfile="${MCP_LOCK_FILE:-${base}/mcp-supervisor.lock}"
 public_base="${MCP_PUBLIC_BASE_URL:-https://cursor-grokbot-1.tail930e77.ts.net/video-timeline}"
+media_url_file="${MCP_MEDIA_URL_FILE:-/tmp/video-timeline-media-url}"
 host="${MCP_HOST:-127.0.0.1}"
 port="${MCP_PORT:-8787}"
 python="${base}/.venv/bin/python"
 server="${base}/mcp_server.py"
+media_launcher="${base}/scripts/start-mcp-media-tunnel-supervised.sh"
 
 [ -x "${python}" ] || exit 1
 [ -r "${server}" ] || exit 1
@@ -20,6 +22,15 @@ if [ -r /usr/local/bin/sand-desktop-supervise.sh ]; then
 	. /usr/local/bin/sand-desktop-supervise.sh
 else
 	exit 1
+fi
+
+if [ -x "${media_launcher}" ]; then
+	"${media_launcher}" "${group}" >/dev/null 2>&1 || true
+fi
+
+media_base="${MCP_MEDIA_BASE_URL:-}"
+if [ -z "${media_base}" ] && [ -r "${media_url_file}" ]; then
+	media_base="$(tr -d '\r\n' <"${media_url_file}" 2>/dev/null || true)"
 fi
 
 process_matches() {
@@ -48,8 +59,8 @@ if [ -r "${pidfile}" ]; then
 	fi
 fi
 
-printf -v run_script 'cd %q && exec env MCP_PUBLIC_BASE_URL=%q MCP_HOST=%q MCP_PORT=%q %q %q' \
-	"${base}" "${public_base}" "${host}" "${port}" "${python}" "${server}"
+printf -v run_script 'cd %q && exec env MCP_PUBLIC_BASE_URL=%q MCP_MEDIA_BASE_URL=%q MCP_HOST=%q MCP_PORT=%q %q %q' \
+	"${base}" "${public_base}" "${media_base}" "${host}" "${port}" "${python}" "${server}"
 run_command=(/bin/bash -lc "${run_script}")
 
 if [ -z "${pid}" ]; then

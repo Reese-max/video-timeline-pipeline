@@ -41,10 +41,16 @@ MCP_MAX_SEGMENTS = env_int("MCP_MAX_SEGMENTS", 0)
 MCP_PUBLIC_BASE_URL = (
     os.getenv("MCP_PUBLIC_BASE_URL", "") or f"http://{MCP_HOST}:{MCP_PORT}"
 ).rstrip("/")
+MCP_MEDIA_BASE_URL = (
+    os.getenv("MCP_MEDIA_BASE_URL", "") or MCP_PUBLIC_BASE_URL
+).rstrip("/")
 UI_URI = "ui://video-timeline-pipeline/v1.html"
 PUBLIC_URL = urlsplit(MCP_PUBLIC_BASE_URL)
+MEDIA_URL = urlsplit(MCP_MEDIA_BASE_URL)
 UI_ORIGIN = f"{PUBLIC_URL.scheme}://{PUBLIC_URL.netloc}"
 PUBLIC_NETLOC = PUBLIC_URL.netloc
+MEDIA_ORIGIN = f"{MEDIA_URL.scheme}://{MEDIA_URL.netloc}"
+MEDIA_NETLOC = MEDIA_URL.netloc
 ALLOWED_HOSTS = sorted(
     {
         f"{MCP_HOST}:{MCP_PORT}",
@@ -52,6 +58,7 @@ ALLOWED_HOSTS = sorted(
         f"localhost:{MCP_PORT}",
         f"[::1]:{MCP_PORT}",
         PUBLIC_NETLOC,
+        MEDIA_NETLOC,
     }
     - {""}
 )
@@ -62,6 +69,7 @@ ALLOWED_ORIGINS = sorted(
         f"http://localhost:{MCP_PORT}",
         f"http://[::1]:{MCP_PORT}",
         UI_ORIGIN,
+        MEDIA_ORIGIN,
     }
     - {""}
 )
@@ -79,14 +87,14 @@ UI_META = {
         "domain": UI_ORIGIN,
         "prefersBorder": True,
         "csp": {
-            "connectDomains": [UI_ORIGIN],
-            "resourceDomains": [UI_ORIGIN],
+            "connectDomains": sorted({UI_ORIGIN, MEDIA_ORIGIN} - {""}),
+            "resourceDomains": sorted({UI_ORIGIN, MEDIA_ORIGIN} - {""}),
         },
     },
     "openai/widgetDomain": UI_ORIGIN,
     "openai/widgetCSP": {
-        "connect_domains": [UI_ORIGIN],
-        "resource_domains": [UI_ORIGIN],
+        "connect_domains": sorted({UI_ORIGIN, MEDIA_ORIGIN} - {""}),
+        "resource_domains": sorted({UI_ORIGIN, MEDIA_ORIGIN} - {""}),
     },
 }
 TOOL_META = {
@@ -149,7 +157,7 @@ def segment_bounds(
 
 def media_url(job_id: str, relative_name: str) -> str:
     escaped = "/".join(part for part in Path(relative_name).parts if part not in {".", ".."})
-    return f"{MCP_PUBLIC_BASE_URL}/media/{job_id}/{escaped}"
+    return f"{MCP_MEDIA_BASE_URL}/media/{job_id}/{escaped}"
 
 
 def safe_media_path(job_id: str, relative_name: str) -> Path | None:

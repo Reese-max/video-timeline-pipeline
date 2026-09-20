@@ -84,12 +84,13 @@ python -m venv .venv
 
 ```powershell
 $env:MCP_PUBLIC_BASE_URL = 'https://你的 HTTPS tunnel 網址'
+$env:MCP_MEDIA_BASE_URL = 'https://可由 ChatGPT 存取的公開 HTTPS 網址'
 $env:MCP_HOST = '127.0.0.1'
 $env:MCP_PORT = '8787'
 .\.venv\Scripts\python mcp_server.py
 ```
 
-本機檢查：`Invoke-RestMethod http://127.0.0.1:8787/health`；ChatGPT Developer Mode 則新增 MCP app，填入 tunnel 網址加 `/mcp`。工具完成後按 widget 的「上傳影片片段並摘要」。影片檔上傳與模型實際讀取是獨立驗收 gate；若 host 不支援影片上傳，widget 會嘗試改傳每段代表影格。
+本機檢查：`Invoke-RestMethod http://127.0.0.1:8787/health`；ChatGPT Developer Mode 則新增 MCP app，填入 MCP tunnel 網址加 `/mcp`。若 MCP 入口是 Tailscale 或其他 ChatGPT 分析環境無法解析的網域，另設 `MCP_MEDIA_BASE_URL` 指向公開 HTTPS 媒體出口；工具完成後按 widget 的「上傳影片片段並摘要」。影片檔上傳與模型實際讀取是獨立驗收 gate；若 host 不支援影片上傳，widget 會嘗試改傳每段代表影格。
 
 可用環境變數：`MCP_MAX_SOURCE_MB`（預設 512）、`MCP_MAX_SEGMENT_SECONDS`（預設 600）、`MCP_MAX_SEGMENTS`（預設 0，不限段數；設為正整數可加硬上限）、`MCP_ROOT`（預設 repo 根目錄）。工具的 `max_segments` 預設不設上限；仍受來源大小與每段最長時間限制。目前是同步下載／切段，適合開發者模式與中短片；長片佇列、OAuth 與自動清理留待有實際使用量再加。
 

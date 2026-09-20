@@ -25,6 +25,12 @@ class MCPValidationTests(unittest.TestCase):
         self.assertIsNone(mcp_server.safe_media_path("0123456789ab", "segments/../source.mp4"))
         self.assertIsNone(mcp_server.safe_media_path("not-a-job", "segments/segment_000.mp4"))
 
+    def test_media_urls_use_media_base(self) -> None:
+        self.assertEqual(
+            mcp_server.media_url("0123456789ab", "segments/segment_000.mp4"),
+            f"{mcp_server.MCP_MEDIA_BASE_URL}/media/0123456789ab/segments/segment_000.mp4",
+        )
+
     def test_tool_errors_are_explicit(self) -> None:
         result = mcp_server.tool_error_result(RuntimeError("download failed"))
         self.assertTrue(result.isError)

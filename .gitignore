@@ -2,6 +2,12 @@
 .env.bak-*
 jobs/
 mcp_jobs/
+mcp-server.log
+mcp-server.pid
+mcp-supervisor.lock
+mcp-media-tunnel.log
+mcp-media-tunnel.pid
+mcp-media-tunnel.lock
 batches/
 rss/
 canary/
