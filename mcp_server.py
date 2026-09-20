@@ -154,18 +154,19 @@ class FileHandoffResult(BaseModel):
 
 class PreparedVideoAnalysisResult(BaseModel):
     status: Literal["complete", "partial", "error"]
-    job_id: str
-    title: str
-    source_url: str
-    duration_seconds: float
-    source_size_bytes: int
-    source_sha256: str
-    audio_status: str
-    visual_status: str
-    summary: dict[str, Any]
-    transcript: dict[str, Any]
-    timeline: list[dict[str, Any]]
-    errors: list[str]
+    job_id: str = ""
+    title: str = ""
+    source_url: str = ""
+    duration_seconds: float = 0.0
+    source_size_bytes: int = 0
+    source_sha256: str = ""
+    audio_status: str = "error"
+    visual_status: str = "error"
+    summary: dict[str, Any] = {}
+    transcript: dict[str, Any] = {}
+    timeline: list[dict[str, Any]] = []
+    errors: list[str] = []
+    error: str | None = None
 
 
 class PreparedVideoSegment(BaseModel):
@@ -768,6 +769,15 @@ def analysis_tool_result(result: dict[str, Any]) -> types.CallToolResult:
     )
 
 
+def analysis_tool_error_result(error: Exception) -> types.CallToolResult:
+    detail = analysis_error(error)
+    return types.CallToolResult(
+        isError=True,
+        structuredContent={"status": "error", "error": detail},
+        content=[types.TextContent(type="text", text=f"影片分析失敗：{detail}")],
+    )
+
+
 WIDGET_HTML = r"""<!doctype html>
 <html lang="zh-Hant">
 <head>
@@ -1056,7 +1066,7 @@ async def analyze_prepared_video(
     try:
         result = await asyncio.to_thread(analyze_prepared_sync, job_id)
     except Exception as error:
-        return tool_error_result(error)
+        return analysis_tool_error_result(error)
     return analysis_tool_result(result)
 
 

@@ -119,6 +119,12 @@ class MCPValidationTests(unittest.TestCase):
         self.assertTrue(tool.meta["openai/widgetAccessible"])
         self.assertIn("analyze_prepared_video", mcp_server.WIDGET_HTML)
 
+    def test_analysis_tool_returns_clean_error_payload(self) -> None:
+        result = asyncio.run(mcp_server.analyze_prepared_video("not-a-job"))
+        self.assertTrue(result.isError)
+        self.assertEqual(result.structuredContent["status"], "error")
+        self.assertIn("job_id", result.structuredContent["error"])
+
     def test_prepared_analysis_reuses_pipeline_stages(self) -> None:
         with tempfile.TemporaryDirectory() as raw_dir:
             video_path = Path(raw_dir) / "source.mp4"
