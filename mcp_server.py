@@ -610,7 +610,8 @@ def analyze_prepared_sync(job_id: str) -> dict[str, Any]:
     has_audio = any(stream.get("codec_type") == "audio" for stream in probe.get("streams", []))
     model = pipeline.minimax_model()
     minimax_key = pipeline.minimax_subscription_key()
-    max_frames = pipeline.vision_frame_limit(duration)
+    # 短片常用快速卡片切換；長片仍 capped at 40，避免每秒抽幀無界增長。
+    max_frames = min(40, max(8, math.ceil(max(0.0, duration))))
     transcript: dict[str, Any] = {
         "provider": "none",
         "language": "",
@@ -625,7 +626,7 @@ def analyze_prepared_sync(job_id: str) -> dict[str, Any]:
             video_path,
             analysis_dir,
             1.0,
-            8,
+            1,
             max_frames,
             False,
             0.75,
