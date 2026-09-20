@@ -44,7 +44,7 @@ MCP_PUBLIC_BASE_URL = (
 MCP_MEDIA_BASE_URL = (
     os.getenv("MCP_MEDIA_BASE_URL", "") or MCP_PUBLIC_BASE_URL
 ).rstrip("/")
-UI_URI = "ui://video-timeline-pipeline/v1.html"
+UI_URI = "ui://video-timeline-pipeline/v2.html"
 PUBLIC_URL = urlsplit(MCP_PUBLIC_BASE_URL)
 MEDIA_URL = urlsplit(MCP_MEDIA_BASE_URL)
 UI_ORIGIN = f"{PUBLIC_URL.scheme}://{PUBLIC_URL.netloc}"
@@ -385,18 +385,31 @@ def tool_payload(manifest: dict) -> dict:
 
 def tool_result(manifest: dict) -> types.CallToolResult:
     payload = tool_payload(manifest)
-    links = [
-        types.ResourceLink(
-            type="resource_link",
-            name=segment["filename"],
-            title=f"{segment['start_seconds']:.0f}s–{segment['end_seconds']:.0f}s",
-            uri=segment["url"],
-            description="影片分段；ChatGPT widget 會優先嘗試上傳此檔案。",
-            mimeType="video/mp4",
-            size=segment["size_bytes"],
+    links = []
+    for segment in payload["segments"]:
+        title = f"{segment['start_seconds']:.0f}s–{segment['end_seconds']:.0f}s"
+        links.append(
+            types.ResourceLink(
+                type="resource_link",
+                name=segment["filename"],
+                title=title,
+                uri=segment["url"],
+                description="影片分段；ChatGPT 可將此公開 MP4 連結實體化為附件。",
+                mimeType="video/mp4",
+                size=segment["size_bytes"],
+            )
         )
-        for segment in payload["segments"]
-    ]
+        if segment.get("preview_url"):
+            links.append(
+                types.ResourceLink(
+                    type="resource_link",
+                    name=f"preview-{segment['index']}.jpg",
+                    title=f"{title} 代表影格",
+                    uri=segment["preview_url"],
+                    description="影片分段的代表影格；當 host 不支援 MP4 上傳時供視覺核對。",
+                    mimeType="image/jpeg",
+                )
+            )
     return types.CallToolResult(
         structuredContent=payload,
         content=[
@@ -404,7 +417,7 @@ def tool_result(manifest: dict) -> types.CallToolResult:
                 type="text",
                 text=(
                     f"已準備 {len(payload['segments'])} 個影片分段（{payload['duration_seconds']:.1f} 秒）。"
-                    "請使用 widget 的「上傳影片片段並摘要」；若主機不支援影片上傳，widget 會改傳代表影格。"
+                    "請使用 widget 的「上傳影片片段並摘要」；若 host 不支援影片上傳，請改用代表影格並標示分析限制。"
                 ),
             ),
             *links,
@@ -448,7 +461,7 @@ WIDGET_HTML = r"""<!doctype html>
     ol { margin: 0; padding-left: 22px; display: grid; gap: 8px; }
     li { display: grid; gap: 4px; }
     a { overflow-wrap: anywhere; }
-    video { width: 100%; max-height: 220px; border-radius: 10px; background: #111; }
+    img, video { width: 100%; max-height: 220px; border-radius: 10px; background: #111; object-fit: contain; }
     #status { min-height: 1.2em; }
   </style>
 </head>
@@ -489,11 +502,11 @@ WIDGET_HTML = r"""<!doctype html>
         label.textContent = `${formatTime(segment.start_seconds)}–${formatTime(segment.end_seconds)} · ${segment.filename}`;
         item.append(label);
         if (segment.preview_url) {
-          const video = document.createElement("video");
-          video.controls = true;
-          video.preload = "metadata";
-          video.src = segment.url;
-          item.append(video);
+          const image = document.createElement("img");
+          image.alt = `代表影格：${segment.filename}`;
+          image.loading = "lazy";
+          image.src = segment.preview_url;
+          item.append(image);
         }
         const link = document.createElement("a");
         link.href = segment.url;
@@ -516,7 +529,16 @@ WIDGET_HTML = r"""<!doctype html>
     async function uploadAndAsk() {
       if (!data?.segments?.length) return;
       if (!openai?.uploadFile) {
-        setStatus("目前 ChatGPT host 沒有 uploadFile；請開啟分段連結，或改用支援檔案上傳的 ChatGPT 網頁。\n");
+        const prompt = [
+          `ChatGPT host 未提供 uploadFile；工具已回傳 ${data.segments.length} 個公開 MP4 resource link 與代表影格附件。`,
+          "請直接使用已核准的 resource link／代表影格做可驗證的內容分析；如果 MP4 不能解碼，只能根據代表影格回答，並明確標示無法逐秒分析。",
+        ].join("\n");
+        if (openai?.sendFollowUpMessage) {
+          await openai.sendFollowUpMessage({ prompt });
+          setStatus("此 host 沒有 uploadFile，已請 ChatGPT 使用已回傳的 MP4／代表影格附件驗證。\n");
+        } else {
+          setStatus("此 host 沒有 uploadFile 或自動追問功能；請直接使用已回傳的 MP4／代表影格附件。\n");
+        }
         return;
       }
       $("upload").disabled = true;
@@ -657,6 +679,7 @@ async def media(request: Request):
     response.headers["Access-Control-Allow-Origin"] = "*"
     response.headers["Cross-Origin-Resource-Policy"] = "cross-origin"
     response.headers["Cache-Control"] = "public, max-age=3600"
+    response.headers["Content-Disposition"] = f'attachment; filename="{path.name}"'
     return response
 
 
