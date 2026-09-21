@@ -117,7 +117,11 @@ class MCPValidationTests(unittest.TestCase):
         tool = next(item for item in tools if item.name == "analyze_prepared_video")
         self.assertIsNotNone(tool.outputSchema)
         self.assertTrue(tool.meta["openai/widgetAccessible"])
-        self.assertIn("analyze_prepared_video", mcp_server.WIDGET_HTML)
+        self.assertNotIn("const openai = window.openai", mcp_server.WIDGET_HTML)
+        self.assertIn("const getOpenAI = () => window.openai", mcp_server.WIDGET_HTML)
+        self.assertIn('request("tools/call"', mcp_server.WIDGET_HTML)
+        self.assertIn('request("ui/message"', mcp_server.WIDGET_HTML)
+        self.assertIn("queueMicrotask(startUpload)", mcp_server.WIDGET_HTML)
 
     def test_analysis_tool_returns_clean_error_payload(self) -> None:
         result = asyncio.run(mcp_server.analyze_prepared_video("not-a-job"))

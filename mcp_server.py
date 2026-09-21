@@ -47,7 +47,7 @@ MCP_PUBLIC_BASE_URL = (
 MCP_MEDIA_BASE_URL = (
     os.getenv("MCP_MEDIA_BASE_URL", "") or MCP_PUBLIC_BASE_URL
 ).rstrip("/")
-UI_URI = "ui://video-timeline-pipeline/v3.html"
+UI_URI = "ui://video-timeline-pipeline/v4.html"
 PUBLIC_URL = urlsplit(MCP_PUBLIC_BASE_URL)
 MEDIA_URL = urlsplit(MCP_MEDIA_BASE_URL)
 UI_ORIGIN = f"{PUBLIC_URL.scheme}://{PUBLIC_URL.netloc}"
@@ -810,8 +810,12 @@ WIDGET_HTML = r"""<!doctype html>
     <ol id="segments"></ol>
   </main>
   <script>
-    const openai = window.openai;
+    const getOpenAI = () => window.openai;
+    const pendingRequests = new Map();
+    let nextRequestId = 1;
     let data = null;
+    let running = false;
+    let startedJobId = null;
     const $ = (id) => document.getElementById(id);
     const formatTime = (seconds) => {
       const value = Math.max(0, Number(seconds) || 0);
@@ -821,6 +825,40 @@ WIDGET_HTML = r"""<!doctype html>
     };
     const normalize = (value) => value?.structuredContent || value || {};
     const setStatus = (value) => { $("status").textContent = value; };
+
+    function request(method, params) {
+      const id = nextRequestId++;
+      return new Promise((resolve, reject) => {
+        const timer = setTimeout(() => {
+          pendingRequests.delete(id);
+          reject(new Error(`${method} bridge timeout`));
+        }, 15000);
+        pendingRequests.set(id, { resolve, reject, timer });
+        window.parent.postMessage({ jsonrpc: "2.0", id, method, params }, "*");
+      });
+    }
+
+    async function callTool(name, args) {
+      const host = getOpenAI();
+      return host?.callTool
+        ? host.callTool(name, args)
+        : request("tools/call", { name, arguments: args });
+    }
+
+    async function sendFollowUp(prompt) {
+      const host = getOpenAI();
+      return host?.sendFollowUpMessage
+        ? host.sendFollowUpMessage({ prompt })
+        : request("ui/message", { content: [{ type: "text", text: prompt }] });
+    }
+
+    async function waitForOpenAI(timeout = 5000) {
+      const deadline = Date.now() + timeout;
+      while (!getOpenAI() && Date.now() < deadline) {
+        await new Promise((resolve) => setTimeout(resolve, 100));
+      }
+      return getOpenAI();
+    }
 
     function render(value) {
       data = normalize(value);
@@ -854,76 +892,25 @@ WIDGET_HTML = r"""<!doctype html>
       }
     }
 
-    async function upload(url, name, type) {
+    async function upload(host, url, name, type) {
       const response = await fetch(url, { credentials: "omit" });
       if (!response.ok) throw new Error(`下載 ${name} 失敗（HTTP ${response.status}）`);
       const blob = await response.blob();
-      const result = await openai.uploadFile(new File([blob], name, { type }), { library: false });
+      const result = await host.uploadFile(new File([blob], name, { type }), { library: false });
       const fileId = result?.fileId || result?.file_id;
       if (!fileId) throw new Error(`${name} 沒有取得 file_id`);
-      const download = await openai.getFileDownloadUrl({ fileId });
+      const download = await host.getFileDownloadUrl({ fileId });
       const downloadUrl = download?.downloadUrl || download?.download_url;
       if (!downloadUrl) throw new Error(`${name} 沒有取得 download_url`);
       return { file_id: fileId, download_url: downloadUrl, mime_type: type, file_name: name };
     }
 
-    function analysisContext(result) {
-      const summary = result?.summary || {};
-      return {
-        status: result?.status,
-        title: result?.title,
-        duration_seconds: result?.duration_seconds,
-        audio_status: result?.audio_status,
-        visual_status: result?.visual_status,
-        short_summary: summary.short_summary || "",
-        topic_points: summary.topic_points || [],
-        chapters: summary.chapters || [],
-        timeline: result?.timeline || [],
-        errors: result?.errors || [],
-      };
-    }
-
-    async function analyzeWithMcp() {
-      if (!openai?.callTool) {
-        setStatus("此 host 沒有 callTool，無法啟動伺服器端影片分析；尚未開始摘要。\n");
-        return;
-      }
-      $("upload").disabled = true;
-      try {
-        setStatus("此 host 不支援 MP4 上傳，改由 MCP 主機實際讀取並用 M3 分析…");
-        const result = normalize(await openai.callTool("analyze_prepared_video", { job_id: data.job_id }));
-        if (!["complete", "partial"].includes(result.status)) {
-          throw new Error(result.error || "MCP 伺服器端分析失敗");
-        }
-        const context = analysisContext(result);
-        const modelContent = [
-          `影片「${data.title || result.title || "未命名"}」已由 MCP 主機實際讀取 MP4 bytes，並完成伺服器端 FFmpeg／ASR／MiniMax 分析。`,
-          "這不是 ChatGPT 直接讀取附件；請依下列已完成的伺服器分析整理繁體中文摘要，保留時間範圍與不確定處。",
-          JSON.stringify(context),
-        ].join("\n");
-        openai.setWidgetState?.({
-          modelContent,
-          privateContent: { jobId: data.job_id, analysisStatus: result.status },
-        });
-        if (openai.sendFollowUpMessage) {
-          await openai.sendFollowUpMessage({ prompt: `${modelContent}\n請現在輸出時間軸重點摘要。` });
-          setStatus(`伺服器端影片分析完成（${result.status}），已請 ChatGPT 整理摘要。`);
-        } else {
-          setStatus(`伺服器端影片分析完成（${result.status}）；此 host 沒有自動追問功能。`);
-        }
-      } finally {
-        $("upload").disabled = false;
-      }
-    }
-
     async function uploadAndAsk() {
       if (!data?.segments?.length) return;
-      if (!openai?.callTool) {
-        setStatus("此 host 不支援 callTool，無法完成檔案交接或伺服器端分析；尚未開始摘要。\n");
-        return;
-      }
-      if (!openai?.uploadFile || !openai?.getFileDownloadUrl) {
-        await analyzeWithMcp();
+      const host = await waitForOpenAI();
+      if (!host?.uploadFile || !host?.getFileDownloadUrl) {
+        startedJobId = null;
+        setStatus("ChatGPT 未提供檔案上傳 API；MP4 bytes 尚未取得，未開始摘要。");
         return;
       }
       $("upload").disabled = true;
@@ -933,18 +920,19 @@ WIDGET_HTML = r"""<!doctype html>
         const segment = data.segments[index];
         setStatus(`上傳影片片段 ${index + 1}/${data.segments.length}…`);
         try {
-          files.push(await upload(segment.url, segment.filename, segment.mime_type || "video/mp4"));
+          files.push(await upload(host, segment.url, segment.filename, segment.mime_type || "video/mp4"));
         } catch (error) {
           failures.push(`${segment.filename}: ${error.message}`);
         }
       }
       if (failures.length) {
+        startedJobId = null;
         setStatus(`檔案交接失敗：${failures.join("；")}；尚未開始摘要。`);
         $("upload").disabled = false;
         return;
       }
       setStatus(`正在確認 ${files.length} 個 ChatGPT 檔案引用…`);
-      const handoff = normalize(await openai.callTool("ingest_video_segments", { files }));
+      const handoff = normalize(await callTool("ingest_video_segments", { files }));
       if (handoff.status !== "files_received" || Number(handoff.files_received) !== files.length) {
         throw new Error("MCP 未確認所有影片檔案引用");
       }
@@ -954,32 +942,50 @@ WIDGET_HTML = r"""<!doctype html>
         `檔案交接工具已確認 ${files.length} 個影片檔案。`,
         "請先讀取所有影片附件，再依每段的時間範圍整理重點、關鍵數字、結論與不確定處；不要把未讀取的內容猜成事實。",
       ].join("\n");
-      openai.setWidgetState?.({
+      host.setWidgetState?.({
         modelContent,
         privateContent: { jobId: data.job_id, videoIds },
       });
       const prompt = `${modelContent}\n請現在直接讀取檔案交接工具提供的影片分段，並以繁體中文摘要。每個重點附上影片時間範圍；若某段無法讀取，明確標示。`;
-      if (openai.sendFollowUpMessage) {
-        await openai.sendFollowUpMessage({ prompt });
-        setStatus(`已確認 ${files.length} 個檔案，已請 ChatGPT 讀取影片並開始摘要。`);
-      } else {
-        setStatus(`已確認 ${files.length} 個檔案；此 host 沒有自動追問功能，尚未開始摘要。`);
-      }
+      await sendFollowUp(prompt);
+      setStatus(`已確認 ${files.length} 個檔案，已請 ChatGPT 讀取影片並開始摘要。`);
       $("upload").disabled = false;
     }
 
-    $("upload").addEventListener("click", () => uploadAndAsk().catch((error) => {
-      setStatus(`處理失敗：${error.message}；尚未開始摘要。`);
-      $("upload").disabled = false;
-    }));
-    render(openai?.toolOutput);
+    async function startUpload() {
+      if (!data?.segments?.length || running || startedJobId === data.job_id) return;
+      running = true;
+      startedJobId = data.job_id;
+      try {
+        await uploadAndAsk();
+      } catch (error) {
+        startedJobId = null;
+        setStatus(`處理失敗：${error.message}；尚未開始摘要。`);
+        $("upload").disabled = false;
+      } finally {
+        running = false;
+      }
+    }
+
+    $("upload").addEventListener("click", () => startUpload());
     window.addEventListener("message", (event) => {
       if (event.source !== window.parent) return;
       const message = event.data;
+      if (message?.jsonrpc === "2.0" && message.id !== undefined && pendingRequests.has(message.id)) {
+        const pending = pendingRequests.get(message.id);
+        pendingRequests.delete(message.id);
+        clearTimeout(pending.timer);
+        if (message.error) pending.reject(new Error(message.error.message || "MCP bridge error"));
+        else pending.resolve(message.result);
+        return;
+      }
       if (message?.jsonrpc === "2.0" && message.method === "ui/notifications/tool-result") {
         render(message.params);
+        queueMicrotask(startUpload);
       }
     }, { passive: true });
+    render(getOpenAI()?.toolOutput);
+    queueMicrotask(startUpload);
   </script>
 </body>
 </html>"""
