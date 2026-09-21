@@ -41,6 +41,20 @@ class MinimaxCompletionTests(unittest.TestCase):
         with self.assertRaises(pipeline.MiniMaxIncompleteError):
             self._chat("content_filter", "{}")
 
+    def test_finish_reason_tool_calls_accepted(self) -> None:
+        self.assertEqual(self._chat("tool_calls", ""), "")
+
+    def test_finish_reason_normalization_accepts_mixed_case(self) -> None:
+        self.assertEqual(self._chat(" Stop ", "答案"), "答案")
+
+    def test_null_content_returns_empty_string(self) -> None:
+        with mock.patch.object(
+            pipeline,
+            "post_json",
+            return_value={"choices": [{"message": {"content": None}, "finish_reason": "tool_calls"}]},
+        ), mock.patch.object(pipeline, "minimax_endpoint", return_value="https://example.invalid/v1/chat/completions"):
+            self.assertEqual(pipeline.minimax_chat([{"role": "user", "content": "t"}], "key", "M"), "")
+
 
 class VisualCacheTests(unittest.TestCase):
     """Truncated/failed visual observations must never enter the reusable cache."""
@@ -69,6 +83,58 @@ class VisualCacheTests(unittest.TestCase):
             self.assertEqual(observation["completion_status"], "incomplete")
             self.assertEqual(observation["finish_reason"], "length")
             self.assertEqual(list(cache_dir.iterdir()) if cache_dir.exists() else [], [])
+
+    def test_unparseable_stop_response_downgraded_and_not_cached(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            image = root / "frame.jpg"
+            image.write_bytes(b"fake-bytes")
+            cache_dir = root / "cache"
+            results = self._analyze(cache_dir, image, "stop", "這不是 JSON")
+            observation = results[0]
+            self.assertEqual(observation["visual_summary"], "尚未執行 MiniMax 視覺理解。")
+            self.assertEqual(observation["completion_status"], "incomplete")
+            self.assertEqual(observation["finish_reason"], "stop")
+            self.assertEqual(observation["raw"], "這不是 JSON")
+            self.assertEqual(list(cache_dir.iterdir()) if cache_dir.exists() else [], [])
+
+    def test_empty_visual_summary_downgraded_and_not_cached(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            image = root / "frame.jpg"
+            image.write_bytes(b"fake-bytes")
+            cache_dir = root / "cache"
+            results = self._analyze(cache_dir, image, "stop", '{"visual_summary": ""}')
+            self.assertEqual(results[0]["completion_status"], "incomplete")
+            self.assertEqual(list(cache_dir.iterdir()) if cache_dir.exists() else [], [])
+
+    def test_sentinel_cache_entry_is_not_reused(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            image = root / "frame.jpg"
+            image.write_bytes(b"fake-bytes")
+            cache_dir = root / "cache"
+
+            calls = []
+            def counting_chat(messages, api_key, model, *args, **kwargs):
+                calls.append(1)
+                return '{"visual_summary": "ok", "screen_type": "x", "visible_text": [], "important_details": [], "confidence": 0.5}'
+
+            with mock.patch.object(pipeline, "uniform_image_observation", return_value=None), \
+                 mock.patch.object(pipeline, "image_data_url", return_value="data:image/jpeg;base64,AA=="), \
+                 mock.patch.object(pipeline, "minimax_chat", counting_chat):
+                pipeline.analyze_images([self._candidate(image)], "key", "MiniMax-M3", workers=1, cache_dir=cache_dir)
+            cache_file = next(cache_dir.iterdir())
+            poisoned = json.loads(cache_file.read_text(encoding="utf-8"))
+            poisoned["visual_summary"] = "尚未執行 MiniMax 視覺理解。"
+            cache_file.write_text(json.dumps(poisoned), encoding="utf-8")
+
+            calls.clear()
+            with mock.patch.object(pipeline, "uniform_image_observation", return_value=None), \
+                 mock.patch.object(pipeline, "image_data_url", return_value="data:image/jpeg;base64,AA=="), \
+                 mock.patch.object(pipeline, "minimax_chat", counting_chat):
+                pipeline.analyze_images([self._candidate(image)], "key", "MiniMax-M3", workers=1, cache_dir=cache_dir)
+            self.assertEqual(calls, [1], "sentinel-valued cache entry must trigger a fresh provider call")
 
     def test_raw_fallback_cache_entry_is_not_reused(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

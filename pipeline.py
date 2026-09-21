@@ -1796,7 +1796,7 @@ def minimax_chat(
     # 也不是完整回應，一律 fail-closed，不得交給呼叫端當成完成結果。
     if finish_reason not in {"stop", "tool_calls"}:
         raise MiniMaxIncompleteError(finish_reason, model)
-    content = choices[0].get("message", {}).get("content", "")
+    content = choices[0].get("message", {}).get("content") or ""
     if isinstance(content, list):
         content = "".join(str(part.get("text", "")) for part in content if isinstance(part, dict))
     usage = raw.get("usage") if isinstance(raw.get("usage"), dict) else {}
@@ -1824,6 +1824,19 @@ def parse_json_object(text: str) -> dict[str, Any]:
             except json.JSONDecodeError:
                 pass
     return {"raw": text}
+
+
+VISUAL_NOT_ANALYZED = "尚未執行 MiniMax 視覺理解。"
+
+
+def usable_visual_observation(observation: Any) -> bool:
+    """視覺觀察可重用且可視為已完成的條件：非未完成標記、非占位、有真實摘要。"""
+    return bool(
+        isinstance(observation, dict)
+        and observation.get("completion_status") != "incomplete"
+        and observation.get("visual_summary")
+        and observation["visual_summary"] != VISUAL_NOT_ANALYZED
+    )
 
 
 def analyze_images(
@@ -1866,15 +1879,10 @@ def analyze_images(
             )
             cache_path = cache_dir / (hashlib.sha256(material.encode("utf-8")).hexdigest() + ".json")
             cached = reuse_artifact(cache_path, "visual_summary")
-            if isinstance(cached, dict):
-                if cached.get("completion_status") == "incomplete" or cached.get(
-                    "visual_summary"
-                ) == "尚未執行 MiniMax 視覺理解。":
-                    cached = None
-                else:
-                    cached = dict(cached)
-                    cached["source_image"] = str(image_path)
-                    return index, cached
+            if usable_visual_observation(cached):
+                cached = dict(cached)
+                cached["source_image"] = str(image_path)
+                return index, cached
         observation = uniform_image_observation(image_path)
         if observation is None:
             try:
@@ -1897,16 +1905,16 @@ def analyze_images(
                     "completion_status": "incomplete",
                     "finish_reason": error.finish_reason or "missing",
                 }
-            if "visual_summary" not in observation:
+            if not usable_visual_observation(observation):
                 # 截斷或內容無法解析的觀察降級為「未執行」，不進快取也不標完成。
                 incomplete = {
                     "screen_type": "候選畫面",
                     "visible_text": [],
-                    "visual_summary": "尚未執行 MiniMax 視覺理解。",
+                    "visual_summary": VISUAL_NOT_ANALYZED,
                     "important_details": [],
                     "confidence": None,
                     "completion_status": "incomplete",
-                    "finish_reason": observation.get("finish_reason"),
+                    "finish_reason": observation.get("finish_reason") or "stop",
                 }
                 if "raw" in observation:
                     incomplete["raw"] = observation["raw"]
@@ -1915,11 +1923,7 @@ def analyze_images(
         observation["source_image"] = str(image_path)
         observation["local_ocr_text"] = local_ocr
         observation["local_ocr_confidence"] = candidate.get("ocr_confidence")
-        if (
-            cache_path is not None
-            and observation.get("completion_status") != "incomplete"
-            and observation.get("visual_summary") not in (None, "尚未執行 MiniMax 視覺理解。")
-        ):
+        if cache_path is not None and usable_visual_observation(observation):
             write_json(cache_path, observation)
         return index, observation
 
@@ -1964,7 +1968,7 @@ def local_observations(candidates: list[dict[str, Any]]) -> list[dict[str, Any]]
             "timestamp": candidate["timestamp"],
             "screen_type": "候選畫面",
             "visible_text": [line for line in str(candidate.get("ocr_text", "")).splitlines() if line],
-            "visual_summary": "尚未執行 MiniMax 視覺理解。",
+            "visual_summary": VISUAL_NOT_ANALYZED,
             "important_details": [],
             "confidence": candidate.get("ocr_confidence"),
             "source_image": candidate.get("path"),
@@ -2073,10 +2077,16 @@ def cached_minimax_summary(
     cached = reuse_artifact(cache_path, "short_summary")
     if valid(cached):
         return cached
-    result = parse_json_object(minimax_chat(messages, api_key, model, thinking="disabled"))
+    try:
+        result = parse_json_object(minimax_chat(messages, api_key, model, thinking="disabled"))
+    except MiniMaxIncompleteError:
+        result = None
     if not valid(result):
         print("! MiniMax 摘要格式不完整，重試一次")
-        result = parse_json_object(minimax_chat(messages, api_key, model, thinking="disabled"))
+        try:
+            result = parse_json_object(minimax_chat(messages, api_key, model, thinking="disabled"))
+        except MiniMaxIncompleteError:
+            result = None
     if not valid(result):
         raise RuntimeError("MiniMax 摘要重試後仍不符合輸出格式。")
     write_json(cache_path, result)
@@ -2421,7 +2431,7 @@ def render_knowledge_markdown(
             f"- 視覺觀察：{len(observations)}",
             (
                 "- 畫面分析：已執行 MiniMax 視覺核對。"
-                if observations and any(item.get("visual_summary") != "尚未執行 MiniMax 視覺理解。" for item in observations)
+                if observations and any(usable_visual_observation(item) for item in observations)
                 else "- 畫面分析：未完成；摘要不可視為已核對影片畫面。"
             ),
             "- 本檔案由影片資料庫管線產生，可重新執行以更新內容。",
@@ -6379,7 +6389,9 @@ def run_pipeline(args: argparse.Namespace) -> Path:
                     and previous.get("models", {}).get("visual") == model
                     else None
                 )
-                if isinstance(cached, list):
+                if isinstance(cached, list) and all(
+                    usable_visual_observation(item) for item in cached
+                ):
                     print("· 重用既有視覺觀察")
                     return cached
                 return analyze_images(
