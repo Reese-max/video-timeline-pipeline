@@ -119,6 +119,8 @@ class MCPValidationTests(unittest.TestCase):
         self.assertTrue(tool.meta["openai/widgetAccessible"])
         self.assertNotIn("const openai = window.openai", mcp_server.WIDGET_HTML)
         self.assertIn("const getOpenAI = () => window.openai", mcp_server.WIDGET_HTML)
+        self.assertIn('request("ui/initialize"', mcp_server.WIDGET_HTML)
+        self.assertIn("ui/notifications/initialized", mcp_server.WIDGET_HTML)
         self.assertIn('request("tools/call"', mcp_server.WIDGET_HTML)
         self.assertIn('request("ui/message"', mcp_server.WIDGET_HTML)
         self.assertIn("queueMicrotask(startUpload)", mcp_server.WIDGET_HTML)

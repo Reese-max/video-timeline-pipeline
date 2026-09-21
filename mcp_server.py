@@ -47,7 +47,7 @@ MCP_PUBLIC_BASE_URL = (
 MCP_MEDIA_BASE_URL = (
     os.getenv("MCP_MEDIA_BASE_URL", "") or MCP_PUBLIC_BASE_URL
 ).rstrip("/")
-UI_URI = "ui://video-timeline-pipeline/v4.html"
+UI_URI = "ui://video-timeline-pipeline/v5.html"
 PUBLIC_URL = urlsplit(MCP_PUBLIC_BASE_URL)
 MEDIA_URL = urlsplit(MCP_MEDIA_BASE_URL)
 UI_ORIGIN = f"{PUBLIC_URL.scheme}://{PUBLIC_URL.netloc}"
@@ -816,6 +816,7 @@ WIDGET_HTML = r"""<!doctype html>
     let data = null;
     let running = false;
     let startedJobId = null;
+    let bridgePromise = null;
     const $ = (id) => document.getElementById(id);
     const formatTime = (seconds) => {
       const value = Math.max(0, Number(seconds) || 0);
@@ -838,18 +839,37 @@ WIDGET_HTML = r"""<!doctype html>
       });
     }
 
+    async function initializeBridge() {
+      const result = await request("ui/initialize", {
+        protocolVersion: "2026-01-26",
+        appCapabilities: {},
+        clientInfo: { name: "video-timeline-pipeline", version: "5" },
+      });
+      window.parent.postMessage({
+        jsonrpc: "2.0",
+        method: "ui/notifications/initialized",
+        params: {},
+      }, "*");
+      return result;
+    }
+
+    function ensureBridge() {
+      bridgePromise ||= initializeBridge();
+      return bridgePromise;
+    }
+
     async function callTool(name, args) {
       const host = getOpenAI();
       return host?.callTool
         ? host.callTool(name, args)
-        : request("tools/call", { name, arguments: args });
+        : ensureBridge().then(() => request("tools/call", { name, arguments: args }));
     }
 
     async function sendFollowUp(prompt) {
       const host = getOpenAI();
       return host?.sendFollowUpMessage
         ? host.sendFollowUpMessage({ prompt })
-        : request("ui/message", { content: [{ type: "text", text: prompt }] });
+        : ensureBridge().then(() => request("ui/message", { content: [{ type: "text", text: prompt }] }));
     }
 
     async function waitForOpenAI(timeout = 5000) {
@@ -893,7 +913,16 @@ WIDGET_HTML = r"""<!doctype html>
     }
 
     async function upload(host, url, name, type) {
-      const response = await fetch(url, { credentials: "omit" });
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), 30000);
+      let response;
+      try {
+        response = await fetch(url, { credentials: "omit", signal: controller.signal });
+      } catch (error) {
+        throw new Error(`下載 ${name} 失敗：${error.name === "AbortError" ? "逾時" : error.message}`);
+      } finally {
+        clearTimeout(timer);
+      }
       if (!response.ok) throw new Error(`下載 ${name} 失敗（HTTP ${response.status}）`);
       const blob = await response.blob();
       const result = await host.uploadFile(new File([blob], name, { type }), { library: false });
@@ -984,6 +1013,7 @@ WIDGET_HTML = r"""<!doctype html>
         queueMicrotask(startUpload);
       }
     }, { passive: true });
+    ensureBridge().catch(() => {});
     render(getOpenAI()?.toolOutput);
     queueMicrotask(startUpload);
   </script>
