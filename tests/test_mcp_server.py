@@ -68,17 +68,13 @@ class MCPValidationTests(unittest.TestCase):
         self.assertEqual(result.files[0].file_id, "file_1")
         self.assertEqual(result.files[0].file_name, "segment_000.mp4")
 
-    def test_file_handoff_accepts_approved_resource_link_url(self) -> None:
-        result = asyncio.run(
-            mcp_server.mcp._tool_manager.call_tool(
-                "ingest_video_segments",
-                {"files": ["https://files.example/segment_000.mp4"]},
-                convert_result=True,
+    def test_file_handoff_rejects_url_without_file_id(self) -> None:
+        with self.assertRaises(ValueError):
+            asyncio.run(
+                mcp_server.ingest_video_segments(
+                    ["https://files.example/segment_000.mp4"]
+                )
             )
-        )
-        self.assertEqual(result[1]["status"], "files_received")
-        self.assertEqual(result[1]["files_received"], 1)
-        self.assertTrue(result[1]["files"][0]["file_id"].startswith("url_"))
 
     def test_file_handoff_declares_complete_openai_file_schema(self) -> None:
         tools = asyncio.run(mcp_server.mcp.list_tools())
@@ -91,10 +87,7 @@ class MCPValidationTests(unittest.TestCase):
         )
         self.assertEqual(file_schema["required"], ["download_url", "file_id"])
         item_schema = tool.inputSchema["properties"]["files"]["items"]
-        self.assertEqual(
-            {variant.get("type", "object") for variant in item_schema["anyOf"]},
-            {"object", "string"},
-        )
+        self.assertEqual(item_schema["$ref"], "#/$defs/OpenAIFileReference")
 
     def test_file_handoff_protocol_returns_structured_content(self) -> None:
         result = asyncio.run(

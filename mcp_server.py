@@ -9,7 +9,6 @@ import os
 import re
 import socket
 import threading
-from hashlib import sha256
 from pathlib import Path
 from typing import Annotated, Any, Literal
 from urllib.parse import urlsplit
@@ -18,7 +17,7 @@ import pipeline
 from mcp import types
 from mcp.server.fastmcp import FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
-from pydantic import BaseModel, ConfigDict, model_validator
+from pydantic import BaseModel, ConfigDict
 from starlette.requests import Request
 from starlette.responses import FileResponse, JSONResponse, PlainTextResponse
 
@@ -128,16 +127,6 @@ class OpenAIFileReference(BaseModel):
     file_id: str
     mime_type: str = ""
     file_name: str = ""
-
-    @model_validator(mode="before")
-    @classmethod
-    def accept_resource_link_url(cls, value):
-        if isinstance(value, str):
-            return {
-                "download_url": value,
-                "file_id": f"url_{sha256(value.encode('utf-8')).hexdigest()[:24]}",
-            }
-        return value
 
 
 class VerifiedFileSummary(BaseModel):
@@ -1114,12 +1103,10 @@ async def analyze_prepared_video(
     description=(
         "Call this after prepare_video_for_chatgpt when ChatGPT has uploaded the MP4 segments. "
         "Pass the files in the same order as the prepared segment list. "
-        "Some ChatGPT web hosts pass an approved MCP resource-link URL string instead of the full "
-        "OpenAI file object. If uploadFile/getFileDownloadUrl is unavailable, pass each prepared "
-        "segment's public HTTPS URL string directly; accept that URL as the file reference and do not "
-        "reject it only for its type. "
-        "This tool only confirms file references; read the attached files before making any visual "
-        "or audio claims, and fail closed when the references are missing."
+        "Each item must be the complete OpenAI file object containing file_id and download_url. "
+        "A public segment URL or MCP resource link alone is not proof that ChatGPT received the MP4 "
+        "bytes and must be rejected. This tool only confirms file references; read the attached files "
+        "before making any visual or audio claims, and fail closed when the references are missing."
     ),
     annotations=types.ToolAnnotations(
         readOnlyHint=True,
@@ -1131,7 +1118,7 @@ async def analyze_prepared_video(
     structured_output=True,
 )
 async def ingest_video_segments(
-    files: list[OpenAIFileReference | str],
+    files: list[OpenAIFileReference],
 ) -> FileHandoffResult:
     references = normalize_file_references(
         [OpenAIFileReference.model_validate(item).model_dump() for item in files]
