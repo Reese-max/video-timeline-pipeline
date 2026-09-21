@@ -11,6 +11,7 @@ import http.client
 import json
 import os
 import re
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -140,6 +141,8 @@ def _upload_file(
     mime_type: str = "video/mp4",
 ) -> dict[str, Any]:
     size = path.stat().st_size
+    if not size:
+        raise ValueError("Google Drive 不接受空的影片分段。")
     metadata: dict[str, Any] = {"name": name, "mimeType": mime_type}
     if parent_id:
         metadata["parents"] = [parent_id]
@@ -174,25 +177,50 @@ def _upload_file(
     parsed = urllib.parse.urlsplit(upload_url)
     if parsed.scheme != "https" or not parsed.netloc:
         raise RuntimeError("Google Drive 回傳的 upload URL 不安全。")
-    connection = http.client.HTTPSConnection(parsed.netloc, timeout=120)
     request_path = parsed.path + (f"?{parsed.query}" if parsed.query else "")
-    try:
-        connection.putrequest("PUT", request_path)
-        connection.putheader("Authorization", f"Bearer {token}")
-        connection.putheader("Content-Type", mime_type)
-        connection.putheader("Content-Length", str(size))
-        connection.endheaders()
-        with path.open("rb") as source:
-            while chunk := source.read(UPLOAD_CHUNK_BYTES):
-                connection.send(chunk)
-        response = connection.getresponse()
-        raw = response.read()
-    except (OSError, TimeoutError) as exc:
-        raise RuntimeError("Google Drive resumable upload 無法完成。") from exc
-    finally:
-        connection.close()
-    if response.status not in {200, 201}:
-        raise RuntimeError(f"Google Drive 上傳失敗（HTTP {response.status}）。")
+    offset, failures, query_status = 0, 0, False
+    while True:
+        connection = http.client.HTTPSConnection(parsed.netloc, timeout=120)
+        length = 0 if query_status else min(UPLOAD_CHUNK_BYTES, size - offset)
+        status, received = None, ""
+        try:
+            connection.putrequest("PUT", request_path)
+            connection.putheader("Authorization", f"Bearer {token}")
+            connection.putheader("Content-Type", mime_type)
+            connection.putheader("Content-Length", str(length))
+            connection.putheader("Content-Range", f"bytes */{size}" if query_status
+                                 else f"bytes {offset}-{offset + length - 1}/{size}")
+            connection.endheaders()
+            if length:
+                with path.open("rb") as source:
+                    source.seek(offset)
+                    connection.send(source.read(length))
+            response = connection.getresponse()
+            raw = response.read()
+            status = response.status
+            received = response.getheader("Range") or ""
+        except (OSError, http.client.HTTPException):
+            pass  # The server may have committed bytes: query before retransmitting.
+        finally:
+            connection.close()
+        if status in {200, 201}:
+            break
+        if status == 308:
+            match = re.fullmatch(r"bytes=0-(\d+)", received)
+            next_offset = int(match[1]) + 1 if match else 0
+            if (received and not match) or not 0 <= next_offset < size:
+                raise RuntimeError("Google Drive 續傳進度無效。")
+            if not query_status and next_offset <= offset:
+                raise RuntimeError("Google Drive 上傳沒有進展。")
+            offset, query_status = next_offset, False
+            continue
+        detail = f"HTTP {status}" if status is not None else "連線中斷"
+        if (status is None or status == 429 or 500 <= status < 600) and failures < 3:
+            time.sleep(2 ** failures)
+            failures += 1
+            query_status = True
+            continue
+        raise RuntimeError(f"Google Drive 上傳失敗（{detail}；已重試 {failures} 次）。")
     try:
         result = json.loads(raw.decode("utf-8"))
     except json.JSONDecodeError as exc:
