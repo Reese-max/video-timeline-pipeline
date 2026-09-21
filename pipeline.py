@@ -1748,6 +1748,17 @@ def minimax_model() -> str:
     return model
 
 
+class MiniMaxIncompleteError(RuntimeError):
+    """MiniMax 回應的完成狀態不是成功終止（截斷、內容過濾或缺漏）。"""
+
+    def __init__(self, finish_reason: str | None, model: str) -> None:
+        self.finish_reason = finish_reason
+        self.model = model
+        super().__init__(
+            f"MiniMax 回應未完成（finish_reason={finish_reason or 'missing'}，model={model}）。"
+        )
+
+
 def minimax_chat(
     messages: list[dict[str, Any]],
     api_key: str,
@@ -1779,6 +1790,12 @@ def minimax_chat(
     choices = raw.get("choices") or []
     if not choices:
         raise RuntimeError(f"MiniMax 回應缺少 choices：{raw}")
+    raw_reason = choices[0].get("finish_reason")
+    finish_reason = str(raw_reason).strip().lower() if raw_reason else None
+    # finish_reason=length 代表輸出被截斷：即使殘餘內容剛好能 parse 成 JSON，
+    # 也不是完整回應，一律 fail-closed，不得交給呼叫端當成完成結果。
+    if finish_reason not in {"stop", "tool_calls"}:
+        raise MiniMaxIncompleteError(finish_reason, model)
     content = choices[0].get("message", {}).get("content", "")
     if isinstance(content, list):
         content = "".join(str(part.get("text", "")) for part in content if isinstance(part, dict))
@@ -1848,32 +1865,61 @@ def analyze_images(
                 separators=(",", ":"),
             )
             cache_path = cache_dir / (hashlib.sha256(material.encode("utf-8")).hexdigest() + ".json")
-            cached = reuse_artifact(cache_path, "source_image")
+            cached = reuse_artifact(cache_path, "visual_summary")
             if isinstance(cached, dict):
-                cached = dict(cached)
-                cached["source_image"] = str(image_path)
-                return index, cached
+                if cached.get("completion_status") == "incomplete" or cached.get(
+                    "visual_summary"
+                ) == "尚未執行 MiniMax 視覺理解。":
+                    cached = None
+                else:
+                    cached = dict(cached)
+                    cached["source_image"] = str(image_path)
+                    return index, cached
         observation = uniform_image_observation(image_path)
         if observation is None:
-            response = minimax_chat(
-                [
-                    {
-                        "role": "user",
-                        "content": [
-                            {"type": "text", "text": prompt},
-                            {"type": "image_url", "image_url": {"url": image_data_url(image_path)}},
-                        ],
-                    }
-                ],
-                api_key,
-                model,
-            )
-            observation = parse_json_object(response)
+            try:
+                response = minimax_chat(
+                    [
+                        {
+                            "role": "user",
+                            "content": [
+                                {"type": "text", "text": prompt},
+                                {"type": "image_url", "image_url": {"url": image_data_url(image_path)}},
+                            ],
+                        }
+                    ],
+                    api_key,
+                    model,
+                )
+                observation = parse_json_object(response)
+            except MiniMaxIncompleteError as error:
+                observation = {
+                    "completion_status": "incomplete",
+                    "finish_reason": error.finish_reason or "missing",
+                }
+            if "visual_summary" not in observation:
+                # 截斷或內容無法解析的觀察降級為「未執行」，不進快取也不標完成。
+                incomplete = {
+                    "screen_type": "候選畫面",
+                    "visible_text": [],
+                    "visual_summary": "尚未執行 MiniMax 視覺理解。",
+                    "important_details": [],
+                    "confidence": None,
+                    "completion_status": "incomplete",
+                    "finish_reason": observation.get("finish_reason"),
+                }
+                if "raw" in observation:
+                    incomplete["raw"] = observation["raw"]
+                observation = incomplete
         observation["timestamp"] = candidate["timestamp"]
         observation["source_image"] = str(image_path)
         observation["local_ocr_text"] = local_ocr
         observation["local_ocr_confidence"] = candidate.get("ocr_confidence")
-        if cache_path is not None:
+        if (
+            cache_path is not None
+            and observation.get("completion_status") != "incomplete"
+            and observation.get("visual_summary") not in (None, "尚未執行 MiniMax 視覺理解。")
+        ):
             write_json(cache_path, observation)
         return index, observation
 
@@ -5005,7 +5051,7 @@ def self_test() -> None:
 
     def capture_minimax_payload(url: str, headers: dict[str, str], body: bytes, timeout: int) -> dict[str, Any]:
         captured_payload.update(json.loads(body.decode("utf-8")))
-        return {"choices": [{"message": {"content": "{}"}}]}
+        return {"choices": [{"message": {"content": "{}"}, "finish_reason": "stop"}]}
 
     globals()["post_json"] = capture_minimax_payload
     globals()["minimax_endpoint"] = lambda: "https://example.invalid/v1/chat/completions"
@@ -5533,7 +5579,7 @@ def self_test() -> None:
         tag = messages[0]["content"][0]["text"].rsplit("：", 1)[-1]
         vision_barrier.wait(timeout=5)
         time.sleep((count - int(tag[3:])) * 0.02)
-        return json.dumps({"tag": tag})
+        return json.dumps({"tag": tag, "visual_summary": tag})
 
     globals()["minimax_chat"] = parallel_vision_chat
     try:
@@ -5579,7 +5625,9 @@ def self_test() -> None:
         image.write_bytes(b"frame")
         original_chat, original_data_url = minimax_chat, image_data_url
         globals()["image_data_url"] = lambda path: "data:image/jpeg;base64,x"
-        globals()["minimax_chat"] = lambda *args, **kwargs: json.dumps({"screen_type": "slide"})
+        globals()["minimax_chat"] = lambda *args, **kwargs: json.dumps(
+            {"screen_type": "slide", "visual_summary": "slide"}
+        )
         try:
             first = analyze_images(
                 [{"timestamp": 1, "path": str(image), "ocr_text": "OCR"}],

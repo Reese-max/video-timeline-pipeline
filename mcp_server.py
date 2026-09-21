@@ -14,6 +14,7 @@ from typing import Annotated, Any, Literal
 from urllib.parse import urlsplit
 
 import pipeline
+import drive_storage
 from mcp import types
 from mcp.server.fastmcp import FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
@@ -118,6 +119,12 @@ ANALYSIS_META = {
     "openai/toolInvocation/invoking": "正在用 FFmpeg、Groq 與 MiniMax 分析影片…",
     "openai/toolInvocation/invoked": "影片分析完成",
 }
+DRIVE_META = {
+    "ui": {"visibility": ["model", "app"]},
+    "openai/widgetAccessible": True,
+    "openai/toolInvocation/invoking": "正在把影片分段存到 Google Drive…",
+    "openai/toolInvocation/invoked": "影片分段已存到 Google Drive",
+}
 
 
 class OpenAIFileReference(BaseModel):
@@ -178,6 +185,24 @@ class PreparedVideoResult(BaseModel):
     duration_seconds: float | None = None
     segment_seconds: int | None = None
     segments: list[PreparedVideoSegment] | None = None
+    error: str | None = None
+
+
+class DriveFileResult(BaseModel):
+    file_id: str
+    url: str
+    file_name: str
+    mime_type: str
+    size_bytes: int
+    sha256: str
+
+
+class DriveUploadResult(BaseModel):
+    status: Literal["drive_ready", "error"]
+    job_id: str = ""
+    folder_id: str = ""
+    folder_url: str = ""
+    files: list[DriveFileResult] = []
     error: str | None = None
 
 
@@ -769,6 +794,49 @@ def analysis_tool_error_result(error: Exception) -> types.CallToolResult:
     )
 
 
+def drive_tool_result(result: dict[str, Any]) -> types.CallToolResult:
+    files = result.get("files") or []
+    links = [
+        types.ResourceLink(
+            type="resource_link",
+            name=str(item.get("file_name") or f"segment_{index:03d}.mp4"),
+            title=f"Google Drive 影片分段 {index + 1}",
+            uri=str(item["url"]),
+            description=(
+                "已由 MCP 上傳到 Google Drive；請先用 Google Drive connector 取得原始 MP4，"
+                "再進行影片分析。"
+            ),
+            mimeType=str(item.get("mime_type") or "video/mp4"),
+            size=int(item.get("size_bytes") or 0),
+        )
+        for index, item in enumerate(files)
+        if item.get("url")
+    ]
+    return types.CallToolResult(
+        structuredContent=result,
+        content=[
+            types.TextContent(
+                type="text",
+                text=(
+                    f"已將 {len(files)} 個 MP4 分段存到 Google Drive。"
+                    "這些是 Drive 檔案引用，不是 ChatGPT 原生附件；"
+                    "請用 Google Drive connector 取得原始檔後再摘要。"
+                ),
+            ),
+            *links,
+        ],
+    )
+
+
+def drive_tool_error_result(error: Exception) -> types.CallToolResult:
+    detail = str(error).strip() or error.__class__.__name__
+    return types.CallToolResult(
+        isError=True,
+        structuredContent={"status": "error", "error": detail},
+        content=[types.TextContent(type="text", text=f"Google Drive 交接失敗：{detail}")],
+    )
+
+
 WIDGET_HTML = r"""<!doctype html>
 <html lang="zh-Hant">
 <head>
@@ -923,12 +991,54 @@ WIDGET_HTML = r"""<!doctype html>
       return { file_id: fileId, download_url: downloadUrl, mime_type: type, file_name: name };
     }
 
+    async function driveAndAsk() {
+      setStatus("ChatGPT uploadFile 不可用，正在把 MP4 分段存到 Google Drive…");
+      const drive = normalize(await callTool("upload_prepared_video_to_drive", { job_id: data.job_id }));
+      if (drive.status !== "drive_ready" || !Array.isArray(drive.files) || drive.files.length !== data.segments.length) {
+        throw new Error(drive.error || "Google Drive 沒有確認所有 MP4 分段");
+      }
+      const entries = drive.files.map((file, index) =>
+        `${index + 1}. ${file.file_name} | file_id=${file.file_id} | ${file.size_bytes} bytes | ${file.url}`
+      ).join("\n");
+      const modelContent = [
+        `影片「${data.title || "未命名"}」的 ${drive.files.length} 個 MP4 分段已由 MCP 存到 Google Drive。`,
+        "Drive 檔案清單：",
+        entries,
+      ].join("\n");
+      getOpenAI()?.setWidgetState?.({
+        modelContent,
+        privateContent: { jobId: data.job_id, driveFileIds: drive.files.map((file) => file.file_id) },
+      });
+      await sendFollowUp([
+        modelContent,
+        "請使用已連線的 Google Drive connector，對上列每個 Drive 檔案執行原始檔 fetch（download_raw_file=true、include_base64=false）。",
+        "確認 connector 回傳 video/mp4 的實際檔案引用後，再逐一讀取影片畫面與音訊並摘要。",
+        "不要把 Drive URL、檔名或 metadata 當成影片內容；若任何分段無法取得原始檔，請明確標示。",
+      ].join("\n"));
+      setStatus(`已將 ${drive.files.length} 個 MP4 存到 Google Drive，已請 ChatGPT 透過 Drive connector 讀取。`);
+    }
+
+    async function analyzeOnServer() {
+      setStatus("Google Drive 未完成設定，改用 MCP 主機端實際讀取 MP4…");
+      const result = normalize(await callTool("analyze_prepared_video", { job_id: data.job_id }));
+      if (result.status === "error") throw new Error(result.error || "MCP 主機端分析失敗");
+      await sendFollowUp([
+        `MCP 已在伺服器端實際讀取影片「${data.title || "未命名"}」的 MP4 bytes，並完成 FFmpeg、畫面與音訊分析。`,
+        "這不是 ChatGPT 原生附件讀取；請根據上一個分析工具結果輸出繁體中文時間軸摘要，並標示任何不確定處。",
+      ].join("\n"));
+      setStatus("MCP 主機端分析完成；結果已交給 ChatGPT 整理。");
+    }
+
     async function uploadAndAsk() {
       if (!data?.segments?.length) return;
       const host = await waitForOpenAI();
       if (!host?.uploadFile || !host?.getFileDownloadUrl) {
-        startedJobId = null;
-        setStatus("ChatGPT 未提供檔案上傳 API；MP4 bytes 尚未取得，未開始摘要。");
+        try {
+          await driveAndAsk();
+        } catch (driveError) {
+          setStatus(`Google Drive 交接未完成（${driveError.message}），改用 MCP 主機端分析…`);
+          await analyzeOnServer();
+        }
         return;
       }
       $("upload").disabled = true;
@@ -1015,9 +1125,10 @@ mcp = FastMCP(
     instructions=(
         "Use prepare_video_for_chatgpt when the user gives a public video URL and wants a summary. "
         "The tool downloads and segments the video; the ChatGPT widget then uploads the segments. "
-        "If the host does not expose file upload APIs, use analyze_prepared_video for a server-side "
-        "FFmpeg/Groq/MiniMax-M3 fallback. Do not claim that ChatGPT itself read the MP4 unless the "
-        "file handoff and model response succeed."
+        "If the host does not expose file upload APIs, the widget first tries the configured Google "
+        "Drive handoff and asks the Google Drive connector to fetch the raw MP4s; if Drive is not "
+        "configured, use analyze_prepared_video for a server-side FFmpeg/Groq/MiniMax-M3 fallback. "
+        "Do not claim that ChatGPT itself read the MP4 unless the file handoff and model response succeed."
     ),
     host=MCP_HOST,
     port=MCP_PORT,
@@ -1095,6 +1206,47 @@ async def analyze_prepared_video(
     except Exception as error:
         return analysis_tool_error_result(error)
     return analysis_tool_result(result)
+
+
+@mcp.tool(
+    name="upload_prepared_video_to_drive",
+    title="Store prepared video in Google Drive",
+    description=(
+        "Use this when prepare_video_for_chatgpt has produced MP4 segments but the ChatGPT host "
+        "does not expose uploadFile. Upload the actual prepared MP4 bytes to a configured private "
+        "Google Drive folder and return observed Drive file IDs and view URLs. The model must then "
+        "use the connected Google Drive connector to fetch each raw MP4 before analyzing it. A Drive "
+        "URL alone is never treated as proof that ChatGPT received or read the video bytes."
+    ),
+    annotations=types.ToolAnnotations(
+        readOnlyHint=False,
+        destructiveHint=False,
+        idempotentHint=True,
+        openWorldHint=True,
+    ),
+    meta=DRIVE_META,
+    structured_output=True,
+)
+async def upload_prepared_video_to_drive(
+    job_id: str,
+) -> Annotated[types.CallToolResult, DriveUploadResult]:
+    try:
+        job_dir = prepared_job_dir(job_id)
+        manifest = read_manifest(job_dir)
+        if not manifest:
+            raise RuntimeError("影片尚未準備完成，請先呼叫 prepare_video_for_chatgpt。")
+        source = manifest.get("source") or {}
+        result = await asyncio.to_thread(
+            drive_storage.upload_prepared_segments,
+            job_dir,
+            job_id,
+            str(source.get("title") or job_id),
+            str(source.get("fingerprint") or ""),
+            list(manifest.get("segments") or []),
+        )
+    except Exception as error:
+        return drive_tool_error_result(error)
+    return drive_tool_result(result)
 
 
 @mcp.tool(

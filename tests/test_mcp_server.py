@@ -4,6 +4,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+import drive_storage
 import mcp_server
 
 
@@ -118,6 +119,15 @@ class MCPValidationTests(unittest.TestCase):
         self.assertIn('request("ui/message"', mcp_server.WIDGET_HTML)
         self.assertIn("queueMicrotask(startUpload)", mcp_server.WIDGET_HTML)
 
+    def test_drive_tool_exposes_output_schema_and_widget_path(self) -> None:
+        tools = asyncio.run(mcp_server.mcp.list_tools())
+        tool = next(item for item in tools if item.name == "upload_prepared_video_to_drive")
+        self.assertIsNotNone(tool.outputSchema)
+        self.assertTrue(tool.meta["openai/widgetAccessible"])
+        self.assertIn("upload_prepared_video_to_drive", mcp_server.WIDGET_HTML)
+        self.assertIn("Google Drive connector", mcp_server.WIDGET_HTML)
+        self.assertIn("analyzeOnServer", mcp_server.WIDGET_HTML)
+
     def test_analysis_tool_returns_clean_error_payload(self) -> None:
         result = asyncio.run(mcp_server.analyze_prepared_video("not-a-job"))
         self.assertTrue(result.isError)
@@ -196,6 +206,56 @@ class MCPValidationTests(unittest.TestCase):
         self.assertEqual(result["visual_status"], "complete")
         self.assertEqual(result["summary"]["short_summary"], "ok")
         self.assertEqual(extract_candidates_mock.call_args.args[3], 0)
+
+    def test_drive_upload_caches_verified_segment_metadata(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_dir:
+            job_dir = Path(raw_dir)
+            segment_dir = job_dir / "segments"
+            segment_dir.mkdir()
+            segment_path = segment_dir / "segment_000.mp4"
+            segment_path.write_bytes(b"fake-mp4")
+            segment_rows = [{"filename": segment_path.name}]
+            folder = {
+                "id": "folder_1",
+                "webViewLink": "https://drive.google.com/drive/folders/folder_1",
+            }
+            uploaded = {
+                "id": "file_1",
+                "name": "segment_000.mp4",
+                "mimeType": "video/mp4",
+                "size": 8,
+                "webViewLink": "https://drive.google.com/file/d/file_1/view",
+            }
+            with (
+                patch.dict(
+                    drive_storage.os.environ,
+                    {"GOOGLE_DRIVE_ACCESS_TOKEN": "token", "GOOGLE_DRIVE_FOLDER_ID": "parent"},
+                    clear=False,
+                ),
+                patch.object(drive_storage, "_access_token", return_value="token"),
+                patch.object(drive_storage, "_create_folder", return_value=folder) as create_folder,
+                patch.object(drive_storage, "_upload_file", return_value=uploaded) as upload_file,
+            ):
+                first = drive_storage.upload_prepared_segments(
+                    job_dir,
+                    "0123456789ab",
+                    "demo",
+                    "source-fingerprint",
+                    segment_rows,
+                )
+                second = drive_storage.upload_prepared_segments(
+                    job_dir,
+                    "0123456789ab",
+                    "demo",
+                    "source-fingerprint",
+                    segment_rows,
+                )
+
+        self.assertEqual(first["status"], "drive_ready")
+        self.assertEqual(first["files"][0]["file_id"], "file_1")
+        self.assertEqual(second, first)
+        create_folder.assert_called_once()
+        upload_file.assert_called_once()
 
     def test_prepare_tool_structured_result_matches_schema(self) -> None:
         manifest = {
