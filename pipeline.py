@@ -34,12 +34,19 @@ from pathlib import Path
 from typing import Any, Callable
 
 
-__version__ = "0.2.0"
+__version__ = "0.2.1"
 
 MEDIA_EXTENSIONS = {
     ".mp4", ".mkv", ".webm", ".mov", ".avi", ".m4v",
     ".mp3", ".m4a", ".aac", ".wav", ".flac", ".ogg", ".opus", ".m3u8",
 }
+
+THREADS_HOSTS = {"threads.com", "www.threads.com", "threads.net", "www.threads.net"}
+THREADS_POST_RE = re.compile(r"/(?:@[^/]+/)?(?:post|t)/(?P<id>[^/?#&]+)", re.IGNORECASE)
+THREADS_CRAWLER_USER_AGENT = "facebookexternalhit/1.1"
+THREADS_PAGE_MAX_BYTES = 16 * 1024 * 1024
+THREADS_REQUEST_ATTEMPTS = 4
+THREADS_MAX_VIDEO_ITEMS = 10
 
 
 # 基礎 I/O、來源下載與影音抽取
@@ -251,6 +258,299 @@ def sanitize_download_info(path: Path) -> None:
     write_json(path, clean(info))
 
 
+def is_threads_url(url: str) -> bool:
+    try:
+        hostname = (urllib.parse.urlsplit(url).hostname or "").lower()
+    except ValueError:
+        return False
+    return hostname in THREADS_HOSTS
+
+
+def threads_post_id(url: str) -> str:
+    value = require_http_url(url, "Threads URL")
+    parsed = urllib.parse.urlsplit(value)
+    if (parsed.hostname or "").lower() not in THREADS_HOSTS:
+        raise ValueError("Threads URL 必須使用 threads.com 或 threads.net。")
+    match = THREADS_POST_RE.search(parsed.path)
+    if not match:
+        raise ValueError("Threads URL 必須包含 /post/<ID> 或 /t/<ID>。")
+    return match.group("id")
+
+
+def fetch_threads_html(url: str) -> str:
+    post_id = threads_post_id(url)
+    headers = {
+        "User-Agent": THREADS_CRAWLER_USER_AGENT,
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+    }
+    delay = 2.0
+    for attempt in range(1, THREADS_REQUEST_ATTEMPTS + 1):
+        request = urllib.request.Request(url, headers=headers, method="GET")
+        try:
+            with urllib.request.urlopen(request, timeout=30) as response:
+                raw = response.read(THREADS_PAGE_MAX_BYTES + 1)
+            if len(raw) > THREADS_PAGE_MAX_BYTES:
+                raise RuntimeError("Threads 頁面超過 16 MB 安全上限。")
+            return raw.decode("utf-8", errors="replace")
+        except urllib.error.HTTPError as exc:
+            if exc.code in RETRY_STATUS and attempt < THREADS_REQUEST_ATTEMPTS:
+                wait = retry_delay(exc, delay)
+                print(f"! Threads HTTP {exc.code}，{wait:.0f} 秒後重試（{attempt}/{THREADS_REQUEST_ATTEMPTS - 1}）")
+                time.sleep(wait)
+                delay *= 2
+                continue
+            raise RuntimeError(f"Threads HTTP {exc.code}（{public_url(url)}）：貼文頁面無法取得。") from exc
+        except (urllib.error.URLError, TimeoutError) as exc:
+            reason = getattr(exc, "reason", None) or type(exc).__name__
+            if attempt < THREADS_REQUEST_ATTEMPTS:
+                print(f"! Threads 網路錯誤（{reason}），{delay:.0f} 秒後重試（{attempt}/{THREADS_REQUEST_ATTEMPTS - 1}）")
+                time.sleep(delay)
+                delay *= 2
+                continue
+            raise RuntimeError(f"Threads 網路錯誤（{public_url(url)}）：{reason}") from exc
+    raise RuntimeError(f"Threads 貼文頁面取得失敗：{public_url(url)}#{post_id}")
+
+
+def _threads_json_scripts(html_text: str) -> list[Any]:
+    nodes: list[Any] = []
+    for match in re.finditer(r"<script[^>]*data-sjs[^>]*>(.*?)</script\s*>", html_text, re.IGNORECASE | re.DOTALL):
+        try:
+            nodes.append(json.loads(match.group(1).strip()))
+        except json.JSONDecodeError:
+            continue
+    return nodes
+
+
+def _threads_find_post(value: Any, post_id: str) -> dict[str, Any] | None:
+    if isinstance(value, dict):
+        if value.get("code") == post_id:
+            return value
+        for child in value.values():
+            found = _threads_find_post(child, post_id)
+            if found is not None:
+                return found
+    elif isinstance(value, list):
+        for child in value:
+            found = _threads_find_post(child, post_id)
+            if found is not None:
+                return found
+    return None
+
+
+def _threads_number(value: Any) -> int:
+    try:
+        return int(value or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _threads_best_video(media: dict[str, Any]) -> dict[str, Any] | None:
+    candidates: list[tuple[tuple[int, int, int], str, dict[str, Any]]] = []
+    variants = media.get("video_versions")
+    if isinstance(variants, list):
+        for variant in variants:
+            if not isinstance(variant, dict):
+                continue
+            value = variant.get("url") or variant.get("video_url") or variant.get("src")
+            if not isinstance(value, str) or urllib.parse.urlsplit(value).scheme not in {"http", "https"}:
+                continue
+            score = (
+                _threads_number(variant.get("width")) * _threads_number(variant.get("height")),
+                _threads_number(variant.get("bitrate")),
+                _threads_number(variant.get("type")),
+            )
+            candidates.append((score, value, variant))
+    for key in ("video_url", "playback_url"):
+        value = media.get(key)
+        if isinstance(value, str) and urllib.parse.urlsplit(value).scheme in {"http", "https"}:
+            candidates.append(((0, 0, 0), value, media))
+    if not candidates:
+        return None
+    _, value, variant = max(candidates, key=lambda item: item[0])
+    return {
+        "url": value,
+        "width": _threads_number(variant.get("width")),
+        "height": _threads_number(variant.get("height")),
+        "duration": variant.get("duration") or media.get("video_duration"),
+    }
+
+
+def _threads_video_media(value: Any) -> list[dict[str, Any]]:
+    found: list[dict[str, Any]] = []
+
+    def walk(node: Any) -> None:
+        if isinstance(node, dict):
+            if _threads_best_video(node) is not None:
+                found.append(node)
+            for child in node.values():
+                walk(child)
+        elif isinstance(node, list):
+            for child in node:
+                walk(child)
+
+    walk(value)
+    return found
+
+
+def parse_threads_post(html_text: str, url: str) -> dict[str, Any]:
+    post_id = threads_post_id(url)
+    post = None
+    for node in _threads_json_scripts(html_text):
+        post = _threads_find_post(node, post_id)
+        if post is not None:
+            break
+    if post is None:
+        raise RuntimeError(
+            f"Threads 貼文資料未找到（{public_url(url)}）；可能已刪除、需要登入，或頁面格式已變更。"
+        )
+
+    entries: list[dict[str, Any]] = []
+    seen_urls: set[str] = set()
+    for media in _threads_video_media(post):
+        video = _threads_best_video(media)
+        if video is None or video["url"] in seen_urls:
+            continue
+        seen_urls.add(video["url"])
+        entries.append(video)
+    if not entries:
+        raise RuntimeError(f"Threads 貼文沒有可下載的影片：{public_url(url)}。")
+    if len(entries) > THREADS_MAX_VIDEO_ITEMS:
+        raise RuntimeError(f"Threads carousel 影片數量超過 {THREADS_MAX_VIDEO_ITEMS} 段安全上限。")
+
+    caption = post.get("caption") or {}
+    user = post.get("user") or {}
+    title = caption.get("text") if isinstance(caption, dict) else ""
+    return {
+        "id": post_id,
+        "title": str(title or f"Threads post {post_id}"),
+        "uploader": str(user.get("username") or ""),
+        "webpage_url": public_url(url),
+        "entries": entries,
+    }
+
+
+def fetch_threads_post(url: str) -> dict[str, Any]:
+    return parse_threads_post(fetch_threads_html(url), url)
+
+
+def _download_threads_media(
+    media_url: str,
+    target: Path,
+    source_url: str,
+    *,
+    max_filesize: int | None = None,
+) -> None:
+    temporary = target.with_name(target.name + ".part")
+    temporary.unlink(missing_ok=True)
+    page = urllib.parse.urlsplit(source_url)
+    headers = {
+        "User-Agent": THREADS_CRAWLER_USER_AGENT,
+        "Accept": "video/mp4,video/*;q=0.9,*/*;q=0.8",
+        "Referer": f"{page.scheme}://{page.netloc}/",
+    }
+    delay = 2.0
+    for attempt in range(1, THREADS_REQUEST_ATTEMPTS + 1):
+        request = urllib.request.Request(media_url, headers=headers, method="GET")
+        try:
+            with urllib.request.urlopen(request, timeout=60) as response, temporary.open("wb") as output:
+                expected = _threads_number(response.headers.get("Content-Length"))
+                if max_filesize is not None and expected > max_filesize:
+                    raise RuntimeError(f"Threads 影片超過檔案大小上限：{target.name}。")
+                total = 0
+                while True:
+                    chunk = response.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    total += len(chunk)
+                    if max_filesize is not None and total > max_filesize:
+                        raise RuntimeError(f"Threads 影片超過檔案大小上限：{target.name}。")
+                    output.write(chunk)
+            if total <= 0:
+                raise RuntimeError(f"Threads 媒體是空檔案：{target.name}。")
+            temporary.replace(target)
+            return
+        except urllib.error.HTTPError as exc:
+            temporary.unlink(missing_ok=True)
+            if exc.code in RETRY_STATUS and attempt < THREADS_REQUEST_ATTEMPTS:
+                wait = retry_delay(exc, delay)
+                print(f"! Threads 媒體 HTTP {exc.code}，{wait:.0f} 秒後重試（{attempt}/{THREADS_REQUEST_ATTEMPTS - 1}）")
+                time.sleep(wait)
+                delay *= 2
+                continue
+            raise RuntimeError(f"Threads 媒體 HTTP {exc.code}（{public_url(source_url)}）。") from exc
+        except (urllib.error.URLError, TimeoutError) as exc:
+            temporary.unlink(missing_ok=True)
+            reason = getattr(exc, "reason", None) or type(exc).__name__
+            if attempt < THREADS_REQUEST_ATTEMPTS:
+                print(f"! Threads 媒體網路錯誤（{reason}），{delay:.0f} 秒後重試（{attempt}/{THREADS_REQUEST_ATTEMPTS - 1}）")
+                time.sleep(delay)
+                delay *= 2
+                continue
+            raise RuntimeError(f"Threads 媒體網路錯誤（{public_url(source_url)}）：{reason}") from exc
+
+
+def _concat_threads_media(media_paths: list[Path], output: Path, job_dir: Path) -> None:
+    if len(media_paths) == 1:
+        media_paths[0].replace(output)
+        return
+    concat_list = job_dir / "threads.concat.txt"
+    lines = []
+    for path in media_paths:
+        escaped = str(path.resolve()).replace("\\", "/").replace("'", "'\\''")
+        lines.append(f"file '{escaped}'")
+    write_text(concat_list, "\n".join(lines) + "\n")
+    command = [
+        require_tool("ffmpeg"), "-y", "-hide_banner", "-loglevel", "error",
+        "-f", "concat", "-safe", "0", "-i", str(concat_list), "-c", "copy", str(output),
+    ]
+    try:
+        run_external(command)
+    except RuntimeError:
+        output.unlink(missing_ok=True)
+        run_external([
+            require_tool("ffmpeg"), "-y", "-hide_banner", "-loglevel", "error",
+            "-f", "concat", "-safe", "0", "-i", str(concat_list),
+            "-c:v", "libx264", "-c:a", "aac", "-movflags", "+faststart", str(output),
+        ])
+
+
+def download_threads_video(
+    url: str,
+    job_dir: Path,
+    *,
+    max_filesize: int | None = None,
+    max_duration: int | None = None,
+) -> Path:
+    del max_duration  # Threads page metadata does not consistently expose duration.
+    resolved = fetch_threads_post(url)
+    job_dir.mkdir(parents=True, exist_ok=True)
+    output = job_dir / "source.mp4"
+    output.unlink(missing_ok=True)
+    media_paths: list[Path] = []
+    for index, entry in enumerate(resolved["entries"]):
+        target = job_dir / f"threads_media_{index:03d}.mp4"
+        _download_threads_media(entry["url"], target, url, max_filesize=max_filesize)
+        media_paths.append(target)
+    _concat_threads_media(media_paths, output, job_dir)
+    write_json(
+        job_dir / "source.info.json",
+        {
+            "id": resolved["id"],
+            "extractor": "Threads",
+            "title": resolved["title"],
+            "uploader": resolved["uploader"],
+            "webpage_url": resolved["webpage_url"],
+            "playlist_count": len(media_paths),
+            "entries": [
+                {"id": f"{resolved['id']}_{index + 1}", "width": item.get("width"), "height": item.get("height")}
+                for index, item in enumerate(resolved["entries"])
+            ],
+        },
+    )
+    return output
+
+
 def download_video(
     url: str,
     job_dir: Path,
@@ -267,6 +567,12 @@ def download_video(
             sanitize_download_info(job_dir / "source.info.json")
         return locate_source_video(job_dir)
     job_dir.mkdir(parents=True, exist_ok=True)
+    if is_threads_url(url):
+        video_path = download_threads_video(
+            url, job_dir, max_filesize=max_filesize, max_duration=max_duration
+        )
+        done.touch()
+        return video_path
     command = yt_dlp_command()
     if private_url:
         command += ["--quiet", "--no-warnings"]
@@ -348,12 +654,25 @@ def file_sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
-def extract_audio(video_path: Path, job_dir: Path, chunk_seconds: int) -> list[dict[str, Any]]:
+def extract_audio(
+    video_path: Path,
+    job_dir: Path,
+    chunk_seconds: int,
+    *,
+    has_audio: bool = True,
+) -> list[dict[str, Any]]:
     audio_dir = job_dir / "audio"
     audio_dir.mkdir(parents=True, exist_ok=True)
     done = audio_dir / ".complete"
     chunk_list = audio_dir / "chunks.csv"
     chunk_manifest = audio_dir / "chunks.json"
+    if not has_audio:
+        for stale in audio_dir.glob("audio_*.mp3"):
+            stale.unlink()
+        chunk_list.unlink(missing_ok=True)
+        write_json(chunk_manifest, [])
+        write_text(done, f"v=3;source={file_fingerprint(video_path)};audio=none")
+        return []
     signature = f"v=3;source={file_fingerprint(video_path)};chunk={chunk_seconds};codec=mp3-64k"
     legacy_signature = f"v=2;chunk={chunk_seconds};codec=mp3-64k"
     chunks = sorted(audio_dir.glob("audio_*.mp3"))
@@ -532,24 +851,56 @@ def extract_candidates(
         all_frames = []
     if not all_frames:
         filter_value = f"fps=1/{interval:g},scale=1280:-2:force_original_aspect_ratio=decrease"
-        run_external(
-            [
-                require_tool("ffmpeg"),
-                "-y",
-                "-hide_banner",
-                "-loglevel",
-                "error",
-                "-stats",
-                "-i",
-                str(video_path),
-                "-vf",
-                filter_value,
-                "-q:v",
-                "3",
-                str(frames_dir / "frame_%06d.jpg"),
-            ],
-            stream=True,
-        )
+        try:
+            run_external(
+                [
+                    require_tool("ffmpeg"),
+                    "-y",
+                    "-hide_banner",
+                    "-loglevel",
+                    "error",
+                    "-stats",
+                    "-i",
+                    str(video_path),
+                    "-vf",
+                    filter_value,
+                    "-q:v",
+                    "3",
+                    str(frames_dir / "frame_%06d.jpg"),
+                ],
+                stream=True,
+            )
+        except RuntimeError:
+            # 短片沒有命中固定取樣點，或來源色彩格式讓 MJPEG encoder 失敗；下方再取第 0 秒。
+            pass
+        all_frames = sorted(frames_dir.glob("frame_*.jpg"))
+    if not all_frames:
+        # 短片可能比固定取樣間隔更短；至少保留第 0 秒，不能把整支影片當成沒有畫面。
+        try:
+            run_external(
+                [
+                    require_tool("ffmpeg"),
+                    "-y",
+                    "-hide_banner",
+                    "-loglevel",
+                    "error",
+                    "-ss",
+                    "0",
+                    "-i",
+                    str(video_path),
+                    "-frames:v",
+                    "1",
+                    "-vf",
+                    "scale=1280:-2:force_original_aspect_ratio=decrease",
+                    "-q:v",
+                    "3",
+                    str(frames_dir / "frame_000001.jpg"),
+                ],
+                stream=True,
+            )
+        except RuntimeError:
+            # 原始 fps filter 對短片／特殊色彩格式可能回傳非零，但 fallback 仍有機會成功。
+            pass
         all_frames = sorted(frames_dir.glob("frame_*.jpg"))
     if not all_frames:
         raise RuntimeError("FFmpeg 沒有產生截圖。")
@@ -1074,6 +1425,17 @@ def transcribe_all(
     cache_dir: Path,
     word_timestamps: bool = False,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
+    if not chunks:
+        return (
+            {
+                "provider": "none",
+                "model": model,
+                "language": language,
+                "segments": [],
+                "cache": {"hits": 0, "misses": 0},
+            },
+            {"provider": "none", "reason": "source has no audio", "chunks": []},
+        )
     cache_dir.mkdir(parents=True, exist_ok=True)
     hits = 0
     misses = 0
@@ -5420,7 +5782,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="影片語音＋畫面時間軸摘要管線")
     parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     source = parser.add_mutually_exclusive_group()
-    source.add_argument("--url", help="YouTube／Facebook 等 yt-dlp 支援的影片 URL")
+    source.add_argument("--url", help="YouTube／Facebook／Instagram／Threads 等支援的影片 URL")
     source.add_argument("--video", help="本機影片路徑")
     source.add_argument("--url-file", type=Path, help="批次 URL 清單；每行一個影片 URL")
     parser.add_argument("--root", type=Path, default=Path(__file__).resolve().parent)
@@ -5879,7 +6241,13 @@ def run_pipeline(args: argparse.Namespace) -> Path:
 
             local_started = time.monotonic()
             audio_chunks, (candidates, frame_meta, frame_cache_key) = run_parallel_stages(
-                lambda: extract_audio(video_path, job_dir, args.chunk_seconds), frame_stage
+                lambda: extract_audio(
+                    video_path,
+                    job_dir,
+                    args.chunk_seconds,
+                    has_audio=any(stream.get("codec_type") == "audio" for stream in probe.get("streams", [])),
+                ),
+                frame_stage,
             )
             write_json(
                 job_dir / "frame_candidates.json",
