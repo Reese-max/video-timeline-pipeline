@@ -47,7 +47,7 @@ MCP_PUBLIC_BASE_URL = (
 MCP_MEDIA_BASE_URL = (
     os.getenv("MCP_MEDIA_BASE_URL", "") or MCP_PUBLIC_BASE_URL
 ).rstrip("/")
-UI_URI = "ui://video-timeline-pipeline/v6.html"
+UI_URI = "ui://video-timeline-pipeline/v7.html"
 PUBLIC_URL = urlsplit(MCP_PUBLIC_BASE_URL)
 MEDIA_URL = urlsplit(MCP_MEDIA_BASE_URL)
 UI_ORIGIN = f"{PUBLIC_URL.scheme}://{PUBLIC_URL.netloc}"
@@ -857,6 +857,7 @@ WIDGET_HTML = r"""<!doctype html>
     const pendingRequests = new Map();
     let nextRequestId = 1;
     let data = null;
+    let jobVersion = 0;
     let running = false;
     let startedJobId = null;
     let bridgePromise = null;
@@ -869,6 +870,9 @@ WIDGET_HTML = r"""<!doctype html>
     };
     const normalize = (value) => value?.structuredContent || value || {};
     const setStatus = (value) => { $("status").textContent = value; };
+    const checkJob = (version) => {
+      if (version !== jobVersion) throw new Error("影片工作已切換，忽略舊交接結果。");
+    };
 
     function request(method, params) {
       const id = nextRequestId++;
@@ -886,7 +890,7 @@ WIDGET_HTML = r"""<!doctype html>
       const result = await request("ui/initialize", {
         protocolVersion: "2026-01-26",
         appCapabilities: {},
-        clientInfo: { name: "video-timeline-pipeline", version: "6" },
+        clientInfo: { name: "video-timeline-pipeline", version: "7" },
       });
       window.parent.postMessage({
         jsonrpc: "2.0",
@@ -901,18 +905,26 @@ WIDGET_HTML = r"""<!doctype html>
       return bridgePromise;
     }
 
-    async function callTool(name, args) {
+    async function callTool(name, args, version) {
       const host = getOpenAI();
+      checkJob(version);
       return host?.callTool
         ? host.callTool(name, args)
-        : ensureBridge().then(() => request("tools/call", { name, arguments: args }));
+        : ensureBridge().then(() => {
+          checkJob(version);
+          return request("tools/call", { name, arguments: args });
+        });
     }
 
-    async function sendFollowUp(prompt) {
+    async function sendFollowUp(prompt, version) {
       const host = getOpenAI();
+      checkJob(version);
       return host?.sendFollowUpMessage
         ? host.sendFollowUpMessage({ prompt })
-        : ensureBridge().then(() => request("ui/message", { content: [{ type: "text", text: prompt }] }));
+        : ensureBridge().then(() => {
+          checkJob(version);
+          return request("ui/message", { content: [{ type: "text", text: prompt }] });
+        });
     }
 
     async function waitForOpenAI(timeout = 5000) {
@@ -924,13 +936,27 @@ WIDGET_HTML = r"""<!doctype html>
     }
 
     function render(value) {
-      data = normalize(value);
+      const next = normalize(value);
+      // Handoff results are data-only; they are not a newly prepared video.
+      if (["drive_ready", "files_received"].includes(next.status)) return false;
+      if (!data || next.job_id !== data.job_id) {
+        jobVersion += 1;
+        startedJobId = null;
+        getOpenAI()?.setWidgetState?.({
+          modelContent: next.job_id
+            ? `目前影片「${next.title || "未命名"}」（job_id=${next.job_id}）尚待檔案交接；請勿沿用先前影片或檔案。`
+            : "尚未取得目前影片的檔案交接資訊；請勿沿用先前影片或檔案。",
+          privateContent: { jobId: next.job_id || null },
+        });
+        setStatus("");
+      }
+      data = next;
       const segments = Array.isArray(data.segments) ? data.segments : [];
       $("title").textContent = data.title || "影片時間軸";
       $("summary").textContent = segments.length
         ? `${formatTime(data.duration_seconds)} · ${segments.length} 段 · 每段約 ${data.segment_seconds} 秒`
         : "尚未取得影片分段。";
-      $("upload").disabled = !segments.length;
+      $("upload").disabled = !segments.length || running;
       const list = $("segments");
       list.replaceChildren();
       for (const segment of segments) {
@@ -953,9 +979,10 @@ WIDGET_HTML = r"""<!doctype html>
         item.append(link);
         list.append(item);
       }
+      return true;
     }
 
-    async function upload(host, url, name, type) {
+    async function upload(host, url, name, type, version) {
       const controller = new AbortController();
       const timer = setTimeout(() => controller.abort(), 30000);
       let response;
@@ -966,105 +993,122 @@ WIDGET_HTML = r"""<!doctype html>
       } finally {
         clearTimeout(timer);
       }
+      checkJob(version);
       if (!response.ok) throw new Error(`下載 ${name} 失敗（HTTP ${response.status}）`);
       const blob = await response.blob();
+      checkJob(version);
       const result = await host.uploadFile(new File([blob], name, { type }), { library: false });
+      checkJob(version);
       const fileId = result?.fileId || result?.file_id;
       if (!fileId) throw new Error(`${name} 沒有取得 file_id`);
       const download = await host.getFileDownloadUrl({ fileId });
+      checkJob(version);
       const downloadUrl = download?.downloadUrl || download?.download_url;
       if (!downloadUrl) throw new Error(`${name} 沒有取得 download_url`);
       return { file_id: fileId, download_url: downloadUrl, mime_type: type, file_name: name };
     }
 
-    async function driveAndAsk() {
+    async function driveAndAsk(job, version) {
+      checkJob(version);
       setStatus("正在把所有 MP4 分段存到 Google Drive，完成後交由 connector 讀取…");
-      const drive = normalize(await callTool("upload_prepared_video_to_drive", { job_id: data.job_id }));
-      if (drive.status !== "drive_ready" || !Array.isArray(drive.files) || drive.files.length !== data.segments.length) {
+      const drive = normalize(await callTool("upload_prepared_video_to_drive", { job_id: job.job_id }, version));
+      checkJob(version);
+      if (drive.status !== "drive_ready" || !Array.isArray(drive.files) || drive.files.length !== job.segments.length) {
         throw new Error(drive.error || "Google Drive 沒有確認所有 MP4 分段");
       }
+      if (drive.job_id !== job.job_id) throw new Error("Google Drive 回傳工作不符，停止檔案交接。");
       const entries = drive.files.map((file, index) =>
         `${index + 1}. ${file.file_name} | file_id=${file.file_id} | ${file.size_bytes} bytes | ${file.url}`
       ).join("\n");
       const modelContent = [
-        `影片「${data.title || "未命名"}」的 ${drive.files.length} 個 MP4 分段已由 MCP 存到 Google Drive。`,
+        `影片「${job.title || "未命名"}」的 ${drive.files.length} 個 MP4 分段已由 MCP 存到 Google Drive。`,
         "Drive 檔案清單：",
         entries,
       ].join("\n");
       getOpenAI()?.setWidgetState?.({
         modelContent,
-        privateContent: { jobId: data.job_id, driveFileIds: drive.files.map((file) => file.file_id) },
+        privateContent: { jobId: job.job_id, driveFileIds: drive.files.map((file) => file.file_id) },
       });
       await sendFollowUp([
         modelContent,
         "請使用已連線的 Google Drive connector，對上列每個 Drive 檔案執行原始檔 fetch（download_raw_file=true、include_base64=false）。",
         "確認 connector 回傳 video/mp4 的實際檔案引用後，再逐一讀取影片畫面與音訊並摘要。",
         "不要把 Drive URL、檔名或 metadata 當成影片內容；若任何分段無法取得原始檔，請明確標示。",
-      ].join("\n"));
+      ].join("\n"), version);
+      checkJob(version);
       setStatus(`已將 ${drive.files.length} 個 MP4 存到 Google Drive，已請 ChatGPT 透過 Drive connector 讀取。`);
     }
 
-    async function uploadAndAsk() {
-      if (!data?.segments?.length) return;
+    async function uploadAndAsk(job, version) {
       $("upload").disabled = true;
       const host = await waitForOpenAI();
+      checkJob(version);
       if (!host?.uploadFile || !host?.getFileDownloadUrl) {
-        await driveAndAsk();
+        await driveAndAsk(job, version);
         return;
       }
       $("upload").disabled = true;
       const files = [];
       const failures = [];
-      for (let index = 0; index < data.segments.length; index += 1) {
-        const segment = data.segments[index];
-        setStatus(`上傳影片片段 ${index + 1}/${data.segments.length}…`);
+      for (let index = 0; index < job.segments.length; index += 1) {
+        const segment = job.segments[index];
+        setStatus(`上傳影片片段 ${index + 1}/${job.segments.length}…`);
         try {
-          files.push(await upload(host, segment.url, segment.filename, segment.mime_type || "video/mp4"));
+          files.push(await upload(host, segment.url, segment.filename, segment.mime_type || "video/mp4", version));
+          checkJob(version);
         } catch (error) {
+          checkJob(version);
           failures.push(`${segment.filename}: ${error.message}`);
         }
       }
       if (failures.length) {
         try {
-          await driveAndAsk();
+          await driveAndAsk(job, version);
         } catch (driveError) {
           throw new Error(`原生附件交接失敗：${failures.join("；")}；Google Drive 交接失敗：${driveError.message}`);
         }
         return;
       }
       setStatus(`正在確認 ${files.length} 個 ChatGPT 檔案引用…`);
-      const handoff = normalize(await callTool("ingest_video_segments", { files }));
+      const handoff = normalize(await callTool("ingest_video_segments", { files }, version));
+      checkJob(version);
       if (handoff.status !== "files_received" || Number(handoff.files_received) !== files.length) {
         throw new Error("MCP 未確認所有影片檔案引用");
       }
       const videoIds = files.map((file) => file.file_id);
       const modelContent = [
-        `影片「${data.title || "未命名"}」已由 video-timeline-pipeline 分成 ${data.segments.length} 段。`,
+        `影片「${job.title || "未命名"}」已由 video-timeline-pipeline 分成 ${job.segments.length} 段。`,
         `檔案交接工具已確認 ${files.length} 個影片檔案。`,
         "請先讀取所有影片附件，再依每段的時間範圍整理重點、關鍵數字、結論與不確定處；不要把未讀取的內容猜成事實。",
       ].join("\n");
       host.setWidgetState?.({
         modelContent,
-        privateContent: { jobId: data.job_id, videoIds },
+        privateContent: { jobId: job.job_id, videoIds },
       });
       const prompt = `${modelContent}\n請現在直接讀取檔案交接工具提供的影片分段，並以繁體中文摘要。每個重點附上影片時間範圍；若某段無法讀取，明確標示。`;
-      await sendFollowUp(prompt);
+      await sendFollowUp(prompt, version);
+      checkJob(version);
       setStatus(`已確認 ${files.length} 個檔案，已請 ChatGPT 讀取影片並開始摘要。`);
       $("upload").disabled = false;
     }
 
     async function startUpload() {
       if (!data?.segments?.length || running || startedJobId === data.job_id) return;
+      const job = data;
+      const version = jobVersion;
       running = true;
-      startedJobId = data.job_id;
+      startedJobId = job.job_id;
       try {
-        await uploadAndAsk();
+        await uploadAndAsk(job, version);
       } catch (error) {
+        if (version !== jobVersion) return;
         startedJobId = null;
         setStatus(`處理失敗：${error.message}；尚未開始摘要。`);
         $("upload").disabled = false;
       } finally {
         running = false;
+        // ponytail: submitted uploads may finish; remote cancellation needs server support.
+        if (version !== jobVersion) queueMicrotask(startUpload);
       }
     }
 
@@ -1081,8 +1125,7 @@ WIDGET_HTML = r"""<!doctype html>
         return;
       }
       if (message?.jsonrpc === "2.0" && message.method === "ui/notifications/tool-result") {
-        render(message.params);
-        queueMicrotask(startUpload);
+        if (render(message.params)) queueMicrotask(startUpload);
       }
     }, { passive: true });
     ensureBridge().catch(() => {});

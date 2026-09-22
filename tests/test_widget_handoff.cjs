@@ -18,7 +18,7 @@ async function check({ native = true, failedFetch = -1, driveFails = false } = {
       calls.push(name);
       if (name === 'upload_prepared_video_to_drive') return { structuredContent: driveFails
         ? { status: 'error', error: 'HTTP 502' }
-        : { status: 'drive_ready', files: segments.map(s => ({ file_name: s.filename, file_id: s.filename, size_bytes: 8, url: 'https://drive.google.com/file/d/test/view' })) } };
+        : { status: 'drive_ready', job_id: args.job_id, files: segments.map(s => ({ file_name: s.filename, file_id: s.filename, size_bytes: 8, url: 'https://drive.google.com/file/d/test/view' })) } };
       if (name === 'ingest_video_segments') return { status: 'files_received', files_received: args.files.length };
       throw new Error(`Unexpected tool: ${name}`);
     },
@@ -53,6 +53,83 @@ async function check({ native = true, failedFetch = -1, driveFails = false } = {
   }
 }
 
+async function checkJobSwitch(stage, { backToOld = false, rejectOld = false, wrongDriveJob = false } = {}) {
+  const elements = new Map(), states = [], prompts = [], tools = [], queued = [], listeners = {};
+  const element = () => ({ append() {}, replaceChildren() {}, addEventListener() {} });
+  const job = id => ({ job_id: id, title: id, segments: [{ filename: 'segment_000.mp4', url: `https://media.example/${id}` }] });
+  let release, reached;
+  const paused = new Promise(resolve => { reached = resolve; });
+  let held = false;
+  async function pause(name) {
+    if (stage !== name || held) return;
+    held = true;
+    reached();
+    await new Promise((resolve, reject) => { release = () => rejectOld ? reject(new Error('old job failed')) : resolve(); });
+  }
+  const host = {
+    toolOutput: job('old-job'),
+    widgetState: { modelContent: 'OLD CONTEXT', privateContent: { jobId: 'obsolete-job', driveFileIds: ['obsolete-file'] } },
+    setWidgetState(state) { this.widgetState = state; states.push(state); },
+    async callTool(name, args) {
+      tools.push({ name, args });
+      await pause(name === 'upload_prepared_video_to_drive' ? 'drive' : 'ingest');
+      return name === 'upload_prepared_video_to_drive'
+        ? { status: 'drive_ready', job_id: wrongDriveJob ? 'wrong-job' : args.job_id, files: [{ file_id: `${args.job_id}-file`, file_name: 'segment_000.mp4', size_bytes: 8, url: 'https://drive.google.com/file/d/test/view' }] }
+        : { status: 'files_received', files_received: args.files.length };
+    },
+    async sendFollowUpMessage({ prompt }) { prompts.push(prompt); },
+    ...(stage !== 'drive' ? {
+      async uploadFile() { await pause('upload'); return { fileId: 'native-file' }; },
+      async getFileDownloadUrl() { await pause('download-url'); return { downloadUrl: 'https://files.example/video' }; },
+    } : {}),
+  };
+  const parent = { postMessage() {} };
+  const context = vm.createContext({
+    window: { openai: host, parent, addEventListener(name, handler) { listeners[name] = handler; } },
+    document: { getElementById: id => { if (!elements.has(id)) elements.set(id, element()); return elements.get(id); }, createElement: element },
+    async fetch() { await pause('fetch'); return { ok: true, blob: async () => new Blob(['video']) }; },
+    Blob, File, AbortController, setTimeout: () => 0, clearTimeout() {}, queueMicrotask: callback => queued.push(callback),
+  });
+  vm.runInContext(script + '\nglobalThis.start = startUpload;', context);
+  assert.equal(host.widgetState.privateContent.jobId, 'old-job');
+  assert(!JSON.stringify(host.widgetState).includes('obsolete-file'), 'Clear persisted context on mount');
+  queued.length = 0;
+  const notify = value => listeners.message({ source: parent, data: { jsonrpc: '2.0', method: 'ui/notifications/tool-result', params: { structuredContent: value } } });
+  const pending = context.start();
+  await paused;
+  if (!wrongDriveJob) {
+    notify(job('new-job'));
+    if (backToOld) notify(job('old-job'));
+    assert.equal(host.widgetState.privateContent.jobId, backToOld ? 'old-job' : 'new-job');
+    assert(!JSON.stringify(host.widgetState).includes('old-job-file'));
+    const count = states.length;
+    notify(job(backToOld ? 'old-job' : 'new-job'));
+    assert.equal(states.length, count, 'Duplicate notification must not reset context');
+  }
+  const stateCount = states.length;
+  release();
+  await pending;
+  assert.equal(prompts.length, 0, 'A superseded or mismatched result must never send a follow-up');
+  assert.equal(states.length, stateCount, 'A late completion must not overwrite current context');
+  if (wrongDriveJob) {
+    assert.match(elements.get('status').textContent, /工作不符/);
+    return;
+  }
+  assert(!elements.get('status').textContent.includes('old job failed'));
+  assert(queued.length > 0, 'The new job must be scheduled after the previous run finishes');
+  // Simulate the browser microtask queue, including the task queued by finally.
+  for (let count = 0; count < 100 && (queued.length || !prompts.length); count++) {
+    while (queued.length) queued.shift()();
+    await new Promise(resolve => setImmediate(resolve));
+  }
+  assert.equal(prompts.length, 1, 'Exactly one follow-up for the current job');
+  assert.equal(host.widgetState.privateContent.jobId, backToOld ? 'old-job' : 'new-job');
+  if (!backToOld) assert(!prompts[0].includes('old-job-file'));
+  const currentState = JSON.stringify(host.widgetState);
+  notify({ status: 'drive_ready', job_id: 'old-job', files: [] });
+  assert.equal(JSON.stringify(host.widgetState), currentState, 'A data-only response must not replace the prepared job');
+}
+
 (async () => {
   await check();
   await check({ failedFetch: 0 });
@@ -60,5 +137,9 @@ async function check({ native = true, failedFetch = -1, driveFails = false } = {
   await check({ native: false });
   await check({ failedFetch: 0, driveFails: true });
   await check({ native: false, driveFails: true });
-  console.log('PASS: 6 widget handoff scenarios');
+  for (const stage of ['drive', 'fetch', 'upload', 'download-url', 'ingest']) await checkJobSwitch(stage);
+  await checkJobSwitch('drive', { backToOld: true });
+  await checkJobSwitch('drive', { rejectOld: true });
+  await checkJobSwitch('drive', { wrongDriveJob: true });
+  console.log('PASS: 14 widget handoff scenarios');
 })().catch(error => { console.error(error); process.exitCode = 1; });

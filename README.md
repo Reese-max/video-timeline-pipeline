@@ -90,7 +90,9 @@ $env:MCP_PORT = '8787'
 .\.venv\Scripts\python mcp_server.py
 ```
 
-本機檢查：`Invoke-RestMethod http://127.0.0.1:8787/health`；ChatGPT Developer Mode 則新增 MCP app，填入 MCP tunnel 網址加 `/mcp`。若 MCP 入口是 Tailscale 或其他 ChatGPT 分析環境無法解析的網域，另設 `MCP_MEDIA_BASE_URL` 指向公開 HTTPS 媒體出口；工具完成後按 widget 的「上傳影片片段並摘要」。影片檔上傳、檔案引用交接與模型實際讀取是獨立驗收 gate。host 支援 `uploadFile`／`getFileDownloadUrl` 時走 ChatGPT 原生附件讀取；若缺少 API，或任一分段下載／上傳失敗（包括臨時網址失效、CORS、`Failed to fetch`），v6 widget 會用既有 `upload_prepared_video_to_drive` 將所有分段存到私人 Google Drive，再請 Google Drive connector 取回原始檔。Drive 失敗時停止並顯示錯誤，不會自動以伺服器端摘要代替 ChatGPT 讀取。`analyze_prepared_video` 仍保留為使用者明確選擇的獨立工具。更新後須重新整理 ChatGPT 外掛動作並產生新 widget；舊訊息中的 v5 widget 不會變成 v6。
+本機檢查：`Invoke-RestMethod http://127.0.0.1:8787/health`；ChatGPT Developer Mode 則新增 MCP app，填入 MCP tunnel 網址加 `/mcp`。若 MCP 入口是 Tailscale 或其他 ChatGPT 分析環境無法解析的網域，另設 `MCP_MEDIA_BASE_URL` 指向公開 HTTPS 媒體出口；工具完成後按 widget 的「上傳影片片段並摘要」。影片檔上傳、檔案引用交接與模型實際讀取是獨立驗收 gate。host 支援 `uploadFile`／`getFileDownloadUrl` 時走 ChatGPT 原生附件讀取；若缺少 API，或任一分段下載／上傳失敗（包括臨時網址失效、CORS、`Failed to fetch`），widget 會用既有 `upload_prepared_video_to_drive` 將所有分段存到私人 Google Drive，再請 Google Drive connector 取回原始檔。Drive 失敗時停止並顯示錯誤，不會自動以伺服器端摘要代替 ChatGPT 讀取。`analyze_prepared_video` 仍保留為使用者明確選擇的獨立工具。更新後須重新整理 ChatGPT 外掛動作並產生新 widget；舊訊息中的 v6 widget 不會自動變成 v7。
+
+v7 修正跨工作狀態：切換 job 時立即替換 model context、清除舊附件 ID，並以工作快照及遞增版本隔離非同步結果（包含 A → B → A）。舊作業回傳或失敗不得覆寫目前 context、送出摘要要求或改寫目前錯誤；待舊呼叫結束後僅啟動最新工作。已送出的上傳可能在遠端完成，但過期結果會被丟棄，不刪除已建立的檔案。Drive 回應的 job_id 必須吻合；資料型交接回應不會當成新影片。回歸測試：`node tests/test_widget_handoff.cjs`。UI URI 按 [官方快取規則](https://developers.openai.com/plugins/build/chatgpt-ui#embed-the-component-in-the-server-response) 升版為 `ui://video-timeline-pipeline/v7.html`。
 
 Drive 上傳以 1 MiB 分塊；遇到斷線、HTTP 429／5xx，最多退避重試三次，先查詢同一 resumable session 的已接收範圍，再續傳，避免盲目重建檔案。回歸檢查：`node tests/test_widget_handoff.cjs` 與 `python -m unittest discover -s tests -p test_mcp_server.py -v`。
 
