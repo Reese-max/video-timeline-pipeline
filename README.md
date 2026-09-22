@@ -195,6 +195,14 @@ python pipeline.py --url 'https://www.instagram.com/reel/<SHORTCODE>/'
 
 Bright Data 只負責作者內容發現；實際下載仍由 yt-dlp 完成，之後才是 Groq 時間戳轉錄與 MiniMax 摘要。免費額度與餘額續用行為依帳戶主控台為準，程式無法保證不扣款，因此所有 Bright Data 盤點都要求明確加上 `--allow-batch-cloud`。
 
+### Instagram 下載與診斷
+
+在執行 Pipeline 的虛擬環境安裝／更新：`python -m pip install -U "yt-dlp[default,curl-cffi]"`。虛擬環境內已安裝的套件優先於 PATH／VidBee 的獨立執行檔，避免更新了錯誤的版本。依 [yt-dlp 官方更新通道與 impersonation 文件](https://github.com/yt-dlp/yt-dlp#update-channels)，如需比較 nightly，請先在獨立測試環境使用 `python -m pip install -U --pre "yt-dlp[default,curl-cffi]"`，不要在每次下載時自動更新。
+
+Instagram 先以無登入方式下載；可用時採用 `curl_cffi` 的 Chrome impersonation，忽略外部 yt-dlp 設定與外掛，避免暗中帶入 cookies。公開下載失敗後，僅在 `YTDLP_INSTAGRAM_COOKIE_FILE` 明確設定時嘗試一次 authenticated fallback。此變數須指向使用者自行提供、位於 repo 外的 Netscape cookies 絕對路徑（建議 Unix 權限 `600`）；只複製 Instagram 網域且未過期的 cookies 到私人暫存檔，結束即清理，不覆寫原檔、不讀取瀏覽器、不傳送憑證給 ChatGPT。需要時可設定 `YTDLP_INSTAGRAM_USER_AGENT`，通常留白交給 impersonation 管理。
+
+每次實際下載在工作目錄保存 `instagram-download.json`：包含實際 yt-dlp 版本、request handlers、`curl_cffi` 版本、impersonation 能力、User-Agent 設定模式、Python／作業系統／容器標記、是否使用 cookies，以及每次嘗試的結果。失敗也會在 MCP 的錯誤文字回傳相同診斷，保留第一次失敗原因；不輸出 Cookie／Authorization 值或憑證路徑。錯誤不等於影片已刪除；cookies 也不保證能修正上游 extractor／帳戶／網路限制。Regression：`python -m unittest discover -s tests -p test_instagram_download.py -v`。
+
 ### Threads 單篇影片與 carousel
 
 公開 Threads 貼文可直接使用同一個入口，支援 `threads.com`／`threads.net` 的 `/@user/post/<ID>` 與 `/t/<ID>` 連結：
@@ -266,10 +274,10 @@ JSON 狀態仍是最短且可備份的方案；`--rss-cleanup-days` 會清掉舊
 
 ## 完整流程
 
-本機會優先重用 VidBee 隨附的 `yt-dlp.exe`；只有沒有 VidBee 時才需另裝：
+虛擬環境內優先使用已安裝的 yt-dlp 套件；其他情況仍可重用 PATH／VidBee 隨附的 `yt-dlp.exe`。Instagram 建議安裝：
 
 ```powershell
-python -m pip install yt-dlp
+python -m pip install -U "yt-dlp[default,curl-cffi]"
 ```
 
 複製 `.env.example` 為 `.env`，填入 Groq 金鑰、MiniMax Token Plan Subscription Key、帳戶平台 Base URL 與已確認可用的模型。`.env` 已由 Git 忽略；Windows 可用下列命令限制 ACL：

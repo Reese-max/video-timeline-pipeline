@@ -11,6 +11,7 @@ import datetime
 import difflib
 import email.utils
 import hashlib
+import http.cookiejar
 import importlib.util
 import io
 import json
@@ -137,6 +138,9 @@ def require_tool(name: str) -> str:
 
 
 def yt_dlp_command() -> list[str]:
+    # Use the package we install/update in this service's virtualenv, not an older PATH binary.
+    if sys.prefix != sys.base_prefix and importlib.util.find_spec("yt_dlp"):
+        return [sys.executable, "-m", "yt_dlp"]
     executable = shutil.which("yt-dlp")
     if executable:
         return [executable]
@@ -248,7 +252,8 @@ def sanitize_download_info(path: Path) -> None:
 
     def clean(value: Any) -> Any:
         if isinstance(value, dict):
-            return {key: clean(item) for key, item in value.items()}
+            return {key: clean(item) for key, item in value.items()
+                    if key.lower() not in {"cookie", "cookies", "authorization", "set-cookie"}}
         if isinstance(value, list):
             return [clean(item) for item in value]
         if isinstance(value, str) and value.startswith(("http://", "https://")):
@@ -551,6 +556,111 @@ def download_threads_video(
     return output
 
 
+def instagram_download_diagnostics(command: list[str]) -> dict[str, Any]:
+    """Read only whitelisted CLI diagnostics; verbose output can contain proxy credentials."""
+    result: dict[str, Any] = {
+        "yt_dlp_version": "unknown", "request_handlers": [], "curl_cffi_version": None,
+        "chrome_impersonation": False, "os": sys.platform, "python": sys.version.split()[0],
+        "container": Path("/.dockerenv").is_file(),
+    }
+    try:
+        probe = subprocess.run(
+            command + ["--ignore-config", "--no-plugin-dirs", "--verbose", "--list-impersonate-targets"],
+            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=20,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        result["probe_error"] = "yt-dlp diagnostics unavailable"
+        return result
+    output = probe.stdout + "\n" + probe.stderr
+    version = re.search(r"\[debug\] yt-dlp version (\S+)", output)
+    handlers = re.search(r"\[debug\] Request Handlers: ([^\r\n]+)", output)
+    curl = re.search(r"\bcurl_cffi-([\w.]+)", output)
+    result.update(
+        yt_dlp_version=version[1] if version else "unknown",
+        request_handlers=handlers[1].split(", ") if handlers else [],
+        curl_cffi_version=curl[1] if curl else None,
+        chrome_impersonation=bool(re.search(r"^Chrome-\S+\s+\S+\s+curl_cffi\s*$", output, re.MULTILINE)),
+    )
+    return result
+
+
+def download_instagram(command: list[str], url: str, job_dir: Path) -> None:
+    diagnostics = instagram_download_diagnostics(yt_dlp_command())
+    cookie_file = os.getenv("YTDLP_INSTAGRAM_COOKIE_FILE", "").strip()
+    user_agent = os.getenv("YTDLP_INSTAGRAM_USER_AGENT", "").strip()
+    diagnostics.update(
+        status="error", cookies_configured=bool(cookie_file), cookies_used=False,
+        user_agent=user_agent or "yt-dlp default; curl_cffi-managed when impersonating",
+        attempts=[],
+    )
+    redactions = {url, cookie_file}
+
+    def safe_error(error: Exception) -> str:
+        text = redact_values(str(error), redactions)
+        text = re.sub(r"(?im)\b(authorization|cookie|set-cookie):[^\r\n]*", r"\1: <redacted>", text)
+        return sanitize_public_urls(text)[-800:]
+
+    def attempt(arguments: list[str], mode: str) -> None:
+        try:
+            run_external(arguments, stream=False, redact=redactions)
+            completed = [path for path in job_dir.glob("source.*")
+                         if path.stem == "source" and path.suffix.lower() in MEDIA_EXTENSIONS and path.stat().st_size]
+            if not completed:
+                raise RuntimeError("yt-dlp 未產生完整影片；可能被大小／長度限制略過。")
+        except RuntimeError as error:
+            diagnostics["attempts"].append({"mode": mode, "status": "error", "error": safe_error(error)})
+            raise
+        diagnostics["attempts"].append({"mode": mode, "status": "ok"})
+
+    try:
+        if len(user_agent) > 512 or any(character in user_agent for character in "\r\n"):
+            diagnostics["user_agent"] = "invalid"
+            raise ValueError("YTDLP_INSTAGRAM_USER_AGENT 格式無效。")
+        options = ["--ignore-config", "--no-plugin-dirs", "--no-cookies", "--no-cookies-from-browser",
+                   "--socket-timeout", "20", "--retries", "1", "--extractor-retries", "1"]
+        if diagnostics["chrome_impersonation"]:
+            options += ["--impersonate", "chrome"]
+        if user_agent:
+            options += ["--user-agent", user_agent]
+        public_command = command[:-1] + options + [url]
+        try:
+            attempt(public_command, "public")
+        except RuntimeError:
+            if not cookie_file:
+                raise RuntimeError("公開抓取失敗；未設定 YTDLP_INSTAGRAM_COOKIE_FILE，未嘗試登入。") from None
+            path = Path(cookie_file)
+            if not path.is_absolute() or not path.is_file() or path.stat().st_size > 1024 * 1024:
+                raise RuntimeError("YTDLP_INSTAGRAM_COOKIE_FILE 必須是既有絕對路徑、至多 1 MiB 的 Netscape cookies 檔。")
+            jar = http.cookiejar.MozillaCookieJar(str(path))
+            try:
+                jar.load(ignore_discard=True)
+            except (OSError, http.cookiejar.LoadError):
+                raise RuntimeError("Instagram cookies 無法讀取或不是 Netscape 格式。") from None
+            cookies = [cookie for cookie in jar if cookie.domain.lstrip(".").lower() == "instagram.com"
+                       or cookie.domain.lower().endswith(".instagram.com")]
+            if not any(cookie.name == "sessionid" and cookie.value for cookie in cookies):
+                raise RuntimeError("Instagram cookies 沒有未過期的 sessionid；請由使用者更新授權檔案。")
+            redactions.update(cookie.value for cookie in cookies if cookie.value)
+            # yt-dlp writes back its cookie jar. Never modify the supplied credential file.
+            with tempfile.TemporaryDirectory(prefix="vtp-instagram-") as directory:
+                temporary = Path(directory) / "cookies.txt"
+                redactions.add(str(temporary))
+                scoped = http.cookiejar.MozillaCookieJar(str(temporary))
+                for cookie in cookies:
+                    scoped.set_cookie(cookie)
+                scoped.save(ignore_discard=True)
+                temporary.chmod(0o600)
+                diagnostics["cookies_used"] = True
+                attempt(public_command[:-1] + ["--cookies", str(temporary), url], "authenticated")
+        diagnostics["status"] = "ok"
+    except (OSError, ValueError, RuntimeError) as error:
+        diagnostics["error"] = safe_error(error)
+        raise RuntimeError("Instagram 下載失敗；診斷：" + json.dumps(diagnostics, ensure_ascii=False)) from None
+    finally:
+        sanitize_download_info(job_dir / "source.info.json")
+        write_json(job_dir / "instagram-download.json", diagnostics)
+
+
 def download_video(
     url: str,
     job_dir: Path,
@@ -589,7 +699,10 @@ def download_video(
     if max_duration is not None:
         command += ["--match-filter", f"duration <= {max_duration}"]
     command.append(url)
-    run_external(command, stream=not private_url, redact={url} if private_url else None)
+    if (urllib.parse.urlsplit(url).hostname or "").lower() in {"instagram.com", "www.instagram.com", "m.instagram.com"}:
+        download_instagram(command, url, job_dir)
+    else:
+        run_external(command, stream=not private_url, redact={url} if private_url else None)
     if private_url:
         sanitize_download_info(job_dir / "source.info.json")
     video_path = locate_source_video(job_dir)
