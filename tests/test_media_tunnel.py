@@ -73,7 +73,7 @@ print('200', end='')
                 urlfile = root / "media-url"
                 env = dict(os.environ, PATH=f"{root}:{os.environ['PATH']}", MCP_BASE_DIR=str(root),
                            MCP_MEDIA_URL_FILE=str(urlfile), CLOUDFLARED_BIN=str(root / "cloudflared"),
-                           TEST_SCENARIO=scenario)
+                           MCP_MEDIA_STARTUP_ATTEMPTS="5", TEST_SCENARIO=scenario)
                 process = subprocess.Popen(["bash", str(script), "test", "--worker"], env=env,
                                            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
                 try:

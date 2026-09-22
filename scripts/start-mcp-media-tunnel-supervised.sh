@@ -10,6 +10,9 @@ lockfile="${MCP_MEDIA_TUNNEL_LOCK_FILE:-${base}/mcp-media-tunnel.lock}"
 urlfile="${MCP_MEDIA_URL_FILE:-/tmp/video-timeline-media-url}"
 target="${MCP_MEDIA_TUNNEL_TARGET:-http://${MCP_HOST:-127.0.0.1}:${MCP_PORT:-8787}}"
 cloudflared="${CLOUDFLARED_BIN:-$(command -v cloudflared 2>/dev/null || true)}"
+startup_attempts="${MCP_MEDIA_STARTUP_ATTEMPTS:-300}"
+case "${startup_attempts}" in ''|*[!0-9]*) exit 1 ;; esac
+[ "${startup_attempts}" -ge 1 ] && [ "${startup_attempts}" -le 900 ] || exit 1
 script_path="$(readlink -f "${BASH_SOURCE[0]}")"
 probe() {
 	curl --silent --output /dev/null --write-out '%{http_code}' \
@@ -35,7 +38,9 @@ if [ "${mode}" = "--worker" ]; then
 		"${cloudflared}" tunnel --url "${target}" --no-autoupdate >>"${log}" 2>&1 &
 		tunnel_pid="$!"
 		url=""
-		for _ in $(seq 1 60); do
+		# New quick-tunnel names can remain negatively cached at the host resolver.
+		# Allow propagation before replacing a newly registered, otherwise healthy tunnel.
+		for _ in $(seq 1 "${startup_attempts}"); do
 			if ! kill -0 "${tunnel_pid}" 2>/dev/null; then
 				break
 			fi
