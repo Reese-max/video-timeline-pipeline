@@ -90,13 +90,23 @@ $env:MCP_PORT = '8787'
 .\.venv\Scripts\python mcp_server.py
 ```
 
-本機檢查：`Invoke-RestMethod http://127.0.0.1:8787/health`；ChatGPT Developer Mode 則新增 MCP app，填入 MCP tunnel 網址加 `/mcp`。若 MCP 入口是 Tailscale 或其他 ChatGPT 分析環境無法解析的網域，另設 `MCP_MEDIA_BASE_URL` 指向公開 HTTPS 媒體出口；工具完成後按 widget 的「上傳影片片段並摘要」。影片檔上傳、檔案引用交接與模型實際讀取是獨立驗收 gate。host 支援 `uploadFile`／`getFileDownloadUrl` 時走 ChatGPT 原生附件讀取；若缺少 API，或任一分段下載／上傳失敗（包括臨時網址失效、CORS、`Failed to fetch`），widget 會用既有 `upload_prepared_video_to_drive` 將所有分段存到私人 Google Drive，再請 Google Drive connector 取回原始檔。Drive 失敗時停止並顯示錯誤，不會自動以伺服器端摘要代替 ChatGPT 讀取。`analyze_prepared_video` 仍保留為使用者明確選擇的獨立工具。更新後須重新整理 ChatGPT 外掛動作並產生新 widget；舊訊息中的 v6 widget 不會自動變成 v7。
+本機檢查：`Invoke-RestMethod http://127.0.0.1:8787/health`；ChatGPT Developer Mode 則新增 MCP app，填入 MCP tunnel 網址加 `/mcp`。若 MCP 入口是 Tailscale 或其他 ChatGPT 分析環境無法解析的網域，另設 `MCP_MEDIA_BASE_URL` 指向公開 HTTPS 媒體出口；工具完成後按 widget 的「上傳影片片段並摘要」。影片檔上傳、檔案引用交接與模型實際讀取是獨立驗收 gate。host 支援 `uploadFile`／`getFileDownloadUrl` 時走 ChatGPT 原生附件讀取；若缺少 API，或任一分段下載／上傳失敗（包括臨時網址失效、CORS、`Failed to fetch`），widget 會用既有 `upload_prepared_video_to_drive` 將所有分段存到私人 Google Drive，再請 Google Drive connector 取回原始檔。Drive 失敗時停止並顯示錯誤，不會自動以伺服器端摘要代替 ChatGPT 讀取。`analyze_prepared_video` 仍保留為使用者明確選擇的獨立工具。更新後須重新整理 ChatGPT 外掛動作並產生新 widget；舊訊息中的 v6／v7 widget 不會自動變成 v8。
 
 v7 修正跨工作狀態：切換 job 時立即替換 model context、清除舊附件 ID，並以工作快照及遞增版本隔離非同步結果（包含 A → B → A）。舊作業回傳或失敗不得覆寫目前 context、送出摘要要求或改寫目前錯誤；待舊呼叫結束後僅啟動最新工作。已送出的上傳可能在遠端完成，但過期結果會被丟棄，不刪除已建立的檔案。Drive 回應的 job_id 必須吻合；資料型交接回應不會當成新影片。回歸測試：`node tests/test_widget_handoff.cjs`。UI URI 按 [官方快取規則](https://developers.openai.com/plugins/build/chatgpt-ui#embed-the-component-in-the-server-response) 升版為 `ui://video-timeline-pipeline/v7.html`。
 
+v8 保留 v7 的工作隔離，下載期限改為涵蓋 HTTP 回應與完整 `blob()` 讀取；內容串流卡住也會在 30 秒中止並走 Drive fallback。UI URI 為 `ui://video-timeline-pipeline/v8.html`。時間軸改讀 FFmpeg `segments.csv` 的實際 muxer 起訖（非 `index × segment_seconds`），並停用負時間戳自動平移，避免編碼延遲造成偏移；manifest 升為 v2，重新 prepare 時會重建舊估算快取。超過 999 的分段使用數字排序，媒體與預覽路由亦接受較長索引。
+
 Drive 上傳以 1 MiB 分塊；遇到斷線、HTTP 429／5xx，最多退避重試三次，先查詢同一 resumable session 的已接收範圍，再續傳，避免盲目重建檔案。回歸檢查：`node tests/test_widget_handoff.cjs` 與 `python -m unittest discover -s tests -p test_mcp_server.py -v`。
 
-可用環境變數：`MCP_MAX_SOURCE_MB`（預設 512）、`MCP_MAX_SEGMENT_SECONDS`（預設 600）、`MCP_MAX_SEGMENTS`（預設 0，不限段數；設為正整數可加硬上限）、`MCP_ROOT`（預設 repo 根目錄）、`TRANSCRIBE_BACKEND`（`groq` 或 `local`）、`GROQ_ASR_MODEL`、`MINIMAX_MODEL`。工具的 `max_segments` 預設不設上限；仍受來源大小與每段最長時間限制。目前是同步下載／切段，適合開發者模式與中短片；長片佇列與自動清理留待有實際使用量再加。Drive fallback 另需 `GOOGLE_DRIVE_FOLDER_ID`（可留白表示根目錄）及 `GOOGLE_DRIVE_REFRESH_TOKEN`、`GOOGLE_DRIVE_CLIENT_ID`、`GOOGLE_DRIVE_CLIENT_SECRET`；`GOOGLE_DRIVE_ACCESS_TOKEN` 僅適合短期測試。這些憑證只放在 MCP 主機環境，不提交到 Git；OAuth 使用者必須能讀取該資料夾，否則 ChatGPT 的 Google Drive connector 無法取回影片。
+跨呼叫重試也保留進度：採 [Google Drive 預先配置 ID](https://developers.google.com/workspace/drive/api/guides/manage-uploads#use_a_pre-generated_id_to_upload_files)，先原子保存 ID 再建立資料夾／影片。每次重用都重新讀取 Drive，確認未進垃圾桶、大小、SHA-256 與父資料夾；403／網路錯誤會停止，不把它當成不存在。已刪除或被修改的檔案會建立新 ID，不覆寫原檔。只有全部驗證成功才標示 `drive_ready`。舊版未記錄的孤立上傳不會自動刪除。此實作使用單程序鎖與 JSON checkpoint；多程序部署需先換成共享鎖，大量分段若 checkpoint 寫入成為瓶頸，再改成增量日誌。
+
+可用環境變數：`MCP_MAX_SOURCE_MB`（預設 512）、`MCP_MAX_SEGMENT_SECONDS`（預設 600）、`MCP_MAX_SEGMENTS`（預設 0，不限段數；設為正整數後，省略 `max_segments` 也不會繞過伺服器上限）、`MCP_MIN_FREE_MB`（預設保留 1024 MiB）、`MCP_ROOT`（預設 repo 根目錄）、`TRANSCRIBE_BACKEND`（`groq` 或 `local`）、`GROQ_ASR_MODEL`、`MINIMAX_MODEL`。工具的 `max_segments` 預設仍不設上限。
+
+容量保護是事前檢查：下載前預留來源上限，切割／分析前至少再預留一份來源大小與最低剩餘空間；轉碼大小不固定，這不是磁碟配額保證。準備、分析、Drive 上傳共用單程序工作鎖；忙碌時立即回傳可重試錯誤，不讓背景執行緒無限排隊。仍採同步處理；持久化長片佇列、Drive 配額管理、定期刪除未實作。沒有保留天數授權時不刪除任何既有影片。
+
+Drive fallback 另需 `GOOGLE_DRIVE_FOLDER_ID`（可留白表示根目錄）及 `GOOGLE_DRIVE_REFRESH_TOKEN`、`GOOGLE_DRIVE_CLIENT_ID`、`GOOGLE_DRIVE_CLIENT_SECRET`；`GOOGLE_DRIVE_ACCESS_TOKEN` 僅適合短期測試。這些憑證只放在 MCP 主機環境，不提交到 Git；OAuth 使用者必須能讀取該資料夾，否則 ChatGPT 的 Google Drive connector 無法取回影片。Drive OAuth 僅處理儲存端授權，**不代表 MCP 公開入口已驗證呼叫者**；本版沒有更動入口驗證設定。
+
+可靠性回歸：`python -m unittest discover -s tests -p test_mcp_reliability.py -v` 含實際 FFmpeg 影音切割／解碼、非整秒影格邊界、快取失效、Drive 中斷／重試／校驗、段數限制、容量與 SQLite 關閉檢查。Drive 部分使用模擬 API；不等於已完成線上 Drive 或 ChatGPT 新版 widget 驗收。
 
 Drive 工具只回傳結構化檔案資訊與文字說明，不把私有 `webViewLink` 包裝成 MP4 `resource_link`。檢視頁回傳的是 HTML；必須由已授權的 Google Drive connector 執行 `fetch(download_raw_file=true, include_base64=false)` 取得原始影片，避免 ChatGPT 嘗試直接實體化檢視頁而中斷交接。
 

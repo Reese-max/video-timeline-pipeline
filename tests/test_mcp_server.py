@@ -290,6 +290,8 @@ class MCPValidationTests(unittest.TestCase):
             segment_rows = [{"filename": segment_path.name}]
             folder = {
                 "id": "folder_1",
+                "mimeType": drive_storage.FOLDER_MIME,
+                "parents": ["parent"],
                 "webViewLink": "https://drive.google.com/drive/folders/folder_1",
             }
             uploaded = {
@@ -297,6 +299,8 @@ class MCPValidationTests(unittest.TestCase):
                 "name": "segment_000.mp4",
                 "mimeType": "video/mp4",
                 "size": 8,
+                "sha256Checksum": drive_storage._sha256(segment_path),
+                "parents": ["folder_1"],
                 "webViewLink": "https://drive.google.com/file/d/file_1/view",
             }
             with (
@@ -306,6 +310,8 @@ class MCPValidationTests(unittest.TestCase):
                     clear=False,
                 ),
                 patch.object(drive_storage, "_access_token", return_value="token"),
+                patch.object(drive_storage, "_new_id", side_effect=["folder_1", "file_1"]),
+                patch.object(drive_storage, "_get_file", side_effect=lambda token, fid: folder if fid == "folder_1" else uploaded),
                 patch.object(drive_storage, "_create_folder", return_value=folder) as create_folder,
                 patch.object(drive_storage, "_upload_file", return_value=uploaded) as upload_file,
             ):

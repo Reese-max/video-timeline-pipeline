@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import asyncio
+import csv
 import ipaddress
 import json
 import math
 import mimetypes
 import os
 import re
+import shutil
 import socket
 import threading
 from pathlib import Path
@@ -41,13 +43,14 @@ MCP_JOBS_ROOT = MCP_ROOT / "mcp_jobs"
 MCP_MAX_SOURCE_BYTES = env_int("MCP_MAX_SOURCE_MB", 512) * 1024 * 1024
 MCP_MAX_SEGMENT_SECONDS = env_int("MCP_MAX_SEGMENT_SECONDS", 600)
 MCP_MAX_SEGMENTS = env_int("MCP_MAX_SEGMENTS", 0)
+MCP_MIN_FREE_BYTES = max(0, env_int("MCP_MIN_FREE_MB", 1024)) * 1024 * 1024
 MCP_PUBLIC_BASE_URL = (
     os.getenv("MCP_PUBLIC_BASE_URL", "") or f"http://{MCP_HOST}:{MCP_PORT}"
 ).rstrip("/")
 MCP_MEDIA_BASE_URL = (
     os.getenv("MCP_MEDIA_BASE_URL", "") or MCP_PUBLIC_BASE_URL
 ).rstrip("/")
-UI_URI = "ui://video-timeline-pipeline/v7.html"
+UI_URI = "ui://video-timeline-pipeline/v8.html"
 PUBLIC_URL = urlsplit(MCP_PUBLIC_BASE_URL)
 MEDIA_URL = urlsplit(MCP_MEDIA_BASE_URL)
 UI_ORIGIN = f"{PUBLIC_URL.scheme}://{PUBLIC_URL.netloc}"
@@ -274,6 +277,8 @@ def segment_bounds(
         raise ValueError("max_segments 必須是正整數，或省略以取消上限。")
     if MCP_MAX_SEGMENTS > 0 and max_segments is not None and max_segments > MCP_MAX_SEGMENTS:
         raise ValueError(f"max_segments 不可超過 {MCP_MAX_SEGMENTS}。")
+    if MCP_MAX_SEGMENTS > 0:
+        max_segments = MCP_MAX_SEGMENTS if max_segments is None else min(max_segments, MCP_MAX_SEGMENTS)
     if duration <= 0:
         raise RuntimeError("影片沒有可用的長度資訊。")
     count = math.ceil(duration / segment_seconds)
@@ -281,6 +286,7 @@ def segment_bounds(
         raise ValueError(
             f"影片長度 {duration:.0f} 秒需要 {count} 段，超過 max_segments={max_segments}；"
             "請提高 segment_seconds、設定較高的 max_segments，或省略 max_segments。"
+            "省略參數仍受 MCP_MAX_SEGMENTS 伺服器上限限制。"
         )
     return [
         (start, min(duration, start + segment_seconds))
@@ -300,9 +306,9 @@ def safe_media_path(job_id: str, relative_name: str) -> Path | None:
     if relative.is_absolute() or ".." in relative.parts or len(relative.parts) != 2:
         return None
     directory, filename = relative.parts
-    if directory == "segments" and not re.fullmatch(r"segment_\d{3}\.mp4", filename):
+    if directory == "segments" and not re.fullmatch(r"segment_\d{3,}\.mp4", filename):
         return None
-    if directory == "previews" and not re.fullmatch(r"preview_\d{3}\.jpg", filename):
+    if directory == "previews" and not re.fullmatch(r"preview_\d{3,}\.jpg", filename):
         return None
     if directory not in {"segments", "previews"}:
         return None
@@ -327,6 +333,8 @@ def read_manifest(job_dir: Path) -> dict | None:
 def manifest_is_ready(
     manifest: dict, video_path: Path, segment_seconds: int, max_segments: int | None
 ) -> bool:
+    if manifest.get("version") != 2:
+        return False
     if manifest.get("segment_seconds") != segment_seconds or manifest.get("max_segments") != max_segments:
         return False
     source = manifest.get("source") or {}
@@ -341,7 +349,7 @@ def manifest_is_ready(
     return bool(manifest.get("segments"))
 
 
-def split_video(video_path: Path, segment_dir: Path, segment_seconds: int) -> list[Path]:
+def split_video(video_path: Path, segment_dir: Path, segment_seconds: int) -> list[tuple[Path, float, float]]:
     segment_dir.mkdir(parents=True, exist_ok=True)
     for stale in segment_dir.glob("segment_*.mp4"):
         stale.unlink()
@@ -374,16 +382,45 @@ def split_video(video_path: Path, segment_dir: Path, segment_seconds: int) -> li
             "segment",
             "-segment_time",
             str(segment_seconds),
+            "-segment_list",
+            str(segment_dir / "segments.csv"),
+            "-segment_list_type",
+            "csv",
+            "-avoid_negative_ts",
+            "disabled",
             "-reset_timestamps",
             "1",
             str(segment_dir / "segment_%03d.mp4"),
         ],
         stream=True,
     )
-    segments = sorted(segment_dir.glob("segment_*.mp4"))
+    segments = sorted(segment_dir.glob("segment_*.mp4"), key=lambda p: int(p.stem.split("_")[-1]))
     if not segments:
         raise RuntimeError("FFmpeg 沒有產生影片片段。")
-    return segments
+    rows = list(csv.reader((segment_dir / "segments.csv").read_text(encoding="utf-8-sig").splitlines()))
+    if len(rows) != len(segments):
+        raise RuntimeError("FFmpeg 影片分段與實際時間清單數量不一致。")
+    result = []
+    previous_end = 0.0
+    for path, row in zip(segments, rows, strict=True):
+        if len(row) != 3 or Path(row[0]).name != path.name:
+            raise RuntimeError("FFmpeg 影片分段時間清單格式錯誤。")
+        start, end = float(row[1]), float(row[2])
+        if not (math.isfinite(start) and math.isfinite(end) and 0 <= start < end
+                and start >= previous_end - 0.001):
+            raise RuntimeError("FFmpeg 影片分段時間無效或重疊。")
+        result.append((path, start, end))
+        previous_end = end
+    return result
+
+
+def require_disk_space(additional_bytes: int = 0) -> None:
+    MCP_JOBS_ROOT.mkdir(parents=True, exist_ok=True)
+    free = shutil.disk_usage(MCP_JOBS_ROOT).free
+    required = MCP_MIN_FREE_BYTES + additional_bytes
+    if free < required:
+        raise RuntimeError(f"MCP 磁碟空間不足：剩餘 {free // (1024 * 1024)} MiB，"
+                           f"至少需要 {required // (1024 * 1024)} MiB；請先整理舊工作，本工具不會自動刪除影片。")
 
 
 def extract_preview(segment_path: Path, preview_path: Path) -> bool:
@@ -417,6 +454,8 @@ def extract_preview(segment_path: Path, preview_path: Path) -> bool:
 def prepare_video_sync(url: str, segment_seconds: int, max_segments: int | None) -> dict:
     source_url = validate_source_url(url)
     segment_bounds(1, segment_seconds, max_segments)
+    if MCP_MAX_SEGMENTS > 0 and max_segments is None:
+        max_segments = MCP_MAX_SEGMENTS
     job_id = pipeline.job_key(source_url, f"mcp-video-v1:{segment_seconds}:{max_segments}")
     job_dir = MCP_JOBS_ROOT / job_id
     job_dir.mkdir(parents=True, exist_ok=True)
@@ -424,6 +463,7 @@ def prepare_video_sync(url: str, segment_seconds: int, max_segments: int | None)
     try:
         video_path = pipeline.locate_source_video(job_dir)
     except RuntimeError:
+        require_disk_space(MCP_MAX_SOURCE_BYTES)
         video_path = pipeline.download_video(
             source_url,
             job_dir,
@@ -438,18 +478,19 @@ def prepare_video_sync(url: str, segment_seconds: int, max_segments: int | None)
     if not any(stream.get("codec_type") == "video" for stream in probe.get("streams", [])):
         raise RuntimeError("來源沒有視訊串流。")
     duration = pipeline.video_duration(probe)
-    bounds = segment_bounds(duration, segment_seconds, max_segments)
+    segment_bounds(duration, segment_seconds, max_segments)
     existing = read_manifest(job_dir)
     if existing and manifest_is_ready(existing, video_path, segment_seconds, max_segments):
         return existing
 
+    require_disk_space(video_path.stat().st_size)
+    pipeline.write_json(job_dir / "manifest.json", {"version": 2, "status": "preparing", "job_id": job_id})
     segments = split_video(video_path, job_dir / "segments", segment_seconds)
     if max_segments is not None and len(segments) > max_segments:
         raise RuntimeError(f"FFmpeg 產生 {len(segments)} 段，超過 max_segments={max_segments}。")
     previews_dir = job_dir / "previews"
     segment_rows = []
-    for index, segment_path in enumerate(segments):
-        start, end = bounds[min(index, len(bounds) - 1)]
+    for index, (segment_path, start, end) in enumerate(segments):
         preview_name = f"preview_{index:03d}.jpg"
         preview_path = previews_dir / preview_name
         has_preview = extract_preview(segment_path, preview_path)
@@ -466,7 +507,7 @@ def prepare_video_sync(url: str, segment_seconds: int, max_segments: int | None)
         )
 
     manifest = {
-        "version": 1,
+        "version": 2,
         "status": "ready",
         "job_id": job_id,
         "source": {
@@ -485,8 +526,16 @@ def prepare_video_sync(url: str, segment_seconds: int, max_segments: int | None)
 
 
 def prepare_video_locked(url: str, segment_seconds: int, max_segments: int | None) -> dict:
-    with JOB_LOCK:
-        return prepare_video_sync(url, segment_seconds, max_segments)
+    return run_job(prepare_video_sync, url, segment_seconds, max_segments)
+
+
+def run_job(operation, *args):
+    if not JOB_LOCK.acquire(blocking=False):
+        raise RuntimeError("MCP 正在處理另一個影片工作，請稍後重試；本次未加入背景佇列。")
+    try:
+        return operation(*args)
+    finally:
+        JOB_LOCK.release()
 
 
 def tool_payload(manifest: dict) -> dict:
@@ -609,7 +658,6 @@ def analyze_prepared_sync(job_id: str) -> dict[str, Any]:
     video_path = pipeline.locate_source_video(job_dir)
     source_fingerprint = pipeline.file_fingerprint(video_path)
     analysis_dir = job_dir / "analysis"
-    analysis_dir.mkdir(parents=True, exist_ok=True)
     result_path = analysis_dir / "result.json"
     cached = pipeline.reuse_artifact(result_path)
     if (
@@ -619,6 +667,8 @@ def analyze_prepared_sync(job_id: str) -> dict[str, Any]:
     ):
         return cached
 
+    require_disk_space(video_path.stat().st_size)
+    analysis_dir.mkdir(parents=True, exist_ok=True)
     probe = pipeline.probe_video(video_path, analysis_dir / "source.probe.json")
     duration = pipeline.video_duration(probe)
     has_audio = any(stream.get("codec_type") == "audio" for stream in probe.get("streams", []))
@@ -890,7 +940,7 @@ WIDGET_HTML = r"""<!doctype html>
       const result = await request("ui/initialize", {
         protocolVersion: "2026-01-26",
         appCapabilities: {},
-        clientInfo: { name: "video-timeline-pipeline", version: "7" },
+        clientInfo: { name: "video-timeline-pipeline", version: "8" },
       });
       window.parent.postMessage({
         jsonrpc: "2.0",
@@ -985,17 +1035,17 @@ WIDGET_HTML = r"""<!doctype html>
     async function upload(host, url, name, type, version) {
       const controller = new AbortController();
       const timer = setTimeout(() => controller.abort(), 30000);
-      let response;
+      let blob;
       try {
-        response = await fetch(url, { credentials: "omit", signal: controller.signal });
+        const response = await fetch(url, { credentials: "omit", signal: controller.signal });
+        checkJob(version);
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        blob = await response.blob();
       } catch (error) {
         throw new Error(`下載 ${name} 失敗：${error.name === "AbortError" ? "逾時" : error.message}`);
       } finally {
         clearTimeout(timer);
       }
-      checkJob(version);
-      if (!response.ok) throw new Error(`下載 ${name} 失敗（HTTP ${response.status}）`);
-      const blob = await response.blob();
       checkJob(version);
       const result = await host.uploadFile(new File([blob], name, { type }), { library: false });
       checkJob(version);
@@ -1218,7 +1268,7 @@ async def analyze_prepared_video(
     job_id: str,
 ) -> Annotated[types.CallToolResult, PreparedVideoAnalysisResult]:
     try:
-        result = await asyncio.to_thread(analyze_prepared_sync, job_id)
+        result = await asyncio.to_thread(run_job, analyze_prepared_sync, job_id)
     except Exception as error:
         return analysis_tool_error_result(error)
     return analysis_tool_result(result)
@@ -1249,22 +1299,21 @@ async def upload_prepared_video_to_drive(
     job_id: str,
 ) -> Annotated[types.CallToolResult, DriveUploadResult]:
     try:
-        job_dir = prepared_job_dir(job_id)
-        manifest = read_manifest(job_dir)
-        if not manifest:
-            raise RuntimeError("影片尚未準備完成，請先呼叫 prepare_video_for_chatgpt。")
-        source = manifest.get("source") or {}
-        result = await asyncio.to_thread(
-            drive_storage.upload_prepared_segments,
-            job_dir,
-            job_id,
-            str(source.get("title") or job_id),
-            str(source.get("fingerprint") or ""),
-            list(manifest.get("segments") or []),
-        )
+        result = await asyncio.to_thread(run_job, upload_prepared_drive_sync, job_id)
     except Exception as error:
         return drive_tool_error_result(error)
     return drive_tool_result(result)
+
+
+def upload_prepared_drive_sync(job_id: str) -> dict:
+    job_dir = prepared_job_dir(job_id)
+    manifest = read_manifest(job_dir)
+    if not manifest:
+        raise RuntimeError("影片尚未準備完成，請先呼叫 prepare_video_for_chatgpt。")
+    source = manifest.get("source") or {}
+    return drive_storage.upload_prepared_segments(
+        job_dir, job_id, str(source.get("title") or job_id),
+        str(source.get("fingerprint") or ""), list(manifest.get("segments") or []))
 
 
 @mcp.tool(

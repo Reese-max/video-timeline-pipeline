@@ -1,0 +1,209 @@
+import csv
+import json
+import shutil
+import tempfile
+import unittest
+import urllib.error
+from pathlib import Path
+from unittest.mock import patch
+
+import drive_storage as drive
+import mcp_server as server
+
+
+class ReliabilityTests(unittest.TestCase):
+    def test_server_limit_applies_when_argument_is_omitted(self):
+        with patch.object(server, "MCP_MAX_SEGMENTS", 1):
+            with self.assertRaisesRegex(ValueError, "max_segments"):
+                server.segment_bounds(301, 120, None)
+
+    def test_media_accepts_four_digit_indices_without_loosening_paths(self):
+        with tempfile.TemporaryDirectory() as raw, patch.object(server, "MCP_JOBS_ROOT", Path(raw)):
+            folder = Path(raw) / "0123456789ab" / "segments"
+            folder.mkdir(parents=True)
+            target = folder / "segment_1000.mp4"
+            target.write_bytes(b"mp4")
+            self.assertEqual(server.safe_media_path(folder.parent.name, "segments/segment_1000.mp4"), target.resolve())
+            self.assertIsNone(server.safe_media_path(folder.parent.name, "segments/../segment_1000.mp4"))
+
+    def test_old_nominal_timeline_cache_is_not_reused(self):
+        with patch.object(server.pipeline, "file_fingerprint", return_value="same"):
+            manifest = {"version": 1, "segment_seconds": 120, "max_segments": None,
+                        "source": {"fingerprint": "same"}, "segments": [{"filename": "segment_000.mp4"}]}
+            with tempfile.TemporaryDirectory() as raw:
+                source = Path(raw) / "source.mp4"
+                (Path(raw) / "segments").mkdir()
+                (Path(raw) / "segments" / "segment_000.mp4").write_bytes(b"mp4")
+                self.assertFalse(server.manifest_is_ready(manifest, source, 120, None))
+
+    def test_prepare_publishes_observed_times_and_invalidates_old_ready_first(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            job_dir = root / "0123456789ab"
+            (job_dir / "segments").mkdir(parents=True)
+            source = job_dir / "source.mp4"
+            source.write_bytes(b"source")
+            parts = [(job_dir / "segments" / f"segment_{i:03}.mp4", start, end)
+                     for i, (start, end) in enumerate([(0, 15.143), (15.143, 30.286), (30.286, 31.143)])]
+            for path, _, _ in parts:
+                path.write_bytes(b"video")
+            server.pipeline.write_json(job_dir / "manifest.json", {"version": 1, "status": "ready"})
+            def split(*_args):
+                self.assertIsNone(server.read_manifest(job_dir))
+                return parts
+            with (patch.object(server, "MCP_JOBS_ROOT", root),
+                  patch.object(server, "validate_source_url", side_effect=lambda url: url),
+                  patch.object(server.pipeline, "job_key", return_value=job_dir.name),
+                  patch.object(server.pipeline, "probe_video", return_value={"format": {"duration": "31.143"}, "streams": [{"codec_type": "video"}]}),
+                  patch.object(server, "split_video", side_effect=split),
+                  patch.object(server, "extract_preview", return_value=False),
+                  patch.object(server, "require_disk_space")):
+                result = server.prepare_video_sync("https://example.test/video", 15, None)
+            self.assertEqual(result["version"], 2)
+            self.assertEqual([(r["start_seconds"], r["end_seconds"]) for r in result["segments"]],
+                             [(start, end) for _, start, end in parts])
+
+    @unittest.skipUnless(shutil.which("ffmpeg") and shutil.which("ffprobe"), "FFmpeg required")
+    def test_real_segments_use_muxer_timestamps_not_requested_boundaries(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            source = root / "source.mp4"
+            server.pipeline.run_external([
+                server.pipeline.require_tool("ffmpeg"), "-v", "error", "-f", "lavfi", "-i",
+                "testsrc2=size=64x64:rate=7/2:duration=31", "-f", "lavfi", "-i",
+                "sine=frequency=880:duration=31", "-c:v", "libx264", "-c:a", "aac", str(source)])
+            parts = server.split_video(source, root / "segments", 15)
+            rows = list(csv.reader((root / "segments" / "segments.csv").read_text().splitlines()))
+            self.assertEqual(len(parts), 3)
+            self.assertNotEqual(float(rows[1][1]), 15.0)
+            for (path, start, end), row in zip(parts, rows, strict=True):
+                self.assertEqual(path.name, row[0])
+                self.assertEqual((start, end), (float(row[1]), float(row[2])))
+                self.assertTrue(path.is_file())
+                server.pipeline.run_external([server.pipeline.require_tool("ffmpeg"), "-v", "error",
+                                              "-i", str(path), "-f", "null", "-"])
+            self.assertAlmostEqual(parts[-1][2], 218 / 7, places=3)
+            self.assertAlmostEqual(parts[1][1], 106 / 7, places=3)
+
+    def test_busy_and_low_disk_fail_without_starting_work(self):
+        from types import SimpleNamespace
+        from unittest.mock import Mock
+        operation = Mock()
+        with server.JOB_LOCK:
+            with self.assertRaisesRegex(RuntimeError, "請稍後重試"):
+                server.run_job(operation)
+        operation.assert_not_called()
+        with self.assertRaisesRegex(ValueError, "failed"):
+            server.run_job(lambda: (_ for _ in ()).throw(ValueError("failed")))
+        self.assertFalse(server.JOB_LOCK.locked())
+        with tempfile.TemporaryDirectory() as raw, patch.object(server, "MCP_JOBS_ROOT", Path(raw)):
+            with patch.object(server.shutil, "disk_usage", return_value=SimpleNamespace(free=1)):
+                with self.assertRaisesRegex(RuntimeError, "磁碟空間不足"):
+                    server.require_disk_space(10)
+
+    def test_database_handles_close_even_when_schema_setup_fails(self):
+        from unittest.mock import MagicMock
+        import cost_tracker
+        import notifications
+        connection = MagicMock()
+        with (patch.object(notifications.sqlite3, "connect", return_value=connection),
+              patch.object(notifications, "_init_operations_schema", side_effect=RuntimeError("schema"))):
+            with self.assertRaisesRegex(RuntimeError, "schema"):
+                notifications.get_operations_db(Path("unused"))
+        connection.close.assert_called_once()
+        connection.reset_mock()
+        with (patch.object(cost_tracker, "get_operations_db", return_value=connection),
+              patch.object(cost_tracker, "_init_cost_schema", side_effect=RuntimeError("schema"))):
+            with self.assertRaisesRegex(RuntimeError, "schema"):
+                cost_tracker.get_cost_report(Path("unused"))
+        connection.close.assert_called_once()
+
+    def test_drive_partial_and_lost_responses_reuse_ids_and_verify_cache(self):
+        # Exercise a real on-disk journal, including a restart after Drive committed the bytes.
+        for committed in (False, True):
+            with self.subTest(committed=committed), tempfile.TemporaryDirectory() as raw:
+                root = Path(raw)
+                (root / "segments").mkdir()
+                for i in range(2):
+                    (root / "segments" / f"segment_{i:03}.mp4").write_bytes(f"video-{i}".encode())
+                rows = [{"filename": f"segment_{i:03}.mp4"} for i in range(2)]
+                remote, uploaded, folders = {}, [], []
+                next_id, fail = 0, True
+
+                def reserve(_token):
+                    nonlocal next_id
+                    next_id += 1
+                    return f"id_{next_id}"
+
+                def folder(_token, name, parent, file_id=None):
+                    folders.append(file_id)
+                    remote[file_id] = {"id": file_id, "mimeType": drive.FOLDER_MIME, "parents": [],
+                                       "webViewLink": f"https://drive.google.com/drive/folders/{file_id}"}
+                    return remote[file_id]
+
+                def upload(_token, path, name, parent, *, file_id):
+                    nonlocal fail
+                    uploaded.append(file_id)
+                    should_fail = name == "segment_001.mp4" and fail
+                    if not should_fail or committed:
+                        remote[file_id] = {"id": file_id, "mimeType": "video/mp4", "parents": [parent],
+                            "size": str(path.stat().st_size), "sha256Checksum": drive._sha256(path),
+                            "webViewLink": f"https://drive.google.com/file/d/{file_id}/view"}
+                    if should_fail:
+                        fail = False
+                        raise RuntimeError("lost response")
+                    return remote[file_id]
+
+                with (patch.object(drive, "configured", return_value=True),
+                      patch.object(drive, "_access_token", return_value="test"),
+                      patch.object(drive, "_env", return_value=""),
+                      patch.object(drive, "_new_id", side_effect=reserve),
+                      patch.object(drive, "_create_folder", side_effect=folder),
+                      patch.object(drive, "_upload_file", side_effect=upload),
+                      patch.object(drive, "_get_file", side_effect=lambda _, fid: remote.get(fid))):
+                    args = (root, "0123456789ab", "demo", "source", rows)
+                    with self.assertRaisesRegex(RuntimeError, "lost response"):
+                        drive.upload_prepared_segments(*args)
+                    journal = json.loads((root / "drive-manifest.json").read_text())
+                    self.assertEqual(journal["status"], "uploading")
+                    second = drive.upload_prepared_segments(*args)
+                    self.assertEqual(second["status"], "drive_ready")
+                    self.assertEqual(folders, ["id_1"])
+                    self.assertEqual(uploaded, ["id_2", "id_3"] if committed else ["id_2", "id_3", "id_3"])
+                    self.assertEqual(drive.upload_prepared_segments(*args), second)
+                    # Deleted or edited files must not be returned as ready or overwritten.
+                    del remote["id_2"]
+                    repaired = drive.upload_prepared_segments(*args)
+                    self.assertEqual(repaired["files"][0]["file_id"], "id_4")
+                    self.assertEqual(repaired["files"][1]["file_id"], "id_3")
+                    remote["id_3"]["sha256Checksum"] = "edited-by-user"
+                    repaired = drive.upload_prepared_segments(*args)
+                    self.assertEqual(repaired["files"][1]["file_id"], "id_5")
+                    self.assertEqual(remote["id_3"]["sha256Checksum"], "edited-by-user")
+                    before = list(uploaded)
+                    with patch.object(drive, "_get_file", side_effect=drive.DriveAPIError(403)):
+                        with self.assertRaisesRegex(RuntimeError, "403"):
+                            drive.upload_prepared_segments(*args)
+                    self.assertEqual(uploaded, before)
+                    self.assertEqual(json.loads((root / "drive-manifest.json").read_text())["status"], "uploading")
+
+    def test_drive_conflict_reads_back_reserved_id_and_get_has_no_body(self):
+        from unittest.mock import MagicMock
+        metadata = {"id": "reserved", "webViewLink": "https://drive.google.com/file/d/reserved/view"}
+        with tempfile.TemporaryDirectory() as raw:
+            path = Path(raw) / "video.mp4"
+            path.write_bytes(b"video")
+            with (patch.object(drive.urllib.request, "urlopen", side_effect=urllib.error.HTTPError("https://example.test", 409, "conflict", {}, None)),
+                  patch.object(drive, "_get_file", return_value=metadata) as readback):
+                self.assertEqual(drive._upload_file("test", path, path.name, "folder", file_id="reserved"), metadata)
+                readback.assert_called_once_with("test", "reserved")
+        response = MagicMock()
+        response.__enter__.return_value.read.return_value = json.dumps(metadata).encode()
+        with patch.object(drive.urllib.request, "urlopen", return_value=response) as request:
+            drive._get_file("test", "reserved")
+            self.assertIsNone(request.call_args.args[0].data)
+            self.assertEqual(request.call_args.args[0].method, "GET")
+
+
+if __name__ == "__main__":
+    unittest.main()

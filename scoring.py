@@ -13,6 +13,7 @@ import os
 import sqlite3
 import uuid
 from dataclasses import dataclass
+from contextlib import closing
 from pathlib import Path
 from typing import Any
 
@@ -137,32 +138,31 @@ def retrieve_history_evidence(
 
     if db_path.is_file():
         try:
-            conn = sqlite3.connect(db_path)
-            conn.row_factory = sqlite3.Row
-            # Search for keyword matches across events
-            for kw in keywords[:4]:
-                if len(evidence) >= max_evidence:
-                    break
-                cur = conn.cursor()
-                cur.execute(
-                    """
-                    SELECT job, kind, timestamp, snippet
-                    FROM events
-                    WHERE job != ? AND snippet LIKE ?
-                    LIMIT 3
-                    """,
-                    (current_job, f"%{kw}%"),
-                )
-                for row in cur.fetchall():
-                    evidence.append(
-                        {
-                            "job": row["job"],
-                            "kind": row["kind"],
-                            "timestamp": row["timestamp"],
-                            "text": row["snippet"][:250],
-                        }
+            with closing(sqlite3.connect(db_path)) as conn:
+                conn.row_factory = sqlite3.Row
+                # Search for keyword matches across events
+                for kw in keywords[:4]:
+                    if len(evidence) >= max_evidence:
+                        break
+                    cur = conn.cursor()
+                    cur.execute(
+                        """
+                        SELECT job, kind, timestamp, snippet
+                        FROM events
+                        WHERE job != ? AND snippet LIKE ?
+                        LIMIT 3
+                        """,
+                        (current_job, f"%{kw}%"),
                     )
-            conn.close()
+                    for row in cur.fetchall():
+                        evidence.append(
+                            {
+                                "job": row["job"],
+                                "kind": row["kind"],
+                                "timestamp": row["timestamp"],
+                                "text": row["snippet"][:250],
+                            }
+                        )
         except Exception:
             pass
 
@@ -252,203 +252,203 @@ def score_video(
         job, analysis_revision, current_input_hash, profile_hash, evidence_hash, model
     )
 
-    conn = get_operations_db(root)
-    _init_scoring_schema(conn)
+    with closing(get_operations_db(root)) as conn:
+        _init_scoring_schema(conn)
 
-    # Check cache unless force_rescore
-    if not force_rescore:
-        cur = conn.cursor()
-        cur.execute("SELECT * FROM video_scores WHERE cache_key = ?", (cache_key,))
-        cached = cur.fetchone()
-        if cached:
-            score_id = cached["score_id"]
-            cur.execute("SELECT * FROM score_decisions WHERE score_id = ?", (score_id,))
-            dec_row = cur.fetchone()
-            return {
-                "score_id": score_id,
-                "job": job,
-                "cached": True,
-                "importance": cached["importance"],
-                "relevance": cached["relevance"],
-                "novelty": cached["novelty"],
-                "novelty_status": cached["novelty_status"],
-                "evidence_confidence": cached["evidence_confidence"],
-                "priority_score": cached["priority_score"],
-                "decision": dec_row["decision"] if dec_row else "digest",
-                "reasons": json.loads(cached["reasons_json"] or "{}"),
-            }
+        # Check cache unless force_rescore
+        if not force_rescore:
+            cur = conn.cursor()
+            cur.execute("SELECT * FROM video_scores WHERE cache_key = ?", (cache_key,))
+            cached = cur.fetchone()
+            if cached:
+                score_id = cached["score_id"]
+                cur.execute("SELECT * FROM score_decisions WHERE score_id = ?", (score_id,))
+                dec_row = cur.fetchone()
+                return {
+                    "score_id": score_id,
+                    "job": job,
+                    "cached": True,
+                    "importance": cached["importance"],
+                    "relevance": cached["relevance"],
+                    "novelty": cached["novelty"],
+                    "novelty_status": cached["novelty_status"],
+                    "evidence_confidence": cached["evidence_confidence"],
+                    "priority_score": cached["priority_score"],
+                    "decision": dec_row["decision"] if dec_row else "digest",
+                    "reasons": json.loads(cached["reasons_json"] or "{}"),
+                }
 
-    # Execute scoring (mock or local deterministic computation)
-    if mock_score:
-        res = mock_score
-    else:
-        # Deterministic heuristic scoring based on artifact depth and terms
-        sum_data = json.loads(summary_raw)
-        brief = sum_data.get("brief") or sum_data.get("summary") or ""
-        char_count = len(brief)
-        term_count = len(terms)
-
-        # Importance heuristic: length and terms depth
-        imp = min(9.5, max(3.0, round(5.0 + (term_count * 0.4) + (char_count / 300.0), 1)))
-        rel = min(9.0, max(4.0, round(6.0 + (term_count * 0.3), 1)))
-
-        if not evidence:
-            nov = None
-            nov_status = "insufficient_history"
+        # Execute scoring (mock or local deterministic computation)
+        if mock_score:
+            res = mock_score
         else:
-            nov = min(8.5, max(2.0, round(4.0 + (10.0 / (len(evidence) + 1)), 1)))
-            nov_status = "measured"
+            # Deterministic heuristic scoring based on artifact depth and terms
+            sum_data = json.loads(summary_raw)
+            brief = sum_data.get("brief") or sum_data.get("summary") or ""
+            char_count = len(brief)
+            term_count = len(terms)
 
-        conf = min(0.95, max(0.5, round(0.6 + (0.05 * min(term_count, 6)), 2)))
-        priority = calculate_priority_score(imp, rel, nov)
-        reasons = {
-            "importance": f"Assessed from {term_count} technical terms and {char_count} chars of summary.",
-            "relevance": f"Aligned with tracked topics ({len(profile.get('topics', []))} topics configured).",
-            "novelty": f"Evaluated against {len(evidence)} historical evidence references.",
+            # Importance heuristic: length and terms depth
+            imp = min(9.5, max(3.0, round(5.0 + (term_count * 0.4) + (char_count / 300.0), 1)))
+            rel = min(9.0, max(4.0, round(6.0 + (term_count * 0.3), 1)))
+
+            if not evidence:
+                nov = None
+                nov_status = "insufficient_history"
+            else:
+                nov = min(8.5, max(2.0, round(4.0 + (10.0 / (len(evidence) + 1)), 1)))
+                nov_status = "measured"
+
+            conf = min(0.95, max(0.5, round(0.6 + (0.05 * min(term_count, 6)), 2)))
+            priority = calculate_priority_score(imp, rel, nov)
+            reasons = {
+                "importance": f"Assessed from {term_count} technical terms and {char_count} chars of summary.",
+                "relevance": f"Aligned with tracked topics ({len(profile.get('topics', []))} topics configured).",
+                "novelty": f"Evaluated against {len(evidence)} historical evidence references.",
+            }
+            res = ScoreResult(
+                importance=imp,
+                relevance=rel,
+                novelty=nov,
+                novelty_status=nov_status,
+                evidence_confidence=conf,
+                priority_score=priority,
+                reasons=reasons,
+                claims=[],
+                raw_output="local_heuristic",
+            )
+
+        score_id = str(uuid.uuid4())
+        now_iso = datetime.datetime.now(datetime.timezone.utc).isoformat()
+
+        decision, dec_reason, policy_hash = evaluate_decision(res)
+
+        with conn:
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO video_scores (
+                    score_id, library_id, job, analysis_revision, current_input_hash,
+                    schema_version, prompt_version, model_version, provider,
+                    profile_hash, evidence_hash, knowledge_cutoff, status,
+                    importance, relevance, novelty, novelty_status, evidence_confidence,
+                    priority_score, reasons_json, claims_json, raw_output, cache_key, scored_at
+                ) VALUES (?, ?, ?, ?, ?, '1', '1', ?, 'local', ?, ?, ?, 'completed', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    score_id,
+                    manifest.get("library_id"),
+                    job,
+                    analysis_revision,
+                    current_input_hash,
+                    model,
+                    profile_hash,
+                    evidence_hash,
+                    cutoff_time,
+                    res.importance,
+                    res.relevance,
+                    res.novelty,
+                    res.novelty_status,
+                    res.evidence_confidence,
+                    res.priority_score,
+                    json.dumps(res.reasons, ensure_ascii=False),
+                    json.dumps(res.claims, ensure_ascii=False),
+                    res.raw_output,
+                    cache_key,
+                    now_iso,
+                ),
+            )
+            conn.execute(
+                """
+                INSERT INTO score_decisions (
+                    decision_id, score_id, policy_hash, priority, decision, reasons, decided_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (str(uuid.uuid4()), score_id, policy_hash, res.priority_score, decision, dec_reason, now_iso),
+            )
+
+        return {
+            "score_id": score_id,
+            "job": job,
+            "cached": False,
+            "importance": res.importance,
+            "relevance": res.relevance,
+            "novelty": res.novelty,
+            "novelty_status": res.novelty_status,
+            "evidence_confidence": res.evidence_confidence,
+            "priority_score": res.priority_score,
+            "decision": decision,
+            "reasons": res.reasons,
         }
-        res = ScoreResult(
-            importance=imp,
-            relevance=rel,
-            novelty=nov,
-            novelty_status=nov_status,
-            evidence_confidence=conf,
-            priority_score=priority,
-            reasons=reasons,
-            claims=[],
-            raw_output="local_heuristic",
-        )
-
-    score_id = str(uuid.uuid4())
-    now_iso = datetime.datetime.now(datetime.timezone.utc).isoformat()
-
-    decision, dec_reason, policy_hash = evaluate_decision(res)
-
-    with conn:
-        conn.execute(
-            """
-            INSERT OR REPLACE INTO video_scores (
-                score_id, library_id, job, analysis_revision, current_input_hash,
-                schema_version, prompt_version, model_version, provider,
-                profile_hash, evidence_hash, knowledge_cutoff, status,
-                importance, relevance, novelty, novelty_status, evidence_confidence,
-                priority_score, reasons_json, claims_json, raw_output, cache_key, scored_at
-            ) VALUES (?, ?, ?, ?, ?, '1', '1', ?, 'local', ?, ?, ?, 'completed', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                score_id,
-                manifest.get("library_id"),
-                job,
-                analysis_revision,
-                current_input_hash,
-                model,
-                profile_hash,
-                evidence_hash,
-                cutoff_time,
-                res.importance,
-                res.relevance,
-                res.novelty,
-                res.novelty_status,
-                res.evidence_confidence,
-                res.priority_score,
-                json.dumps(res.reasons, ensure_ascii=False),
-                json.dumps(res.claims, ensure_ascii=False),
-                res.raw_output,
-                cache_key,
-                now_iso,
-            ),
-        )
-        conn.execute(
-            """
-            INSERT INTO score_decisions (
-                decision_id, score_id, policy_hash, priority, decision, reasons, decided_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?)
-            """,
-            (str(uuid.uuid4()), score_id, policy_hash, res.priority_score, decision, dec_reason, now_iso),
-        )
-
-    return {
-        "score_id": score_id,
-        "job": job,
-        "cached": False,
-        "importance": res.importance,
-        "relevance": res.relevance,
-        "novelty": res.novelty,
-        "novelty_status": res.novelty_status,
-        "evidence_confidence": res.evidence_confidence,
-        "priority_score": res.priority_score,
-        "decision": decision,
-        "reasons": res.reasons,
-    }
 
 
 def explain_score(root: Path, job: str) -> dict[str, Any]:
     """Read-only score explanation without any API cost."""
-    conn = get_operations_db(root)
-    _init_scoring_schema(conn)
+    with closing(get_operations_db(root)) as conn:
+        _init_scoring_schema(conn)
 
-    cur = conn.cursor()
-    cur.execute(
-        """
-        SELECT s.*, d.decision, d.reasons as decision_reason, d.policy_hash
-        FROM video_scores s
-        LEFT JOIN score_decisions d ON s.score_id = d.score_id
-        WHERE s.job = ?
-        ORDER BY s.scored_at DESC LIMIT 1
-        """,
-        (job,),
-    )
-    row = cur.fetchone()
-    if not row:
-        return {"job": job, "status": "unscored", "detail": "No scoring record exists for this job."}
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT s.*, d.decision, d.reasons as decision_reason, d.policy_hash
+            FROM video_scores s
+            LEFT JOIN score_decisions d ON s.score_id = d.score_id
+            WHERE s.job = ?
+            ORDER BY s.scored_at DESC LIMIT 1
+            """,
+            (job,),
+        )
+        row = cur.fetchone()
+        if not row:
+            return {"job": job, "status": "unscored", "detail": "No scoring record exists for this job."}
 
-    return {
-        "job": job,
-        "score_id": row["score_id"],
-        "importance": row["importance"],
-        "relevance": row["relevance"],
-        "novelty": row["novelty"],
-        "novelty_status": row["novelty_status"],
-        "evidence_confidence": row["evidence_confidence"],
-        "priority_score": row["priority_score"],
-        "decision": row["decision"],
-        "decision_reason": row["decision_reason"],
-        "policy_hash": row["policy_hash"],
-        "reasons": json.loads(row["reasons_json"] or "{}"),
-        "knowledge_cutoff": row["knowledge_cutoff"],
-        "scored_at": row["scored_at"],
-    }
+        return {
+            "job": job,
+            "score_id": row["score_id"],
+            "importance": row["importance"],
+            "relevance": row["relevance"],
+            "novelty": row["novelty"],
+            "novelty_status": row["novelty_status"],
+            "evidence_confidence": row["evidence_confidence"],
+            "priority_score": row["priority_score"],
+            "decision": row["decision"],
+            "decision_reason": row["decision_reason"],
+            "policy_hash": row["policy_hash"],
+            "reasons": json.loads(row["reasons_json"] or "{}"),
+            "knowledge_cutoff": row["knowledge_cutoff"],
+            "scored_at": row["scored_at"],
+        }
 
 
 def generate_score_report(root: Path) -> dict[str, Any]:
     """Aggregate daily/overall scoring summary from operations.db."""
-    conn = get_operations_db(root)
-    _init_scoring_schema(conn)
+    with closing(get_operations_db(root)) as conn:
+        _init_scoring_schema(conn)
 
-    cur = conn.cursor()
-    cur.execute(
-        """
-        SELECT COUNT(*) as total_scored,
-               AVG(importance) as avg_importance,
-               AVG(priority_score) as avg_priority,
-               COUNT(CASE WHEN novelty_status = 'measured' THEN 1 END) as measured_novelty_count
-        FROM video_scores
-        """
-    )
-    summary_row = cur.fetchone()
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT COUNT(*) as total_scored,
+                   AVG(importance) as avg_importance,
+                   AVG(priority_score) as avg_priority,
+                   COUNT(CASE WHEN novelty_status = 'measured' THEN 1 END) as measured_novelty_count
+            FROM video_scores
+            """
+        )
+        summary_row = cur.fetchone()
 
-    cur.execute(
-        """
-        SELECT job, priority_score, importance, relevance, novelty, status
-        FROM video_scores
-        ORDER BY priority_score DESC LIMIT 10
-        """
-    )
-    top_items = [dict(row) for row in cur.fetchall()]
+        cur.execute(
+            """
+            SELECT job, priority_score, importance, relevance, novelty, status
+            FROM video_scores
+            ORDER BY priority_score DESC LIMIT 10
+            """
+        )
+        top_items = [dict(row) for row in cur.fetchall()]
 
-    return {
-        "total_scored": summary_row["total_scored"],
-        "avg_importance": round(summary_row["avg_importance"] or 0, 2),
-        "avg_priority": round(summary_row["avg_priority"] or 0, 2),
-        "measured_novelty_count": summary_row["measured_novelty_count"],
-        "top_ranked": top_items,
-    }
+        return {
+            "total_scored": summary_row["total_scored"],
+            "avg_importance": round(summary_row["avg_importance"] or 0, 2),
+            "avg_priority": round(summary_row["avg_priority"] or 0, 2),
+            "measured_novelty_count": summary_row["measured_novelty_count"],
+            "top_ranked": top_items,
+        }
