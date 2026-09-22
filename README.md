@@ -90,7 +90,11 @@ $env:MCP_PORT = '8787'
 .\.venv\Scripts\python mcp_server.py
 ```
 
-本機檢查：`Invoke-RestMethod http://127.0.0.1:8787/health`；ChatGPT Developer Mode 則新增 MCP app，填入 MCP tunnel 網址加 `/mcp`。若 MCP 入口是 Tailscale 或其他 ChatGPT 分析環境無法解析的網域，另設 `MCP_MEDIA_BASE_URL` 指向公開 HTTPS 媒體出口；工具完成後按 widget 的「上傳影片片段並摘要」。影片檔上傳、檔案引用交接與模型實際讀取是獨立驗收 gate。host 支援 `uploadFile`／`getFileDownloadUrl` 時走 ChatGPT 原生附件讀取；若缺少 API，或任一分段下載／上傳失敗（包括臨時網址失效、CORS、`Failed to fetch`），widget 會用既有 `upload_prepared_video_to_drive` 將所有分段存到私人 Google Drive，再請 Google Drive connector 取回原始檔。Drive 失敗時停止並顯示錯誤，不會自動以伺服器端摘要代替 ChatGPT 讀取。`analyze_prepared_video` 仍保留為使用者明確選擇的獨立工具。更新後須重新整理 ChatGPT 外掛動作並產生新 widget；舊訊息中的 v6／v7 widget 不會自動變成 v8。
+本機檢查：`Invoke-RestMethod http://127.0.0.1:8787/health`；ChatGPT Developer Mode 則新增 MCP app，填入 MCP tunnel 網址加 `/mcp`。若 MCP 入口是 Tailscale 或其他 ChatGPT 分析環境無法解析的網域，另設 `MCP_MEDIA_BASE_URL` 指向公開 HTTPS 媒體出口；工具完成後按 widget 的「上傳影片片段並摘要」。影片檔上傳、檔案引用交接與模型實際讀取是獨立驗收 gate。host 有 `uploadFile`／`getFileDownloadUrl` 時嘗試原生附件，不代表已驗證該 host 接受 MP4；若缺少 API，或任一分段下載／上傳失敗（包括臨時網址失效、CORS、`Failed to fetch`），widget 停止剩餘原生嘗試，將所有分段存到私人 Google Drive，顯示可複製的一般對話交接內容。Drive 失敗時停止並顯示錯誤，不會自動以伺服器端摘要代替 ChatGPT 讀取。`analyze_prepared_video` 仍保留為使用者明確選擇的獨立工具。更新後須重新整理 ChatGPT 外掛動作並產生新 widget；舊訊息不會自動變成 v9。
+
+v9 修正 developer MCP 與官方 Drive 的交接邊界：不在原對話送出 Drive 讀取／摘要 follow-up；先開啟未啟用 developer MCP 的一般 ChatGPT 對話，選擇官方 Google Drive，再貼上 widget 的交接內容（job ID、全部檔案 ID／網址／大小與原片分段時間）。新對話須實際取得 bytes、記錄大小／SHA-256 並解碼，不能把 `drive_ready` 當成讀取成功。一般對話連結不會自動改變帳號的 developer mode 或連線設定，使用者需確認對話類型。登入、OAuth、Drive 檔案權限均未變更。UI URI 為 `ui://video-timeline-pipeline/v9-<媒體網址 SHA-256 前 12 碼>.html`，避免換網址後仍使用舊 CSP 快取。
+
+媒體 tunnel worker 現在會驗證 DNS／TLS 後才發佈網址，每 30 秒檢查公開 `/health`；連續三次失敗才重建自己的 cloudflared 子行程。來源服務尚未啟動／故障或公開端 HTTP 429 不會觸發無效的 tunnel 重建。tunnel 不可用時，啟動器忽略舊網址並退回 MCP 原有公開 origin，保留 MCP／Drive 功能，不宣稱原生附件已恢復；現有 MCP 若仍持有不同的媒體網址，啟動器回傳非零，不強制中斷正在處理的影片。網址更換後，仍須受控重載 MCP、重新整理 ChatGPT 動作並 prepare 新 widget，才能更新確切的 CSP 網域；舊 widget 須使用 Drive 交接。回歸檢查（Linux／WSL）：`python3 -m unittest discover -s tests -p test_media_tunnel.py -v`。這不等於外部 ChatGPT 能下載 MP4 的驗收；[Quick Tunnels 官方不提供 SLA，僅供開發測試](https://developers.cloudflare.com/cloudflare-one/networks/connectors/cloudflare-tunnel/do-more-with-tunnels/trycloudflare/)，固定網域部署需另行設定 named tunnel。本次不新增網域或更動公開入口。
 
 v7 修正跨工作狀態：切換 job 時立即替換 model context、清除舊附件 ID，並以工作快照及遞增版本隔離非同步結果（包含 A → B → A）。舊作業回傳或失敗不得覆寫目前 context、送出摘要要求或改寫目前錯誤；待舊呼叫結束後僅啟動最新工作。已送出的上傳可能在遠端完成，但過期結果會被丟棄，不刪除已建立的檔案。Drive 回應的 job_id 必須吻合；資料型交接回應不會當成新影片。回歸測試：`node tests/test_widget_handoff.cjs`。UI URI 按 [官方快取規則](https://developers.openai.com/plugins/build/chatgpt-ui#embed-the-component-in-the-server-response) 升版為 `ui://video-timeline-pipeline/v7.html`。
 
@@ -108,7 +112,7 @@ Drive fallback 另需 `GOOGLE_DRIVE_FOLDER_ID`（可留白表示根目錄）及 
 
 可靠性回歸：`python -m unittest discover -s tests -p test_mcp_reliability.py -v` 含實際 FFmpeg 影音切割／解碼、非整秒影格邊界、快取失效、Drive 中斷／重試／校驗、段數限制、容量與 SQLite 關閉檢查。Drive 部分使用模擬 API；不等於已完成線上 Drive 或 ChatGPT 新版 widget 驗收。
 
-Drive 工具只回傳結構化檔案資訊與文字說明，不把私有 `webViewLink` 包裝成 MP4 `resource_link`。檢視頁回傳的是 HTML；必須由已授權的 Google Drive connector 執行 `fetch(download_raw_file=true, include_base64=false)` 取得原始影片，避免 ChatGPT 嘗試直接實體化檢視頁而中斷交接。
+Drive 工具只回傳結構化檔案資訊與文字說明，不把私有 `webViewLink` 包裝成 MP4 `resource_link`。檢視頁回傳的是 HTML；必須在未啟用 developer MCP 的一般對話，由已授權的 Google Drive connector 執行 `fetch(download_raw_file=true, include_base64=false)` 取得原始影片，避免在 developer MCP 對話觸發 `FORBIDDEN`，或把檢視頁誤當影片。
 
 ## 批次建立頻道知識庫
 

@@ -6,7 +6,7 @@ const path = require('node:path');
 const source = fs.readFileSync(path.join(__dirname, '..', 'mcp_server.py'), 'utf8');
 const script = source.match(/<script>([\s\S]*?)<\/script>/)[1];
 
-async function check({ native = true, failedFetch = -1, driveFails = false, stalledBody = false } = {}) {
+async function check({ native = true, failedFetch = -1, driveFails = false, stalledBody = false, uploadFails = false } = {}) {
   const elements = new Map();
   const element = () => ({ append() {}, replaceChildren() {}, addEventListener() {} });
   const calls = [], prompts = [];
@@ -26,7 +26,7 @@ async function check({ native = true, failedFetch = -1, driveFails = false, stal
     },
     sendFollowUpMessage: async ({ prompt }) => prompts.push(prompt),
     ...(native ? {
-      uploadFile: async () => ({ fileId: `file-${++uploaded}` }),
+      uploadFile: async () => { if (uploadFails) throw new Error('Unsupported MP4'); return { fileId: `file-${++uploaded}` }; },
       getFileDownloadUrl: async ({ fileId }) => ({ downloadUrl: `https://files.example/${fileId}` }),
     } : {}),
   };
@@ -56,15 +56,25 @@ async function check({ native = true, failedFetch = -1, driveFails = false, stal
     assert.equal(prompts.length, 0);
     assert.match(elements.get('status').textContent, /502/);
     assert.equal(elements.get('upload').disabled, false);
-  } else if (!native || failedFetch >= 0 || stalledBody) {
+  } else if (!native || failedFetch >= 0 || stalledBody || uploadFails) {
     assert.deepEqual(calls, ['upload_prepared_video_to_drive']);
-    assert.equal(prompts.length, 1);
-    assert.match(prompts[0], /download_raw_file=true/);
-    for (const segment of segments) assert(prompts[0].includes(segment.filename));
+    assert.equal(prompts.length, 0, 'Never request the official Drive connector in the developer MCP chat');
+    assert.equal(elements.get('drive-handoff').hidden, false);
+    const handoff = elements.get('drive-prompt').value;
+    assert.match(handoff, /download_raw_file=true/);
+    assert.match(handoff, /job_id=job/);
+    assert.match(handoff, /一般對話/);
+    for (const segment of segments) assert(handoff.includes(segment.filename));
+    assert.match(elements.get('status').textContent, /未送出/);
+    if (failedFetch >= 0) {
+      assert.equal(fetched, failedFetch + 1, 'Stop fetching after the first failure');
+      assert.match(elements.get('status').textContent, /Failed to fetch/);
+    }
   } else {
     assert.deepEqual(calls, ['ingest_video_segments']);
     assert.equal(uploaded, 2);
     assert.equal(prompts.length, 1);
+    assert.equal(elements.get('drive-handoff').hidden, true);
   }
   assert.equal(timers.size, 0, 'Always clear the download deadline');
 }
@@ -115,6 +125,8 @@ async function checkJobSwitch(stage, { backToOld = false, rejectOld = false, wro
   await paused;
   if (!wrongDriveJob) {
     notify(job('new-job'));
+    assert.equal(elements.get('drive-prompt').value, '', 'Clear previous handoff text on job switch');
+    assert.equal(elements.get('drive-handoff').hidden, true);
     if (backToOld) notify(job('old-job'));
     assert.equal(host.widgetState.privateContent.jobId, backToOld ? 'old-job' : 'new-job');
     assert(!JSON.stringify(host.widgetState).includes('old-job-file'));
@@ -134,13 +146,14 @@ async function checkJobSwitch(stage, { backToOld = false, rejectOld = false, wro
   assert(!elements.get('status').textContent.includes('old job failed'));
   assert(queued.length > 0, 'The new job must be scheduled after the previous run finishes');
   // Simulate the browser microtask queue, including the task queued by finally.
-  for (let count = 0; count < 100 && (queued.length || !prompts.length); count++) {
+  for (let count = 0; count < 100 && (queued.length || !(prompts.length || elements.get('drive-prompt').value)); count++) {
     while (queued.length) queued.shift()();
     await new Promise(resolve => setImmediate(resolve));
   }
-  assert.equal(prompts.length, 1, 'Exactly one follow-up for the current job');
+  assert.equal(prompts.length, stage === 'drive' ? 0 : 1, 'Drive requires a separate normal chat');
   assert.equal(host.widgetState.privateContent.jobId, backToOld ? 'old-job' : 'new-job');
-  if (!backToOld) assert(!prompts[0].includes('old-job-file'));
+  const handoff = stage === 'drive' ? elements.get('drive-prompt').value : prompts[0];
+  if (!backToOld) assert(!handoff.includes('old-job-file'));
   const currentState = JSON.stringify(host.widgetState);
   notify({ status: 'drive_ready', job_id: 'old-job', files: [] });
   assert.equal(JSON.stringify(host.widgetState), currentState, 'A data-only response must not replace the prepared job');
@@ -154,9 +167,10 @@ async function checkJobSwitch(stage, { backToOld = false, rejectOld = false, wro
   await check({ failedFetch: 0, driveFails: true });
   await check({ native: false, driveFails: true });
   await check({ stalledBody: true });
+  await check({ uploadFails: true });
   for (const stage of ['drive', 'fetch', 'upload', 'download-url', 'ingest']) await checkJobSwitch(stage);
   await checkJobSwitch('drive', { backToOld: true });
   await checkJobSwitch('drive', { rejectOld: true });
   await checkJobSwitch('drive', { wrongDriveJob: true });
-  console.log('PASS: 15 widget handoff scenarios');
+  console.log('PASS: 16 widget handoff scenarios');
 })().catch(error => { console.error(error); process.exitCode = 1; });

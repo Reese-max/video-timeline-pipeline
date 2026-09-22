@@ -200,6 +200,8 @@ class MCPValidationTests(unittest.TestCase):
         mcp_server.DriveUploadResult.model_validate(result.structuredContent)
         self.assertIn("download_raw_file=true", result.content[0].text)
         self.assertIn("include_base64=false", result.content[0].text)
+        self.assertIn("一般 ChatGPT 對話", result.content[0].text)
+        self.assertIn("本 developer MCP 對話不可使用官方 Drive", result.content[0].text)
 
     def test_analysis_tool_returns_clean_error_payload(self) -> None:
         result = asyncio.run(mcp_server.analyze_prepared_video("not-a-job"))

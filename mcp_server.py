@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import csv
+import hashlib
 import ipaddress
 import json
 import math
@@ -50,7 +51,7 @@ MCP_PUBLIC_BASE_URL = (
 MCP_MEDIA_BASE_URL = (
     os.getenv("MCP_MEDIA_BASE_URL", "") or MCP_PUBLIC_BASE_URL
 ).rstrip("/")
-UI_URI = "ui://video-timeline-pipeline/v8.html"
+UI_URI = f"ui://video-timeline-pipeline/v9-{hashlib.sha256(MCP_MEDIA_BASE_URL.encode()).hexdigest()[:12]}.html"
 PUBLIC_URL = urlsplit(MCP_PUBLIC_BASE_URL)
 MEDIA_URL = urlsplit(MCP_MEDIA_BASE_URL)
 UI_ORIGIN = f"{PUBLIC_URL.scheme}://{PUBLIC_URL.netloc}"
@@ -856,7 +857,8 @@ def drive_tool_result(result: dict[str, Any]) -> types.CallToolResult:
                     f"已將 {len(files)} 個 MP4 分段存到 Google Drive。"
                     "這些是 Drive 檔案引用，不是 ChatGPT 原生附件；"
                     "files[].url 是檢視頁，不是 MP4 下載網址。"
-                    "請用 Google Drive connector 對各網址執行 fetch"
+                    "本 developer MCP 對話不可使用官方 Drive；請轉到未啟用 developer MCP 的一般 ChatGPT 對話，"
+                    "選擇已連線的官方 Google Drive connector，對各網址執行 fetch"
                     "（download_raw_file=true、include_base64=false），取得原始檔後再摘要。"
                 ),
             ),
@@ -892,6 +894,7 @@ WIDGET_HTML = r"""<!doctype html>
     a { overflow-wrap: anywhere; }
     img, video { width: 100%; max-height: 220px; border-radius: 10px; background: #111; object-fit: contain; }
     #status { min-height: 1.2em; }
+    textarea { box-sizing: border-box; width: 100%; min-height: 160px; }
   </style>
 </head>
 <body>
@@ -900,6 +903,12 @@ WIDGET_HTML = r"""<!doctype html>
     <p id="summary" class="muted">等待影片分段資料…</p>
     <button id="upload" type="button" disabled>上傳影片片段並摘要</button>
     <p id="status" role="status" aria-live="polite"></p>
+    <section id="drive-handoff" hidden>
+      <p>此 developer MCP 對話不能使用官方 Drive。請開啟一般對話、確認未啟用 developer MCP、選擇 Google Drive，再貼上以下內容。</p>
+      <label for="drive-prompt">一般對話交接內容（可選取並複製）</label>
+      <textarea id="drive-prompt" readonly></textarea>
+      <a href="https://chatgpt.com/" target="_blank" rel="noopener noreferrer">開啟 ChatGPT，建立一般對話</a>
+    </section>
     <ol id="segments"></ol>
   </main>
   <script>
@@ -940,7 +949,7 @@ WIDGET_HTML = r"""<!doctype html>
       const result = await request("ui/initialize", {
         protocolVersion: "2026-01-26",
         appCapabilities: {},
-        clientInfo: { name: "video-timeline-pipeline", version: "8" },
+        clientInfo: { name: "video-timeline-pipeline", version: "9" },
       });
       window.parent.postMessage({
         jsonrpc: "2.0",
@@ -992,6 +1001,8 @@ WIDGET_HTML = r"""<!doctype html>
       if (!data || next.job_id !== data.job_id) {
         jobVersion += 1;
         startedJobId = null;
+        $("drive-handoff").hidden = true;
+        $("drive-prompt").value = "";
         getOpenAI()?.setWidgetState?.({
           modelContent: next.job_id
             ? `目前影片「${next.title || "未命名"}」（job_id=${next.job_id}）尚待檔案交接；請勿沿用先前影片或檔案。`
@@ -1058,9 +1069,9 @@ WIDGET_HTML = r"""<!doctype html>
       return { file_id: fileId, download_url: downloadUrl, mime_type: type, file_name: name };
     }
 
-    async function driveAndAsk(job, version) {
+    async function prepareDriveHandoff(job, version, nativeError = "原生附件 API 不可用") {
       checkJob(version);
-      setStatus("正在把所有 MP4 分段存到 Google Drive，完成後交由 connector 讀取…");
+      setStatus("正在把所有 MP4 分段存到 Google Drive，準備一般對話交接內容…");
       const drive = normalize(await callTool("upload_prepared_video_to_drive", { job_id: job.job_id }, version));
       checkJob(version);
       if (drive.status !== "drive_ready" || !Array.isArray(drive.files) || drive.files.length !== job.segments.length) {
@@ -1071,7 +1082,8 @@ WIDGET_HTML = r"""<!doctype html>
         `${index + 1}. ${file.file_name} | file_id=${file.file_id} | ${file.size_bytes} bytes | ${file.url}`
       ).join("\n");
       const modelContent = [
-        `影片「${job.title || "未命名"}」的 ${drive.files.length} 個 MP4 分段已由 MCP 存到 Google Drive。`,
+        `影片「${job.title || "未命名"}」（job_id=${job.job_id}）的 ${drive.files.length} 個 MP4 分段已由 MCP 存到 Google Drive；尚未證實 ChatGPT 讀取。`,
+        "本 developer MCP 對話不可呼叫官方 Drive；須轉未啟用 developer MCP 的一般對話。",
         "Drive 檔案清單：",
         entries,
       ].join("\n");
@@ -1079,14 +1091,18 @@ WIDGET_HTML = r"""<!doctype html>
         modelContent,
         privateContent: { jobId: job.job_id, driveFileIds: drive.files.map((file) => file.file_id) },
       });
-      await sendFollowUp([
+      $("drive-prompt").value = [
         modelContent,
+        "分段時間：",
+        ...job.segments.map(segment => `${segment.filename}: ${segment.start_seconds ?? "未知"}–${segment.end_seconds ?? "未知"} 秒`),
+        "這是新的一般對話，請勿啟用 developer MCP。",
         "請使用已連線的 Google Drive connector，對上列每個 Drive 檔案執行原始檔 fetch（download_raw_file=true、include_base64=false）。",
-        "確認 connector 回傳 video/mp4 的實際檔案引用後，再逐一讀取影片畫面與音訊並摘要。",
+        "取得實際 MP4 bytes 後，記錄檔案大小與 SHA-256、解碼影片畫面與音訊，再依原片時間範圍摘要。",
+        "抽出音軌不代表已取得逐字稿；未辨識語音時請明確標示。",
         "不要把 Drive URL、檔名或 metadata 當成影片內容；若任何分段無法取得原始檔，請明確標示。",
-      ].join("\n"), version);
-      checkJob(version);
-      setStatus(`已將 ${drive.files.length} 個 MP4 存到 Google Drive，已請 ChatGPT 透過 Drive connector 讀取。`);
+      ].join("\n");
+      $("drive-handoff").hidden = false;
+      setStatus(`${nativeError}。已將 ${drive.files.length} 個 MP4 存到 Google Drive；請轉一般對話。此處未送出 Drive 讀取或摘要要求。`);
     }
 
     async function uploadAndAsk(job, version) {
@@ -1094,7 +1110,7 @@ WIDGET_HTML = r"""<!doctype html>
       const host = await waitForOpenAI();
       checkJob(version);
       if (!host?.uploadFile || !host?.getFileDownloadUrl) {
-        await driveAndAsk(job, version);
+        await prepareDriveHandoff(job, version);
         return;
       }
       $("upload").disabled = true;
@@ -1109,11 +1125,12 @@ WIDGET_HTML = r"""<!doctype html>
         } catch (error) {
           checkJob(version);
           failures.push(`${segment.filename}: ${error.message}`);
+          break; // Same media origin: do not retry a failed handoff for every segment.
         }
       }
       if (failures.length) {
         try {
-          await driveAndAsk(job, version);
+          await prepareDriveHandoff(job, version, `原生附件交接失敗：${failures.join("；")}`);
         } catch (driveError) {
           throw new Error(`原生附件交接失敗：${failures.join("；")}；Google Drive 交接失敗：${driveError.message}`);
         }
@@ -1192,7 +1209,8 @@ mcp = FastMCP(
         "Use prepare_video_for_chatgpt when the user gives a public video URL and wants a summary. "
         "The tool downloads and segments the video; the ChatGPT widget then uploads the segments. "
         "If native file download or upload is unavailable or fails, the widget tries the configured "
-        "Google Drive handoff and asks the Google Drive connector to fetch the raw MP4s. "
+        "Google Drive handoff. The official Drive connector is forbidden in this developer MCP chat; "
+        "provide the file list for a separate normal chat without developer MCP, then fetch the raw MP4s there. "
         "If Drive fails, stop and report the error; do not substitute server-side analysis. "
         "Do not claim that ChatGPT itself read the MP4 unless the file handoff and model response succeed."
     ),
@@ -1281,8 +1299,9 @@ async def analyze_prepared_video(
         "Use this when prepare_video_for_chatgpt has produced MP4 segments but the ChatGPT host "
         "cannot download or upload the native attachments, or the user requests Drive. "
         "Upload the actual prepared MP4 bytes to a configured private "
-        "Google Drive folder and return observed Drive file IDs and view URLs. The model must then "
-        "use the connected Google Drive connector to fetch each raw MP4 before analyzing it. "
+        "Google Drive folder and return observed Drive file IDs and view URLs. Do not invoke the official "
+        "Drive connector in this developer MCP chat. Transfer the file list to a separate normal chat "
+        "without developer MCP and fetch each raw MP4 using the official Drive connector there. "
         "The returned view URLs are metadata, not directly downloadable MP4 attachments. A Drive "
         "URL alone is never treated as proof that ChatGPT received or read the video bytes."
     ),
