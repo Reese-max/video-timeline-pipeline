@@ -4028,6 +4028,164 @@ def instagram_feed_item(record: dict[str, Any]) -> dict[str, str] | None:
     }
 
 
+def social_post_target(url: str) -> tuple[str, str, str, str]:
+    """Return platform, public post ID, canonical URL and a fixed provider dataset."""
+    parsed = urllib.parse.urlsplit(require_http_url(url, "貼文 URL"))
+    if parsed.username or parsed.password or parsed.port not in {None, 443} or parsed.scheme != "https":
+        raise ValueError("貼文必須是無帳密的標準 HTTPS 網址。")
+    host = (parsed.hostname or "").lower()
+    if host in {"instagram.com", "www.instagram.com", "m.instagram.com"}:
+        match = re.fullmatch(r"/(?:[A-Za-z0-9_.]+/)?(p|reel|reels)/([A-Za-z0-9_-]+)/?", parsed.path)
+        if match:
+            kind, post_id = match.groups()
+            kind = "p" if kind == "p" else "reel"
+            dataset = "gd_lk5ns7kz21pck8jpis" if kind == "p" else BRIGHTDATA_INSTAGRAM_REELS_DATASET_ID
+            return "instagram", post_id, f"https://www.instagram.com/{kind}/{post_id}/", dataset
+    elif host in THREADS_HOSTS:
+        match = re.fullmatch(r"/(@[A-Za-z0-9_.]+/post|t)/([A-Za-z0-9_-]+)/?", parsed.path)
+        if match:
+            prefix, post_id = match.groups()
+            return "threads", post_id, f"https://www.threads.com/{prefix}/{post_id}", "gd_md75myxy14rihbjksa"
+    elif host in {"facebook.com", "www.facebook.com", "m.facebook.com", "web.facebook.com"}:
+        query = urllib.parse.parse_qs(parsed.query, keep_blank_values=True, max_num_fields=20)
+        if "comment_id" in query or "reply_comment_id" in query:
+            raise ValueError("請提供 FB 貼文本身的網址，不接受留言網址。")
+        dataset = "gd_lyclm1571iy3mv57zw"
+        post_pattern = r"(?:[0-9]+|pfbid[A-Za-z0-9]+)"
+        match = re.fullmatch(r"/[A-Za-z0-9.]+/posts/(" + post_pattern + r")/?", parsed.path)
+        if match:
+            return "facebook", match[1], f"https://www.facebook.com{parsed.path.rstrip('/')}/", dataset
+        if parsed.path in {"/story.php", "/permalink.php"}:
+            post_ids, owners = query.get("story_fbid", []), query.get("id", [])
+            if (len(post_ids) == len(owners) == 1 and re.fullmatch(post_pattern, post_ids[0])
+                    and re.fullmatch(r"[0-9]+", owners[0])):
+                canonical = "https://www.facebook.com/permalink.php?" + urllib.parse.urlencode(
+                    {"story_fbid": post_ids[0], "id": owners[0]})
+                return "facebook", post_ids[0], canonical, dataset
+        match = re.fullmatch(r"/share/([pv])/([A-Za-z0-9]+)/?", parsed.path)
+        if match:
+            kind, token = match.groups()
+            # ponytail: opaque share tokens cannot be equated to post IDs without verified resolution.
+            return "facebook", f"share:{kind}:{token}", f"https://www.facebook.com/share/{kind}/{token}/", dataset
+    raise ValueError("僅支援公開 IG／Threads／Facebook 單篇貼文；FB 不接受首頁、社團、留言或 reel/watch 網址。")
+
+
+def normalize_social_post(record: dict[str, Any], url: str) -> dict[str, Any]:
+    platform, post_id, canonical, _ = social_post_target(url)
+    if record.get("error") or record.get("error_code") or record.get("is_private"):
+        raise RuntimeError("供應商無法取得公開貼文；可能需要登入、已刪除或無法存取。")
+    if social_post_target(str(record.get("url") or ""))[:2] != (platform, post_id):
+        raise RuntimeError("供應商回傳了不同的貼文，停止交接。")
+    if (platform == "facebook" and post_id.isdigit() and record.get("post_id") is not None
+            and str(record["post_id"]) != post_id):
+        raise RuntimeError("供應商的 FB post_id 與請求不符，停止交接。")
+    text = record.get({"instagram": "description", "threads": "post_content", "facebook": "content"}[platform])
+    text = text if isinstance(text, str) else ""
+    images, videos = [], []
+
+    def collect(value: Any, output: list[str]) -> None:
+        for item in value if isinstance(value, list) else [value]:
+            candidate = item.get("url") if isinstance(item, dict) else item
+            if not isinstance(candidate, str):
+                continue
+            try:
+                parsed = urllib.parse.urlsplit(candidate)
+                host, port = (parsed.hostname or "").lower(), parsed.port
+            except ValueError:
+                continue
+            if (parsed.scheme == "https" and not parsed.username and not parsed.password
+                    and port in {None, 443}
+                    and any(host == domain or host.endswith("." + domain)
+                            for domain in ("fbcdn.net", "cdninstagram.com", "fbsbx.com"))
+                    and candidate not in output):
+                output.append(candidate)
+
+    collect(record.get("photos"), images)
+    collect(record.get("images"), images)
+    collect(record.get("videos"), videos)
+    collect(record.get("video_url"), videos)
+    # IG post_content is a carousel; Threads post_content is text, not media.
+    for media in record.get("post_content", []) if isinstance(record.get("post_content"), list) else []:
+        if isinstance(media, dict) and media.get("type") in {"Photo", "Video"}:
+            collect(media, images if media["type"] == "Photo" else videos)
+    if platform == "facebook":
+        attachments = record.get("attachments")
+        for media in attachments if isinstance(attachments, list) else []:
+            if not isinstance(media, dict):
+                continue
+            kind = str(media.get("type") or "").lower()
+            if kind == "video":
+                collect(media.get("video_url"), videos)
+            elif kind in {"photo", "image"}:
+                collect(media.get("attachment_url"), images)
+    if not text.strip() and not images and not videos:
+        raise RuntimeError("貼文沒有可用文字或媒體；不以作者或互動數字代替內容。")
+    if platform == "facebook":
+        post_id = str(record.get("post_id") or ("" if post_id.startswith("share:") else post_id))
+    return {"status": "ready", "platform": platform, "post_id": post_id, "url": canonical,
+            "text": text, "author": str(record.get("user_posted") or record.get("profile_name")
+                                       or record.get("user_username_raw") or record.get("profile_handle") or ""),
+            "published_at": str(record.get("date_posted") or record.get("post_time") or ""),
+            "image_urls": images, "video_urls": videos, "media_analyzed": False,
+            "metrics": {key: record[field] for key, field in
+                        (("likes", "likes"), ("comments", "num_comments"), ("shares", "num_shares"))
+                        if type(record.get(field)) is int and record[field] >= 0},
+            "limitations": ["文字來自公開貼文採集；圖片／影片僅為網址，尚未解碼或分析。",
+                            "不保證完整留言、私人內容或所有 carousel 媒體；不自動刷新可能過期的 CDN 網址。"]}
+
+
+def fetch_social_post(url: str, cache_root: Path, *, allow_paid: bool = False) -> dict[str, Any]:
+    platform, post_id, canonical, dataset = social_post_target(url)
+    if not allow_paid:
+        raise RuntimeError("Bright Data 可能計費；本次尚未送出採集，需先授權。")
+    folder = cache_root / job_key(f"{platform}:{post_id}")
+    checkpoint = folder / "brightdata.json"
+    state = reuse_artifact(checkpoint)
+    if state and state.get("status") == "ready":
+        return state
+    token = os.getenv("BRIGHTDATA_API_TOKEN", "").strip()
+    if not token:
+        raise RuntimeError("缺少 BRIGHTDATA_API_TOKEN；請在主機安全設定，不要貼到對話。")
+    headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+    try:
+        if not state:
+            folder.mkdir(parents=True, exist_ok=True, mode=0o700)
+            # ponytail: one persisted submission per post; uncertain submissions need operator review.
+            try:
+                (folder / ".submitted").touch(exist_ok=False)
+            except FileExistsError:
+                raise RuntimeError("上次送出狀態不明，禁止再次計費採集；請先到 Bright Data 核對。") from None
+            query = urllib.parse.urlencode({"dataset_id": dataset, "include_errors": "true", "format": "json"})
+            submitted = request_json(
+                f"{BRIGHTDATA_API_ROOT}/trigger?{query}", headers, method="POST",
+                body=json.dumps([{"url": canonical}]).encode(), timeout=60, attempts=1)
+            snapshot = submitted.get("snapshot_id") if isinstance(submitted, dict) else None
+            if not isinstance(snapshot, str) or not re.fullmatch(r"s_[A-Za-z0-9_-]+", snapshot):
+                raise RuntimeError("採集回應缺少 snapshot_id；禁止盲目重送，請到 Bright Data 核對。")
+            state = {"status": "pending", "url": canonical, "snapshot_id": snapshot,
+                     "dataset_id": dataset, "provider": "brightdata"}
+            write_json(checkpoint, state)
+        snapshot = state["snapshot_id"]
+        if not re.fullmatch(r"s_[A-Za-z0-9_-]+", snapshot):
+            raise RuntimeError("快取 snapshot_id 無效。")
+        progress = get_json(f"{BRIGHTDATA_API_ROOT}/progress/{snapshot}", headers)
+        status = progress.get("status") if isinstance(progress, dict) else None
+        if status == "failed":
+            raise RuntimeError("Bright Data 採集失敗；保留 snapshot，不自動重建計費工作。")
+        if status != "ready":
+            return {**state, "retry_after_seconds": 10}
+        rows = get_json(f"{BRIGHTDATA_API_ROOT}/snapshot/{snapshot}?format=json", headers)
+        if isinstance(rows, dict):
+            rows = rows.get("data")
+        if not isinstance(rows, list) or len(rows) != 1 or not isinstance(rows[0], dict):
+            raise RuntimeError("預期單篇貼文結果；收到空白或多筆資料，停止交接。")
+        result = {**state, **normalize_social_post(rows[0], canonical), "fetched_at": rss_now()}
+        write_json(checkpoint, result)
+        return result
+    except Exception as exc:
+        raise RuntimeError(str(exc).replace(token, "<redacted>")) from None
+
+
 def fetch_instagram_author(
     author: str,
     since: str = "365d",

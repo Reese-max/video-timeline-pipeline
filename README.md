@@ -215,7 +215,23 @@ python pipeline.py --rss-process --rss-max-items 4 --allow-batch-cloud
 python pipeline.py --url 'https://www.instagram.com/reel/<SHORTCODE>/'
 ```
 
-Bright Data 只負責作者內容發現；實際下載仍由 yt-dlp 完成，之後才是 Groq 時間戳轉錄與 MiniMax 摘要。免費額度與餘額續用行為依帳戶主控台為準，程式無法保證不扣款，因此所有 Bright Data 盤點都要求明確加上 `--allow-batch-cloud`。
+此 CLI 作者盤點流程的 Bright Data 只負責內容發現；實際下載仍由 yt-dlp 完成，之後才是 Groq 時間戳轉錄與 MiniMax 摘要。免費額度與餘額續用行為依帳戶主控台為準，程式無法保證不扣款，因此所有 Bright Data 盤點都要求明確加上 `--allow-batch-cloud`。
+
+### MCP 公開 IG／Threads／Facebook 單篇貼文
+
+`collect_social_post(url, allow_paid=false)` 使用 Bright Data 官方的 [Instagram Posts API](https://docs.brightdata.com/api-reference/scrapers/social-media-apis/instagram-posts-collect-by-url)、[Reels API](https://docs.brightdata.com/api-reference/scrapers/social-media-apis/instagram-reels-collect-by-url)、[Threads Posts API](https://brightdata.com/products/web-scraper/threads) 或 [Facebook Posts API](https://docs.brightdata.com/api-reference/scrapers/social-media-apis/facebook-posts-collect-by-url)，取得公開單篇文字、作者、發佈時間、可用互動數，以及供應商實際回傳的圖片／影片 CDN 網址。支援 IG `/p/`、`/reel/` 和 Threads `.com`／`.net` 單篇網址，不是任意社群通用閱讀器；不保證私人、已刪除內容、完整留言或所有 carousel 媒體。
+
+Facebook 支援 `/<作者>/posts/<數字 ID 或 pfbid>`、`story.php`／`permalink.php`（必須同時有 `story_fbid` 與 `id`）及 `/share/p/`、`/share/v/`。`www`／`m`／`web` 網域及同一明確貼文 ID 共用快取；不解析任意重新導向或接受首頁、社團、留言網址。FB `/reel/`、`/watch/`、`/share/r/` 仍走既有影片準備流程，不送到貼文 dataset。分享 token 無法離線證明等同某個 post ID，因此分享與原始貼文網址不合併；請固定使用同一網址，避免另建採集。若供應商把分享網址換成無法核對的另一種網址，會停止交接，不猜測它是同一篇。
+
+FB 回應的 `content` 是貼文文字；`attachments` 的照片與影片分開回傳，影片縮圖不當成 MP4。只有通過 HTTPS／Meta CDN 網域檢查的媒體網址會保留。這些網址仍未被下載、辨識或轉錄；互動數為供應商回傳的快照，不代表即時或完整留言。
+
+此工具預設拒絕計費採集。管理員須在主機安全設定 `BRIGHTDATA_API_TOKEN`，並將人工核准的單篇網址放入 `BRIGHTDATA_ALLOWED_POST_URLS`（逗號分隔）；呼叫者另須取得使用者明確同意才設定 `allow_paid=true`。網址核准清單不等於呼叫者身分驗證，也不是金額上限，仍須在供應商設定支出控制。本版不改 MCP 登入設定；憑證不要貼到對話或提交 Git。
+
+回傳 `pending` 時依 `retry_after_seconds` 等待，再以相同網址呼叫，會沿用同一 snapshot；`ready` 後重用本機快取。首次送出僅嘗試一次，回應遺失或供應商失敗時不自動重建計費工作，須人工到 Bright Data 核對。狀態保存在 Git 忽略的 `mcp_jobs/social-posts/`，不要為了重試直接刪除；CDN 網址可能過期，工具不自動付費刷新。
+
+貼文文字可交給 ChatGPT 整理；`image_urls`／`video_urls` 只是媒體參照，`media_analyzed=false`，不能宣稱已看過畫面。ChatGPT 可再將 `video_urls` 逐支交給既有 `prepare_video_for_chatgpt` → Groq／MiniMax 分析 → ChatGPT 整理，並保留原始貼文網址作為來源；這不是 `download_video` 裡的隱式付費 fallback。圖片尚未自動送入視覺模型，Drive 仍為選用儲存。
+
+不計費回歸：`python -m unittest discover -s tests -p test_social_post.py -v`。測試使用模擬供應商回應，不代表真實 Bright Data 採集、媒體下載或 ChatGPT 網頁端驗收已通過；部署新增工具後須重新整理 ChatGPT 外掛動作。
 
 ### Instagram 下載與診斷
 
