@@ -170,7 +170,8 @@ class MCPValidationTests(unittest.TestCase):
         self.assertIn("ui/notifications/initialized", mcp_server.WIDGET_HTML)
         self.assertIn('request("tools/call"', mcp_server.WIDGET_HTML)
         self.assertIn('request("ui/message"', mcp_server.WIDGET_HTML)
-        self.assertIn("queueMicrotask(startUpload)", mcp_server.WIDGET_HTML)
+        self.assertIn("queueMicrotask(startAnalysis)", mcp_server.WIDGET_HTML)
+        self.assertNotIn("uploadFile(", mcp_server.WIDGET_HTML)
 
     def test_drive_tool_exposes_output_schema_and_widget_path(self) -> None:
         tools = asyncio.run(mcp_server.mcp.list_tools())
@@ -243,7 +244,8 @@ class MCPValidationTests(unittest.TestCase):
                         {},
                     ),
                 ) as extract_candidates_mock,
-                patch.object(mcp_server.pipeline, "analyze_images", return_value=[{"timestamp": 0}]),
+                patch.object(mcp_server.pipeline, "analyze_images", return_value=[{
+                    "timestamp": 0, "visual_summary": "A visible sign", "confidence": 0.9}]),
                 patch.object(
                     mcp_server.pipeline,
                     "extract_audio",
@@ -268,7 +270,7 @@ class MCPValidationTests(unittest.TestCase):
                         {},
                     ),
                 ),
-                patch.object(mcp_server.pipeline, "create_summary", return_value={"short_summary": "ok"}),
+                patch.object(mcp_server.pipeline, "create_summary") as create_summary_mock,
                 patch.object(mcp_server.pipeline, "file_sha256", return_value="sha"),
                 patch.object(mcp_server.pipeline, "write_json"),
                 patch.dict(mcp_server.os.environ, {"GROQ_API_KEY": "groq"}, clear=False),
@@ -279,7 +281,9 @@ class MCPValidationTests(unittest.TestCase):
         self.assertEqual(result["source_sha256"], "sha")
         self.assertEqual(result["audio_status"], "complete")
         self.assertEqual(result["visual_status"], "complete")
-        self.assertEqual(result["summary"]["short_summary"], "ok")
+        self.assertEqual(result["summary"]["status"], "pending_chatgpt")
+        self.assertEqual(result["quality"]["status"], "evidence_available")
+        create_summary_mock.assert_not_called()
         self.assertEqual(extract_candidates_mock.call_args.args[3], 0)
 
     def test_drive_upload_caches_verified_segment_metadata(self) -> None:
@@ -366,6 +370,8 @@ class MCPValidationTests(unittest.TestCase):
             )
         self.assertEqual(result.structuredContent["status"], "ready")
         self.assertEqual(result.structuredContent["segments"][0]["filename"], "segment_000.mp4")
+        self.assertIn("analyze_prepared_video", result.content[0].text)
+        self.assertNotIn("先完成檔案交接", result.content[0].text)
 
 
 if __name__ == "__main__":
