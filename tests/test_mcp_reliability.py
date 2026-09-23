@@ -1,3 +1,5 @@
+import asyncio
+import copy
 import csv
 import json
 import shutil
@@ -12,6 +14,57 @@ import mcp_server as server
 
 
 class ReliabilityTests(unittest.TestCase):
+    def test_analysis_quality_requires_usable_evidence_not_just_api_success(self):
+        good = {"status": "complete", "audio_status": "complete", "visual_status": "complete",
+                "transcript": {"segments": [{"text": "hello"}]}, "errors": [],
+                "timeline": [{"timestamp": 0, "type": "visual", "data": {
+                    "visual_summary": "A visible sign", "confidence": 0.9}}]}
+        quality = server.analysis_quality(good)
+        self.assertEqual(quality["status"], "evidence_available")
+        self.assertEqual(quality["visual_frames"], 1)
+        self.assertIn("不保證", quality["limitation"])
+        for case in ["empty_speech", "empty_visual", "incomplete", "low_confidence", "missing_confidence",
+                     "invalid_confidence", "raw_response", "placeholder", "audio_error", "partial"]:
+            with self.subTest(case=case):
+                bad = copy.deepcopy(good)
+                if case == "empty_speech": bad["transcript"]["segments"] = []
+                if case == "empty_visual": bad["timeline"] = []
+                if case == "incomplete": bad["timeline"][0]["data"]["completion_status"] = "incomplete"
+                if case == "low_confidence": bad["timeline"][0]["data"]["confidence"] = 0.2
+                if case == "missing_confidence": bad["timeline"][0]["data"].pop("confidence")
+                if case == "invalid_confidence": bad["timeline"][0]["data"]["confidence"] = True
+                if case == "raw_response": bad["timeline"][0]["data"]["raw"] = "unparsed provider response"
+                if case == "placeholder": bad["timeline"][0]["data"]["visual_summary"] = "尚未執行 MiniMax 視覺理解。"
+                if case == "audio_error": bad["audio_status"] = "error"
+                if case == "partial": bad["status"] = "partial"
+                self.assertEqual(server.analysis_quality(bad)["status"], "needs_review")
+                self.assertTrue(server.analysis_quality(bad)["reasons"])
+                response = server.analysis_tool_result(bad)
+                self.assertEqual(server.PreparedVideoAnalysisResult.model_validate(response.structuredContent).quality.status, "needs_review")
+                self.assertIn("停止摘要", response.content[0].text)
+        good["audio_status"] = "skipped"
+        good["transcript"]["segments"] = []
+        self.assertEqual(server.analysis_quality(good)["status"], "evidence_available", "Silent video is not failed ASR")
+
+    def test_cached_analysis_is_rechecked_for_quality(self):
+        cached = {"status": "complete", "source_fingerprint": "same", "audio_status": "complete",
+                  "visual_status": "complete", "timeline": [], "transcript": {"segments": []}}
+        with (patch.object(server, "prepared_job_dir", return_value=Path("unused")),
+              patch.object(server, "read_manifest", return_value={"status": "ready"}),
+              patch.object(server.pipeline, "locate_source_video", return_value=Path("unused.mp4")),
+              patch.object(server.pipeline, "file_fingerprint", return_value="same"),
+              patch.object(server.pipeline, "reuse_artifact", return_value=cached)):
+            result = server.analyze_prepared_sync("0123456789ab")
+        self.assertEqual(result["quality"]["status"], "needs_review")
+
+    def test_analysis_busy_does_not_start_provider_work(self):
+        with patch.object(server, "analyze_prepared_sync") as analyze, server.JOB_LOCK:
+            result = asyncio.run(server.mcp._tool_manager.call_tool(
+                "analyze_prepared_video", {"job_id": "0123456789ab"}, convert_result=True))
+        analyze.assert_not_called()
+        self.assertFalse(result.isError)
+        self.assertEqual(server.PreparedVideoAnalysisResult.model_validate(result.structuredContent).status, "busy")
+
     def test_server_limit_applies_when_argument_is_omitted(self):
         with patch.object(server, "MCP_MAX_SEGMENTS", 1):
             with self.assertRaisesRegex(ValueError, "max_segments"):
@@ -100,6 +153,24 @@ class ReliabilityTests(unittest.TestCase):
             with patch.object(server.shutil, "disk_usage", return_value=SimpleNamespace(free=1)):
                 with self.assertRaisesRegex(RuntimeError, "磁碟空間不足"):
                     server.require_disk_space(10)
+
+    def test_drive_busy_returns_retryable_state_without_starting_upload(self):
+        with patch.object(server, "upload_prepared_drive_sync") as upload:
+            with server.JOB_LOCK:
+                result = asyncio.run(server.mcp._tool_manager.call_tool(
+                    "upload_prepared_video_to_drive", {"job_id": "0123456789ab"}, convert_result=True))
+            upload.assert_not_called()
+        self.assertFalse(result.isError)
+        state = server.DriveUploadResult.model_validate(result.structuredContent)
+        self.assertEqual(state.status, "busy")
+        self.assertEqual(state.error_code, "MCP_BUSY")
+        self.assertEqual(state.retry_after_seconds, 5)
+        self.assertEqual(state.files, [])
+        self.assertIn("尚未分析或上傳", result.content[0].text)
+        denied = server.drive_tool_error_result(RuntimeError("HTTP 403"))
+        self.assertTrue(denied.isError)
+        self.assertEqual(denied.structuredContent["status"], "error")
+        self.assertFalse(server.JOB_LOCK.locked())
 
     def test_database_handles_close_even_when_schema_setup_fails(self):
         from unittest.mock import MagicMock
