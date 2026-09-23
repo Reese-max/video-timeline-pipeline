@@ -329,6 +329,35 @@ class InstagramAuthorTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "不可使用單篇"):
             pipeline.instagram_username("https://www.instagram.com/reel/CURRENT/")
 
+    def test_brightdata_discovery_fails_closed_without_finite_budget(self) -> None:
+        """--allow-batch-cloud 只是 opt-in，不是預算；無上限請求在送出前拒絕（#8）"""
+        calls: list[str] = []
+        environment = {
+            "BRIGHTDATA_API_TOKEN": "test-brightdata-token",
+            "BRIGHTDATA_RUN_TIMEOUT_SECONDS": "60",
+        }
+        with mock.patch.object(
+            pipeline, "post_json", side_effect=lambda url, *a, **kw: calls.append(url)
+        ), mock.patch.object(
+            pipeline, "get_json", side_effect=lambda url, *a, **kw: calls.append(url)
+        ), mock.patch.dict(pipeline.os.environ, environment, clear=True):
+            with self.assertRaisesRegex(ValueError, "instagram-max-items"):
+                pipeline.fetch_instagram_author(
+                    "https://www.instagram.com/example/",
+                    "365d",
+                    max_items=None,
+                    allow_paid=True,
+                )
+            for bad in (0, -5):
+                with self.assertRaisesRegex(ValueError, "instagram-max-items"):
+                    pipeline.fetch_instagram_author(
+                        "https://www.instagram.com/example/",
+                        "365d",
+                        max_items=bad,
+                        allow_paid=True,
+                    )
+        self.assertEqual(calls, [], "預算閘失敗前不得有任何 Bright Data 請求")
+
 
 if __name__ == "__main__":
     unittest.main()
