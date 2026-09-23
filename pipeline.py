@@ -4160,13 +4160,13 @@ def fetch_social_post(url: str, cache_root: Path, *, allow_paid: bool = False) -
                 f"{BRIGHTDATA_API_ROOT}/trigger?{query}", headers, method="POST",
                 body=json.dumps([{"url": canonical}]).encode(), timeout=60, attempts=1)
             snapshot = submitted.get("snapshot_id") if isinstance(submitted, dict) else None
-            if not isinstance(snapshot, str) or not re.fullmatch(r"s_[A-Za-z0-9_-]+", snapshot):
-                raise RuntimeError("採集回應缺少 snapshot_id；禁止盲目重送，請到 Bright Data 核對。")
+            if not isinstance(snapshot, str) or not re.fullmatch(r"sd?_[A-Za-z0-9_-]+", snapshot):
+                raise RuntimeError("採集回應 snapshot_id 缺少或格式無效；禁止盲目重送，請到 Bright Data 核對。")
             state = {"status": "pending", "url": canonical, "snapshot_id": snapshot,
                      "dataset_id": dataset, "provider": "brightdata"}
             write_json(checkpoint, state)
         snapshot = state["snapshot_id"]
-        if not re.fullmatch(r"s_[A-Za-z0-9_-]+", snapshot):
+        if not re.fullmatch(r"sd?_[A-Za-z0-9_-]+", snapshot):
             raise RuntimeError("快取 snapshot_id 無效。")
         progress = get_json(f"{BRIGHTDATA_API_ROOT}/progress/{snapshot}", headers)
         status = progress.get("status") if isinstance(progress, dict) else None
@@ -4235,7 +4235,7 @@ def fetch_instagram_author(
             timeout=60,
         )
         snapshot_id = str(payload.get("snapshot_id") or "") if isinstance(payload, dict) else ""
-        if not re.fullmatch(r"s_[A-Za-z0-9_-]+", snapshot_id):
+        if not re.fullmatch(r"sd?_[A-Za-z0-9_-]+", snapshot_id):
             raise RuntimeError("Bright Data 啟動回應缺少有效 snapshot_id。")
         deadline = time.monotonic() + timeout_seconds
         status = ""

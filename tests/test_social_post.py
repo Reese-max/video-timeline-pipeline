@@ -105,7 +105,7 @@ class SocialPostTests(unittest.TestCase):
                              ("https://facebook.com/share/v/ABC/", "gd_lyclm1571iy3mv57zw")]:
             with self.subTest(url=url), tempfile.TemporaryDirectory() as root, \
                     patch.dict(pipeline.os.environ, {"BRIGHTDATA_API_TOKEN": "test-secret"}), \
-                    patch.object(pipeline, "request_json", return_value={"snapshot_id": "s_test"}) as submit, \
+                    patch.object(pipeline, "request_json", return_value={"snapshot_id": "sd_test"}) as submit, \
                     patch.object(pipeline, "get_json", side_effect=[{"status": "running"}, {"status": "ready"},
                         [{"url": url, "description": "IG text", "post_content": "Threads text", "content": "FB text"}]]) as read:
                 result = pipeline.fetch_social_post(url, Path(root), allow_paid=True)
@@ -123,6 +123,20 @@ class SocialPostTests(unittest.TestCase):
                 self.assertEqual(submit.call_args.kwargs["attempts"], 1)
                 self.assertEqual(len(pipeline.json.loads(submit.call_args.kwargs["body"])), 1)
                 self.assertNotIn("test-secret", str(result))
+
+    def test_instagram_discovery_snapshot_formats(self):
+        for snapshot in ["s_test", "sd_test", "sd_../escape"]:
+            with self.subTest(snapshot=snapshot), \
+                    patch.dict(pipeline.os.environ, {"BRIGHTDATA_API_TOKEN": "test-secret"}), \
+                    patch.object(pipeline, "post_json", return_value={"snapshot_id": snapshot}), \
+                    patch.object(pipeline, "get_json", side_effect=[{"status": "ready"}, []]) as read:
+                if "/" in snapshot:
+                    with self.assertRaisesRegex(RuntimeError, "snapshot_id"):
+                        pipeline.fetch_instagram_author("testauthor", allow_paid=True)
+                    read.assert_not_called()
+                else:
+                    result = pipeline.fetch_instagram_author("testauthor", allow_paid=True)
+                    self.assertEqual(result["instagram"]["snapshot_id"], snapshot)
 
     def test_uncertain_submission_never_retries_or_leaks_token(self):
         with tempfile.TemporaryDirectory() as root, patch.dict(pipeline.os.environ, {"BRIGHTDATA_API_TOKEN": "test-secret"}), \
