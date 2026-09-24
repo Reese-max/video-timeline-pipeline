@@ -4134,6 +4134,45 @@ def normalize_social_post(record: dict[str, Any], url: str) -> dict[str, Any]:
                             "不保證完整留言、私人內容或所有 carousel 媒體；不自動刷新可能過期的 CDN 網址。"]}
 
 
+def submit_brightdata_once(folder: Path, url: str, headers: dict[str, str], body: bytes) -> str:
+    """Persist a billable submission receipt before interpreting it; never retry the POST."""
+    folder.mkdir(parents=True, exist_ok=True, mode=0o700)
+    receipt_path = folder / "submission.json"
+    fingerprint = hashlib.sha256(body).hexdigest()
+    token = headers.get("Authorization", "").removeprefix("Bearer ")
+    if receipt_path.exists():
+        try:
+            receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+            if receipt["request_url"] != url or receipt["request_sha256"] != fingerprint:
+                raise ValueError("request mismatch")
+        except (OSError, ValueError, KeyError, TypeError):
+            raise RuntimeError(f"採集回執損壞或請求不符；禁止重送，請核對 {receipt_path}。") from None
+    else:
+        receipt = {"request_url": url, "request_sha256": fingerprint,
+                   "input": json.loads(body), "submitted_at": rss_now()}
+        # ponytail: uncertain submissions stay blocked; provider-side reconciliation is manual.
+        try:
+            with (folder / ".submitted").open("x", encoding="utf-8") as marker:
+                json.dump(receipt, marker, ensure_ascii=False)
+                marker.flush()
+                os.fsync(marker.fileno())
+        except FileExistsError:
+            raise RuntimeError(f"上次送出狀態不明，禁止再次計費採集；請核對 {folder} 與 Bright Data。") from None
+        try:
+            receipt["response"] = request_json(url, headers, method="POST", body=body, timeout=60, attempts=1)
+        except Exception as exc:
+            receipt["error"] = str(exc)
+        receipt["received_at"] = rss_now()
+        receipt = json.loads(redact_values(json.dumps(receipt, ensure_ascii=False),
+                                          {json.dumps(token, ensure_ascii=False)[1:-1]}))
+        write_json(receipt_path, receipt)
+    response = receipt.get("response")
+    snapshot = response.get("snapshot_id") if isinstance(response, dict) else None
+    if not isinstance(snapshot, str) or not re.fullmatch(r"sd?_[A-Za-z0-9_-]+", snapshot):
+        raise RuntimeError(f"採集回應 snapshot_id 缺少或格式無效；禁止重送，請核對回執 {receipt_path} 與 Bright Data。")
+    return snapshot
+
+
 def fetch_social_post(url: str, cache_root: Path, *, allow_paid: bool = False) -> dict[str, Any]:
     platform, post_id, canonical, dataset = social_post_target(url)
     if not allow_paid:
@@ -4149,19 +4188,10 @@ def fetch_social_post(url: str, cache_root: Path, *, allow_paid: bool = False) -
     headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
     try:
         if not state:
-            folder.mkdir(parents=True, exist_ok=True, mode=0o700)
-            # ponytail: one persisted submission per post; uncertain submissions need operator review.
-            try:
-                (folder / ".submitted").touch(exist_ok=False)
-            except FileExistsError:
-                raise RuntimeError("上次送出狀態不明，禁止再次計費採集；請先到 Bright Data 核對。") from None
             query = urllib.parse.urlencode({"dataset_id": dataset, "include_errors": "true", "format": "json"})
-            submitted = request_json(
-                f"{BRIGHTDATA_API_ROOT}/trigger?{query}", headers, method="POST",
-                body=json.dumps([{"url": canonical}]).encode(), timeout=60, attempts=1)
-            snapshot = submitted.get("snapshot_id") if isinstance(submitted, dict) else None
-            if not isinstance(snapshot, str) or not re.fullmatch(r"sd?_[A-Za-z0-9_-]+", snapshot):
-                raise RuntimeError("採集回應 snapshot_id 缺少或格式無效；禁止盲目重送，請到 Bright Data 核對。")
+            snapshot = submit_brightdata_once(
+                folder, f"{BRIGHTDATA_API_ROOT}/trigger?{query}", headers,
+                json.dumps([{"url": canonical}]).encode())
             state = {"status": "pending", "url": canonical, "snapshot_id": snapshot,
                      "dataset_id": dataset, "provider": "brightdata"}
             write_json(checkpoint, state)
@@ -4193,6 +4223,8 @@ def fetch_instagram_author(
     max_items: int | None = None,
     exclude_ids: list[str] | None = None,
     allow_paid: bool = False,
+    root: Path | None = None,
+    previous_snapshot_id: str = "",
 ) -> dict[str, Any]:
     if not allow_paid:
         raise RuntimeError("Bright Data 可能計費；確認帳戶額度後加上 --allow-batch-cloud。")
@@ -4212,7 +4244,7 @@ def fetch_instagram_author(
     discovery_input: dict[str, Any] = {"url": author_url}
     if max_items is not None:
         discovery_input["num_of_posts"] = max_items
-    excluded = list(dict.fromkeys(str(item).strip() for item in (exclude_ids or []) if str(item).strip()))
+    excluded = sorted({str(item).strip() for item in (exclude_ids or []) if str(item).strip()})
     if excluded:
         discovery_input["posts_to_not_include"] = excluded
 
@@ -4227,16 +4259,14 @@ def fetch_instagram_author(
         }
     )
     trigger_url = f"{BRIGHTDATA_API_ROOT}/trigger?{query}"
+    if previous_snapshot_id and not re.fullmatch(r"sd?_[A-Za-z0-9_-]+", previous_snapshot_id):
+        raise ValueError("上次已儲存的 snapshot_id 無效。")
+    body = json.dumps({"input": [discovery_input]}, sort_keys=True).encode("utf-8")
+    # Only the caller's persisted success advances the cycle, including empty discoveries.
+    folder = secure_rss_directory(root or Path(__file__).resolve().parent) / "brightdata" / job_key(
+        f"instagram:{username}:{since}:{previous_snapshot_id}", body.decode("utf-8"))
     try:
-        payload = post_json(
-            trigger_url,
-            headers,
-            json.dumps({"input": [discovery_input]}).encode("utf-8"),
-            timeout=60,
-        )
-        snapshot_id = str(payload.get("snapshot_id") or "") if isinstance(payload, dict) else ""
-        if not re.fullmatch(r"sd?_[A-Za-z0-9_-]+", snapshot_id):
-            raise RuntimeError("Bright Data 啟動回應缺少有效 snapshot_id。")
+        snapshot_id = submit_brightdata_once(folder, trigger_url, headers, body)
         deadline = time.monotonic() + timeout_seconds
         status = ""
         while status != "ready":
@@ -4254,8 +4284,8 @@ def fetch_instagram_author(
             f"{BRIGHTDATA_API_ROOT}/snapshot/{urllib.parse.quote(snapshot_id, safe='')}?format=json"
         )
         result = get_json(snapshot_url, headers)
-    except RuntimeError as exc:
-        raise RuntimeError(str(exc).replace(token, "<redacted>")) from exc
+    except Exception as exc:
+        raise RuntimeError(str(exc).replace(token, "<redacted>")) from None
 
     if isinstance(result, list):
         raw_items = [item for item in result if isinstance(item, dict)]
@@ -4486,7 +4516,7 @@ def add_instagram_subscription(
     ):
         raise RuntimeError("這個 Instagram 作者已經訂閱。")
     feed = fetch_instagram_author(
-        username, since, max_items=max_items, allow_paid=allow_paid
+        username, since, max_items=max_items, allow_paid=allow_paid, root=root
     )
     newest = next((item["published"] for item in feed["items"] if item.get("published")), "")
     snapshot = write_instagram_discovery(root, feed)
@@ -4499,6 +4529,7 @@ def add_instagram_subscription(
         "instagram_max_items": max_items,
         "instagram_last_published": newest,
         "instagram_last_discovery": snapshot.name,
+        "instagram_last_snapshot_id": feed["instagram"]["snapshot_id"],
         "name": name.strip() or str(feed["title"]),
         "enabled": True,
         "latest_only": latest_only,
@@ -4555,6 +4586,8 @@ def refresh_rss(root: Path, workers: int = 4, allow_paid: bool = False) -> dict[
                     max_items=subscription.get("instagram_max_items"),
                     exclude_ids=known_ids,
                     allow_paid=allow_paid,
+                    root=root,
+                    previous_snapshot_id=str(subscription.get("instagram_last_snapshot_id") or ""),
                 ), None
             return fetch_rss(
                 str(subscription["url"]),
@@ -4588,6 +4621,7 @@ def refresh_rss(root: Path, workers: int = 4, allow_paid: bool = False) -> dict[
                 elif kind == "instagram-author":
                     snapshot = write_instagram_discovery(root, feed)
                     subscription["instagram_last_discovery"] = snapshot.name
+                    subscription["instagram_last_snapshot_id"] = feed["instagram"]["snapshot_id"]
                     newest = next((item["published"] for item in feed["items"] if item.get("published")), "")
                     if newest:
                         subscription["instagram_last_published"] = newest
@@ -5178,13 +5212,18 @@ def run_rss_command(args: argparse.Namespace) -> int:
     if args.instagram_author:
         since = args.instagram_since or "365d"
         if args.instagram_discover_only:
-            feed = fetch_instagram_author(
-                args.instagram_author,
-                since,
-                max_items=args.instagram_max_items,
-                allow_paid=bool(args.allow_batch_cloud),
-            )
-            snapshot = write_instagram_discovery(root, feed)
+            with rss_writer_lock(root):
+                username = instagram_username(args.instagram_author)
+                previous = reuse_artifact(root / "rss" / f"instagram-{job_key(username)}-latest.json") or {}
+                feed = fetch_instagram_author(
+                    args.instagram_author,
+                    since,
+                    max_items=args.instagram_max_items,
+                    allow_paid=bool(args.allow_batch_cloud),
+                    root=root,
+                    previous_snapshot_id=str(previous.get("instagram", {}).get("snapshot_id") or ""),
+                )
+                snapshot = write_instagram_discovery(root, feed)
             incomplete = (
                 f"；{feed['instagram']['missing_date_count']} 筆缺發佈日期，無法驗證回溯範圍"
                 if feed["instagram"]["missing_date_count"]

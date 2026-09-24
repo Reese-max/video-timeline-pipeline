@@ -126,17 +126,124 @@ class SocialPostTests(unittest.TestCase):
 
     def test_instagram_discovery_snapshot_formats(self):
         for snapshot in ["s_test", "sd_test", "sd_../escape"]:
-            with self.subTest(snapshot=snapshot), \
+            with self.subTest(snapshot=snapshot), tempfile.TemporaryDirectory() as root, \
                     patch.dict(pipeline.os.environ, {"BRIGHTDATA_API_TOKEN": "test-secret"}), \
-                    patch.object(pipeline, "post_json", return_value={"snapshot_id": snapshot}), \
+                    patch.object(pipeline, "request_json", return_value={"snapshot_id": snapshot}), \
                     patch.object(pipeline, "get_json", side_effect=[{"status": "ready"}, []]) as read:
                 if "/" in snapshot:
                     with self.assertRaisesRegex(RuntimeError, "snapshot_id"):
-                        pipeline.fetch_instagram_author("testauthor", allow_paid=True)
+                        pipeline.fetch_instagram_author("testauthor", allow_paid=True, root=Path(root))
                     read.assert_not_called()
                 else:
-                    result = pipeline.fetch_instagram_author("testauthor", allow_paid=True)
+                    result = pipeline.fetch_instagram_author("testauthor", allow_paid=True, root=Path(root))
                     self.assertEqual(result["instagram"]["snapshot_id"], snapshot)
+
+    def test_instagram_timeout_posts_once_even_across_restarts(self):
+        with tempfile.TemporaryDirectory() as root, patch.dict(pipeline.os.environ, {"BRIGHTDATA_API_TOKEN": "test-secret"}), \
+                patch.object(pipeline.urllib.request, "urlopen", side_effect=TimeoutError()) as transport:
+            for _ in range(2):
+                with self.assertRaisesRegex(RuntimeError, "禁止重送"):
+                    pipeline.fetch_instagram_author("testauthor", allow_paid=True, root=Path(root))
+            transport.assert_called_once()
+            receipt = pipeline.json.loads(next(Path(root).rglob("submission.json")).read_text(encoding="utf-8"))
+            self.assertIn("error", receipt)
+            self.assertIn("submitted_at", receipt)
+            self.assertNotIn("test-secret", str(receipt))
+
+    def test_unknown_response_preserved_and_checkpoint_write_recovered_without_post(self):
+        for response in [{"unexpected": "test-secret", "snapshot_id": "future_test"}, {"snapshot_id": "sd_test"}]:
+            with self.subTest(response=response), tempfile.TemporaryDirectory() as root, \
+                    patch.dict(pipeline.os.environ, {"BRIGHTDATA_API_TOKEN": "test-secret"}), \
+                    patch.object(pipeline, "request_json", return_value=response) as submit, \
+                    patch.object(pipeline, "get_json", return_value={"status": "running"}):
+                real_write = pipeline.write_json
+
+                def fail_checkpoint(path, data):
+                    if path.name == "brightdata.json":
+                        raise OSError("disk full")
+                    real_write(path, data)
+
+                with patch.object(pipeline, "write_json", side_effect=fail_checkpoint), self.assertRaises(RuntimeError):
+                    pipeline.fetch_social_post("https://instagram.com/p/ABC", Path(root), allow_paid=True)
+                receipt = pipeline.json.loads(next(Path(root).rglob("submission.json")).read_text(encoding="utf-8"))
+                self.assertEqual(receipt["response"]["snapshot_id"], response["snapshot_id"])
+                self.assertNotIn("test-secret", str(receipt))
+                self.assertNotIn("Authorization", str(receipt))
+                self.assertEqual(receipt["input"], [{"url": "https://www.instagram.com/p/ABC/"}])
+                if response["snapshot_id"] == "sd_test":
+                    result = pipeline.fetch_social_post("https://instagram.com/p/ABC", Path(root), allow_paid=True)
+                    self.assertEqual(result["snapshot_id"], "sd_test")
+                else:
+                    with self.assertRaisesRegex(RuntimeError, "禁止重送"):
+                        pipeline.fetch_social_post("https://instagram.com/p/ABC", Path(root), allow_paid=True)
+                submit.assert_called_once()
+
+    def test_legacy_marker_and_corrupt_receipts_fail_closed(self):
+        for receipt in [None, "{broken", '[]', '{"request_url":"wrong","request_sha256":"wrong"}']:
+            with self.subTest(receipt=receipt), tempfile.TemporaryDirectory() as root, \
+                    patch.dict(pipeline.os.environ, {"BRIGHTDATA_API_TOKEN": "test-secret"}), \
+                    patch.object(pipeline, "request_json") as submit:
+                folder = Path(root) / pipeline.job_key("instagram:ABC")
+                folder.mkdir()
+                (folder / ".submitted").touch()
+                if receipt is not None:
+                    (folder / "submission.json").write_text(receipt, encoding="utf-8")
+                with self.assertRaisesRegex(RuntimeError, "禁止"):
+                    pipeline.fetch_social_post("https://instagram.com/p/ABC", Path(root), allow_paid=True)
+                submit.assert_not_called()
+
+    def test_receipt_io_failure_never_repeats_submission(self):
+        for failure in ["before_post", "after_post"]:
+            with self.subTest(failure=failure), tempfile.TemporaryDirectory() as root, \
+                    patch.dict(pipeline.os.environ, {"BRIGHTDATA_API_TOKEN": "test-secret"}), \
+                    patch.object(pipeline, "request_json", return_value={"snapshot_id": "sd_test"}) as submit:
+                target, method = (pipeline.os, "fsync") if failure == "before_post" else (pipeline, "write_json")
+                with patch.object(target, method, side_effect=OSError("disk full")), self.assertRaises(RuntimeError):
+                    pipeline.fetch_social_post("https://instagram.com/p/ABC", Path(root), allow_paid=True)
+                with self.assertRaisesRegex(RuntimeError, "禁止"):
+                    pipeline.fetch_social_post("https://instagram.com/p/ABC", Path(root), allow_paid=True)
+                self.assertEqual(submit.call_count, 0 if failure == "before_post" else 1)
+
+    def test_instagram_poll_failure_resumes_snapshot(self):
+        with tempfile.TemporaryDirectory() as root, patch.dict(pipeline.os.environ, {"BRIGHTDATA_API_TOKEN": "test-secret"}), \
+                patch.object(pipeline, "request_json", return_value={"snapshot_id": "sd_test"}) as submit, \
+                patch.object(pipeline, "get_json", side_effect=[RuntimeError("GET timeout"), {"status": "ready"}, []]):
+            with self.assertRaisesRegex(RuntimeError, "GET timeout"):
+                pipeline.fetch_instagram_author("testauthor", allow_paid=True, root=Path(root))
+            result = pipeline.fetch_instagram_author("testauthor", allow_paid=True, root=Path(root))
+            self.assertEqual(result["instagram"]["snapshot_id"], "sd_test")
+            submit.assert_called_once()
+
+    def test_instagram_cli_uses_saved_snapshot_and_custom_root(self):
+        with tempfile.TemporaryDirectory() as directory, patch.dict(pipeline.os.environ, {"BRIGHTDATA_API_TOKEN": "test-secret"}), \
+                patch.object(pipeline, "request_json", side_effect=[{"snapshot_id": "sd_first"}, {"snapshot_id": "sd_second"}]) as submit, \
+                patch.object(pipeline, "get_json", side_effect=lambda url, headers: {"status": "ready"} if "/progress/" in url else []), \
+                patch.object(pipeline.sys, "argv", ["pipeline.py", "--instagram-author", "testauthor", "--instagram-discover-only",
+                                                   "--allow-batch-cloud", "--root", directory]):
+            args = pipeline.parse_args()
+            self.assertEqual(pipeline.run_rss_command(args), 0)
+            with patch.object(pipeline, "write_instagram_discovery", side_effect=OSError("disk full")), self.assertRaises(OSError):
+                pipeline.run_rss_command(args)
+            self.assertEqual(pipeline.run_rss_command(args), 0)
+            self.assertEqual(submit.call_count, 2)
+            self.assertEqual(len(list(Path(directory).rglob("submission.json"))), 2)
+
+    def test_instagram_refresh_advances_only_after_state_saved_including_empty_result(self):
+        with tempfile.TemporaryDirectory() as directory, patch.dict(pipeline.os.environ, {"BRIGHTDATA_API_TOKEN": "test-secret"}), \
+                patch.object(pipeline, "request_json", side_effect=[{"snapshot_id": "sd_first"}, {"snapshot_id": "sd_second"}]) as submit, \
+                patch.object(pipeline, "get_json", side_effect=lambda url, headers: {"status": "ready"} if "/progress/" in url else []):
+            root = Path(directory)
+            with patch.object(pipeline, "save_rss_state", side_effect=OSError("disk full")), self.assertRaises(OSError):
+                pipeline.add_instagram_subscription(root, "testauthor", allow_paid=True)
+            pipeline.add_instagram_subscription(root, "testauthor", allow_paid=True)
+            self.assertEqual(submit.call_count, 1)
+            with patch.object(pipeline, "save_rss_state", side_effect=OSError("disk full")), self.assertRaises(OSError):
+                pipeline.refresh_rss(root, allow_paid=True)
+            self.assertEqual(submit.call_count, 2)
+            self.assertEqual(pipeline.load_rss_state(root)["subscriptions"][0]["instagram_last_snapshot_id"], "sd_first")
+            self.assertEqual(pipeline.refresh_rss(root, allow_paid=True)["failed"], 0)
+            self.assertEqual(submit.call_count, 2)
+            self.assertEqual(pipeline.load_rss_state(root)["subscriptions"][0]["instagram_last_snapshot_id"], "sd_second")
 
     def test_uncertain_submission_never_retries_or_leaks_token(self):
         with tempfile.TemporaryDirectory() as root, patch.dict(pipeline.os.environ, {"BRIGHTDATA_API_TOKEN": "test-secret"}), \
