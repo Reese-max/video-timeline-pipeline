@@ -72,6 +72,18 @@ python pipeline.py --video 'D:\path\to\video.mp4' --dry-run --slide-extractor st
 
 `mcp_server.py` 是最小的 ChatGPT Apps/MCP 入口：公開影片 URL → 既有下載器 → FFmpeg 分段 → Groq 語音辨識／MiniMax 抽樣畫面分析 → ChatGPT 根據工具證據整理時間軸。widget 自動呼叫 `analyze_prepared_video`；主流程不再依賴原生 MP4 附件或 Drive。CLI 的 MiniMax 摘要流程不變；MCP 不另呼叫 MiniMax 產生摘要，避免重複成本與失敗環節。影片分段與代表影格放在 Git 忽略的 `mcp_jobs\`。
 
+### MCP 影音暫存保留 7 天
+
+`media_retention.py` 預設只預覽；加 `--apply` 才刪除。只處理準備及分析皆完成、來源指紋一致、品質為 `evidence_available`，且工作內最後檔案寫入已**超過 7 天**的工作。這是保守的完成時間判定，後續寫入會重新延長保留期。失敗、未完成、需要覆核、有 Drive 交接紀錄、`.keep-media`、下載暫存或連結的工作全部保留。
+
+```bash
+cd /home/box/video-timeline-pipeline
+.venv/bin/python media_retention.py --jobs-root /home/box/video-timeline-pipeline/mcp_jobs
+.venv/bin/python media_retention.py --jobs-root /home/box/video-timeline-pipeline/mcp_jobs --apply
+```
+
+只刪除明確命名的來源影片、MP4 分段、音訊與影格檔案；不刪工作目錄、摘要、逐字稿、JSON 紀錄、付費回執或 Google Drive 檔案。刪除紀錄留在各工作的 `media-retention.json`；刪除無法復原，原有媒體網址會失效，可重新下載來源影片。清理與 MCP 共用跨程序工作鎖，忙碌時跳過、不排隊。**啟用排程前必須先部署並重啟新版 MCP**，不可讓不認識共享鎖的舊程序與清理同時執行。可排每日台灣時間 03:00 先預覽再執行；程式本身不會安裝排程。安全回歸：`python -m unittest discover -s tests -p test_media_retention.py -v`。
+
 先在隔離環境安裝依賴（FFmpeg／ffprobe 仍需在 PATH）：
 
 ```powershell

@@ -552,7 +552,11 @@ def run_job(operation, *args):
     if not JOB_LOCK.acquire(blocking=False):
         raise JobBusyError("MCP 正在處理另一個影片工作，請稍後重試；本次未加入背景佇列。")
     try:
-        return operation(*args)
+        # ponytail: one writer across processes; use per-job locks if throughput requires it.
+        with pipeline.file_writer_lock(MCP_JOBS_ROOT / ".writer.lock"):
+            return operation(*args)
+    except pipeline.WriterBusyError:
+        raise JobBusyError("MCP 正在處理另一個影片工作或清理；請稍後重試，本次未加入背景佇列。") from None
     finally:
         JOB_LOCK.release()
 

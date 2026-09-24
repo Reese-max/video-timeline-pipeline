@@ -1,0 +1,124 @@
+import json
+import os
+import subprocess
+import sys
+import tempfile
+import time
+import unittest
+from pathlib import Path
+from unittest.mock import patch
+
+import media_retention as retention
+import mcp_server as server
+import pipeline
+
+
+class RetentionTests(unittest.TestCase):
+    def make_job(self, root, age=8):
+        job = root / "0123456789ab"
+        stamp = self.now - age * 86400
+        for name in ["source.mp4", "threads_media_000.mp4", "segments/segment_000.mp4",
+                     "previews/preview_000.jpg", "analysis/frames/frame_000001.jpg", "analysis/audio/audio_0000.mp3"]:
+            path = job / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(b"media")
+            os.utime(path, (stamp, stamp))
+        fingerprint = pipeline.file_fingerprint(job / "source.mp4")
+        pipeline.write_json(job / "manifest.json", {"status": "ready", "job_id": job.name, "source": {"fingerprint": fingerprint}})
+        pipeline.write_json(job / "analysis/result.json", {"status": "complete", "job_id": job.name,
+            "source_fingerprint": fingerprint, "quality": {"status": "evidence_available"}, "transcript": "keep"})
+        for name in [".download-complete", "summary.md", "captions.srt", "submission.json", "user-upload.mp4"]:
+            (job / name).write_text("keep", encoding="utf-8")
+        for path in job.rglob("*"):
+            if path.is_file():
+                os.utime(path, (stamp, stamp))
+        return job
+
+    def setUp(self):
+        self.now = time.time()
+
+    def test_dry_run_then_delete_only_generated_media_and_keep_records(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve() / "mcp_jobs"
+            job = self.make_job(root)
+            preserved = {p: p.read_bytes() for p in job.rglob("*") if p.is_file() and not retention.MEDIA.fullmatch(p.relative_to(job).as_posix())}
+            report = retention.cleanup(root, now=self.now)
+            self.assertEqual(report["selected_files"], 6)
+            self.assertEqual(report["deleted_files"], 0)
+            self.assertTrue((job / "source.mp4").exists())
+            report = retention.cleanup(root, apply=True, now=self.now)
+            self.assertEqual(report["deleted_files"], 6)
+            self.assertEqual(report["errors"], [])
+            self.assertEqual(json.loads((job / retention.AUDIT).read_text())["status"], "cleaned")
+            for path, content in preserved.items():
+                self.assertEqual(path.read_bytes(), content)
+            self.assertEqual(retention.cleanup(root, apply=True, now=self.now)["deleted_files"], 0)
+
+    def test_ineligible_jobs_are_untouched(self):
+        for reason in ["exactly_7_days", "recent_write", "partial", "needs_review", "drive", "manual_hold", "invalid", "source_changed", "unfinished"]:
+            with self.subTest(reason=reason), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory).resolve() / "mcp_jobs"
+                job = self.make_job(root, 7 if reason == "exactly_7_days" else 8)
+                result = job / "analysis/result.json"
+                if reason in {"partial", "needs_review"}:
+                    data = json.loads(result.read_text())
+                    if reason == "partial": data["status"] = "partial"
+                    else: data["quality"]["status"] = "needs_review"
+                    pipeline.write_json(result, data)
+                    os.utime(result, (self.now - 8 * 86400,) * 2)
+                elif reason == "recent_write":
+                    (job / "recent.json").write_text("{}")
+                elif reason == "drive":
+                    (job / "drive-manifest.json").write_text("{}")
+                elif reason == "manual_hold":
+                    (job / ".keep-media").touch()
+                elif reason == "invalid":
+                    result.write_text("{")
+                elif reason == "source_changed":
+                    (job / "source.mp4").write_bytes(b"changed")
+                elif reason == "unfinished":
+                    (job / "source.mp4.part").touch()
+                self.assertEqual(retention.cleanup(root, apply=True, now=self.now)["deleted_files"], 0)
+                self.assertTrue((job / "source.mp4").exists())
+
+    def test_cross_process_lock_blocks_cleanup_and_mcp_then_releases(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve() / "mcp_jobs"
+            self.make_job(root)
+            with pipeline.file_writer_lock(root / ".writer.lock"):
+                completed = subprocess.run([sys.executable, str(Path(retention.__file__)), "--jobs-root", str(root), "--apply"], capture_output=True, text=True)
+                self.assertEqual(completed.returncode, 0, completed.stderr)
+                self.assertEqual(json.loads(completed.stdout)["status"], "busy")
+                with patch.object(server, "MCP_JOBS_ROOT", root), self.assertRaises(server.JobBusyError):
+                    server.run_job(lambda: self.fail("must not run"))
+            with patch.object(server, "MCP_JOBS_ROOT", root):
+                self.assertEqual(server.run_job(lambda: "ok"), "ok")
+
+    @unittest.skipIf(os.name == "nt", "symlink creation needs Windows privileges")
+    def test_symlink_and_hardlink_do_not_escape_scope(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve() / "mcp_jobs"
+            job = self.make_job(root)
+            outside = Path(directory) / "outside.mp4"
+            outside.write_bytes(b"keep outside")
+            (job / "analysis/frames/frame_999999.jpg").symlink_to(outside)
+            self.assertEqual(retention.cleanup(root, apply=True, now=self.now)["deleted_files"], 0)
+            self.assertEqual(outside.read_bytes(), b"keep outside")
+            (job / "analysis/frames/frame_999999.jpg").unlink()
+            os.link(job / "source.mp4", Path(directory) / "source-hardlink.mp4")
+            self.assertEqual(retention.cleanup(root, apply=True, now=self.now)["deleted_files"], 0)
+
+    def test_expired_source_can_be_downloaded_again_without_removing_records(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / ".download-complete").touch()
+            def downloaded(*args, **kwargs):
+                (root / "source.mp4").write_bytes(b"new")
+                return root / "source.mp4"
+            with patch.object(pipeline, "download_threads_video", side_effect=downloaded) as fetch:
+                self.assertEqual(pipeline.download_video("https://threads.com/t/ABC", root), root / "source.mp4")
+                fetch.assert_called_once()
+
+
+if __name__ == "__main__":
+    unittest.main()

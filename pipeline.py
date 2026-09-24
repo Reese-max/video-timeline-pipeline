@@ -675,7 +675,10 @@ def download_video(
     if done.is_file():
         if private_url:
             sanitize_download_info(job_dir / "source.info.json")
-        return locate_source_video(job_dir)
+        try:
+            return locate_source_video(job_dir)
+        except RuntimeError:
+            pass  # Media retention may remove bytes while preserving the job's records.
     job_dir.mkdir(parents=True, exist_ok=True)
     if is_threads_url(url):
         video_path = download_threads_video(
@@ -3550,11 +3553,16 @@ def secure_rss_directory(root: Path) -> Path:
     return directory
 
 
+class WriterBusyError(RuntimeError):
+    pass
+
+
 @contextlib.contextmanager
-def rss_writer_lock(root: Path, timeout: float = 5.0):
-    """同一個 root 同時只允許一個 RSS 寫入者。"""
-    directory = secure_rss_directory(root)
-    path = directory / ".writer.lock"
+def file_writer_lock(path: Path, timeout: float = 0.0):
+    """An OS lock shared by server operations and the retention command."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if path.is_symlink():
+        raise RuntimeError("拒絕使用符號連結作為工作鎖。")
     handle = path.open("a+b")
     handle.seek(0, os.SEEK_END)
     if handle.tell() == 0:
@@ -3577,7 +3585,7 @@ def rss_writer_lock(root: Path, timeout: float = 5.0):
                 locked = True
             except OSError:
                 if time.monotonic() >= deadline:
-                    raise RuntimeError("另一個 RSS 寫入程序仍在執行；本次未開始。") from None
+                    raise WriterBusyError("另一個寫入程序仍在執行；本次未開始。") from None
                 time.sleep(0.1)
         yield
     finally:
@@ -3592,6 +3600,13 @@ def rss_writer_lock(root: Path, timeout: float = 5.0):
 
                 fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
         handle.close()
+
+
+@contextlib.contextmanager
+def rss_writer_lock(root: Path, timeout: float = 5.0):
+    """同一個 root 同時只允許一個 RSS 寫入者。"""
+    with file_writer_lock(secure_rss_directory(root) / ".writer.lock", timeout):
+        yield
 
 
 def load_rss_state(root: Path) -> dict[str, Any]:
