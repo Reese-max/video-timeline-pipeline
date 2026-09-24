@@ -209,6 +209,8 @@ python pipeline.py --rss-process --rss-max-items 4 --allow-batch-cloud
 
 盤點快照保存在 Git 忽略且受 ACL 保護的 `rss\instagram-<雜湊>-latest.json`，包含原始 Bright Data 結果與 snapshot provenance。刷新時會把已見 Post ID 傳入 `posts_to_not_include`，本機佇列仍以穩定 ID 去重。Bright Data 的 Reel discovery 目前不支援伺服器端日期篩選；若某筆沒有 `date_posted`，工具會保留並在快照及盤點訊息標示「無法驗證回溯範圍」，不會假裝近一年盤點完整。私人／登入限定內容不處理，平台可見性與供應商回傳仍可能造成缺漏。請參考 [Instagram Scraper API](https://docs.brightdata.com/datasets/scrapers/instagram/introduction)、[Reel discovery](https://docs.brightdata.com/api-reference/scrapers/social-media-apis/instagram-reels-discover-by-url) 與 [非同步 snapshot 流程](https://docs.brightdata.com/api-reference/rest-api/scraper/asynchronous-requests)。
 
+每輪作者採集的 POST 僅送一次，回執保存在所選 `--root` 的 `rss/brightdata/<雜湊>/`。相同輸入在輪詢、下載或本機儲存失敗後重試，沿用原 snapshot；只有訂閱狀態（或 `--instagram-discover-only` 的快照）成功儲存，後續明確允許的刷新才會開始新一輪採集，空結果亦同。回應不明時停止，不以重送嘗試恢復；改輸入／root 屬於另一個請求，不應用來繞過此保護。
+
 單篇公開 Reel／影片貼文不需要先建立作者訂閱，可直接走既有入口：
 
 ```powershell
@@ -228,6 +230,8 @@ FB 回應的 `content` 是貼文文字；`attachments` 的照片與影片分開�
 此工具預設拒絕計費採集。管理員須在主機安全設定 `BRIGHTDATA_API_TOKEN`，並將人工核准的單篇網址放入 `BRIGHTDATA_ALLOWED_POST_URLS`（逗號分隔）；呼叫者另須取得使用者明確同意才設定 `allow_paid=true`。網址核准清單不等於呼叫者身分驗證，也不是金額上限，仍須在供應商設定支出控制。本版不改 MCP 登入設定；憑證不要貼到對話或提交 Git。
 
 回傳 `pending` 時依 `retry_after_seconds` 等待，再以相同網址呼叫，會沿用同一 snapshot；`ready` 後重用本機快取。首次送出僅嘗試一次，回應遺失或供應商失敗時不自動重建計費工作，須人工到 Bright Data 核對。狀態保存在 Git 忽略的 `mcp_jobs/social-posts/`，不要為了重試直接刪除；CDN 網址可能過期，工具不自動付費刷新。
+
+兩條 Bright Data 路徑共用提交保護：送出前在 `.submitted` 寫入時間、請求 URL／輸入與 SHA-256，送出後先存 `submission.json` 的回應或錯誤診斷，再解析 snapshot。回執不保存請求 headers，並遮蔽 API token；有效 snapshot 可在 checkpoint 寫入失敗後恢復。未知格式、損壞回執、舊版空白 `.submitted` 或回執未寫成時一律禁止重送，請依該目錄資料與供應商紀錄人工核對，不要刪除標記。
 
 貼文文字可交給 ChatGPT 整理；`image_urls`／`video_urls` 只是媒體參照，`media_analyzed=false`，不能宣稱已看過畫面。ChatGPT 可再將 `video_urls` 逐支交給既有 `prepare_video_for_chatgpt` → Groq／MiniMax 分析 → ChatGPT 整理，並保留原始貼文網址作為來源；這不是 `download_video` 裡的隱式付費 fallback。圖片尚未自動送入視覺模型，Drive 仍為選用儲存。
 
