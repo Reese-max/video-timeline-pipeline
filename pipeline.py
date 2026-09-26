@@ -1988,6 +1988,8 @@ def reusable_visual_artifact(observations: Any, candidates: list[dict[str, Any]]
         and len(observations) == len(candidates)
         and all(
             reusable_visual_observation(observation, candidate)
+            and isinstance(candidate.get("path"), (str, Path))
+            and observation["source_image"] == str(candidate["path"])
             for observation, candidate in zip(observations, candidates)
         )
     )

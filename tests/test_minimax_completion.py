@@ -205,10 +205,11 @@ class VisualSchemaTests(unittest.TestCase):
 
     def test_aggregate_cache_checks_every_frame_and_metadata(self) -> None:
         good = self._good()
-        candidate = {"timestamp": 1.5}
+        candidate = {"timestamp": 1.5, "path": "frame.jpg"}
         self.assertTrue(pipeline.reusable_visual_artifact([good], [candidate]))
         self.assertFalse(pipeline.reusable_visual_artifact([good], [candidate, candidate]))
         self.assertFalse(pipeline.reusable_visual_artifact([{**good, "source_image": ""}], [candidate]))
+        self.assertFalse(pipeline.reusable_visual_artifact([{**good, "source_image": "other.jpg"}], [candidate]))
         self.assertFalse(pipeline.reusable_visual_artifact([{**good, "timestamp": 2.0}], [candidate]))
         self.assertFalse(pipeline.reusable_visual_artifact([{**good, "visible_text": "bad"}], [candidate]))
 
@@ -294,7 +295,7 @@ class VisualSchemaTests(unittest.TestCase):
             self.assertEqual(provider.call_count, 1)
             self.assertEqual(first, second)
             self.assertEqual(first[0]["analysis_method"], "minimax")
-            self.assertTrue(pipeline.reusable_visual_artifact(first, [{"timestamp": 1.5}]))
+            self.assertTrue(pipeline.reusable_visual_artifact(first, [{"timestamp": 1.5, "path": str(image)}]))
 
     def test_valid_legacy_cache_hit_needs_no_provider_call(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
