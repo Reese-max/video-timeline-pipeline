@@ -298,24 +298,27 @@ class InstagramAuthorTests(unittest.TestCase):
             "BRIGHTDATA_API_TOKEN": "test-brightdata-token",
             "BRIGHTDATA_RUN_TIMEOUT_SECONDS": "60",
         }
-        with mock.patch.object(
-            pipeline, "post_json", return_value={"snapshot_id": "s_test"}
+        with tempfile.TemporaryDirectory() as root, mock.patch.object(
+            pipeline, "request_json", return_value={"snapshot_id": "s_test"}
         ) as post, mock.patch.object(
             pipeline, "get_json", side_effect=fake_get
-        ), mock.patch.dict(pipeline.os.environ, environment, clear=True):
+        ), mock.patch.dict(pipeline.os.environ, environment):
             feed = pipeline.fetch_instagram_author(
                 "https://www.instagram.com/example/",
                 "2025-01-01",
                 max_items=20,
                 exclude_ids=["already-seen"],
                 allow_paid=True,
+                root=Path(root),
             )
 
         self.assertEqual([item["id"] for item in feed["items"]], ["video-1", "missing-date"])
         self.assertEqual(feed["items"][0]["url"], "https://www.instagram.com/reel/CURRENT/")
         self.assertFalse(feed["instagram"]["date_filter_complete"])
         self.assertEqual(feed["instagram"]["missing_date_count"], 1)
-        trigger_url, headers, body = post.call_args.args[:3]
+        trigger_url, headers = post.call_args.args
+        body = post.call_args.kwargs["body"]
+        self.assertEqual(post.call_args.kwargs["attempts"], 1)
         self.assertNotIn("test-brightdata-token", trigger_url)
         self.assertIn("dataset_id=gd_lyclm20il4r5helnj", trigger_url)
         self.assertIn("type=discover_new", trigger_url)

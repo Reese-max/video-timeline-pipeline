@@ -37,23 +37,12 @@ class MinimaxCompletionTests(unittest.TestCase):
     def test_finish_reason_stop_returns_content(self) -> None:
         self.assertEqual(self._chat("stop", "純文字答案"), "純文字答案")
 
-    def test_finish_reason_content_filter_raises(self) -> None:
-        with self.assertRaises(pipeline.MiniMaxIncompleteError):
-            self._chat("content_filter", "{}")
-
-    def test_finish_reason_tool_calls_accepted(self) -> None:
-        self.assertEqual(self._chat("tool_calls", ""), "")
-
     def test_finish_reason_normalization_accepts_mixed_case(self) -> None:
         self.assertEqual(self._chat(" Stop ", "答案"), "答案")
 
-    def test_null_content_returns_empty_string(self) -> None:
-        with mock.patch.object(
-            pipeline,
-            "post_json",
-            return_value={"choices": [{"message": {"content": None}, "finish_reason": "tool_calls"}]},
-        ), mock.patch.object(pipeline, "minimax_endpoint", return_value="https://example.invalid/v1/chat/completions"):
-            self.assertEqual(pipeline.minimax_chat([{"role": "user", "content": "t"}], "key", "M"), "")
+    def test_finish_reason_content_filter_raises(self) -> None:
+        with self.assertRaises(pipeline.MiniMaxIncompleteError):
+            self._chat("content_filter", "{}")
 
 
 class VisualCacheTests(unittest.TestCase):
@@ -84,57 +73,16 @@ class VisualCacheTests(unittest.TestCase):
             self.assertEqual(observation["finish_reason"], "length")
             self.assertEqual(list(cache_dir.iterdir()) if cache_dir.exists() else [], [])
 
-    def test_unparseable_stop_response_downgraded_and_not_cached(self) -> None:
+    def test_unparseable_stop_response_is_not_cached(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             image = root / "frame.jpg"
-            image.write_bytes(b"fake-bytes")
+            image.write_bytes(b"frame")
             cache_dir = root / "cache"
             results = self._analyze(cache_dir, image, "stop", "這不是 JSON")
-            observation = results[0]
-            self.assertEqual(observation["visual_summary"], "尚未執行 MiniMax 視覺理解。")
-            self.assertEqual(observation["completion_status"], "incomplete")
-            self.assertEqual(observation["finish_reason"], "stop")
-            self.assertEqual(observation["raw"], "這不是 JSON")
-            self.assertEqual(list(cache_dir.iterdir()) if cache_dir.exists() else [], [])
-
-    def test_empty_visual_summary_downgraded_and_not_cached(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            image = root / "frame.jpg"
-            image.write_bytes(b"fake-bytes")
-            cache_dir = root / "cache"
-            results = self._analyze(cache_dir, image, "stop", '{"visual_summary": ""}')
             self.assertEqual(results[0]["completion_status"], "incomplete")
-            self.assertEqual(list(cache_dir.iterdir()) if cache_dir.exists() else [], [])
-
-    def test_sentinel_cache_entry_is_not_reused(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            image = root / "frame.jpg"
-            image.write_bytes(b"fake-bytes")
-            cache_dir = root / "cache"
-
-            calls = []
-            def counting_chat(messages, api_key, model, *args, **kwargs):
-                calls.append(1)
-                return '{"visual_summary": "ok", "screen_type": "x", "visible_text": [], "important_details": [], "confidence": 0.5}'
-
-            with mock.patch.object(pipeline, "uniform_image_observation", return_value=None), \
-                 mock.patch.object(pipeline, "image_data_url", return_value="data:image/jpeg;base64,AA=="), \
-                 mock.patch.object(pipeline, "minimax_chat", counting_chat):
-                pipeline.analyze_images([self._candidate(image)], "key", "MiniMax-M3", workers=1, cache_dir=cache_dir)
-            cache_file = next(cache_dir.iterdir())
-            poisoned = json.loads(cache_file.read_text(encoding="utf-8"))
-            poisoned["visual_summary"] = "尚未執行 MiniMax 視覺理解。"
-            cache_file.write_text(json.dumps(poisoned), encoding="utf-8")
-
-            calls.clear()
-            with mock.patch.object(pipeline, "uniform_image_observation", return_value=None), \
-                 mock.patch.object(pipeline, "image_data_url", return_value="data:image/jpeg;base64,AA=="), \
-                 mock.patch.object(pipeline, "minimax_chat", counting_chat):
-                pipeline.analyze_images([self._candidate(image)], "key", "MiniMax-M3", workers=1, cache_dir=cache_dir)
-            self.assertEqual(calls, [1], "sentinel-valued cache entry must trigger a fresh provider call")
+            self.assertEqual(results[0]["raw"], "這不是 JSON")
+            self.assertEqual(list(cache_dir.iterdir()), [])
 
     def test_raw_fallback_cache_entry_is_not_reused(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -217,6 +165,184 @@ class VisualCacheTests(unittest.TestCase):
                 results = pipeline.analyze_images([self._candidate(image)], "key", "MiniMax-M3", workers=1, cache_dir=cache_dir)
             self.assertEqual(len(calls), 1)
             self.assertEqual(results[0]["visual_summary"], "ok")
+
+
+
+class VisualSchemaTests(unittest.TestCase):
+    """Both cache layers and the user-visible status require complete evidence."""
+
+    def _good(self) -> dict:
+        return {
+            "screen_type": "slide",
+            "visible_text": [],
+            "visual_summary": "投影片內容",
+            "important_details": [],
+            "confidence": 0.8,
+            "timestamp": 1.5,
+            "source_image": "frame.jpg",
+            "analysis_method": "minimax",
+            "visual_schema_version": pipeline.VISUAL_OBSERVATION_SCHEMA_VERSION,
+            "completion_status": "complete",
+        }
+
+    def test_schema_rejects_partial_values_and_unknown_version(self) -> None:
+        good = self._good()
+        self.assertTrue(pipeline.usable_visual_observation(good))
+        for changes in (
+            {"screen_type": ""},
+            {"visible_text": "text"},
+            {"important_details": [7]},
+            {"visual_summary": ""},
+            {"visual_summary": pipeline.VISUAL_NOT_ANALYZED},
+            {"confidence": None},
+            {"confidence": 1.5},
+            {"visual_schema_version": 999},
+            {"completion_status": "incomplete"},
+            {"raw": "partial"},
+        ):
+            with self.subTest(changes=changes):
+                self.assertFalse(pipeline.usable_visual_observation({**good, **changes}))
+
+    def test_aggregate_cache_checks_every_frame_and_metadata(self) -> None:
+        good = self._good()
+        candidate = {"timestamp": 1.5}
+        self.assertTrue(pipeline.reusable_visual_artifact([good], [candidate]))
+        self.assertFalse(pipeline.reusable_visual_artifact([good], [candidate, candidate]))
+        self.assertFalse(pipeline.reusable_visual_artifact([{**good, "source_image": ""}], [candidate]))
+        self.assertFalse(pipeline.reusable_visual_artifact([{**good, "timestamp": 2.0}], [candidate]))
+        self.assertFalse(pipeline.reusable_visual_artifact([{**good, "visible_text": "bad"}], [candidate]))
+
+    def test_stop_with_partial_schema_is_not_cached(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            image = root / "frame.jpg"
+            image.write_bytes(b"frame")
+            with mock.patch.object(pipeline, "uniform_image_observation", return_value=None), \
+                 mock.patch.object(pipeline, "image_data_url", return_value="data:image/jpeg;base64,AA=="), \
+                 mock.patch.object(pipeline, "post_json", return_value=_response("stop", '{"screen_type":"slide","visual_summary":"只有摘要"}')), \
+                 mock.patch.object(pipeline, "minimax_endpoint", return_value="https://example.invalid/v1/chat/completions"):
+                observations = pipeline.analyze_images(
+                    [{"path": str(image), "timestamp": 1.5}], "key", "MiniMax-M3",
+                    workers=1, cache_dir=root / "cache",
+                )
+            self.assertEqual(observations[0]["completion_status"], "incomplete")
+            self.assertEqual(list((root / "cache").iterdir()), [])
+
+    def test_length_with_parseable_schema_is_not_cached(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            image = root / "frame.jpg"
+            image.write_bytes(b"frame")
+            complete_json = json.dumps({
+                key: value for key, value in self._good().items()
+                if key in {"screen_type", "visible_text", "visual_summary", "important_details", "confidence"}
+            })
+            with mock.patch.object(pipeline, "uniform_image_observation", return_value=None), \
+                 mock.patch.object(pipeline, "image_data_url", return_value="data:image/jpeg;base64,AA=="), \
+                 mock.patch.object(pipeline, "post_json", return_value=_response("length", complete_json)), \
+                 mock.patch.object(pipeline, "minimax_endpoint", return_value="https://example.invalid/v1/chat/completions"):
+                observations = pipeline.analyze_images(
+                    [{"path": str(image), "timestamp": 1.5}], "key", "MiniMax-M3",
+                    workers=1, cache_dir=root / "cache",
+                )
+            self.assertEqual(observations[0]["completion_status"], "incomplete")
+            self.assertEqual(list((root / "cache").iterdir()), [])
+
+    def test_knowledge_requires_all_observations_complete(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            good = self._good()
+            incomplete = {
+                **good,
+                "visual_summary": pipeline.VISUAL_NOT_ANALYZED,
+                "confidence": None,
+                "completion_status": "incomplete",
+            }
+            path = pipeline.render_knowledge_markdown(
+                root, {"title": "video"}, root / "source.mp4",
+                {"segments": []}, [good, incomplete], [], None,
+            )
+            self.assertIn("畫面分析：未完成", path.read_text(encoding="utf-8"))
+            path = pipeline.render_knowledge_markdown(
+                root, {"title": "video"}, root / "source.mp4",
+                {"segments": []}, [good], [], None,
+            )
+            self.assertIn("畫面分析：已執行 MiniMax", path.read_text(encoding="utf-8"))
+
+    def test_stop_with_full_schema_reuses_cache_without_provider_call(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            image = root / "frame.jpg"
+            image.write_bytes(b"frame")
+            content = json.dumps({
+                key: value for key, value in self._good().items()
+                if key in {"screen_type", "visible_text", "visual_summary", "important_details", "confidence"}
+            })
+            provider = mock.Mock(return_value=_response("stop", content))
+            with mock.patch.object(pipeline, "uniform_image_observation", return_value=None), \
+                 mock.patch.object(pipeline, "image_data_url", return_value="data:image/jpeg;base64,AA=="), \
+                 mock.patch.object(pipeline, "post_json", provider), \
+                 mock.patch.object(pipeline, "minimax_endpoint", return_value="https://example.invalid/v1/chat/completions"):
+                first = pipeline.analyze_images(
+                    [{"path": str(image), "timestamp": 1.5}], "key", "MiniMax-M3",
+                    workers=1, cache_dir=root / "cache",
+                )
+                second = pipeline.analyze_images(
+                    [{"path": str(image), "timestamp": 1.5}], "key", "MiniMax-M3",
+                    workers=1, cache_dir=root / "cache",
+                )
+            self.assertEqual(provider.call_count, 1)
+            self.assertEqual(first, second)
+            self.assertEqual(first[0]["analysis_method"], "minimax")
+            self.assertTrue(pipeline.reusable_visual_artifact(first, [{"timestamp": 1.5}]))
+
+    def test_valid_legacy_cache_hit_needs_no_provider_call(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            image = root / "frame.jpg"
+            image.write_bytes(b"frame")
+            cache_dir = root / "cache"
+            valid_json = json.dumps({
+                key: value for key, value in self._good().items()
+                if key in {"screen_type", "visible_text", "visual_summary", "important_details", "confidence"}
+            })
+            with mock.patch.object(pipeline, "uniform_image_observation", return_value=None), \
+                 mock.patch.object(pipeline, "image_data_url", return_value="data:image/jpeg;base64,AA=="), \
+                 mock.patch.object(pipeline, "minimax_chat", return_value=valid_json):
+                pipeline.analyze_images(
+                    [{"path": str(image), "timestamp": 1.5}], "key", "MiniMax-M3",
+                    workers=1, cache_dir=cache_dir,
+                )
+            cache_file = next(cache_dir.iterdir())
+            legacy = json.loads(cache_file.read_text(encoding="utf-8"))
+            legacy.pop("visual_schema_version")
+            legacy.pop("completion_status")
+            legacy.pop("analysis_method")
+            cache_file.write_text(json.dumps(legacy), encoding="utf-8")
+            with mock.patch.object(pipeline, "minimax_chat", side_effect=AssertionError("unexpected provider call")):
+                observations = pipeline.analyze_images(
+                    [{"path": str(image), "timestamp": 1.5}], "key", "MiniMax-M3",
+                    workers=1, cache_dir=cache_dir,
+                )
+            self.assertEqual(observations[0]["visual_summary"], "投影片內容")
+
+    def test_local_uniformity_is_not_reported_as_minimax(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            uniform = {**self._good(), "analysis_method": "local_uniformity_check"}
+            path = pipeline.render_knowledge_markdown(
+                root, {"title": "video"}, root / "source.mp4",
+                {"segments": []}, [uniform], [], None,
+            )
+            content = path.read_text(encoding="utf-8")
+            self.assertIn("已完成本地純色畫面檢查", content)
+            self.assertNotIn("已執行 MiniMax 視覺核對", content)
+
+    def test_tool_calls_is_not_text_completion(self) -> None:
+        with mock.patch.object(pipeline, "post_json", return_value=_response("tool_calls", "{}")), \
+             mock.patch.object(pipeline, "minimax_endpoint", return_value="https://example.invalid/v1/chat/completions"):
+            with self.assertRaises(pipeline.MiniMaxIncompleteError):
+                pipeline.minimax_chat([{"role": "user", "content": "test"}], "key", "MiniMax-M3")
 
 
 if __name__ == "__main__":

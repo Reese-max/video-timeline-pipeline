@@ -1,14 +1,67 @@
 import asyncio
+import json
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import drive_storage
 import mcp_server
 
 
 class MCPValidationTests(unittest.TestCase):
+    def test_drive_upload_recovers_502_in_same_session(self) -> None:
+        completed = {"id": "file_1", "webViewLink": "https://drive.google.com/file/d/file_1/view"}
+        for statuses, ranges, expected_bodies in [
+            ([502, 308, 200], [None, "bytes=0-2", None], [b"fake-mp4", b"", b"e-mp4"]),
+            ([502, 200], [None, None], [b"fake-mp4", b""]),
+            ([502, 503, 308, 200], [None, None, None, None], [b"fake-mp4", b"", b"", b"fake-mp4"]),
+        ]:
+            with self.subTest(statuses=statuses), tempfile.TemporaryDirectory() as raw_dir:
+                path = Path(raw_dir) / "video.mp4"
+                path.write_bytes(b"fake-mp4")
+                init = MagicMock()
+                init.__enter__.return_value.headers = {"Location": "https://www.googleapis.com/upload/session"}
+                connections = []
+                for status, received in zip(statuses, ranges):
+                    connection = MagicMock()
+                    response = connection.getresponse.return_value
+                    response.status = status
+                    response.getheader.return_value = received
+                    response.read.return_value = json.dumps(completed).encode()
+                    connections.append(connection)
+                with (
+                    patch.object(drive_storage.urllib.request, "urlopen", return_value=init) as initialize,
+                    patch.object(drive_storage.http.client, "HTTPSConnection", side_effect=connections),
+                    patch("time.sleep"),
+                ):
+                    self.assertEqual(drive_storage._upload_file("token", path, path.name, "folder"), completed)
+                initialize.assert_called_once()
+                for connection, body in zip(connections, expected_bodies):
+                    self.assertEqual(b"".join(c.args[0] for c in connection.send.call_args_list), body)
+                connections[1].putheader.assert_any_call("Content-Range", "bytes */8")
+                if ranges[1]:
+                    connections[2].putheader.assert_any_call("Content-Range", "bytes 3-7/8")
+
+    def test_drive_upload_retries_are_bounded(self) -> None:
+        for status, attempts in [(502, 4), (429, 4), (403, 1)]:
+            with self.subTest(status=status), tempfile.TemporaryDirectory() as raw_dir:
+                path = Path(raw_dir) / "video.mp4"
+                path.write_bytes(b"fake-mp4")
+                init, connection = MagicMock(), MagicMock()
+                init.__enter__.return_value.headers = {"Location": "https://www.googleapis.com/upload/session"}
+                connection.getresponse.return_value.status = status
+                with (
+                    patch.object(drive_storage.urllib.request, "urlopen", return_value=init) as initialize,
+                    patch.object(drive_storage.http.client, "HTTPSConnection", return_value=connection) as connect,
+                    patch("time.sleep") as sleep,
+                ):
+                    with self.assertRaisesRegex(RuntimeError, f"HTTP {status}"):
+                        drive_storage._upload_file("token", path, path.name, "folder")
+                initialize.assert_called_once()
+                self.assertEqual(connect.call_count, attempts)
+                self.assertEqual(sleep.call_count, attempts - 1)
+
     def test_segment_bounds_allow_unlimited_segments(self) -> None:
         self.assertEqual(
             mcp_server.segment_bounds(301, 120, 4),
@@ -117,7 +170,8 @@ class MCPValidationTests(unittest.TestCase):
         self.assertIn("ui/notifications/initialized", mcp_server.WIDGET_HTML)
         self.assertIn('request("tools/call"', mcp_server.WIDGET_HTML)
         self.assertIn('request("ui/message"', mcp_server.WIDGET_HTML)
-        self.assertIn("queueMicrotask(startUpload)", mcp_server.WIDGET_HTML)
+        self.assertIn("queueMicrotask(startAnalysis)", mcp_server.WIDGET_HTML)
+        self.assertNotIn("uploadFile(", mcp_server.WIDGET_HTML)
 
     def test_drive_tool_exposes_output_schema_and_widget_path(self) -> None:
         tools = asyncio.run(mcp_server.mcp.list_tools())
@@ -126,7 +180,29 @@ class MCPValidationTests(unittest.TestCase):
         self.assertTrue(tool.meta["openai/widgetAccessible"])
         self.assertIn("upload_prepared_video_to_drive", mcp_server.WIDGET_HTML)
         self.assertIn("Google Drive connector", mcp_server.WIDGET_HTML)
-        self.assertIn("analyzeOnServer", mcp_server.WIDGET_HTML)
+        self.assertNotIn("analyzeOnServer", mcp_server.WIDGET_HTML)
+
+    def test_drive_view_urls_are_metadata_not_materializable_attachments(self) -> None:
+        payload = {
+            "status": "drive_ready",
+            "job_id": "0123456789ab",
+            "files": [{
+                "file_id": "file_1",
+                "url": "https://drive.google.com/file/d/file_1/view",
+                "file_name": "segment_000.mp4",
+                "mime_type": "video/mp4",
+                "size_bytes": 8,
+                "sha256": "a" * 64,
+            }],
+        }
+        result = mcp_server.drive_tool_result(payload)
+        self.assertEqual([item.type for item in result.content], ["text"])
+        self.assertEqual(result.structuredContent, payload)
+        mcp_server.DriveUploadResult.model_validate(result.structuredContent)
+        self.assertIn("download_raw_file=true", result.content[0].text)
+        self.assertIn("include_base64=false", result.content[0].text)
+        self.assertIn("一般 ChatGPT 對話", result.content[0].text)
+        self.assertIn("本 developer MCP 對話不可使用官方 Drive", result.content[0].text)
 
     def test_analysis_tool_returns_clean_error_payload(self) -> None:
         result = asyncio.run(mcp_server.analyze_prepared_video("not-a-job"))
@@ -168,7 +244,8 @@ class MCPValidationTests(unittest.TestCase):
                         {},
                     ),
                 ) as extract_candidates_mock,
-                patch.object(mcp_server.pipeline, "analyze_images", return_value=[{"timestamp": 0}]),
+                patch.object(mcp_server.pipeline, "analyze_images", return_value=[{
+                    "timestamp": 0, "visual_summary": "A visible sign", "confidence": 0.9}]),
                 patch.object(
                     mcp_server.pipeline,
                     "extract_audio",
@@ -193,7 +270,7 @@ class MCPValidationTests(unittest.TestCase):
                         {},
                     ),
                 ),
-                patch.object(mcp_server.pipeline, "create_summary", return_value={"short_summary": "ok"}),
+                patch.object(mcp_server.pipeline, "create_summary") as create_summary_mock,
                 patch.object(mcp_server.pipeline, "file_sha256", return_value="sha"),
                 patch.object(mcp_server.pipeline, "write_json"),
                 patch.dict(mcp_server.os.environ, {"GROQ_API_KEY": "groq"}, clear=False),
@@ -204,7 +281,9 @@ class MCPValidationTests(unittest.TestCase):
         self.assertEqual(result["source_sha256"], "sha")
         self.assertEqual(result["audio_status"], "complete")
         self.assertEqual(result["visual_status"], "complete")
-        self.assertEqual(result["summary"]["short_summary"], "ok")
+        self.assertEqual(result["summary"]["status"], "pending_chatgpt")
+        self.assertEqual(result["quality"]["status"], "evidence_available")
+        create_summary_mock.assert_not_called()
         self.assertEqual(extract_candidates_mock.call_args.args[3], 0)
 
     def test_drive_upload_caches_verified_segment_metadata(self) -> None:
@@ -217,6 +296,8 @@ class MCPValidationTests(unittest.TestCase):
             segment_rows = [{"filename": segment_path.name}]
             folder = {
                 "id": "folder_1",
+                "mimeType": drive_storage.FOLDER_MIME,
+                "parents": ["parent"],
                 "webViewLink": "https://drive.google.com/drive/folders/folder_1",
             }
             uploaded = {
@@ -224,6 +305,8 @@ class MCPValidationTests(unittest.TestCase):
                 "name": "segment_000.mp4",
                 "mimeType": "video/mp4",
                 "size": 8,
+                "sha256Checksum": drive_storage._sha256(segment_path),
+                "parents": ["folder_1"],
                 "webViewLink": "https://drive.google.com/file/d/file_1/view",
             }
             with (
@@ -233,6 +316,8 @@ class MCPValidationTests(unittest.TestCase):
                     clear=False,
                 ),
                 patch.object(drive_storage, "_access_token", return_value="token"),
+                patch.object(drive_storage, "_new_id", side_effect=["folder_1", "file_1"]),
+                patch.object(drive_storage, "_get_file", side_effect=lambda token, fid: folder if fid == "folder_1" else uploaded),
                 patch.object(drive_storage, "_create_folder", return_value=folder) as create_folder,
                 patch.object(drive_storage, "_upload_file", return_value=uploaded) as upload_file,
             ):
@@ -285,6 +370,8 @@ class MCPValidationTests(unittest.TestCase):
             )
         self.assertEqual(result.structuredContent["status"], "ready")
         self.assertEqual(result.structuredContent["segments"][0]["filename"], "segment_000.mp4")
+        self.assertIn("analyze_prepared_video", result.content[0].text)
+        self.assertNotIn("先完成檔案交接", result.content[0].text)
 
 
 if __name__ == "__main__":

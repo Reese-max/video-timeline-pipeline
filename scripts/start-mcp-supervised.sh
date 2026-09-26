@@ -24,14 +24,17 @@ else
 	exit 1
 fi
 
-if [ -x "${media_launcher}" ]; then
-	"${media_launcher}" "${group}" >/dev/null 2>&1 || true
-fi
-
 media_base="${MCP_MEDIA_BASE_URL:-}"
+if [ -z "${media_base}" ] && [ -x "${media_launcher}" ]; then
+	if ! "${media_launcher}" "${group}" >/dev/null 2>&1; then
+		printf 'Media tunnel unavailable; ignoring its stale URL. Starting MCP with its public origin so Drive handoff remains available.\n' >&2
+		media_base="${public_base}"
+	fi
+fi
 if [ -z "${media_base}" ] && [ -r "${media_url_file}" ]; then
 	media_base="$(tr -d '\r\n' <"${media_url_file}" 2>/dev/null || true)"
 fi
+media_base="${media_base:-${public_base}}"
 
 process_matches() {
 	local pid="$1"
@@ -58,12 +61,20 @@ if [ -r "${pidfile}" ]; then
 	fi
 fi
 
+if [ -n "${pid}" ]; then
+	running_media="$(tr '\0' '\n' </proc/${pid}/environ | sed -n 's/^MCP_MEDIA_BASE_URL=//p')"
+	if [ "${running_media}" != "${media_base}" ]; then
+		printf 'Media URL changed: reload this MCP, refresh ChatGPT actions, and prepare a new widget. Running jobs were not interrupted.\n' >&2
+		exit 1
+	fi
+fi
+
 printf -v run_script 'cd %q && exec env MCP_PUBLIC_BASE_URL=%q MCP_MEDIA_BASE_URL=%q MCP_HOST=%q MCP_PORT=%q %q %q' \
 	"${base}" "${public_base}" "${media_base}" "${host}" "${port}" "${python}" "${server}"
 run_command=(/bin/bash -lc "${run_script}")
 
 if [ -z "${pid}" ]; then
-	nohup "${run_command[@]}" </dev/null >>"${log}" 2>&1 &
+	nohup "${run_command[@]}" 9>&- </dev/null >>"${log}" 2>&1 &
 	pid="$!"
 	printf '%s\n' "${pid}" >"${pidfile}"
 fi

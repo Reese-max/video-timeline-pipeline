@@ -11,6 +11,7 @@ import datetime
 import difflib
 import email.utils
 import hashlib
+import http.cookiejar
 import importlib.util
 import io
 import json
@@ -137,6 +138,9 @@ def require_tool(name: str) -> str:
 
 
 def yt_dlp_command() -> list[str]:
+    # Use the package we install/update in this service's virtualenv, not an older PATH binary.
+    if sys.prefix != sys.base_prefix and importlib.util.find_spec("yt_dlp"):
+        return [sys.executable, "-m", "yt_dlp"]
     executable = shutil.which("yt-dlp")
     if executable:
         return [executable]
@@ -248,7 +252,8 @@ def sanitize_download_info(path: Path) -> None:
 
     def clean(value: Any) -> Any:
         if isinstance(value, dict):
-            return {key: clean(item) for key, item in value.items()}
+            return {key: clean(item) for key, item in value.items()
+                    if key.lower() not in {"cookie", "cookies", "authorization", "set-cookie"}}
         if isinstance(value, list):
             return [clean(item) for item in value]
         if isinstance(value, str) and value.startswith(("http://", "https://")):
@@ -551,6 +556,111 @@ def download_threads_video(
     return output
 
 
+def instagram_download_diagnostics(command: list[str]) -> dict[str, Any]:
+    """Read only whitelisted CLI diagnostics; verbose output can contain proxy credentials."""
+    result: dict[str, Any] = {
+        "yt_dlp_version": "unknown", "request_handlers": [], "curl_cffi_version": None,
+        "chrome_impersonation": False, "os": sys.platform, "python": sys.version.split()[0],
+        "container": Path("/.dockerenv").is_file(),
+    }
+    try:
+        probe = subprocess.run(
+            command + ["--ignore-config", "--no-plugin-dirs", "--verbose", "--list-impersonate-targets"],
+            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=20,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        result["probe_error"] = "yt-dlp diagnostics unavailable"
+        return result
+    output = probe.stdout + "\n" + probe.stderr
+    version = re.search(r"\[debug\] yt-dlp version (\S+)", output)
+    handlers = re.search(r"\[debug\] Request Handlers: ([^\r\n]+)", output)
+    curl = re.search(r"\bcurl_cffi-([\w.]+)", output)
+    result.update(
+        yt_dlp_version=version[1] if version else "unknown",
+        request_handlers=handlers[1].split(", ") if handlers else [],
+        curl_cffi_version=curl[1] if curl else None,
+        chrome_impersonation=bool(re.search(r"^Chrome-\S+\s+\S+\s+curl_cffi\s*$", output, re.MULTILINE)),
+    )
+    return result
+
+
+def download_instagram(command: list[str], url: str, job_dir: Path) -> None:
+    diagnostics = instagram_download_diagnostics(yt_dlp_command())
+    cookie_file = os.getenv("YTDLP_INSTAGRAM_COOKIE_FILE", "").strip()
+    user_agent = os.getenv("YTDLP_INSTAGRAM_USER_AGENT", "").strip()
+    diagnostics.update(
+        status="error", cookies_configured=bool(cookie_file), cookies_used=False,
+        user_agent=user_agent or "yt-dlp default; curl_cffi-managed when impersonating",
+        attempts=[],
+    )
+    redactions = {url, cookie_file}
+
+    def safe_error(error: Exception) -> str:
+        text = redact_values(str(error), redactions)
+        text = re.sub(r"(?im)\b(authorization|cookie|set-cookie):[^\r\n]*", r"\1: <redacted>", text)
+        return sanitize_public_urls(text)[-800:]
+
+    def attempt(arguments: list[str], mode: str) -> None:
+        try:
+            run_external(arguments, stream=False, redact=redactions)
+            completed = [path for path in job_dir.glob("source.*")
+                         if path.stem == "source" and path.suffix.lower() in MEDIA_EXTENSIONS and path.stat().st_size]
+            if not completed:
+                raise RuntimeError("yt-dlp 未產生完整影片；可能被大小／長度限制略過。")
+        except RuntimeError as error:
+            diagnostics["attempts"].append({"mode": mode, "status": "error", "error": safe_error(error)})
+            raise
+        diagnostics["attempts"].append({"mode": mode, "status": "ok"})
+
+    try:
+        if len(user_agent) > 512 or any(character in user_agent for character in "\r\n"):
+            diagnostics["user_agent"] = "invalid"
+            raise ValueError("YTDLP_INSTAGRAM_USER_AGENT 格式無效。")
+        options = ["--ignore-config", "--no-plugin-dirs", "--no-cookies", "--no-cookies-from-browser",
+                   "--socket-timeout", "20", "--retries", "1", "--extractor-retries", "1"]
+        if diagnostics["chrome_impersonation"]:
+            options += ["--impersonate", "chrome"]
+        if user_agent:
+            options += ["--user-agent", user_agent]
+        public_command = command[:-1] + options + [url]
+        try:
+            attempt(public_command, "public")
+        except RuntimeError:
+            if not cookie_file:
+                raise RuntimeError("公開抓取失敗；未設定 YTDLP_INSTAGRAM_COOKIE_FILE，未嘗試登入。") from None
+            path = Path(cookie_file)
+            if not path.is_absolute() or not path.is_file() or path.stat().st_size > 1024 * 1024:
+                raise RuntimeError("YTDLP_INSTAGRAM_COOKIE_FILE 必須是既有絕對路徑、至多 1 MiB 的 Netscape cookies 檔。")
+            jar = http.cookiejar.MozillaCookieJar(str(path))
+            try:
+                jar.load(ignore_discard=True)
+            except (OSError, http.cookiejar.LoadError):
+                raise RuntimeError("Instagram cookies 無法讀取或不是 Netscape 格式。") from None
+            cookies = [cookie for cookie in jar if cookie.domain.lstrip(".").lower() == "instagram.com"
+                       or cookie.domain.lower().endswith(".instagram.com")]
+            if not any(cookie.name == "sessionid" and cookie.value for cookie in cookies):
+                raise RuntimeError("Instagram cookies 沒有未過期的 sessionid；請由使用者更新授權檔案。")
+            redactions.update(cookie.value for cookie in cookies if cookie.value)
+            # yt-dlp writes back its cookie jar. Never modify the supplied credential file.
+            with tempfile.TemporaryDirectory(prefix="vtp-instagram-") as directory:
+                temporary = Path(directory) / "cookies.txt"
+                redactions.add(str(temporary))
+                scoped = http.cookiejar.MozillaCookieJar(str(temporary))
+                for cookie in cookies:
+                    scoped.set_cookie(cookie)
+                scoped.save(ignore_discard=True)
+                temporary.chmod(0o600)
+                diagnostics["cookies_used"] = True
+                attempt(public_command[:-1] + ["--cookies", str(temporary), url], "authenticated")
+        diagnostics["status"] = "ok"
+    except (OSError, ValueError, RuntimeError) as error:
+        diagnostics["error"] = safe_error(error)
+        raise RuntimeError("Instagram 下載失敗；診斷：" + json.dumps(diagnostics, ensure_ascii=False)) from None
+    finally:
+        sanitize_download_info(job_dir / "source.info.json")
+        write_json(job_dir / "instagram-download.json", diagnostics)
+
+
 def download_video(
     url: str,
     job_dir: Path,
@@ -589,7 +699,10 @@ def download_video(
     if max_duration is not None:
         command += ["--match-filter", f"duration <= {max_duration}"]
     command.append(url)
-    run_external(command, stream=not private_url, redact={url} if private_url else None)
+    if (urllib.parse.urlsplit(url).hostname or "").lower() in {"instagram.com", "www.instagram.com", "m.instagram.com"}:
+        download_instagram(command, url, job_dir)
+    else:
+        run_external(command, stream=not private_url, redact={url} if private_url else None)
     if private_url:
         sanitize_download_info(job_dir / "source.info.json")
     video_path = locate_source_video(job_dir)
@@ -1794,9 +1907,9 @@ def minimax_chat(
     finish_reason = str(raw_reason).strip().lower() if raw_reason else None
     # finish_reason=length 代表輸出被截斷：即使殘餘內容剛好能 parse 成 JSON，
     # 也不是完整回應，一律 fail-closed，不得交給呼叫端當成完成結果。
-    if finish_reason not in {"stop", "tool_calls"}:
+    if finish_reason != "stop":
         raise MiniMaxIncompleteError(finish_reason, model)
-    content = choices[0].get("message", {}).get("content") or ""
+    content = choices[0].get("message", {}).get("content", "")
     if isinstance(content, list):
         content = "".join(str(part.get("text", "")) for part in content if isinstance(part, dict))
     usage = raw.get("usage") if isinstance(raw.get("usage"), dict) else {}
@@ -1827,15 +1940,56 @@ def parse_json_object(text: str) -> dict[str, Any]:
 
 
 VISUAL_NOT_ANALYZED = "尚未執行 MiniMax 視覺理解。"
+VISUAL_OBSERVATION_SCHEMA_VERSION = 1
 
 
 def usable_visual_observation(observation: Any) -> bool:
-    """視覺觀察可重用且可視為已完成的條件：非未完成標記、非占位、有真實摘要。"""
-    return bool(
-        isinstance(observation, dict)
-        and observation.get("completion_status") != "incomplete"
-        and observation.get("visual_summary")
-        and observation["visual_summary"] != VISUAL_NOT_ANALYZED
+    """Only a complete, typed visual response can serve as evidence or reusable cache."""
+    if not isinstance(observation, dict):
+        return False
+    if observation.get("completion_status") not in (None, "complete"):
+        return False
+    if observation.get("visual_schema_version") not in (None, VISUAL_OBSERVATION_SCHEMA_VERSION):
+        return False  # None is the validated legacy cache format (key version 3).
+    if "raw" in observation or "value" in observation:
+        return False
+    if not isinstance(observation.get("screen_type"), str) or not observation["screen_type"].strip():
+        return False
+    summary = observation.get("visual_summary")
+    if not isinstance(summary, str) or not summary.strip() or summary == VISUAL_NOT_ANALYZED:
+        return False
+    for field in ("visible_text", "important_details"):
+        values = observation.get(field)
+        if not isinstance(values, list) or not all(isinstance(value, str) for value in values):
+            return False
+    confidence = observation.get("confidence")
+    return (
+        isinstance(confidence, (int, float))
+        and not isinstance(confidence, bool)
+        and math.isfinite(confidence)
+        and 0 <= confidence <= 1
+    )
+
+
+def reusable_visual_observation(observation: Any, candidate: dict[str, Any]) -> bool:
+    """Check persisted metadata as well as the model's visual schema."""
+    return (
+        usable_visual_observation(observation)
+        and isinstance(observation.get("source_image"), str)
+        and bool(observation["source_image"])
+        and observation.get("timestamp") == candidate.get("timestamp")
+    )
+
+
+def reusable_visual_artifact(observations: Any, candidates: list[dict[str, Any]]) -> bool:
+    """The aggregate cache must cover every selected frame with valid evidence."""
+    return (
+        isinstance(observations, list)
+        and len(observations) == len(candidates)
+        and all(
+            reusable_visual_observation(observation, candidate)
+            for observation, candidate in zip(observations, candidates)
+        )
     )
 
 
@@ -1878,8 +2032,8 @@ def analyze_images(
                 separators=(",", ":"),
             )
             cache_path = cache_dir / (hashlib.sha256(material.encode("utf-8")).hexdigest() + ".json")
-            cached = reuse_artifact(cache_path, "visual_summary")
-            if usable_visual_observation(cached):
+            cached = reuse_artifact(cache_path)
+            if reusable_visual_observation(cached, candidate):
                 cached = dict(cached)
                 cached["source_image"] = str(image_path)
                 return index, cached
@@ -1906,7 +2060,7 @@ def analyze_images(
                     "finish_reason": error.finish_reason or "missing",
                 }
             if not usable_visual_observation(observation):
-                # 截斷或內容無法解析的觀察降級為「未執行」，不進快取也不標完成。
+                # 截斷或不符 schema 的觀察不能進快取，也不能標成已核對畫面。
                 incomplete = {
                     "screen_type": "候選畫面",
                     "visible_text": [],
@@ -1919,11 +2073,16 @@ def analyze_images(
                 if "raw" in observation:
                     incomplete["raw"] = observation["raw"]
                 observation = incomplete
+            else:
+                observation["analysis_method"] = "minimax"
+        if usable_visual_observation(observation):
+            observation["visual_schema_version"] = VISUAL_OBSERVATION_SCHEMA_VERSION
+            observation["completion_status"] = "complete"
         observation["timestamp"] = candidate["timestamp"]
         observation["source_image"] = str(image_path)
         observation["local_ocr_text"] = local_ocr
         observation["local_ocr_confidence"] = candidate.get("ocr_confidence")
-        if cache_path is not None and usable_visual_observation(observation):
+        if cache_path is not None and reusable_visual_observation(observation, candidate):
             write_json(cache_path, observation)
         return index, observation
 
@@ -1968,7 +2127,7 @@ def local_observations(candidates: list[dict[str, Any]]) -> list[dict[str, Any]]
             "timestamp": candidate["timestamp"],
             "screen_type": "候選畫面",
             "visible_text": [line for line in str(candidate.get("ocr_text", "")).splitlines() if line],
-            "visual_summary": VISUAL_NOT_ANALYZED,
+            "visual_summary": "尚未執行 MiniMax 視覺理解。",
             "important_details": [],
             "confidence": candidate.get("ocr_confidence"),
             "source_image": candidate.get("path"),
@@ -2077,16 +2236,10 @@ def cached_minimax_summary(
     cached = reuse_artifact(cache_path, "short_summary")
     if valid(cached):
         return cached
-    try:
-        result = parse_json_object(minimax_chat(messages, api_key, model, thinking="disabled"))
-    except MiniMaxIncompleteError:
-        result = None
+    result = parse_json_object(minimax_chat(messages, api_key, model, thinking="disabled"))
     if not valid(result):
         print("! MiniMax 摘要格式不完整，重試一次")
-        try:
-            result = parse_json_object(minimax_chat(messages, api_key, model, thinking="disabled"))
-        except MiniMaxIncompleteError:
-            result = None
+        result = parse_json_object(minimax_chat(messages, api_key, model, thinking="disabled"))
     if not valid(result):
         raise RuntimeError("MiniMax 摘要重試後仍不符合輸出格式。")
     write_json(cache_path, result)
@@ -2422,6 +2575,12 @@ def render_knowledge_markdown(
             detail += f"（畫面：`{image_name}`）"
         lines.append(f"- {stamp} 畫面：{detail}")
 
+    visual_complete = bool(observations) and all(
+        usable_visual_observation(item) for item in observations
+    )
+    minimax_checked = any(
+        item.get("analysis_method") != "local_uniformity_check" for item in observations
+    )
     lines.extend(
         [
             "",
@@ -2431,8 +2590,12 @@ def render_knowledge_markdown(
             f"- 視覺觀察：{len(observations)}",
             (
                 "- 畫面分析：已執行 MiniMax 視覺核對。"
-                if observations and any(usable_visual_observation(item) for item in observations)
-                else "- 畫面分析：未完成；摘要不可視為已核對影片畫面。"
+                if visual_complete and minimax_checked
+                else (
+                    "- 畫面分析：已完成本地純色畫面檢查；未呼叫 MiniMax。"
+                    if visual_complete
+                    else "- 畫面分析：未完成；摘要不可視為已核對影片畫面。"
+                )
             ),
             "- 本檔案由影片資料庫管線產生，可重新執行以更新內容。",
             "",
@@ -3925,6 +4088,194 @@ def instagram_feed_item(record: dict[str, Any]) -> dict[str, str] | None:
     }
 
 
+def social_post_target(url: str) -> tuple[str, str, str, str]:
+    """Return platform, public post ID, canonical URL and a fixed provider dataset."""
+    parsed = urllib.parse.urlsplit(require_http_url(url, "貼文 URL"))
+    if parsed.username or parsed.password or parsed.port not in {None, 443} or parsed.scheme != "https":
+        raise ValueError("貼文必須是無帳密的標準 HTTPS 網址。")
+    host = (parsed.hostname or "").lower()
+    if host in {"instagram.com", "www.instagram.com", "m.instagram.com"}:
+        match = re.fullmatch(r"/(?:[A-Za-z0-9_.]+/)?(p|reel|reels)/([A-Za-z0-9_-]+)/?", parsed.path)
+        if match:
+            kind, post_id = match.groups()
+            kind = "p" if kind == "p" else "reel"
+            dataset = "gd_lk5ns7kz21pck8jpis" if kind == "p" else BRIGHTDATA_INSTAGRAM_REELS_DATASET_ID
+            return "instagram", post_id, f"https://www.instagram.com/{kind}/{post_id}/", dataset
+    elif host in THREADS_HOSTS:
+        match = re.fullmatch(r"/(@[A-Za-z0-9_.]+/post|t)/([A-Za-z0-9_-]+)/?", parsed.path)
+        if match:
+            prefix, post_id = match.groups()
+            return "threads", post_id, f"https://www.threads.com/{prefix}/{post_id}", "gd_md75myxy14rihbjksa"
+    elif host in {"facebook.com", "www.facebook.com", "m.facebook.com", "web.facebook.com"}:
+        query = urllib.parse.parse_qs(parsed.query, keep_blank_values=True, max_num_fields=20)
+        if "comment_id" in query or "reply_comment_id" in query:
+            raise ValueError("請提供 FB 貼文本身的網址，不接受留言網址。")
+        dataset = "gd_lyclm1571iy3mv57zw"
+        post_pattern = r"(?:[0-9]+|pfbid[A-Za-z0-9]+)"
+        match = re.fullmatch(r"/[A-Za-z0-9.]+/posts/(" + post_pattern + r")/?", parsed.path)
+        if match:
+            return "facebook", match[1], f"https://www.facebook.com{parsed.path.rstrip('/')}/", dataset
+        if parsed.path in {"/story.php", "/permalink.php"}:
+            post_ids, owners = query.get("story_fbid", []), query.get("id", [])
+            if (len(post_ids) == len(owners) == 1 and re.fullmatch(post_pattern, post_ids[0])
+                    and re.fullmatch(r"[0-9]+", owners[0])):
+                canonical = "https://www.facebook.com/permalink.php?" + urllib.parse.urlencode(
+                    {"story_fbid": post_ids[0], "id": owners[0]})
+                return "facebook", post_ids[0], canonical, dataset
+        match = re.fullmatch(r"/share/([pv])/([A-Za-z0-9]+)/?", parsed.path)
+        if match:
+            kind, token = match.groups()
+            # ponytail: opaque share tokens cannot be equated to post IDs without verified resolution.
+            return "facebook", f"share:{kind}:{token}", f"https://www.facebook.com/share/{kind}/{token}/", dataset
+    raise ValueError("僅支援公開 IG／Threads／Facebook 單篇貼文；FB 不接受首頁、社團、留言或 reel/watch 網址。")
+
+
+def normalize_social_post(record: dict[str, Any], url: str) -> dict[str, Any]:
+    platform, post_id, canonical, _ = social_post_target(url)
+    if record.get("error") or record.get("error_code") or record.get("is_private"):
+        raise RuntimeError("供應商無法取得公開貼文；可能需要登入、已刪除或無法存取。")
+    if social_post_target(str(record.get("url") or ""))[:2] != (platform, post_id):
+        raise RuntimeError("供應商回傳了不同的貼文，停止交接。")
+    if (platform == "facebook" and post_id.isdigit() and record.get("post_id") is not None
+            and str(record["post_id"]) != post_id):
+        raise RuntimeError("供應商的 FB post_id 與請求不符，停止交接。")
+    text = record.get({"instagram": "description", "threads": "post_content", "facebook": "content"}[platform])
+    text = text if isinstance(text, str) else ""
+    images, videos = [], []
+
+    def collect(value: Any, output: list[str]) -> None:
+        for item in value if isinstance(value, list) else [value]:
+            candidate = item.get("url") if isinstance(item, dict) else item
+            if not isinstance(candidate, str):
+                continue
+            try:
+                parsed = urllib.parse.urlsplit(candidate)
+                host, port = (parsed.hostname or "").lower(), parsed.port
+            except ValueError:
+                continue
+            if (parsed.scheme == "https" and not parsed.username and not parsed.password
+                    and port in {None, 443}
+                    and any(host == domain or host.endswith("." + domain)
+                            for domain in ("fbcdn.net", "cdninstagram.com", "fbsbx.com"))
+                    and candidate not in output):
+                output.append(candidate)
+
+    collect(record.get("photos"), images)
+    collect(record.get("images"), images)
+    collect(record.get("videos"), videos)
+    collect(record.get("video_url"), videos)
+    # IG post_content is a carousel; Threads post_content is text, not media.
+    for media in record.get("post_content", []) if isinstance(record.get("post_content"), list) else []:
+        if isinstance(media, dict) and media.get("type") in {"Photo", "Video"}:
+            collect(media, images if media["type"] == "Photo" else videos)
+    if platform == "facebook":
+        attachments = record.get("attachments")
+        for media in attachments if isinstance(attachments, list) else []:
+            if not isinstance(media, dict):
+                continue
+            kind = str(media.get("type") or "").lower()
+            if kind == "video":
+                collect(media.get("video_url"), videos)
+            elif kind in {"photo", "image"}:
+                collect(media.get("attachment_url"), images)
+    if not text.strip() and not images and not videos:
+        raise RuntimeError("貼文沒有可用文字或媒體；不以作者或互動數字代替內容。")
+    if platform == "facebook":
+        post_id = str(record.get("post_id") or ("" if post_id.startswith("share:") else post_id))
+    return {"status": "ready", "platform": platform, "post_id": post_id, "url": canonical,
+            "text": text, "author": str(record.get("user_posted") or record.get("profile_name")
+                                       or record.get("user_username_raw") or record.get("profile_handle") or ""),
+            "published_at": str(record.get("date_posted") or record.get("post_time") or ""),
+            "image_urls": images, "video_urls": videos, "media_analyzed": False,
+            "metrics": {key: record[field] for key, field in
+                        (("likes", "likes"), ("comments", "num_comments"), ("shares", "num_shares"))
+                        if type(record.get(field)) is int and record[field] >= 0},
+            "limitations": ["文字來自公開貼文採集；圖片／影片僅為網址，尚未解碼或分析。",
+                            "不保證完整留言、私人內容或所有 carousel 媒體；不自動刷新可能過期的 CDN 網址。"]}
+
+
+def submit_brightdata_once(folder: Path, url: str, headers: dict[str, str], body: bytes) -> str:
+    """Persist a billable submission receipt before interpreting it; never retry the POST."""
+    folder.mkdir(parents=True, exist_ok=True, mode=0o700)
+    receipt_path = folder / "submission.json"
+    fingerprint = hashlib.sha256(body).hexdigest()
+    token = headers.get("Authorization", "").removeprefix("Bearer ")
+    if receipt_path.exists():
+        try:
+            receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+            if receipt["request_url"] != url or receipt["request_sha256"] != fingerprint:
+                raise ValueError("request mismatch")
+        except (OSError, ValueError, KeyError, TypeError):
+            raise RuntimeError(f"採集回執損壞或請求不符；禁止重送，請核對 {receipt_path}。") from None
+    else:
+        receipt = {"request_url": url, "request_sha256": fingerprint,
+                   "input": json.loads(body), "submitted_at": rss_now()}
+        # ponytail: uncertain submissions stay blocked; provider-side reconciliation is manual.
+        try:
+            with (folder / ".submitted").open("x", encoding="utf-8") as marker:
+                json.dump(receipt, marker, ensure_ascii=False)
+                marker.flush()
+                os.fsync(marker.fileno())
+        except FileExistsError:
+            raise RuntimeError(f"上次送出狀態不明，禁止再次計費採集；請核對 {folder} 與 Bright Data。") from None
+        try:
+            receipt["response"] = request_json(url, headers, method="POST", body=body, timeout=60, attempts=1)
+        except Exception as exc:
+            receipt["error"] = str(exc)
+        receipt["received_at"] = rss_now()
+        receipt = json.loads(redact_values(json.dumps(receipt, ensure_ascii=False),
+                                          {json.dumps(token, ensure_ascii=False)[1:-1]}))
+        write_json(receipt_path, receipt)
+    response = receipt.get("response")
+    snapshot = response.get("snapshot_id") if isinstance(response, dict) else None
+    if not isinstance(snapshot, str) or not re.fullmatch(r"sd?_[A-Za-z0-9_-]+", snapshot):
+        raise RuntimeError(f"採集回應 snapshot_id 缺少或格式無效；禁止重送，請核對回執 {receipt_path} 與 Bright Data。")
+    return snapshot
+
+
+def fetch_social_post(url: str, cache_root: Path, *, allow_paid: bool = False) -> dict[str, Any]:
+    platform, post_id, canonical, dataset = social_post_target(url)
+    if not allow_paid:
+        raise RuntimeError("Bright Data 可能計費；本次尚未送出採集，需先授權。")
+    folder = cache_root / job_key(f"{platform}:{post_id}")
+    checkpoint = folder / "brightdata.json"
+    state = reuse_artifact(checkpoint)
+    if state and state.get("status") == "ready":
+        return state
+    token = os.getenv("BRIGHTDATA_API_TOKEN", "").strip()
+    if not token:
+        raise RuntimeError("缺少 BRIGHTDATA_API_TOKEN；請在主機安全設定，不要貼到對話。")
+    headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+    try:
+        if not state:
+            query = urllib.parse.urlencode({"dataset_id": dataset, "include_errors": "true", "format": "json"})
+            snapshot = submit_brightdata_once(
+                folder, f"{BRIGHTDATA_API_ROOT}/trigger?{query}", headers,
+                json.dumps([{"url": canonical}]).encode())
+            state = {"status": "pending", "url": canonical, "snapshot_id": snapshot,
+                     "dataset_id": dataset, "provider": "brightdata"}
+            write_json(checkpoint, state)
+        snapshot = state["snapshot_id"]
+        if not re.fullmatch(r"sd?_[A-Za-z0-9_-]+", snapshot):
+            raise RuntimeError("快取 snapshot_id 無效。")
+        progress = get_json(f"{BRIGHTDATA_API_ROOT}/progress/{snapshot}", headers)
+        status = progress.get("status") if isinstance(progress, dict) else None
+        if status == "failed":
+            raise RuntimeError("Bright Data 採集失敗；保留 snapshot，不自動重建計費工作。")
+        if status != "ready":
+            return {**state, "retry_after_seconds": 10}
+        rows = get_json(f"{BRIGHTDATA_API_ROOT}/snapshot/{snapshot}?format=json", headers)
+        if isinstance(rows, dict):
+            rows = rows.get("data")
+        if not isinstance(rows, list) or len(rows) != 1 or not isinstance(rows[0], dict):
+            raise RuntimeError("預期單篇貼文結果；收到空白或多筆資料，停止交接。")
+        result = {**state, **normalize_social_post(rows[0], canonical), "fetched_at": rss_now()}
+        write_json(checkpoint, result)
+        return result
+    except Exception as exc:
+        raise RuntimeError(str(exc).replace(token, "<redacted>")) from None
+
+
 def fetch_instagram_author(
     author: str,
     since: str = "365d",
@@ -3932,6 +4283,8 @@ def fetch_instagram_author(
     max_items: int | None = None,
     exclude_ids: list[str] | None = None,
     allow_paid: bool = False,
+    root: Path | None = None,
+    previous_snapshot_id: str = "",
 ) -> dict[str, Any]:
     if not allow_paid:
         raise RuntimeError("Bright Data 可能計費；確認帳戶額度後加上 --allow-batch-cloud。")
@@ -3951,7 +4304,7 @@ def fetch_instagram_author(
     discovery_input: dict[str, Any] = {"url": author_url}
     if max_items is not None:
         discovery_input["num_of_posts"] = max_items
-    excluded = list(dict.fromkeys(str(item).strip() for item in (exclude_ids or []) if str(item).strip()))
+    excluded = sorted({str(item).strip() for item in (exclude_ids or []) if str(item).strip()})
     if excluded:
         discovery_input["posts_to_not_include"] = excluded
 
@@ -3966,16 +4319,14 @@ def fetch_instagram_author(
         }
     )
     trigger_url = f"{BRIGHTDATA_API_ROOT}/trigger?{query}"
+    if previous_snapshot_id and not re.fullmatch(r"sd?_[A-Za-z0-9_-]+", previous_snapshot_id):
+        raise ValueError("上次已儲存的 snapshot_id 無效。")
+    body = json.dumps({"input": [discovery_input]}, sort_keys=True).encode("utf-8")
+    # Only the caller's persisted success advances the cycle, including empty discoveries.
+    folder = secure_rss_directory(root or Path(__file__).resolve().parent) / "brightdata" / job_key(
+        f"instagram:{username}:{since}:{previous_snapshot_id}", body.decode("utf-8"))
     try:
-        payload = post_json(
-            trigger_url,
-            headers,
-            json.dumps({"input": [discovery_input]}).encode("utf-8"),
-            timeout=60,
-        )
-        snapshot_id = str(payload.get("snapshot_id") or "") if isinstance(payload, dict) else ""
-        if not re.fullmatch(r"s_[A-Za-z0-9_-]+", snapshot_id):
-            raise RuntimeError("Bright Data 啟動回應缺少有效 snapshot_id。")
+        snapshot_id = submit_brightdata_once(folder, trigger_url, headers, body)
         deadline = time.monotonic() + timeout_seconds
         status = ""
         while status != "ready":
@@ -3993,8 +4344,8 @@ def fetch_instagram_author(
             f"{BRIGHTDATA_API_ROOT}/snapshot/{urllib.parse.quote(snapshot_id, safe='')}?format=json"
         )
         result = get_json(snapshot_url, headers)
-    except RuntimeError as exc:
-        raise RuntimeError(str(exc).replace(token, "<redacted>")) from exc
+    except Exception as exc:
+        raise RuntimeError(str(exc).replace(token, "<redacted>")) from None
 
     if isinstance(result, list):
         raw_items = [item for item in result if isinstance(item, dict)]
@@ -4225,7 +4576,7 @@ def add_instagram_subscription(
     ):
         raise RuntimeError("這個 Instagram 作者已經訂閱。")
     feed = fetch_instagram_author(
-        username, since, max_items=max_items, allow_paid=allow_paid
+        username, since, max_items=max_items, allow_paid=allow_paid, root=root
     )
     newest = next((item["published"] for item in feed["items"] if item.get("published")), "")
     snapshot = write_instagram_discovery(root, feed)
@@ -4238,6 +4589,7 @@ def add_instagram_subscription(
         "instagram_max_items": max_items,
         "instagram_last_published": newest,
         "instagram_last_discovery": snapshot.name,
+        "instagram_last_snapshot_id": feed["instagram"]["snapshot_id"],
         "name": name.strip() or str(feed["title"]),
         "enabled": True,
         "latest_only": latest_only,
@@ -4294,6 +4646,8 @@ def refresh_rss(root: Path, workers: int = 4, allow_paid: bool = False) -> dict[
                     max_items=subscription.get("instagram_max_items"),
                     exclude_ids=known_ids,
                     allow_paid=allow_paid,
+                    root=root,
+                    previous_snapshot_id=str(subscription.get("instagram_last_snapshot_id") or ""),
                 ), None
             return fetch_rss(
                 str(subscription["url"]),
@@ -4327,6 +4681,7 @@ def refresh_rss(root: Path, workers: int = 4, allow_paid: bool = False) -> dict[
                 elif kind == "instagram-author":
                     snapshot = write_instagram_discovery(root, feed)
                     subscription["instagram_last_discovery"] = snapshot.name
+                    subscription["instagram_last_snapshot_id"] = feed["instagram"]["snapshot_id"]
                     newest = next((item["published"] for item in feed["items"] if item.get("published")), "")
                     if newest:
                         subscription["instagram_last_published"] = newest
@@ -4917,13 +5272,18 @@ def run_rss_command(args: argparse.Namespace) -> int:
     if args.instagram_author:
         since = args.instagram_since or "365d"
         if args.instagram_discover_only:
-            feed = fetch_instagram_author(
-                args.instagram_author,
-                since,
-                max_items=args.instagram_max_items,
-                allow_paid=bool(args.allow_batch_cloud),
-            )
-            snapshot = write_instagram_discovery(root, feed)
+            with rss_writer_lock(root):
+                username = instagram_username(args.instagram_author)
+                previous = reuse_artifact(root / "rss" / f"instagram-{job_key(username)}-latest.json") or {}
+                feed = fetch_instagram_author(
+                    args.instagram_author,
+                    since,
+                    max_items=args.instagram_max_items,
+                    allow_paid=bool(args.allow_batch_cloud),
+                    root=root,
+                    previous_snapshot_id=str(previous.get("instagram", {}).get("snapshot_id") or ""),
+                )
+                snapshot = write_instagram_discovery(root, feed)
             incomplete = (
                 f"；{feed['instagram']['missing_date_count']} 筆缺發佈日期，無法驗證回溯範圍"
                 if feed["instagram"]["missing_date_count"]
@@ -5589,7 +5949,7 @@ def self_test() -> None:
         tag = messages[0]["content"][0]["text"].rsplit("：", 1)[-1]
         vision_barrier.wait(timeout=5)
         time.sleep((count - int(tag[3:])) * 0.02)
-        return json.dumps({"tag": tag, "visual_summary": tag})
+        return json.dumps({"tag": tag, "screen_type": "slide", "visible_text": [], "visual_summary": tag, "important_details": [], "confidence": 0.5})
 
     globals()["minimax_chat"] = parallel_vision_chat
     try:
@@ -5636,7 +5996,7 @@ def self_test() -> None:
         original_chat, original_data_url = minimax_chat, image_data_url
         globals()["image_data_url"] = lambda path: "data:image/jpeg;base64,x"
         globals()["minimax_chat"] = lambda *args, **kwargs: json.dumps(
-            {"screen_type": "slide", "visual_summary": "slide"}
+            {"screen_type": "slide", "visible_text": [], "visual_summary": "slide", "important_details": [], "confidence": 0.5}
         )
         try:
             first = analyze_images(
@@ -6389,9 +6749,7 @@ def run_pipeline(args: argparse.Namespace) -> Path:
                     and previous.get("models", {}).get("visual") == model
                     else None
                 )
-                if isinstance(cached, list) and all(
-                    usable_visual_observation(item) for item in cached
-                ):
+                if reusable_visual_artifact(cached, candidates):
                     print("· 重用既有視覺觀察")
                     return cached
                 return analyze_images(
@@ -6407,6 +6765,11 @@ def run_pipeline(args: argparse.Namespace) -> Path:
                 transcribe_stage, visual_stage
             )
             print(f"· 轉錄與畫面分析並行階段：{time.monotonic() - cloud_started:.1f} 秒")
+        # Provider 未完整完成時，整體流程仍可保存逐字稿與部分結果，但視覺狀態須明確。
+        manifest["visual_status"] = (
+            "complete" if observations and all(usable_visual_observation(item) for item in observations)
+            else "incomplete"
+        )
         # 記下每個階段實際由誰產生：換模型後回頭看產物才知道該不該重跑
         manifest["models"] = {
             "transcript": transcript.get("model") if isinstance(transcript, dict) else None,
