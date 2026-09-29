@@ -648,6 +648,35 @@ class GroundedAnswerTests(unittest.TestCase):
             self.assertEqual(result["citations"], [])
             self.assertEqual(result["retrieval"]["retrieval_mode"], "fts")
 
+    def test_ask_hybrid_degradation_uses_keyword_fts_path(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            seed_library(root)  # no vectors: hybrid retrieval must degrade to FTS
+
+            def fake_chat(messages, api_key, model, *a, **kw):
+                prompt = messages[-1]["content"]
+                if "關鍵詞" in prompt:
+                    return '{"keywords": ["密碼外洩"]}'
+                return "影片提到密碼外洩 [1]。"
+
+            with mock.patch.object(pipeline, "minimax_chat", side_effect=fake_chat):
+                result = pipeline.answer_question(
+                    root,
+                    "哪支影片提到密碼外洩？",
+                    "key",
+                    "m",
+                    8,
+                    mode="hybrid",
+                    embed_key="",
+                    embed_model="test-embed",
+                    embed_backend="openrouter",
+                )
+
+            self.assertEqual(result["retrieval"]["retrieval_mode"], "fts")
+            self.assertEqual(result["retrieval"]["degraded_reason"], "no_vectors")
+            self.assertEqual(result["keywords"], ["密碼外洩"])
+            self.assertTrue(any(item["job"] == "job-beta" for item in result["evidence"]))
+
     def test_ask_keeps_legacy_keyword_path_without_semantic(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
