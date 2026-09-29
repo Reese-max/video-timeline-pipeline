@@ -3418,6 +3418,39 @@ def question_keywords(question: str, api_key: str, model: str) -> list[str]:
     return keywords or [question]
 
 
+def _keyword_search_hits(
+    root: Path,
+    question: str,
+    api_key: str,
+    model: str,
+    limit: int,
+    *,
+    filters: SearchFilter,
+) -> tuple[list[str], list[dict[str, Any]]]:
+    """Use the same keyword FTS path for direct FTS and hybrid degradation."""
+    keywords = question_keywords(question, api_key, model)
+    per_keyword = [
+        search_index(root, keyword, limit, filters=filters) for keyword in keywords
+    ]
+    seen: set[str] = set()
+    hits: list[dict[str, Any]] = []
+    for rank in range(limit):
+        for results in per_keyword:
+            if rank >= len(results):
+                continue
+            hit = results[rank]
+            key = hit.get("occurrence_id") or f"{hit['job']}:{hit['timestamp']}:{hit['kind']}"
+            if key in seen:
+                continue
+            seen.add(key)
+            hits.append(hit)
+            if len(hits) >= limit:
+                break
+        if len(hits) >= limit:
+            break
+    return keywords, hits
+
+
 def answer_question(
     root: Path,
     question: str,
@@ -3456,8 +3489,14 @@ def answer_question(
             rerank=rerank,
             rerank_key=rerank_key,
         )
-        hits = retrieval["hits"]
-        keywords = ["（混合檢索）"]
+        if retrieval.get("degraded_reason"):
+            # 保留一般 FTS Ask 的關鍵詞檢索；整句問題在 FTS5 中是精確片語。
+            keywords, hits = _keyword_search_hits(
+                root, question, api_key, model, limit, filters=filters
+            )
+        else:
+            hits = retrieval["hits"]
+            keywords = ["（混合檢索）"]
     elif mode == "semantic":
         # 有向量就直接拿問句比對語意，不必先抽關鍵詞——少一次呼叫，命中也更準。
         keywords = ["（語意檢索）"]
@@ -3466,29 +3505,9 @@ def answer_question(
         )
         retrieval = {"retrieval_mode": "semantic", "degraded_reason": None}
     else:
-        keywords = question_keywords(question, api_key, model)
-        # 逐詞取滿再換下一個，等於讓第一個關鍵詞吃光配額——問「TDD 搭配 AI 編碼」時
-        # 抽出的是「Matt、TDD、AI、編碼」，人名 Matt 先塞滿，真正相關的 TDD 一筆都進不來。
-        # 改成輪流取：每個關鍵詞先貢獻第一名，再回頭拿第二名。
-        per_keyword = [
-            search_index(root, keyword, limit, filters=filters) for keyword in keywords
-        ]
-        seen: set[str] = set()
-        hits = []
-        for rank in range(limit):
-            for results in per_keyword:
-                if rank >= len(results):
-                    continue
-                hit = results[rank]
-                key = hit.get("occurrence_id") or f"{hit['job']}:{hit['timestamp']}:{hit['kind']}"
-                if key in seen:
-                    continue
-                seen.add(key)
-                hits.append(hit)
-                if len(hits) >= limit:
-                    break
-            if len(hits) >= limit:
-                break
+        keywords, hits = _keyword_search_hits(
+            root, question, api_key, model, limit, filters=filters
+        )
         retrieval = {"retrieval_mode": "fts", "degraded_reason": None}
     # hits 走自己的欄位回傳；retrieval 只留模式與降級等 metadata
     retrieval = {k: v for k, v in retrieval.items() if k != "hits"}
