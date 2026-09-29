@@ -5,6 +5,8 @@ real ``build_index`` plus a deterministic fake embedder, so the whole hybrid
 path can be replayed offline with no provider calls.
 """
 
+import contextlib
+import io
 import json
 import math
 import sqlite3
@@ -287,16 +289,13 @@ class FilterTests(unittest.TestCase):
             self.assertEqual({hit["job"] for hit in hits}, {"job-beta"})
             unknown = pipeline.unknown_date_count(root, filters)
             self.assertEqual(unknown, 1)  # job-gamma 沒有 published_at
-            # 明確開啟才把未知日期納入
-            hits = pipeline.search_index(
-                root,
-                "資安",
-                10,
-                filters=pipeline.SearchFilter(
-                    since="2026-05-01", until="2026-08-10", include_unknown_dates=True
-                ),
+            # 明確開啟才把未知日期納入；啟用後它們不再算「已排除」。
+            include_unknown = pipeline.SearchFilter(
+                since="2026-05-01", until="2026-08-10", include_unknown_dates=True
             )
+            hits = pipeline.search_index(root, "資安", 10, filters=include_unknown)
             self.assertEqual({hit["job"] for hit in hits}, {"job-beta", "job-gamma"})
+            self.assertEqual(pipeline.unknown_date_count(root, include_unknown), 0)
 
     def test_kind_and_job_filters(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -490,6 +489,13 @@ class EmbeddingContractTests(unittest.TestCase):
                     row[0]
                     for row in connection.execute("SELECT DISTINCT model FROM vectors")
                 }
+                default_model = pipeline.DEFAULT_EMBED_MODEL["openrouter"]
+                self.assertEqual(
+                    pipeline.resolve_vector_key(connection, "openrouter", default_model),
+                    pipeline.vector_namespace("openrouter", default_model),
+                )
+                self.assertIsNone(pipeline.resolve_vector_key(connection, "openrouter", "mystery"))
+                self.assertIsNone(pipeline.resolve_vector_key(connection, "local", "mystery"))
             finally:
                 connection.close()
             self.assertIn(
@@ -677,6 +683,37 @@ class GroundedAnswerTests(unittest.TestCase):
             self.assertEqual(result["keywords"], ["密碼外洩"])
             self.assertTrue(any(item["job"] == "job-beta" for item in result["evidence"]))
 
+    def test_ask_stops_when_context_packing_drops_all_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            seed_library(root)
+            calls = []
+
+            def fake_chat(messages, api_key, model, *a, **kw):
+                prompt = messages[-1]["content"]
+                calls.append(prompt)
+                if "關鍵詞" in prompt:
+                    return '{"keywords": ["時間軸"]}'
+                raise AssertionError("answer generation must stop without packed evidence")
+
+            with mock.patch.object(pipeline, "minimax_chat", side_effect=fake_chat):
+                result = pipeline.answer_question(
+                    root,
+                    "時間軸怎麼合併？",
+                    "key",
+                    "m",
+                    8,
+                    mode="fts",
+                    context_budget=1,
+                )
+
+            self.assertTrue(result["insufficient_evidence"])
+            self.assertEqual(result["citations"], [])
+            self.assertEqual(result["evidence"], [])
+            self.assertEqual(result["packing"]["included"], 0)
+            self.assertGreater(result["packing"]["omitted"], 0)
+            self.assertEqual(len(calls), 1)  # keyword extraction only; no answer call
+
     def test_ask_keeps_legacy_keyword_path_without_semantic(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -723,6 +760,45 @@ class CliParserTests(unittest.TestCase):
         self.assertTrue(args.embed_plan)
         with self.assertRaises(SystemExit):
             pipeline.parse_args(["--date-field", "bogus"])
+
+
+class CliOutputTests(unittest.TestCase):
+    def test_citations_keep_their_evidence_block_indices(self) -> None:
+        result = {
+            "retrieval": {"retrieval_mode": "hybrid", "degraded_reason": None},
+            "keywords": ["（混合檢索）"],
+            "insufficient_evidence": False,
+            "answer": "第一項 [1]，第三項 [3]。",
+            "dropped_citations": 0,
+            "citations": [
+                {
+                    "block_index": 1, "title": "Alpha", "job": "job-alpha",
+                    "timestamp_kind": "source_level", "timestamp": 0, "kind": "summary",
+                    "occurrence_id": "occ_alpha", "link": "https://example.com/alpha",
+                    "source": "https://example.com/alpha", "text": "第一來源",
+                },
+                {
+                    "block_index": 3, "title": "Gamma", "job": "job-gamma",
+                    "timestamp_kind": "source_level", "timestamp": 0, "kind": "summary",
+                    "occurrence_id": "occ_gamma", "link": "https://example.com/gamma",
+                    "source": "https://example.com/gamma", "text": "第三來源",
+                },
+            ],
+        }
+        with tempfile.TemporaryDirectory() as temporary:
+            output = io.StringIO()
+            argv = ["pipeline.py", "--ask", "問題", "--root", temporary]
+            with mock.patch.object(pipeline.sys, "argv", argv):
+                with mock.patch.object(pipeline, "minimax_subscription_key", return_value="key"):
+                    with mock.patch.object(pipeline, "minimax_model", return_value="model"):
+                        with mock.patch.object(pipeline, "answer_question", return_value=result):
+                            with contextlib.redirect_stdout(output):
+                                exit_code = pipeline.main()
+        rendered = output.getvalue()
+        self.assertEqual(exit_code, 0)
+        self.assertIn("[1] Alpha", rendered)
+        self.assertIn("[3] Gamma", rendered)
+        self.assertNotIn("[2] Gamma", rendered)
 
 
 class AuditTests(unittest.TestCase):
