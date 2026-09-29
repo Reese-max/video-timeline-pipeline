@@ -2259,7 +2259,7 @@ def remap_legacy_vectors(connection: sqlite3.Connection) -> None:
     """把舊版裸模型名的向量無歧義地改名為 `backend::model`。
 
     只有剛好是某個 backend 預設模型的裸名才能確定歸屬；其他裸名保留原樣，
-    `resolve_vector_key` 仍查得到——不為了改名重算付費向量。
+    但不會被任何後端重用，避免把不同向量空間混在一起。
     """
     try:
         models = {row[0] for row in connection.execute("SELECT DISTINCT model FROM vectors")}
@@ -2282,7 +2282,7 @@ def remap_legacy_vectors(connection: sqlite3.Connection) -> None:
 
 
 def resolve_vector_key(connection: sqlite3.Connection, backend: str, model: str) -> str | None:
-    """決定這次要用的向量鍵：新契約優先，舊裸名沿用（付費向量不可無故重算）。"""
+    """只沿用新契約鍵，或 backend 歸屬唯一可證明的舊預設模型鍵。"""
     namespaced = vector_namespace(backend, model)
     found = {
         row[0]
@@ -2292,8 +2292,13 @@ def resolve_vector_key(connection: sqlite3.Connection, backend: str, model: str)
     }
     if namespaced in found:
         return namespaced
-    if model in found:  # 舊版以裸模型名存的向量，契約可驗證沿用
-        return model
+    if model in found:
+        legacy_backends = [
+            name for name, default_model in DEFAULT_EMBED_MODEL.items()
+            if default_model == model
+        ]
+        if legacy_backends == [backend]:
+            return model
     return None
 
 
@@ -2680,8 +2685,8 @@ def _video_filter_sql(
 
 
 def unknown_date_count(root: Path, filters: SearchFilter) -> int:
-    """日期篩選下被「未知發布日」排除的影片數——顯示出來，不靜默漏掉。"""
-    if not filters.filters_dates:
+    """日期篩選下實際被排除的未知發布日影片數。"""
+    if not filters.filters_dates or filters.include_unknown_dates:
         return 0
     connection = read_connection(root)
     try:
@@ -3528,6 +3533,23 @@ def answer_question(
     per_job_cap = None if len(filters.jobs) == 1 else max(2, math.ceil(limit / 2))
     packed = pack_context(hits, token_budget=context_budget, per_job_cap=per_job_cap)
     blocks = packed["blocks"]
+    if not blocks:
+        return {
+            "question": question,
+            "keywords": keywords,
+            "answer": "找到相關片段，但沒有片段能放進回答預算，無法提供可引用證據。",
+            "citations": [],
+            "evidence": [],
+            "retrieval": retrieval,
+            "insufficient_evidence": True,
+            "dropped_citations": 0,
+            "packing": {
+                "included": packed["included"],
+                "omitted": packed["omitted"],
+                "omitted_reasons": packed["omitted_reasons"],
+                "est_tokens": packed["est_tokens"],
+            },
+        }
     context = "\n".join(
         f"[{block['block_index']}] 《{block['title'] or block['job']}》 "
         f"{_block_range_label(block)}（{block['kind']}）：{block['text']}"
@@ -7377,21 +7399,21 @@ def main() -> int:
                     mode_note += f"（降級：{retrieval['degraded_reason']}）"
                 print(f"檢索：{mode_note}／檢索詞：{'、'.join(result['keywords'])}")
                 if result.get("insufficient_evidence"):
-                    print("證據不足：下列為找到但不足以支持回答的片段。")
+                    print("證據不足：沒有可供引用的片段。")
                 print()
                 print(result["answer"])
                 if result["dropped_citations"]:
                     print(f"\n! 捨棄 {result['dropped_citations']} 個無法對應證據的引用編號")
                 if result["citations"]:
                     print("\n引用：")
-                    for index, hit in enumerate(result["citations"], 1):
+                    for hit in result["citations"]:
                         label = hit["title"] or hit["job"]
                         stamp = (
                             "—"
                             if hit.get("timestamp_kind") == "source_level"
                             else format_timestamp(hit["timestamp"])
                         )
-                        print(f"  [{index}] {label} {stamp}（{hit['kind']}）{hit.get('occurrence_id') or ''}")
+                        print(f"  [{hit['block_index']}] {label} {stamp}（{hit['kind']}）{hit.get('occurrence_id') or ''}")
                         print(f"      {hit.get('link') or source_link(hit['source'], hit['timestamp'])}")
                         # 附上原文：不點開影片就能判斷這個引用該不該信
                         excerpt = " ".join(str(hit.get("text") or "").split())
