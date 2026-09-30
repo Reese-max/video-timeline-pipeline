@@ -300,8 +300,8 @@ def normalize_file_references(files: list[dict]) -> list[dict]:
             {
                 "file_id": file_id,
                 "download_url": download_url,
-                "mime_type": item.get("mime_type") or None,
-                "file_name": item.get("file_name") or None,
+                "mime_type": str(item.get("mime_type") or "").strip() or None,
+                "file_name": str(item.get("file_name") or "").strip() or None,
                 "segment_index": segment_index,
                 "start_seconds": start,
                 "end_seconds": end,
@@ -310,31 +310,37 @@ def normalize_file_references(files: list[dict]) -> list[dict]:
     return normalized
 
 
-def bind_handoff_segments(manifest: dict, references: list[dict]) -> list[dict]:
-    """Attach authoritative segment time ranges from a ready manifest."""
+def usable_manifest_segment(segment: Any) -> bool:
+    if not isinstance(segment, dict):
+        return False
+    index = segment.get("index")
+    start = segment.get("start_seconds")
+    end = segment.get("end_seconds")
+    return (
+        isinstance(index, int)
+        and not isinstance(index, bool)
+        and isinstance(start, (int, float))
+        and not isinstance(start, bool)
+        and isinstance(end, (int, float))
+        and not isinstance(end, bool)
+        and math.isfinite(start)
+        and math.isfinite(end)
+        and 0 <= start < end
+    )
+
+
+def bind_handoff_segments(manifest: dict, references: list[dict]) -> tuple[list[dict], int]:
+    """Attach authoritative segment time ranges from a ready manifest.
+
+    Returns the bound references and the count of usable manifest segments.
+    """
     segments = manifest.get("segments") or []
     by_name: dict[str, tuple[dict, str]] = {}
     by_index: dict[int, dict] = {}
     for segment in segments:
-        if not isinstance(segment, dict):
+        if not usable_manifest_segment(segment):
             continue
-        index = segment.get("index")
-        start = segment.get("start_seconds")
-        end = segment.get("end_seconds")
-        usable = (
-            isinstance(index, int)
-            and not isinstance(index, bool)
-            and isinstance(start, (int, float))
-            and not isinstance(start, bool)
-            and isinstance(end, (int, float))
-            and not isinstance(end, bool)
-            and math.isfinite(start)
-            and math.isfinite(end)
-            and 0 <= start < end
-        )
-        if not usable:
-            continue
-        by_index[index] = segment
+        by_index[segment["index"]] = segment
         for kind, key in (("segment", "filename"), ("preview", "preview_filename")):
             name = segment.get(key)
             if isinstance(name, str) and name:
@@ -379,7 +385,7 @@ def bind_handoff_segments(manifest: dict, references: list[dict]) -> list[dict]:
         reference["end_seconds"] = segment["end_seconds"]
         reference["kind"] = kind
         bound.append(reference)
-    return bound
+    return bound, len(by_index)
 
 
 def validate_source_url(value: str) -> str:
@@ -1644,16 +1650,15 @@ async def ingest_video_segments(
         )
         bound_job_id = None
         segments_expected = None
-        if job_id:
+        if job_id is not None:
             job_dir = prepared_job_dir(job_id)
             manifest = read_manifest(job_dir)
             if not manifest:
                 raise ValueError(
                     "影片尚未準備完成，無法核對分段時間範圍；請先呼叫 prepare_video_for_chatgpt。"
                 )
-            references = bind_handoff_segments(manifest, references)
+            references, segments_expected = bind_handoff_segments(manifest, references)
             bound_job_id = job_id
-            segments_expected = len(manifest.get("segments") or [])
         summaries = [VerifiedFileSummary(**reference) for reference in references]
         segments_received = len(
             {

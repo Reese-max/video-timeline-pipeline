@@ -347,6 +347,66 @@ class MCPValidationTests(unittest.TestCase):
                         result.structuredContent["error_code"], "FILE_HANDOFF_INVALID"
                     )
 
+    def test_file_handoff_blank_job_id_fails_instead_of_silent_downgrade(self) -> None:
+        result = asyncio.run(
+            mcp_server.ingest_video_segments(
+                [
+                    {
+                        "file_id": "file_1",
+                        "download_url": "https://files.example/v.mp4",
+                        "file_name": "segment_000.mp4",
+                    }
+                ],
+                job_id="",
+            )
+        )
+        self.assertTrue(result.isError)
+        self.assertEqual(
+            result.structuredContent["error_code"], "FILE_HANDOFF_INVALID"
+        )
+
+    def test_file_handoff_expected_counts_only_usable_manifest_segments(self) -> None:
+        manifest = {
+            "status": "ready",
+            "segments": [
+                {
+                    "index": 0,
+                    "filename": "segment_000.mp4",
+                    "preview_filename": "preview_000.jpg",
+                    "start_seconds": 0,
+                    "end_seconds": 30,
+                },
+                {
+                    "index": 1,
+                    "filename": "segment_001.mp4",
+                    "start_seconds": float("nan"),
+                    "end_seconds": 60,
+                },
+            ],
+        }
+        with (
+            patch.object(mcp_server, "prepared_job_dir", return_value=Path("unused")),
+            patch.object(mcp_server, "read_manifest", return_value=manifest),
+        ):
+            result = asyncio.run(
+                mcp_server.ingest_video_segments(
+                    [
+                        {
+                            "file_id": "file_1",
+                            "download_url": "https://files.example/v.mp4",
+                            "file_name": "  segment_000.mp4  ",
+                        }
+                    ],
+                    job_id="0123456789ab",
+                )
+            )
+        self.assertFalse(result.isError)
+        payload = mcp_server.FileHandoffResult.model_validate(result.structuredContent)
+        self.assertEqual(payload.segments_expected, 1)
+        self.assertEqual(payload.segments_received, 1)
+        self.assertEqual(payload.files[0].file_name, "segment_000.mp4")
+        self.assertEqual(payload.files[0].kind, "segment")
+
     def test_file_handoff_invalid_error_does_not_blame_host(self) -> None:
         result = asyncio.run(
             mcp_server.ingest_video_segments([{"file_id": "file_1"}])
