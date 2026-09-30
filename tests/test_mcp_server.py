@@ -178,6 +178,7 @@ class MCPValidationTests(unittest.TestCase):
             {"start_seconds": 30, "end_seconds": 10},
             {"start_seconds": -5, "end_seconds": 10},
             {"segment_index": -1},
+            {"segment_index": True},
         ):
             with self.subTest(fields=fields):
                 result = asyncio.run(
@@ -296,6 +297,66 @@ class MCPValidationTests(unittest.TestCase):
                     self.assertEqual(
                         result.structuredContent["error_code"], "FILE_HANDOFF_INVALID"
                     )
+
+    def test_file_handoff_job_binding_rejects_unbound_or_duplicate_files(self) -> None:
+        manifest = {
+            "status": "ready",
+            "segments": [
+                {
+                    "index": 0,
+                    "filename": "segment_000.mp4",
+                    "preview_filename": "preview_000.jpg",
+                    "start_seconds": 0,
+                    "end_seconds": 30,
+                },
+                {
+                    "index": 1,
+                    "filename": "segment_001.mp4",
+                    "start_seconds": float("nan"),
+                    "end_seconds": 60,
+                },
+            ],
+        }
+        cases = [
+            [{"file_name": "cover.jpg"}],
+            [{}],
+            [{"segment_index": 1}],
+            [{"file_name": "segment_001.mp4"}],
+            [{"file_name": "segment_000.mp4"}, {"file_name": "segment_000.mp4"}],
+            [{"file_name": "segment_000.mp4"}, {"segment_index": 0}],
+        ]
+        with (
+            patch.object(mcp_server, "prepared_job_dir", return_value=Path("unused")),
+            patch.object(mcp_server, "read_manifest", return_value=manifest),
+        ):
+            for case in cases:
+                with self.subTest(case=case):
+                    files = [
+                        {
+                            "file_id": f"file_{i}",
+                            "download_url": f"https://files.example/{i}.mp4",
+                            **extra,
+                        }
+                        for i, extra in enumerate(case)
+                    ]
+                    result = asyncio.run(
+                        mcp_server.ingest_video_segments(files, job_id="0123456789ab")
+                    )
+                    self.assertTrue(result.isError)
+                    self.assertEqual(
+                        result.structuredContent["error_code"], "FILE_HANDOFF_INVALID"
+                    )
+
+    def test_file_handoff_invalid_error_does_not_blame_host(self) -> None:
+        result = asyncio.run(
+            mcp_server.ingest_video_segments([{"file_id": "file_1"}])
+        )
+        self.assertTrue(result.isError)
+        self.assertEqual(
+            result.structuredContent["error_code"], "FILE_HANDOFF_INVALID"
+        )
+        self.assertIn("metadata", result.content[0].text)
+        self.assertNotIn("未產生可用的檔案引用", result.content[0].text)
 
     def test_file_handoff_requires_ready_manifest_for_job_binding(self) -> None:
         with (
