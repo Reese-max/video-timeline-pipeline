@@ -360,7 +360,9 @@ python pipeline.py --digest
 
 `--ask` 先讓模型把問句拆成檢索詞（整句丟進 FTS5 是 phrase 比對，長問句必定 0 筆），再用檢索到的片段生成答案，並標註 `[1]`、`[2]` 對應到影片標題與時間戳。提示詞限定只能引用片段內容，資訊不足時會直說找不到，不會臆造。
 
-每個片段都有穩定的 `occurrence_id`（由 job、類型、起點與內容雜湊決定），重建索引不會改變它——引用不會因 `--index` 重跑而指到別的片段。模型只能回引用編號：不在這次 evidence 內的編號會被剔除並計數（`dropped_citations`），影片裡的注入文字也只是一段資料，提示詞明確宣告片段內容不可信。查無證據時回傳 `insufficient_evidence`，不拿模型常識補洞。
+每個片段都有穩定的 `occurrence_id`（由 job、類型、起點與內容雜湊決定），重建索引不會改變它——引用不會因 `--index` 重跑而指到別的片段。模型的數字引用編號須對應這次 evidence：非法編號會被剔除並計數（`dropped_citations`）；完全沒有合法引用的回答會被攔下，回傳 `insufficient_evidence`。片段中的指令視為不可信資料。目前核對的是引用身分，尚未驗證每個主張的語意支持，合法編號不代表內容必然正確。
+
+Ask 以 UTF-8 byte 數保守估算 token，計入指令、問題、標題、時間範圍與 512 token 的回答預留；這是 context 規劃，並未限制供應商實際輸出長度。合併相鄰片段會保留全部來源 ID，合併後超出預算則維持分段；省略數與原因見 `packing`，只有命中多支影片時才限制單片占比。
 
 `--digest` 把各支影片的摘要合成 `digest.md`：主題分群、跨影片反覆出現的術語、建議觀看順序、涵蓋落差。只吃跑過完整流程的 job，`--local-only`／`--dry-run` 的 job 沒有真摘要會被跳過。
 
@@ -394,7 +396,7 @@ OpenRouter 有官方的 [embeddings](https://openrouter.ai/docs/api/reference/em
 
 本機後端首次使用要下載約 2.2 GB 模型。CPU 實測約 94 筆/秒；裝的若是 `torch+cpu` 就吃不到 GPU，要 GPU 得另外裝 CUDA 版。
 
-`--embed` 只補算「這個 embedding 契約還沒算過」的片段：重跑不重複付費，換契約才重算。契約是 `backend::model`（例如 `openrouter::nvidia/nemotron-3-embed-1b:free`）；舊版以裸模型名存的向量仍可沿用，會在無歧義時自動改名，不為換名字重算付費向量。查詢與文件向量契約不同（含維度）會明確拒絕比較，不會靜默混算。`--embed-plan` 可先列「可重用／待計費」筆數，`--rebuild-embeddings` 會刪除該契約向量再重算（雲端後端要加 `--allow-batch-cloud` 授權）。
+`--embed` 只補算「這個 embedding 契約還沒算過」的片段：重跑不重複付費，換契約才重算。契約是 `backend::model`（例如 `openrouter::nvidia/nemotron-3-embed-1b:free`）；舊版以裸模型名存的向量仍可沿用，會在無歧義時自動改名，不覆寫已存在的新契約向量，也不為換名字重算付費向量。所有後端均驗證筆數、維度與有限值；查詢與文件維度或快取內容不符時拒絕比較。`--embed-plan` 列出補算的「可重用／待計費」筆數；`--rebuild-embeddings` 會先列出全部重算量，所有批次成功才在同一交易替換該契約，失敗保留舊向量（雲端後端須加 `--allow-batch-cloud` 授權）。
 
 ### 為什麼不直接嵌入截圖
 
@@ -434,9 +436,11 @@ python pipeline.py --search '資安' --category '資安新聞' --since 2026-05-0
 python pipeline.py --search '合併' --hybrid --rerank --explain --json
 ```
 
-篩選旗標（`--search`／`--ask` 共用）：`--kind speech,visual`、`--job`、`--platform`、`--author`、`--since/--until`（欄位由 `--date-field` 選 `published_at`／`first_completed_at`／`indexed_at`，預設 `published_at`）、`--include-unknown-dates`。日期未知的影片預設排除並提示筆數——發布日不會拿索引日冒充。分類是 JSON 精確比對，「資安」不會誤命中「資安新聞」。platform／author／published_at 由 manifest 與 yt-dlp `source.info.json` 可追溯回填，沒有證據就是 NULL。
+篩選旗標（`--search`／`--ask` 共用）：`--kind speech,visual`、`--job`、`--platform`、`--author`、`--since/--until`（欄位由 `--date-field` 選 `published_at`／`first_completed_at`／`indexed_at`，預設 `published_at`）、`--include-unknown-dates`。套用日期篩選時，日期未知的影片預設排除並提示筆數；JSON 搜尋與 Ask 檢索資訊包含 `unknown_dates_excluded` 與 `date_field`。發布日不拿索引日冒充，完成日不拿建立日代替。分類是 JSON 精確比對，「資安」不會誤命中「資安新聞」。platform／author／published_at 由 manifest（含 RSS 發布日）與 yt-dlp `source.info.json` 可追溯回填，沒有證據就是 NULL。
 
 `--rerank` 是可選的 provider 重排（預設關閉，需 `OPENROUTER_API_KEY`，失效時保留原排序）。`--explain` 顯示每筆的 RRF／各路名次，只讀已存資料、不額外呼叫模型。`--json` 輸出完整結構（含 `occurrence_id`、`rank_detail`、`retrieval_mode`）。
+
+`--dry-run`／`--local-only` 會拒絕雲端 embedding、Ask、rerank、分類與 Digest；純全文搜尋與 `--embed-plan` 可使用。`--dry-run` 也禁止本機向量寫入與重建。離線 fake-provider 評估可重播，但尚未提供人工 golden evidence、FTS／semantic 基準比較或真實供應商驗收，不能據此宣稱完整 RAG 語意品質已驗證。
 
 ## Open Notebook 知識庫
 

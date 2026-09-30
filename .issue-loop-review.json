@@ -1,0 +1,23 @@
+{
+  "pr": 21,
+  "head": "4afdaaf200f4b5d246ec9d56cc4bfd465ce4dce6",
+  "findings": [
+    {"severity":"med","file":"pipeline.py","line":2751,"issue":"FTS snippet still selects column 3 after occurrence_id was inserted there; >=3-character searches display occurrence IDs instead of matching text."},
+    {"severity":"high","file":"pipeline.py","line":2969,"issue":"Rebuild commits deletion before embedding and publishes each batch separately. A provider failure loses the previous usable cache; its plan also reports reusable/zero pending even though every text will be recomputed."},
+    {"severity":"med","file":"pipeline.py","line":2276,"issue":"Legacy vector migration uses INSERT OR REPLACE, allowing stale bare-model entries to overwrite already namespaced vectors."},
+    {"severity":"high","file":"pipeline.py","line":2825,"issue":"Embedding validation coerces fractional/bool/string indices, trusts malformed response containers, permits float32 overflow, and omits local-provider validation, cross-batch/cache dimension checks and cached blob validation."},
+    {"severity":"med","file":"pipeline.py","line":3002,"issue":"Vector candidates retain every eligible occurrence and its full text in wanted, so Python memory grows with the entire corpus despite a bounded top-K heap."},
+    {"severity":"med","file":"pipeline.py","line":3301,"issue":"Context packing merges adjacent individually usable fragments before budgeting; the oversized merged block can discard all otherwise usable evidence."},
+    {"severity":"med","file":"pipeline.py","line":3337,"issue":"Context budget counts only text plus fixed metadata overhead; arbitrarily large titles/questions and answer output reserve are omitted, and CJK text is underestimated."},
+    {"severity":"med","file":"pipeline.py","line":3533,"issue":"Diversity cap drops evidence even when every hit belongs to one video unless an explicit --job filter was supplied."},
+    {"severity":"med","file":"pipeline.py","line":3355,"issue":"Citation regex ignores numeric references longer than three digits, allowing fabricated [1000] and longer references to bypass validation."},
+    {"severity":"high","file":"pipeline.py","line":3579,"issue":"Answers with no valid citations are still published as sufficient evidence after invalid references are stripped."},
+    {"severity":"high","file":"pipeline.py","line":7268,"issue":"New hybrid/rerank/rebuild paths ignore --dry-run and --local-only; cloud requests and destructive rebuilds can execute despite offline flags."},
+    {"severity":"med","file":"pipeline.py","line":2365,"issue":"Metadata backfill ignores manifest.rss.published and invents first_completed_at from created_at, producing incorrect date filtering."},
+    {"severity":"med","file":"pipeline.py","line":7345,"issue":"Unknown-date exclusion counts and selected date field disappear from JSON search and every Ask response; human output also hides the date field when there are no unknown dates. Affected callers cannot see the filtering basis or why videos were omitted."},
+    {"severity":"high","file":"pipeline.py","line":3568,"issue":"needs-human: A5 claim/support_kind schema, excerpt matching and semantic claim support are not implemented. Valid citation IDs alone still permit unsupported assertions; completing this requires an agreed answer/API contract."},
+    {"severity":"med","file":"tests/test_retrieval.py","line":815,"issue":"needs-human: A9 fake-provider hit assertions lack FTS/semantic baseline comparisons, golden occurrence/time ranges and human support labels. They do not establish retrieval non-regression or semantic answer quality."}
+  ],
+  "fixed": true,
+  "summary": "Fixed 13 concrete review findings with 19 new offline regressions covering vector data safety, retrieval, context budgets, citations, offline flags and date metadata. Git Bash verification passed 45 retrieval tests and self-test; the full suite still has the same 8 Windows operations.db cleanup errors reproduced on main. needs-human: A5 semantic claim validation and A9 baseline/golden evaluation remain incomplete, so this is a partial delivery of issue #5."
+}

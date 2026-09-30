@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- 修正 PR #21 審查缺陷：向量重建原子替換與失敗回復、供應商及快取驗證、FTS 摘錄、有界向量候選、context 預算與單片證據保留、引用拒答、離線旗標及日期中繼資料；新增離線回歸測試。
 - 新增 `occurrences` 證據層：每筆片段有重建不變的 `occurrence_id` 與 `timestamp_kind`（source_level／point／range），引用不再依賴會重排的 FTS rowid。
 - 新增 `--hybrid` 混合檢索：篩選 eligible-set 後全文＋向量候選去重、RRF 融合，語意路不可用時明確降級（`--strict-retrieval` 可改為失敗）。
 - 新增檢索篩選：`--kind`、`--job`、`--platform`、`--author`、`--since/--until`、`--date-field`、`--include-unknown-dates`；分類改為 JSON 精確比對，日期未知預設排除並提示筆數。
