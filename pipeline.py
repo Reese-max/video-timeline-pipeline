@@ -2361,6 +2361,11 @@ def format_timestamp(value: Any) -> str:
     return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
 
 
+def format_hit_timestamp(hit: dict[str, Any]) -> str:
+    timestamp = hit.get("timestamp")
+    return "—" if timestamp is None else format_timestamp(timestamp)
+
+
 def format_srt_timestamp(value: Any) -> str:
     milliseconds = max(0, round(float(value or 0) * 1000))
     hours, remainder = divmod(milliseconds, 3_600_000)
@@ -2717,6 +2722,16 @@ def index_connection(root: Path) -> sqlite3.Connection:
             signature TEXT NOT NULL,
             row_count INTEGER NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS event_occurrences (
+            event_rowid INTEGER PRIMARY KEY,
+            occurrence_id TEXT NOT NULL UNIQUE,
+            job TEXT NOT NULL,
+            seq INTEGER NOT NULL,
+            start REAL,
+            end REAL,
+            timestamp_kind TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS event_occurrences_job_idx ON event_occurrences(job);
         """
     )
     # 不同模型的向量不能混用，vectors 必須記住是誰算的，而且主鍵要含 model——
@@ -2760,6 +2775,18 @@ def text_hash(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
 
 
+def make_occurrence_id(
+    job: str, kind: str, start: Any, end: Any, timestamp_kind: str, content_hash: str, ordinal: int = 0
+) -> str:
+    """Create a stable evidence identity from source fields, never from the FTS rowid."""
+    basis = json.dumps(
+        [job, kind, start, end, timestamp_kind, content_hash, ordinal],
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    return "occ_" + hashlib.sha256(basis.encode("utf-8")).hexdigest()
+
+
 def index_job(connection: sqlite3.Connection, job_dir: Path) -> int:
     manifest_path = job_dir / "manifest.json"
     if not manifest_path.is_file():
@@ -2773,6 +2800,7 @@ def index_job(connection: sqlite3.Connection, job_dir: Path) -> int:
         # 失敗的 job 沒有內容，留在索引裡只會讓「共幾支影片」這個數字說謊。
         # 目錄本身保留（manifest 記著錯誤原因，可用來診斷）。
         connection.execute("DELETE FROM events WHERE job = ?", (job,))
+        connection.execute("DELETE FROM event_occurrences WHERE job = ?", (job,))
         connection.execute("DELETE FROM videos WHERE job = ?", (job,))
         connection.execute("DELETE FROM index_state WHERE job = ?", (job,))
         return 0
@@ -2782,7 +2810,7 @@ def index_job(connection: sqlite3.Connection, job_dir: Path) -> int:
     signature = text_hash(
         json.dumps(
             {
-                "version": 1,
+                "version": 2,
                 "source": {
                     "title": source.get("title"),
                     "url": source.get("url"),
@@ -2804,8 +2832,9 @@ def index_job(connection: sqlite3.Connection, job_dir: Path) -> int:
     ).fetchone()
     if indexed is not None:
         return int(indexed[0])
-    # 向量以文字 hash 為鍵，不隨 events 重建而失效，所以這裡只清片段
+    # 向量以文字 hash 為鍵，不隨 events 重建而失效；引用對照則隨片段一起重建。
     connection.execute("DELETE FROM events WHERE job = ?", (job,))
+    connection.execute("DELETE FROM event_occurrences WHERE job = ?", (job,))
     connection.execute(
         "INSERT OR REPLACE INTO videos VALUES (?, ?, ?, ?, ?, ?, ?)",
         (
@@ -2820,8 +2849,35 @@ def index_job(connection: sqlite3.Connection, job_dir: Path) -> int:
     )
 
     rows: list[tuple[str, Any, str, str]] = []
-    if source.get("title"):  # 用影片名找片是最直覺的查法，標題也得進全文索引
-        rows.append((job, 0, "title", str(source["title"])))
+    occurrence_rows: list[tuple[str, int, Any, Any, str]] = []
+    ordinals: dict[str, int] = {}
+
+    def add_occurrence(
+        kind: str,
+        start: Any,
+        end: Any,
+        timestamp_kind: str,
+        text: str,
+        fts_timestamp: Any,
+    ) -> None:
+        content_hash = hashlib.sha256(text.encode("utf-8")).hexdigest()
+        identity = json.dumps(
+            [kind, start, end, timestamp_kind, content_hash],
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        ordinal = ordinals.get(identity, 0)
+        ordinals[identity] = ordinal + 1
+        occurrence_id = make_occurrence_id(
+            job, kind, start, end, timestamp_kind, content_hash, ordinal
+        )
+        seq = len(rows)
+        rows.append((job, fts_timestamp, kind, text))
+        occurrence_rows.append((occurrence_id, seq, start, end, timestamp_kind))
+
+    if source.get("title"):  # 標題是影片級證據，不把舊 timestamp=0 當成真實時間
+        add_occurrence("title", None, None, "source_level", str(source["title"]), 0)
     if timeline_path.is_file():
         try:
             timeline = json.loads(timeline_path.read_text(encoding="utf-8"))
@@ -2835,7 +2891,12 @@ def index_job(connection: sqlite3.Connection, job_dir: Path) -> int:
             else:
                 text = flatten_text(event.get("data")).strip()
             if text:
-                rows.append((job, event.get("timestamp"), str(event.get("type", "")), text))
+                start = event.get("timestamp")
+                end = event.get("end")
+                timestamp_kind = "range" if end is not None else ("point" if start is not None else "unknown")
+                add_occurrence(
+                    str(event.get("type", "")), start, end, timestamp_kind, text, start
+                )
 
     if summary_path.is_file():
         try:
@@ -2845,16 +2906,36 @@ def index_job(connection: sqlite3.Connection, job_dir: Path) -> int:
         if isinstance(summary, dict) and summary.get("status") != "skipped":
             text = flatten_text(summary).strip()
             if text:
-                rows.append((job, 0, "summary", text))
-            # 章節另外建一筆：整份摘要那筆的 timestamp 只能是 0，命中了也跳不回影片；
-            # 章節自帶 start，而且範圍夠窄，向量比整份摘要聚焦得多。
+                add_occurrence("summary", None, None, "source_level", text, 0)
+            # 章節沒有 start 時保留未知，不用 0 假裝有可跳轉的時間。
             for chapter in summary.get("chapters") or []:
                 if not isinstance(chapter, dict) or not chapter.get("title"):
                     continue
                 detail = f"{chapter['title']}：{chapter.get('summary', '')}".strip("：")
-                rows.append((job, chapter.get("start") or 0, "chapter", detail))
+                start = chapter.get("start")
+                end = chapter.get("end")
+                timestamp_kind = "range" if end is not None else ("point" if start is not None else "unknown")
+                add_occurrence(
+                    "chapter", start, end, timestamp_kind, detail, 0 if start is None else start
+                )
 
-    connection.executemany("INSERT INTO events VALUES (?, ?, ?, ?)", rows)
+    if rows:
+        first_rowid = int(connection.execute("SELECT COALESCE(MAX(rowid), 0) + 1 FROM events").fetchone()[0])
+        connection.executemany(
+            "INSERT INTO events (rowid, job, timestamp, kind, text) VALUES (?, ?, ?, ?, ?)",
+            [(first_rowid + seq, *row) for seq, row in enumerate(rows)],
+        )
+        connection.executemany(
+            """
+            INSERT INTO event_occurrences
+                (event_rowid, occurrence_id, job, seq, start, end, timestamp_kind)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            [
+                (first_rowid + seq, occurrence_id, job, seq, start, end, timestamp_kind)
+                for occurrence_id, seq, start, end, timestamp_kind in occurrence_rows
+            ],
+        )
     connection.execute(
         "INSERT OR REPLACE INTO index_state VALUES (?, ?, ?)", (job, signature, len(rows))
     )
@@ -2896,6 +2977,20 @@ def like_pattern(query: str) -> str:
     return f"%{escaped}%"
 
 
+def _require_occurrence_index(connection: sqlite3.Connection) -> None:
+    missing = connection.execute(
+        """
+        SELECT 1
+        FROM events
+        LEFT JOIN event_occurrences ON event_occurrences.event_rowid = events.rowid
+        WHERE event_occurrences.event_rowid IS NULL
+        LIMIT 1
+        """
+    ).fetchone()
+    if missing is not None:
+        raise RuntimeError("索引缺少穩定引用資料；請先執行 --index 重建索引。")
+
+
 def search_index(root: Path, query: str, limit: int, category: str = "") -> list[dict[str, Any]]:
     db_path = root / "library.db"
     if not db_path.is_file():
@@ -2933,11 +3028,15 @@ def search_index(root: Path, query: str, limit: int, category: str = "") -> list
 
     connection = index_connection(root)
     try:
+        _require_occurrence_index(connection)
         cursor = connection.execute(
             f"""
-            SELECT videos.title, videos.source, events.job, events.timestamp,
-                   events.kind, {snippet_column}, events.text
-            FROM events JOIN videos ON videos.job = events.job
+            SELECT videos.title, videos.source, events.job, event_occurrences.start,
+                   events.kind, {snippet_column}, events.text, event_occurrences.occurrence_id,
+                   event_occurrences.end, event_occurrences.timestamp_kind
+            FROM events
+            JOIN videos ON videos.job = events.job
+            JOIN event_occurrences ON event_occurrences.event_rowid = events.rowid
             WHERE {where}{category_clause}
             ORDER BY {order}
             LIMIT ?
@@ -2953,6 +3052,10 @@ def search_index(root: Path, query: str, limit: int, category: str = "") -> list
                 "kind": row[4],
                 "snippet": make_snippet(row[5], query) if scan else row[5],
                 "text": row[6],  # 完整原文：snippet 只有 16 字窗口，餵給 LLM 不夠用
+                "occurrence_id": row[7],
+                "start": row[3],
+                "end": row[8],
+                "timestamp_kind": row[9],
                 "mode": "scan" if scan else "index",
             }
             for row in cursor
@@ -3086,18 +3189,20 @@ def semantic_search(
     db_path = root / "library.db"
     if not db_path.is_file():
         raise RuntimeError(f"索引不存在：{db_path}；先執行 `--index`。")
-    query_vector = embed_texts([query], api_key, model, backend)[0]
     connection = index_connection(root)
     try:
-        # 向量以文字 hash 為鍵，SQLite 沒有內建 sha256，所以在 Python 端對應
+        _require_occurrence_index(connection)
         stored = dict(connection.execute("SELECT text_hash, vector FROM vectors WHERE model = ?", (model,)))
         rows = [
-            (title, source, job, timestamp, kind, text, stored[text_hash(text)])
-            for title, source, job, timestamp, kind, text in connection.execute(
+            (title, source, job, start, kind, text, occurrence_id, end, timestamp_kind, stored[text_hash(text)])
+            for title, source, job, start, kind, text, occurrence_id, end, timestamp_kind in connection.execute(
                 """
-                SELECT videos.title, videos.source, events.job, events.timestamp,
-                       events.kind, events.text
-                FROM events JOIN videos ON videos.job = events.job
+                SELECT videos.title, videos.source, events.job, event_occurrences.start,
+                       events.kind, events.text, event_occurrences.occurrence_id,
+                       event_occurrences.end, event_occurrences.timestamp_kind
+                FROM events
+                JOIN videos ON videos.job = events.job
+                JOIN event_occurrences ON event_occurrences.event_rowid = events.rowid
                 """
             )
             if text_hash(text) in stored
@@ -3106,6 +3211,8 @@ def semantic_search(
         connection.close()
     if not rows:
         raise RuntimeError(f"索引裡沒有 {model} 的向量；先執行 `--embed`。")
+    # 先驗證本機索引和快取，再呼叫嵌入服務；無效索引不應消耗 provider 呼叫。
+    query_vector = embed_texts([query], api_key, model, backend)[0]
     # ponytail: 純 Python 全掃描。幾千個向量是毫秒級；真的大到會慢再換 sqlite-vec。
     scored = sorted(
         (
@@ -3117,7 +3224,11 @@ def semantic_search(
                 "kind": row[4],
                 "text": row[5],
                 "snippet": row[5][:120],
-                "score": cosine(query_vector, unpack_vector(row[6])),
+                "occurrence_id": row[6],
+                "start": row[3],
+                "end": row[7],
+                "timestamp_kind": row[8],
+                "score": cosine(query_vector, unpack_vector(row[9])),
                 "mode": "semantic",
             }
             for row in rows
@@ -3125,7 +3236,7 @@ def semantic_search(
         key=lambda item: item["score"],
         reverse=True,
     )
-    # 沒有下限的話每次都回傳整個索引，末幾筆只是「最不像的那些」，不是命中。
+    # 沒有下限的話每次都回傳整個索引，末幾筆只是最不像的那些，不是命中。
     if not scored:
         return []
     cutoff = similarity_cutoff(scored[0]["score"], threshold)
@@ -3179,7 +3290,7 @@ def answer_question(
                 if rank >= len(results):
                     continue
                 hit = results[rank]
-                key = (hit["job"], hit["timestamp"], hit["kind"])
+                key = hit.get("occurrence_id") or (hit["job"], hit["timestamp"], hit["kind"])
                 if key in seen:
                     continue
                 seen.add(key)
@@ -3192,7 +3303,7 @@ def answer_question(
         return {"question": question, "keywords": keywords, "answer": "索引裡找不到相關片段。", "citations": []}
 
     context = "\n".join(
-        f"[{index}] 《{hit['title'] or hit['job']}》 {format_timestamp(hit['timestamp'])} "
+        f"[{index}] 《{hit['title'] or hit['job']}》 {format_hit_timestamp(hit)} "
         f"（{hit['kind']}）：{hit['text']}"
         for index, hit in enumerate(hits, 1)
     )
@@ -7034,7 +7145,10 @@ def main() -> int:
                 for hit in hits:
                     label = hit["title"] or hit["job"]
                     score = f" {hit['score']:.3f}" if "score" in hit else ""
-                    print(f"-{score} [{format_timestamp(hit['timestamp'])}] {label}（{hit['kind']}）")
+                    print(
+                        f"-{score} [{format_hit_timestamp(hit)}] {label}（{hit['kind']}） "
+                        f"[{hit['occurrence_id']}]"
+                    )
                     print(f"    {hit['snippet']}")
                     print(f"    {source_link(hit['source'], hit['timestamp'])}")
             if args.categorize:
@@ -7061,7 +7175,10 @@ def main() -> int:
                     print("\n引用：")
                     for index, hit in enumerate(result["citations"], 1):
                         label = hit["title"] or hit["job"]
-                        print(f"  [{index}] {label} {format_timestamp(hit['timestamp'])}（{hit['kind']}）")
+                        print(
+                            f"  [{index}] {label} {format_hit_timestamp(hit)}（{hit['kind']}） "
+                            f"[{hit['occurrence_id']}]"
+                        )
                         print(f"      {source_link(hit['source'], hit['timestamp'])}")
                         # 附上原文：不點開影片就能判斷這個引用該不該信
                         excerpt = " ".join(str(hit.get("text") or "").split())
