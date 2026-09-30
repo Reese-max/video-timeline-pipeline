@@ -21,7 +21,7 @@ import drive_storage
 from mcp import types
 from mcp.server.fastmcp import FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, StrictFloat, StrictInt
 from starlette.requests import Request
 from starlette.responses import FileResponse, JSONResponse, PlainTextResponse
 
@@ -93,6 +93,10 @@ class JobBusyError(RuntimeError):
     """No work started; safe for a caller to retry after backoff."""
 
 
+class UnsupportedFileHandoff(ValueError):
+    """The host never produced usable file references (e.g. no file_id at all)."""
+
+
 UI_META = {
     "openai/widgetDescription": "MCP 分析影音，ChatGPT 整理證據；Drive 為選用儲存及原片覆核交接。",
     "ui": {
@@ -137,24 +141,37 @@ DRIVE_META = {
 
 
 class OpenAIFileReference(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="ignore")
 
     download_url: str
     file_id: str
     mime_type: str = ""
     file_name: str = ""
+    segment_index: StrictInt | None = None
+    start_seconds: StrictFloat | None = None
+    end_seconds: StrictFloat | None = None
 
 
 class VerifiedFileSummary(BaseModel):
     file_id: str
+    download_url: str
     mime_type: str | None = None
     file_name: str | None = None
+    kind: Literal["segment", "preview"] | None = None
+    segment_index: int | None = None
+    start_seconds: float | None = None
+    end_seconds: float | None = None
 
 
 class FileHandoffResult(BaseModel):
-    status: Literal["files_received"]
-    files_received: int
-    files: list[VerifiedFileSummary]
+    status: Literal["files_received", "error"]
+    job_id: str | None = None
+    files_received: int = 0
+    segments_expected: int | None = None
+    segments_received: int = 0
+    files: list[VerifiedFileSummary] = []
+    error: str | None = None
+    error_code: str | None = None
 
 
 class AnalysisQuality(BaseModel):
@@ -230,34 +247,151 @@ class DriveUploadResult(BaseModel):
 
 def normalize_file_references(files: list[dict]) -> list[dict]:
     if not files:
-        raise ValueError("至少需要一個影片檔案引用。")
+        raise UnsupportedFileHandoff(
+            "至少需要一個檔案引用；host 未交付任何檔案，不支援檔案交接。"
+        )
 
     normalized = []
     seen_ids = set()
     for index, item in enumerate(files):
         if not isinstance(item, dict):
-            raise ValueError(f"files[{index}] 必須是檔案引用物件。")
+            raise UnsupportedFileHandoff(
+                f"files[{index}] 必須是包含 file_id 的檔案引用物件，不接受純 URL。"
+            )
         file_id = str(item.get("file_id") or "").strip()
         if not file_id:
-            raise ValueError(f"files[{index}].file_id 必填。")
+            raise UnsupportedFileHandoff(
+                f"files[{index}].file_id 必填；host 未提供檔案引用，不支援檔案交接。"
+            )
         if file_id in seen_ids:
             raise ValueError(f"files[{index}].file_id 重複。")
         download_url = str(item.get("download_url") or "").strip()
+        if not download_url:
+            raise ValueError(f"files[{index}].download_url 必填。")
         parsed = urlsplit(download_url)
         if parsed.scheme.lower() != "https" or not parsed.netloc:
             raise ValueError(f"files[{index}].download_url 必須是 HTTPS URL。")
         if parsed.username or parsed.password:
             raise ValueError(f"files[{index}].download_url 不可包含帳號或密碼。")
+        segment_index = item.get("segment_index")
+        if segment_index is not None and (
+            isinstance(segment_index, bool)
+            or not isinstance(segment_index, int)
+            or segment_index < 0
+        ):
+            raise ValueError(f"files[{index}].segment_index 必須是非負整數。")
+        start = item.get("start_seconds")
+        end = item.get("end_seconds")
+        if (start is None) != (end is None):
+            raise ValueError(f"files[{index}].start_seconds 與 end_seconds 必須同時提供。")
+        if start is not None:
+            valid_range = all(
+                isinstance(value, (int, float))
+                and not isinstance(value, bool)
+                and math.isfinite(value)
+                for value in (start, end)
+            )
+            if not valid_range or not 0 <= start < end:
+                raise ValueError(
+                    f"files[{index}] 的影片時間範圍必須滿足 0 <= start_seconds < end_seconds。"
+                )
         seen_ids.add(file_id)
         normalized.append(
             {
                 "file_id": file_id,
                 "download_url": download_url,
-                "mime_type": item.get("mime_type"),
-                "file_name": item.get("file_name"),
+                "mime_type": str(item.get("mime_type") or "").strip() or None,
+                "file_name": str(item.get("file_name") or "").strip() or None,
+                "segment_index": segment_index,
+                "start_seconds": start,
+                "end_seconds": end,
             }
         )
     return normalized
+
+
+def usable_manifest_segment(segment: Any) -> bool:
+    if not isinstance(segment, dict):
+        return False
+    index = segment.get("index")
+    start = segment.get("start_seconds")
+    end = segment.get("end_seconds")
+    return (
+        isinstance(index, int)
+        and not isinstance(index, bool)
+        and isinstance(start, (int, float))
+        and not isinstance(start, bool)
+        and isinstance(end, (int, float))
+        and not isinstance(end, bool)
+        and math.isfinite(start)
+        and math.isfinite(end)
+        and 0 <= start < end
+    )
+
+
+def bind_handoff_segments(manifest: dict, references: list[dict]) -> tuple[list[dict], int]:
+    """Attach authoritative segment time ranges from a ready manifest.
+
+    Returns the bound references and the count of usable manifest segments.
+    """
+    segments = manifest.get("segments") or []
+    by_name: dict[str, tuple[dict, str]] = {}
+    by_index: dict[int, dict] = {}
+    for segment in segments:
+        if not usable_manifest_segment(segment):
+            continue
+        by_index[segment["index"]] = segment
+        for kind, key in (("segment", "filename"), ("preview", "preview_filename")):
+            name = segment.get(key)
+            if isinstance(name, str) and name:
+                by_name[name] = (segment, kind)
+
+    bound = []
+    used: set[tuple[str, int]] = set()
+    for index, reference in enumerate(references):
+        reference = dict(reference)
+        segment = None
+        kind = None
+        file_name = reference.get("file_name") or ""
+        mime_type = (reference.get("mime_type") or "").split(";", 1)[0].strip().lower()
+        basename = file_name.replace("\\", "/").rsplit("/", 1)[-1]
+        if basename:
+            hit = by_name.get(basename)
+            if hit is None:
+                raise ValueError(
+                    f"files[{index}].file_name 不在此工作的分段清單中；請勿以檔名推測分段。"
+                )
+            segment, kind = hit
+        claimed_index = reference.get("segment_index")
+        if claimed_index is not None:
+            indexed = by_index.get(claimed_index)
+            if indexed is None:
+                raise ValueError(f"files[{index}].segment_index 不在此工作的分段清單中。")
+            if segment is not None and indexed is not segment:
+                raise ValueError(f"files[{index}] 的 segment_index 與 file_name 指向不同分段。")
+            segment = indexed
+            kind = kind or ("preview" if mime_type == "image/jpeg" else "segment")
+        if segment is None:
+            raise ValueError(f"files[{index}] 無法對應到此工作的任何分段或影格。")
+        if kind == "preview" and not segment.get("preview_filename"):
+            raise ValueError(f"files[{index}] 對應的分段沒有代表影格。")
+        expected_mime = "image/jpeg" if kind == "preview" else "video/mp4"
+        if mime_type and mime_type != expected_mime:
+            raise ValueError(f"files[{index}].mime_type 與分段或影格類型不符。")
+        marker = (kind, segment["index"])
+        if marker in used:
+            raise ValueError(f"files[{index}] 與先前檔案重複對應同一分段。")
+        used.add(marker)
+        for field in ("start_seconds", "end_seconds"):
+            claimed = reference.get(field)
+            if claimed is not None and abs(float(claimed) - float(segment[field])) > 0.001:
+                raise ValueError(f"files[{index}].{field} 與分段實際時間範圍不符。")
+        reference["segment_index"] = segment["index"]
+        reference["start_seconds"] = segment["start_seconds"]
+        reference["end_seconds"] = segment["end_seconds"]
+        reference["kind"] = kind
+        bound.append(reference)
+    return bound, len(by_index)
 
 
 def validate_source_url(value: str) -> str:
@@ -606,7 +740,7 @@ def tool_result(manifest: dict) -> types.CallToolResult:
             links.append(
                 types.ResourceLink(
                     type="resource_link",
-                    name=f"preview-{segment['index']}.jpg",
+                    name=segment["preview_filename"],
                     title=f"{title} 代表影格",
                     uri=segment["preview_url"],
                     description="影片分段的代表影格；不能代替完整影片分析。",
@@ -922,6 +1056,50 @@ def drive_tool_error_result(error: Exception) -> types.CallToolResult:
         isError=True,
         structuredContent={"status": "error", "error": detail},
         content=[types.TextContent(type="text", text=f"Google Drive 交接失敗：{detail}")],
+    )
+
+
+def file_handoff_error_result(error_code: str, error: Exception) -> types.CallToolResult:
+    detail = str(error).strip() or error.__class__.__name__
+    payload = FileHandoffResult(status="error", error_code=error_code, error=detail)
+    cause = (
+        "host 未產生可用的檔案引用（可能沒有 uploadFile／fileParams 支援）；"
+        if error_code == "HOST_FILE_HANDOFF_UNSUPPORTED"
+        else "檔案引用無效或未通過 manifest 核對；"
+    )
+    return types.CallToolResult(
+        isError=True,
+        structuredContent=payload.model_dump(),
+        content=[
+            types.TextContent(
+                type="text",
+                text=(
+                    f"影片檔案交接未完成（{error_code}）：{detail}\n"
+                    f"{cause}請勿根據 URL、檔名或 metadata 摘要影片內容；"
+                    "可改用 analyze_prepared_video 伺服器分析或 Drive 原片交接。"
+                ),
+            )
+        ],
+    )
+
+
+def file_handoff_result(payload: FileHandoffResult) -> types.CallToolResult:
+    text = f"已確認 {payload.files_received} 個檔案引用（file_id 與 download_url 均已驗證）。"
+    if payload.job_id:
+        text += (
+            f"已依 job_id={payload.job_id} 的 manifest 核對："
+            f"{payload.segments_received}/{payload.segments_expected} 個分段取得 MP4 檔案，"
+            "時間範圍為伺服器端核對值。"
+        )
+    text += (
+        "現在才可讀取附件，依各檔案的 segment_index 與 start_seconds–end_seconds 逐段摘要；"
+        "kind=preview 為該分段的代表影格。"
+        "沒有對應檔案的分段不得以檔名、URL 或 metadata 推測內容；讀取失敗需明確標示。"
+    )
+    return types.CallToolResult(
+        structuredContent=payload.model_dump(),
+        content=[types.TextContent(type="text", text=text)],
+        _meta={"job_id": payload.job_id} if payload.job_id else {},
     )
 
 
@@ -1444,13 +1622,21 @@ async def collect_social_post(url: str, allow_paid: bool = False) -> dict[str, A
     name="ingest_video_segments",
     title="Receive video segments for analysis",
     description=(
-        "Legacy native-file handoff only; not used by the current server-analysis widget. "
-        "Call this only when ChatGPT has actually uploaded the MP4 segments. "
-        "Pass the files in the same order as the prepared segment list. "
-        "Each item must be the complete OpenAI file object containing file_id and download_url. "
-        "A public segment URL or MCP resource link alone is not proof that ChatGPT received the MP4 "
-        "bytes and must be rejected. This tool only confirms file references; read the attached files "
-        "before making any visual or audio claims, and fail closed when the references are missing."
+        "Confirm a ChatGPT-native file handoff for prepared video segments. "
+        "Call only when the host actually delivered file attachments (e.g. via "
+        "window.openai.uploadFile or a fileParams-capable flow); the current "
+        "server-analysis widget does not call this. Pass the complete OpenAI file "
+        "objects in prepared segment order: file_id and download_url are required, "
+        "and mime_type, file_name and the segment time range are preserved. "
+        "Provide job_id from prepare_video_for_chatgpt so the server binds "
+        "authoritative segment_index/start_seconds/end_seconds; every file must "
+        "then map to a manifest segment_*.mp4 or preview_*.jpg name (or a valid "
+        "segment_index), and unknown, unbound or conflicting references fail. "
+        "Only after this tool returns files_received may the attached files be "
+        "analyzed for per-segment summaries. If a file_id is missing, report that "
+        "the host did not provide a usable file handoff; report other validation "
+        "errors as invalid references. Never summarize the video from URLs, "
+        "filenames or metadata after a failed handoff."
     ),
     annotations=types.ToolAnnotations(
         readOnlyHint=True,
@@ -1463,22 +1649,44 @@ async def collect_social_post(url: str, allow_paid: bool = False) -> dict[str, A
 )
 async def ingest_video_segments(
     files: list[OpenAIFileReference],
-) -> FileHandoffResult:
-    references = normalize_file_references(
-        [OpenAIFileReference.model_validate(item).model_dump() for item in files]
-    )
-    return FileHandoffResult(
-        status="files_received",
-        files_received=len(references),
-        files=[
-            VerifiedFileSummary(
-                file_id=item["file_id"],
-                mime_type=item.get("mime_type"),
-                file_name=item.get("file_name"),
-            )
-            for item in references
-        ],
-    )
+    job_id: str | None = None,
+) -> Annotated[types.CallToolResult, FileHandoffResult]:
+    try:
+        references = normalize_file_references(
+            [item.model_dump() if isinstance(item, BaseModel) else item for item in files]
+        )
+        bound_job_id = None
+        segments_expected = None
+        if job_id is not None:
+            job_dir = prepared_job_dir(job_id)
+            manifest = read_manifest(job_dir)
+            if not manifest:
+                raise ValueError(
+                    "影片尚未準備完成，無法核對分段時間範圍；請先呼叫 prepare_video_for_chatgpt。"
+                )
+            references, segments_expected = bind_handoff_segments(manifest, references)
+            bound_job_id = job_id
+        summaries = [VerifiedFileSummary(**reference) for reference in references]
+        segments_received = len(
+            {
+                item.segment_index
+                for item in summaries
+                if item.kind == "segment" and item.segment_index is not None
+            }
+        )
+        payload = FileHandoffResult(
+            status="files_received",
+            job_id=bound_job_id,
+            files_received=len(summaries),
+            segments_expected=segments_expected,
+            segments_received=segments_received,
+            files=summaries,
+        )
+    except UnsupportedFileHandoff as error:
+        return file_handoff_error_result("HOST_FILE_HANDOFF_UNSUPPORTED", error)
+    except Exception as error:
+        return file_handoff_error_result("FILE_HANDOFF_INVALID", error)
+    return file_handoff_result(payload)
 
 
 @mcp.custom_route("/health", methods=["GET"], include_in_schema=False)

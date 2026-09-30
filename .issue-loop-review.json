@@ -1,0 +1,32 @@
+{
+  "pr": 30,
+  "head": "1568dadd26283df23d667289d364b8b00a22fa4c",
+  "findings": [
+    {
+      "severity": "med",
+      "file": "mcp_server.py",
+      "line": 151,
+      "issue": "FastMCP coerces boolean start_seconds/end_seconds to floats before normalize_file_references runs, bypassing its explicit boolean rejection. A tools/call with False/True succeeds with the invented range 0.0-1.0; use strict numeric input fields and test the registered protocol handler."
+    },
+    {
+      "severity": "med",
+      "file": "mcp_server.py",
+      "line": 372,
+      "issue": "Manifest binding defaults index-only references to kind=segment and never checks mime_type. An image/jpeg reference, including one claiming an MP4 filename, is counted and announced as a received MP4. Classify index-only JPEGs as previews, require a manifest preview, and reject MIME/kind conflicts."
+    },
+    {
+      "severity": "med",
+      "file": "mcp_server.py",
+      "line": 357,
+      "issue": "The new exact-name lookup rejects preview ResourceLink names emitted by prepare_video_for_chatgpt: tool_result names them preview-0.jpg while the manifest contains preview_000.jpg. A host preserving the advertised resource name fails even with the correct segment_index. Emit the manifest filename and test the producer-to-ingestion round trip."
+    },
+    {
+      "severity": "high",
+      "file": "mcp_server.py",
+      "line": 1081,
+      "issue": "needs-human: Issue #23 requires a real ChatGPT file reference, a visually verified preview, and per-segment MP4 summaries when supported. This receipt checks supplied metadata and the current widget does not invoke native ingestion; synthetic files.example references and offline tests do not demonstrate those acceptance criteria. Obtain a real host/model receipt or explicitly approve narrowing the issue scope; do not treat the PR's checked acceptance mapping as end-to-end completion."
+    }
+  ],
+  "fixed": true,
+  "summary": "Fixed all three code defects with failing-before-fix regression tests: boolean timestamp coercion, JPEG/MP4 misclassification, and incompatible preview resource names. Git Bash validation passed: 138 Python tests and 21 widget scenarios, with 2 Linux/WSL-only tests skipped. needs-human: actual ChatGPT attachment delivery, visible-frame verification, and supported MP4 summaries remain unverified against issue #23."
+}
