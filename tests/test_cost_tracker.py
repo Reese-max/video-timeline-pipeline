@@ -234,6 +234,15 @@ class BudgetTimezoneAccountingTests(unittest.TestCase):
         self.assertIsNotNone(row)
         return row["period_id"]
 
+    def _reservation_status(self, reservation_id: str) -> str:
+        with closing(cost_tracker.get_operations_db(self.root)) as conn:
+            row = conn.execute(
+                "SELECT status FROM budget_reservations WHERE reservation_id = ?",
+                (reservation_id,),
+            ).fetchone()
+        self.assertIsNotNone(row)
+        return row["status"]
+
     def test_taipei_day_spans_utc_date_boundary(self) -> None:
         env = {"COST_TIMEZONE": "Asia/Taipei", "DAILY_BUDGET_USD": "0.010", "BUDGET_HARD_STOP": "true"}
         with patch.dict(os.environ, env):
@@ -323,6 +332,19 @@ class BudgetTimezoneAccountingTests(unittest.TestCase):
 
             self.assertEqual(self._reservation_period(res1), "2026-10-01")
             self.assertEqual(self._reservation_period(res2), "2026-10-02")
+
+            # Settle the prior-day reservation after local midnight. Settlement
+            # must not rewrite the period that was reserved before rollover.
+            with self._freeze(2026, 10, 1, 16, 45):
+                cost_tracker.record_usage(
+                    self.root,
+                    provider="groq",
+                    operation="transcribe",
+                    reservation_id=res1,
+                    status="succeeded",
+                )
+            self.assertEqual(self._reservation_period(res1), "2026-10-01")
+            self.assertEqual(self._reservation_status(res1), "settled")
 
     def test_blocked_event_and_outputs_share_local_period(self) -> None:
         env = {"COST_TIMEZONE": "Asia/Taipei", "DAILY_BUDGET_USD": "0.001", "BUDGET_HARD_STOP": "true"}
