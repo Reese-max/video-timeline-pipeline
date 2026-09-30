@@ -19,6 +19,7 @@ from contextlib import closing
 from pathlib import Path
 from typing import Any
 
+import cost_tracker
 from digests import build_digest_payload, collect_digest_candidates, compute_digest_window
 from email_providers import BaseProvider, DeliveryResult, get_configured_provider
 from email_templates import render_digest_email, render_event_email
@@ -126,6 +127,12 @@ def _init_operations_schema(conn: sqlite3.Connection) -> None:
 
 def _utc_now_iso() -> str:
     return datetime.datetime.now(datetime.timezone.utc).isoformat()
+
+
+def _send_with_cost_tracking(root: Path, provider: BaseProvider, **kwargs: Any) -> DeliveryResult:
+    """Make direct notification-provider calls inherit the issue #4 guard."""
+    with cost_tracker.cost_tracking(root):
+        return provider.send(**kwargs)
 
 
 def record_event(
@@ -435,7 +442,9 @@ def run_digest_send(
 
         target = claimed[0]
         started_at = _utc_now_iso()
-        result = active_provider.send(
+        result = _send_with_cost_tracking(
+            root,
+            active_provider,
             recipient=target["recipient_id"],
             subject=subject,
             text_body=text_body,
@@ -540,7 +549,9 @@ def run_notify_test(root: Path, provider: BaseProvider | None = None) -> dict[st
 
         target = claimed[0]
         started = _utc_now_iso()
-        result = active_provider.send(
+        result = _send_with_cost_tracking(
+            root,
+            active_provider,
             recipient=target["recipient_id"],
             subject=subject,
             text_body=text,
@@ -589,7 +600,9 @@ def run_notification_retry(root: Path, provider: BaseProvider | None = None) -> 
                 text_body = "無法解碼 payload"
                 html_body = None
 
-            result = active_provider.send(
+            result = _send_with_cost_tracking(
+                root,
+                active_provider,
                 recipient=item["recipient_id"],
                 subject=subject,
                 text_body=text_body,
@@ -658,7 +671,9 @@ def record_pipeline_completed_event(root: Path, job_dir: Path, manifest: dict[st
                     text, html_msg = render_event_email("video.completed", event_payload)
                     provider = get_configured_provider("webhook")
                     started = _utc_now_iso()
-                    result = provider.send(
+                    result = _send_with_cost_tracking(
+                        root,
+                        provider,
                         recipient=target["recipient_id"],
                         subject=f"【影片處理完成】{title}",
                         text_body=text,
