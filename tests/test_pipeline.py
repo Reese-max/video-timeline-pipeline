@@ -332,6 +332,51 @@ class InstagramAuthorTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "不可使用單篇"):
             pipeline.instagram_username("https://www.instagram.com/reel/CURRENT/")
 
+    def test_brightdata_discovery_fails_closed_without_finite_budget(self) -> None:
+        """#8: --allow-batch-cloud 只是 opt-in；缺／零／負預算在送出前拒絕，零供應商呼叫。"""
+        environment = {
+            "BRIGHTDATA_API_TOKEN": "test-brightdata-token",
+            "BRIGHTDATA_RUN_TIMEOUT_SECONDS": "60",
+        }
+        for bad in (None, 0, -5):
+            with self.subTest(budget=bad), tempfile.TemporaryDirectory() as root, mock.patch.object(
+                pipeline, "request_json"
+            ) as post, mock.patch.object(
+                pipeline, "get_json"
+            ) as read, mock.patch.dict(
+                pipeline.os.environ, environment
+            ):
+                with self.assertRaisesRegex(ValueError, "instagram-max-items"):
+                    pipeline.fetch_instagram_author(
+                        "https://www.instagram.com/example/",
+                        "365d",
+                        max_items=bad,
+                        allow_paid=True,
+                        root=Path(root),
+                    )
+                post.assert_not_called()
+                read.assert_not_called()
+                self.assertEqual(list(Path(root).rglob("submission.json")), [])
+
+    def test_brightdata_reports_bound_before_paid_trigger(self) -> None:
+        """#8: 觸發快照前先印出有效供應商工作上限；輸出不得包含 token。"""
+        with tempfile.TemporaryDirectory() as root, mock.patch.dict(
+            pipeline.os.environ, {"BRIGHTDATA_API_TOKEN": "test-brightdata-token"}
+        ), mock.patch.object(
+            pipeline, "request_json", return_value={"snapshot_id": "sd_test"}
+        ), mock.patch.object(
+            pipeline, "get_json", side_effect=[{"status": "ready"}, []]
+        ), mock.patch(
+            "sys.stderr", new_callable=io.StringIO
+        ) as err:
+            feed = pipeline.fetch_instagram_author(
+                "testauthor", max_items=7, allow_paid=True, root=Path(root)
+            )
+        printed = err.getvalue()
+        self.assertIn("num_of_posts=7", printed)
+        self.assertNotIn("test-brightdata-token", printed)
+        self.assertEqual(feed["instagram"]["max_items"], 7)
+
 
 if __name__ == "__main__":
     unittest.main()
