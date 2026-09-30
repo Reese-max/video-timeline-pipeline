@@ -1,0 +1,12 @@
+{
+  "repo": "Reese-max/video-timeline-pipeline",
+  "issue": 30,
+  "base_sha": "1568dadd26283df23d667289d364b8b00a22fa4c",
+  "red_proof": "Before implementation, with only the new regression tests added to reviewed HEAD 1568dadd26283df23d667289d364b8b00a22fa4c, ran: .venv/Scripts/python.exe -X utf8 -B -m pytest -q tests/test_mcp_server.py -k \"protocol_rejects_boolean_timestamps or protocol_checks_media_kind or accepts_emitted_preview_resource_name\". Exit 1. FAILED test_file_handoff_accepts_emitted_preview_resource_name: AssertionError: True is not false. SUBFAILED test_file_handoff_protocol_checks_media_kind (segment_index=0, mime_type=image/jpeg): AssertionError: 1 != 0; MIME conflicts and a missing manifest preview also failed. SUBFAILED test_file_handoff_protocol_rejects_boolean_timestamps (start=False, end=30), (start=0, end=True), (start=False, end=True): AssertionError: False is not true. Pytest summary: 10 failed, 2 passed, 30 deselected, 3 subtests passed in 0.96s (failures include 9 subtest failures).",
+  "test_command": ".venv/Scripts/python.exe -X utf8 -B -m pytest -q -rs && node tests/test_widget_handoff.cjs && git diff --check",
+  "test_exit": 0,
+  "tests_passed": 159,
+  "tests_failed": 0,
+  "summary": "Strict timestamp fields reject booleans at the registered MCP boundary, manifest binding distinguishes JPEG previews from MP4 segments and rejects MIME conflicts or absent previews, and emitted preview names match the manifest. Three regression methods reproduce the original defects before the fix; the Git Bash command passed 138 Python tests (plus 105 subtests) and 21 widget scenarios, with git diff --check clean. Documentation now distinguishes MCP schema rejection from structured handoff errors; file_id/download_url remain required. Tests ran in this worktree's isolated .venv with requirements.txt and pytest installed; no project dependency declarations changed.",
+  "not_done": "needs-human: issue #23 still lacks a real ChatGPT-native file_id/download_url receipt, visually verified preview contents, and supported per-segment MP4 summaries; no end-to-end acceptance or narrowed scope is claimed. Two Linux/WSL-only media-tunnel tests were skipped on Windows. No deployment, paid provider calls, external messages, push, or other branch changes were performed."
+}

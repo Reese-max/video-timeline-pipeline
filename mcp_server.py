@@ -21,7 +21,7 @@ import drive_storage
 from mcp import types
 from mcp.server.fastmcp import FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
-from pydantic import BaseModel, ConfigDict, StrictInt
+from pydantic import BaseModel, ConfigDict, StrictFloat, StrictInt
 from starlette.requests import Request
 from starlette.responses import FileResponse, JSONResponse, PlainTextResponse
 
@@ -148,8 +148,8 @@ class OpenAIFileReference(BaseModel):
     mime_type: str = ""
     file_name: str = ""
     segment_index: StrictInt | None = None
-    start_seconds: float | None = None
-    end_seconds: float | None = None
+    start_seconds: StrictFloat | None = None
+    end_seconds: StrictFloat | None = None
 
 
 class VerifiedFileSummary(BaseModel):
@@ -353,6 +353,7 @@ def bind_handoff_segments(manifest: dict, references: list[dict]) -> tuple[list[
         segment = None
         kind = None
         file_name = reference.get("file_name") or ""
+        mime_type = (reference.get("mime_type") or "").split(";", 1)[0].strip().lower()
         basename = file_name.replace("\\", "/").rsplit("/", 1)[-1]
         if basename:
             hit = by_name.get(basename)
@@ -369,9 +370,14 @@ def bind_handoff_segments(manifest: dict, references: list[dict]) -> tuple[list[
             if segment is not None and indexed is not segment:
                 raise ValueError(f"files[{index}] 的 segment_index 與 file_name 指向不同分段。")
             segment = indexed
-            kind = kind or "segment"
+            kind = kind or ("preview" if mime_type == "image/jpeg" else "segment")
         if segment is None:
             raise ValueError(f"files[{index}] 無法對應到此工作的任何分段或影格。")
+        if kind == "preview" and not segment.get("preview_filename"):
+            raise ValueError(f"files[{index}] 對應的分段沒有代表影格。")
+        expected_mime = "image/jpeg" if kind == "preview" else "video/mp4"
+        if mime_type and mime_type != expected_mime:
+            raise ValueError(f"files[{index}].mime_type 與分段或影格類型不符。")
         marker = (kind, segment["index"])
         if marker in used:
             raise ValueError(f"files[{index}] 與先前檔案重複對應同一分段。")
@@ -734,7 +740,7 @@ def tool_result(manifest: dict) -> types.CallToolResult:
             links.append(
                 types.ResourceLink(
                     type="resource_link",
-                    name=f"preview-{segment['index']}.jpg",
+                    name=segment["preview_filename"],
                     title=f"{title} 代表影格",
                     uri=segment["preview_url"],
                     description="影片分段的代表影格；不能代替完整影片分析。",
@@ -1627,9 +1633,10 @@ async def collect_social_post(url: str, allow_paid: bool = False) -> dict[str, A
         "then map to a manifest segment_*.mp4 or preview_*.jpg name (or a valid "
         "segment_index), and unknown, unbound or conflicting references fail. "
         "Only after this tool returns files_received may the attached files be "
-        "analyzed for per-segment summaries. If the call errors or a file_id is "
-        "missing, the host does not support file handoff; report that plainly and "
-        "never summarize the video from URLs, filenames or metadata."
+        "analyzed for per-segment summaries. If a file_id is missing, report that "
+        "the host did not provide a usable file handoff; report other validation "
+        "errors as invalid references. Never summarize the video from URLs, "
+        "filenames or metadata after a failed handoff."
     ),
     annotations=types.ToolAnnotations(
         readOnlyHint=True,

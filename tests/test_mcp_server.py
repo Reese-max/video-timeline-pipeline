@@ -479,6 +479,93 @@ class MCPValidationTests(unittest.TestCase):
         self.assertEqual(result.structuredContent["files_received"], 1)
         mcp_server.FileHandoffResult.model_validate(result.structuredContent)
 
+    def test_file_handoff_protocol_rejects_boolean_timestamps(self) -> None:
+        handler = mcp_server.mcp._mcp_server.request_handlers[mcp_server.types.CallToolRequest]
+        for start, end in ((False, 30), (0, True), (False, True)):
+            with self.subTest(start=start, end=end):
+                request = mcp_server.types.CallToolRequest(
+                    method="tools/call",
+                    params=mcp_server.types.CallToolRequestParams(
+                        name="ingest_video_segments",
+                        arguments={"files": [{
+                            "file_id": "file_1",
+                            "download_url": "https://files.example/video.mp4",
+                            "start_seconds": start,
+                            "end_seconds": end,
+                        }]},
+                    ),
+                )
+                result = asyncio.run(handler(request)).root
+                self.assertTrue(result.isError)
+                self.assertNotEqual((result.structuredContent or {}).get("status"), "files_received")
+
+    def test_file_handoff_protocol_checks_media_kind(self) -> None:
+        manifest = {"status": "ready", "segments": [{
+            "index": 0, "filename": "segment_000.mp4",
+            "preview_filename": "preview_000.jpg", "start_seconds": 0, "end_seconds": 30,
+        }, {
+            "index": 1, "filename": "segment_001.mp4",
+            "preview_filename": None, "start_seconds": 30, "end_seconds": 60,
+        }]}
+        cases = (
+            ({"segment_index": 0, "mime_type": "image/jpeg"}, "preview"),
+            ({"segment_index": 0, "mime_type": "video/mp4"}, "segment"),
+            ({"segment_index": 0}, "segment"),
+            ({"file_name": "preview_000.jpg"}, "preview"),
+            ({"segment_index": 0, "mime_type": "IMAGE/JPEG; q=1"}, "preview"),
+            ({"file_name": "segment_000.mp4", "mime_type": "image/jpeg"}, None),
+            ({"file_name": "preview_000.jpg", "mime_type": "video/mp4"}, None),
+            ({"segment_index": 0, "mime_type": "text/plain"}, None),
+            ({"segment_index": 1, "mime_type": "image/jpeg"}, None),
+        )
+        with (
+            patch.object(mcp_server, "prepared_job_dir", return_value=Path("unused")),
+            patch.object(mcp_server, "read_manifest", return_value=manifest),
+        ):
+            for fields, kind in cases:
+                with self.subTest(fields=fields):
+                    result = asyncio.run(mcp_server.mcp.call_tool("ingest_video_segments", {
+                        "job_id": "0123456789ab",
+                        "files": [{"file_id": "file_1", "download_url": "https://files.example/media", **fields}],
+                    }))
+                    payload = mcp_server.FileHandoffResult.model_validate(result.structuredContent)
+                    self.assertEqual(result.isError, kind is None)
+                    self.assertEqual(payload.segments_received, int(kind == "segment"))
+                    if kind is None:
+                        self.assertEqual(payload.error_code, "FILE_HANDOFF_INVALID")
+                        self.assertEqual(payload.files_received, 0)
+                        self.assertEqual(payload.files, [])
+                    else:
+                        self.assertEqual(payload.files[0].kind, kind)
+                        self.assertEqual(payload.files[0].start_seconds, 0)
+                        self.assertEqual(payload.files[0].end_seconds, 30)
+
+    def test_file_handoff_accepts_emitted_preview_resource_name(self) -> None:
+        manifest = {
+            "status": "ready", "job_id": "0123456789ab", "segment_seconds": 30,
+            "source": {"title": "demo", "url": "https://example.com/video", "duration_seconds": 30},
+            "segments": [{
+                "index": 0, "filename": "segment_000.mp4", "preview_filename": "preview_000.jpg",
+                "start_seconds": 0, "end_seconds": 30, "size_bytes": 10, "mime_type": "video/mp4",
+            }],
+        }
+        preview = next(item for item in mcp_server.tool_result(manifest).content
+                       if item.type == "resource_link" and item.mimeType == "image/jpeg")
+        with (
+            patch.object(mcp_server, "prepared_job_dir", return_value=Path("unused")),
+            patch.object(mcp_server, "read_manifest", return_value=manifest),
+        ):
+            result = asyncio.run(mcp_server.mcp.call_tool("ingest_video_segments", {
+                "job_id": manifest["job_id"],
+                "files": [{
+                    "file_id": "file_1", "download_url": "https://files.example/preview.jpg",
+                    "file_name": preview.name, "mime_type": preview.mimeType, "segment_index": 0,
+                }],
+            }))
+        self.assertFalse(result.isError)
+        self.assertEqual(result.structuredContent["files"][0]["kind"], "preview")
+        self.assertEqual(result.structuredContent["segments_received"], 0)
+
     def test_prepare_tool_exposes_output_schema(self) -> None:
         tools = asyncio.run(mcp_server.mcp.list_tools())
         tool = next(item for item in tools if item.name == "prepare_video_for_chatgpt")
