@@ -199,12 +199,18 @@ BRIGHTDATA_RUN_TIMEOUT_SECONDS=1800
 python pipeline.py --instagram-author 'https://www.instagram.com/<USERNAME>/' --instagram-max-items 3 --instagram-discover-only --allow-batch-cloud
 ```
 
-確認後加入佇列。預設不設結果筆數上限；`--instagram-since 365d` 會在本機依供應商實際回傳的發佈時間保留近一年結果：
+確認後加入佇列。**`--instagram-max-items` 是必填的供應商端結果上限**，會以 `num_of_posts` 送進 Bright Data 請求；未提供（或為 0／負數）會在任何計費請求送出前拒絕，`--allow-batch-cloud` 只是支出授權、不構成預算。`--instagram-since 365d` 只是本機日期篩選——依供應商實際回傳的發佈時間保留近一年結果——不影響計費範圍。每次觸發快照前程式會在 stderr 印出本次 `num_of_posts` 上限（不印 API Token）：
 
 ```powershell
-python pipeline.py --instagram-author '<USERNAME>' --instagram-since 365d --rss-all-items --allow-batch-cloud
+python pipeline.py --instagram-author '<USERNAME>' --instagram-since 365d --instagram-max-items 100 --rss-all-items --allow-batch-cloud
 python pipeline.py --rss-refresh --allow-batch-cloud
 python pipeline.py --rss-process --rss-max-items 4 --allow-batch-cloud
+```
+
+既有訂閱若缺少上限（舊版狀態），刷新會失敗關閉且不呼叫 Bright Data；可用非破壞性更新補設上限，佇列項目不受影響：
+
+```powershell
+python pipeline.py --rss-update <訂閱ID> --instagram-max-items 100
 ```
 
 盤點快照保存在 Git 忽略且受 ACL 保護的 `rss\instagram-<雜湊>-latest.json`，包含原始 Bright Data 結果與 snapshot provenance。刷新時會把已見 Post ID 傳入 `posts_to_not_include`，本機佇列仍以穩定 ID 去重。Bright Data 的 Reel discovery 目前不支援伺服器端日期篩選；若某筆沒有 `date_posted`，工具會保留並在快照及盤點訊息標示「無法驗證回溯範圍」，不會假裝近一年盤點完整。私人／登入限定內容不處理，平台可見性與供應商回傳仍可能造成缺漏。請參考 [Instagram Scraper API](https://docs.brightdata.com/datasets/scrapers/instagram/introduction)、[Reel discovery](https://docs.brightdata.com/api-reference/scrapers/social-media-apis/instagram-reels-discover-by-url) 與 [非同步 snapshot 流程](https://docs.brightdata.com/api-reference/rest-api/scraper/asynchronous-requests)。
