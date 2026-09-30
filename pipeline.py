@@ -2896,7 +2896,19 @@ def like_pattern(query: str) -> str:
     return f"%{escaped}%"
 
 
-def search_index(root: Path, query: str, limit: int, category: str = "") -> list[dict[str, Any]]:
+def search_index(
+    root: Path,
+    query: str,
+    limit: int,
+    category: str = "",
+    connection: sqlite3.Connection | None = None,
+) -> list[dict[str, Any]]:
+    """Keyword/FTS search over library.db.
+
+    ``connection`` lets callers inject an existing (e.g. read-only)
+    connection — the web dashboard uses this so GET search never opens a
+    writable DB handle nor runs index_connection's schema-migration path.
+    """
     db_path = root / "library.db"
     if not db_path.is_file():
         raise RuntimeError(f"索引不存在：{db_path}；先執行 `--index`。")
@@ -2931,7 +2943,9 @@ def search_index(root: Path, query: str, limit: int, category: str = "") -> list
         category_params = (f"%{category}%",) if category else ()
         params = ('"' + query.replace('"', '""') + '"',) + category_params + (limit,)
 
-    connection = index_connection(root)
+    owns_connection = connection is None
+    if owns_connection:
+        connection = index_connection(root)
     try:
         cursor = connection.execute(
             f"""
@@ -2958,7 +2972,8 @@ def search_index(root: Path, query: str, limit: int, category: str = "") -> list
             for row in cursor
         ]
     finally:
-        connection.close()
+        if owns_connection:
+            connection.close()
 
 
 _LOCAL_EMBEDDERS: dict[str, Any] = {}
@@ -6421,6 +6436,12 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Dashboard 授權 token；也可用 WEB_AUTH_TOKEN 環境變數",
     )
+    web.add_argument(
+        "--serve-allowed-host",
+        action="append",
+        default=None,
+        help="額外允許的 Host（遠端網域等）；可重複，也可用 WEB_ALLOWED_HOSTS 逗號分隔",
+    )
     web.add_argument("--serve-worker", action="store_true", help="執行 Dashboard 持久化工作佇列的 worker")
     web.add_argument("--serve-worker-once", action="store_true", help="worker 只處理目前已到期的工作後結束")
     parser.add_argument("--self-test", action="store_true")
@@ -6919,6 +6940,9 @@ def main() -> int:
             if getattr(args, "serve", False):
                 import webapp
 
+                extra_hosts = list(args.serve_allowed_host or [])
+                env_hosts = os.getenv("WEB_ALLOWED_HOSTS", "")
+                extra_hosts.extend(h.strip() for h in env_hosts.split(",") if h.strip())
                 return webapp.serve(
                     root,
                     host=args.serve_host,
@@ -6926,6 +6950,7 @@ def main() -> int:
                     auth_token=args.serve_auth_token or os.getenv("WEB_AUTH_TOKEN", "") or None,
                     allow_remote=bool(args.serve_allow_remote),
                     trusted_proxy=bool(args.serve_trusted_proxy),
+                    extra_allowed_hosts=extra_hosts,
                 )
             import web_tasks
 

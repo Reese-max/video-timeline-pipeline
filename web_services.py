@@ -435,8 +435,9 @@ def list_videos_page(
         if not matched:
             return {"items": [], "page": page, "page_size": page_size, "total": 0,
                     "sort": sort, "order": order, "filters": filters}
-        where.append(f"videos.job IN ({','.join('?' for _ in matched)})")
-        params.extend(sorted(matched))
+        # single JSON param — avoids SQLITE_MAX_VARIABLE_NUMBER on large sets
+        where.append("videos.job IN (SELECT value FROM json_each(?))")
+        params.append(json.dumps(sorted(matched)))
 
     clause = ("WHERE " + " AND ".join(where)) if where else ""
     with closing(connect_library_ro(root)) as conn:
@@ -559,7 +560,6 @@ def get_video_detail(
     timeline_offset = max(0, int(timeline_offset))
     window = entries[timeline_offset : timeline_offset + timeline_limit]
 
-    transcript_path = job_dir / "transcript.txt"
     transcript: dict[str, Any] = {"available": False}
     for name in ("transcript.txt", "transcript_verified.txt", "whisper.txt"):
         candidate = job_dir / name
@@ -571,7 +571,12 @@ def get_video_detail(
     score = _latest_scores(root).get(job)
     related: list[dict[str, Any]] = []
     try:
-        categories = {str(c) for c in (manifest.get("categories") or [])}
+        raw_categories = manifest.get("categories")
+        categories = (
+            {str(c) for c in raw_categories}
+            if isinstance(raw_categories, list)
+            else ({str(raw_categories)} if raw_categories else set())
+        )
         if categories:
             with closing(connect_library_ro(root)) as conn:
                 placeholders = ",".join("?" for _ in categories)
@@ -689,16 +694,16 @@ def search_local(root: Path, query: str, limit: int = 20, category: str = "") ->
     if category and len(category) > 64:
         raise ServiceError("invalid_param", "category too long", http_status=400)
 
-    # Schema check first: search_index reuses index_connection which would
-    # CREATE/migrate; we only delegate when the existing schema is intact.
-    with closing(connect_library_ro(root)):
-        pass
+    # Reads go through a mode=ro connection — search_index must never open a
+    # writable handle or run index_connection's CREATE/migration path on GET.
     import pipeline
 
     try:
-        hits = pipeline.search_index(root, query, limit, category)
+        with closing(connect_library_ro(root)) as conn:
+            hits = pipeline.search_index(root, query, limit, category, connection=conn)
     except RuntimeError as exc:
-        raise ServiceError("search_failed", str(exc)[:200], http_status=400) from exc
+        # never forward exception text — RuntimeError messages embed db paths
+        raise ServiceError("search_failed", "local search failed", http_status=400) from exc
     results = [
         {
             "job": hit.get("job"),
@@ -757,6 +762,10 @@ def enqueue_semantic_search(
         },
         dedup_key=idempotency_key or None,
     )
+    if not task.get("created", True):
+        # Dedup hit: the new reservation belongs to a task that already exists —
+        # settle it as zero-cost so it doesn't count against the budget forever.
+        _settle_unused_reservation(root, reservation_id, "semantic_search")
     return _task_accepted(task, mode="semantic")
 
 
@@ -778,7 +787,31 @@ def enqueue_ask(
         payload={"question": question, "limit": limit, "reservation_id": reservation_id},
         dedup_key=idempotency_key or None,
     )
+    if not task.get("created", True):
+        _settle_unused_reservation(root, reservation_id, "ask")
     return _task_accepted(task, mode="ask")
+
+
+def _settle_unused_reservation(root: Path, reservation_id: str | None, operation: str) -> None:
+    """Release a budget reservation whose task deduplicated onto an existing row."""
+    if not reservation_id:
+        return
+    try:
+        import cost_tracker
+
+        cost_tracker.record_usage(
+            root,
+            provider="internal",
+            operation=f"{operation}_deduplicated",
+            cost_status="zero_local",
+            estimated_micro_usd=0,
+            actual_micro_usd=0,
+            cache_hit=True,
+            status="succeeded",
+            reservation_id=reservation_id,
+        )
+    except Exception:
+        pass
 
 
 def enqueue_rss_retry(root: Path, item_id: str, *, idempotency_key: str | None = None) -> dict[str, Any]:
@@ -1049,65 +1082,93 @@ def preview_digest(root: Path, digest_type: str = "daily", date_str: str | None 
                 "SELECT DISTINCT job FROM digest_items WHERE disposition IN ('delivered','pending')"
             ).fetchall()
         }
-        cur = conn.execute(
-            """
-            SELECT digest_id, revision, rendered_payload_hash, selection_snapshot
-            FROM digest_runs
-            WHERE schedule_id = ? AND type = ? AND window_start = ? AND window_end = ? AND recipient_id = ?
-            ORDER BY revision DESC LIMIT 1
-            """,
-            (schedule_id, digest_type, win_start.isoformat(), win_end.isoformat(), recipient),
-        )
-        existing = cur.fetchone()
-        if existing:
-            stored_sig = (json.loads(existing["selection_snapshot"] or "{}")).get("content_signature")
-            if stored_sig == signature:
-                return _digest_preview_response(dict(existing), payload, tz_name, already)
-            revision = int(existing["revision"]) + 1
-        else:
-            revision = 1
-        digest_id = str(uuid.uuid4())
-        snapshot = {"content_signature": signature, "items": payload["selected_items"]}
-        with conn:
-            conn.execute(
+        # Bounded retry loop: a concurrent preview of the same window can win
+        # the unique-key insert — re-read the winner instead of 500ing.
+        for _attempt in range(3):
+            cur = conn.execute(
                 """
-                INSERT INTO digest_runs (
-                    digest_id, schedule_id, type, window_start, window_end, timezone, recipient_id,
-                    revision, selection_snapshot, rendered_payload_hash, status,
-                    candidate_count, selected_count, deferred_count, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'previewed', ?, ?, ?, ?)
+                SELECT digest_id, revision, rendered_payload_hash, selection_snapshot
+                FROM digest_runs
+                WHERE schedule_id = ? AND type = ? AND window_start = ? AND window_end = ? AND recipient_id = ?
+                ORDER BY revision DESC LIMIT 1
                 """,
-                (
-                    digest_id,
-                    schedule_id,
-                    digest_type,
-                    win_start.isoformat(),
-                    win_end.isoformat(),
-                    tz_name,
-                    recipient,
-                    revision,
-                    json.dumps(snapshot, ensure_ascii=False),
-                    payload["rendered_payload_hash"],
-                    payload["candidate_count"],
-                    payload["selected_count"],
-                    payload["deferred_count"],
-                    _iso(_utc_now()),
-                ),
+                (schedule_id, digest_type, win_start.isoformat(), win_end.isoformat(), recipient),
             )
-            for rank, item in enumerate(payload["selected_items"], 1):
-                conn.execute(
-                    """
-                    INSERT OR REPLACE INTO digest_items (digest_id, job, analysis_revision, rank, reason, disposition)
-                    VALUES (?, ?, ?, ?, 'selected_by_time', 'previewed')
-                    """,
-                    (digest_id, item["job"], item.get("analysis_revision", "1"), rank),
-                )
+            existing = cur.fetchone()
+            if existing:
+                stored_sig = (json.loads(existing["selection_snapshot"] or "{}")).get("content_signature")
+                if stored_sig == signature:
+                    return _digest_preview_response(dict(existing), payload, tz_name, already)
+                revision = int(existing["revision"]) + 1
+            else:
+                revision = 1
+            digest_id = str(uuid.uuid4())
+            snapshot = {"content_signature": signature, "items": payload["selected_items"]}
+            try:
+                with conn:
+                    _insert_digest_preview(
+                        conn, digest_id, schedule_id, digest_type, win_start, win_end,
+                        tz_name, recipient, revision, snapshot, payload,
+                    )
+                break
+            except sqlite3.IntegrityError:
+                continue
+        else:
+            raise ServiceError("internal_error", "preview insert conflicted repeatedly", http_status=500)
         row = {
             "digest_id": digest_id,
             "revision": revision,
             "rendered_payload_hash": payload["rendered_payload_hash"],
         }
     return _digest_preview_response(row, payload, tz_name, already)
+
+
+def _insert_digest_preview(
+    conn: sqlite3.Connection,
+    digest_id: str,
+    schedule_id: str,
+    digest_type: str,
+    win_start: datetime.datetime,
+    win_end: datetime.datetime,
+    tz_name: str,
+    recipient: str,
+    revision: int,
+    snapshot: dict[str, Any],
+    payload: dict[str, Any],
+) -> None:
+    conn.execute(
+        """
+        INSERT INTO digest_runs (
+            digest_id, schedule_id, type, window_start, window_end, timezone, recipient_id,
+            revision, selection_snapshot, rendered_payload_hash, status,
+            candidate_count, selected_count, deferred_count, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'previewed', ?, ?, ?, ?)
+        """,
+        (
+            digest_id,
+            schedule_id,
+            digest_type,
+            win_start.isoformat(),
+            win_end.isoformat(),
+            tz_name,
+            recipient,
+            revision,
+            json.dumps(snapshot, ensure_ascii=False),
+            payload["rendered_payload_hash"],
+            payload["candidate_count"],
+            payload["selected_count"],
+            payload["deferred_count"],
+            _iso(_utc_now()),
+        ),
+    )
+    for rank, item in enumerate(payload["selected_items"], 1):
+        conn.execute(
+            """
+            INSERT OR REPLACE INTO digest_items (digest_id, job, analysis_revision, rank, reason, disposition)
+            VALUES (?, ?, ?, ?, 'selected_by_time', 'previewed')
+            """,
+            (digest_id, item["job"], item.get("analysis_revision", "1"), rank),
+        )
 
 
 def _digest_preview_response(

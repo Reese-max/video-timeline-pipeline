@@ -146,6 +146,7 @@ def serve(
     auth_token: str | None = None,
     allow_remote: bool = False,
     trusted_proxy: bool = False,
+    extra_allowed_hosts: list[str] | None = None,
 ) -> int:
     """Run the dashboard until SIGINT/SIGTERM; graceful shutdown (W0)."""
     server = build_server(
@@ -155,6 +156,7 @@ def serve(
         auth_token=auth_token,
         allow_remote=allow_remote,
         trusted_proxy=trusted_proxy,
+        extra_allowed_hosts=extra_allowed_hosts,
     )
     bound_host, bound_port = server.server_address[:2]
 
@@ -178,12 +180,30 @@ def _display_host(host: str) -> str:
 class DashboardHandler(BaseHTTPRequestHandler):
     server: DashboardServer
     protocol_version = "HTTP/1.1"
-    timeout = 30
+    request_timeout = 30.0
+
+    def setup(self) -> None:
+        super().setup()
+        # Bound every socket op — a stalled client must not pin a thread
+        # forever (slowloris); BaseHTTPRequestHandler does not apply one.
+        self.request.settimeout(self.request_timeout)
+
+    def handle(self) -> None:
+        try:
+            super().handle()
+        except (BrokenPipeError, ConnectionResetError, TimeoutError, OSError):
+            # idle keep-alive timeout / client disconnect — not an error
+            self.close_connection = True
 
     # --- plumbing --------------------------------------------------------
 
-    def log_message(self, fmt: str, *args: Any) -> None:  # keep access log secret-free
-        log.info("%s %s", self.address_string(), fmt % args)
+    def log_message(self, fmt: str, *args: Any) -> None:
+        # Access log without query strings — ?q=/auth params must not persist.
+        safe_args = tuple(
+            a.split("?")[0] if isinstance(a, str) and a.startswith(("/", "GET", "POST")) else a
+            for a in args
+        )
+        log.info("%s %s", self.address_string(), fmt % safe_args)
 
     def _request_id(self) -> str:
         rid = getattr(self, "_rid", None)
@@ -318,6 +338,10 @@ class DashboardHandler(BaseHTTPRequestHandler):
         except ValueError:
             self._error("invalid_param", "bad Content-Length")
             return None
+        if size < 0:
+            self.close_connection = True
+            self._error("invalid_param", "bad Content-Length")
+            return None
         if size > MAX_BODY_BYTES:
             # Reject and drop the connection: an unread oversized body would
             # otherwise be parsed as the next request line on keep-alive.
@@ -360,6 +384,9 @@ class DashboardHandler(BaseHTTPRequestHandler):
             path = parsed.path
             query = urllib.parse.parse_qs(parsed.query)
             if method == "GET":
+                # Unread request bodies corrupt keep-alive parsing (smuggling).
+                if _int(self.headers.get("Content-Length"), 0) > 0:
+                    self.close_connection = True
                 if not self._check_read_auth():
                     return
                 self._route_get(path, query)
@@ -378,10 +405,10 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 self._error("method_not_allowed", "method not allowed", status=405)
         except web_services.ServiceError as exc:
             self._error(exc.code, exc.safe_message, status=exc.http_status, retryable=exc.retryable)
-        except (BrokenPipeError, ConnectionResetError):
+        except (BrokenPipeError, ConnectionResetError, TimeoutError, OSError):
             pass
         except Exception:
-            log.exception("unhandled error in %s %s", method, self.path)
+            log.exception("unhandled error in %s %s", method, self.path.split("?")[0])
             self._error("internal_error", "internal error", retryable=True)
 
     # --- GET routes --------------------------------------------------------

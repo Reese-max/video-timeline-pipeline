@@ -532,7 +532,7 @@ Dashboard 只用 Python 標準函式庫（`webapp.py`＋`web_services.py`＋`web
 
 **唯讀頁面**：`/`（今日/本週新片依 `eligible_at`、狀態計數、成本/評分摘要——缺資料顯示 unavailable 不補 0）、`/videos`、`/videos/{job}`（分頁時間軸與逐字稿視窗）、`/operations`、`/operations/failed`、`/operations/providers`、`/digests`、`/notifications`、`/tasks`。對應 JSON API 在 `/api/*`，路由表見 issue #6 W9。
 
-**非 loopback** 必須三個條件同時成立才會啟動：`--serve-allow-remote`、授權 token（`WEB_AUTH_TOKEN` 或 `--serve-auth-token`）、`--serve-trusted-proxy`（聲明有可信 TLS 反向代理／私有通道）；此模式下所有請求都要 `Authorization: Bearer`，缺一拒絕綁定。
+**非 loopback** 必須三個條件同時成立才會啟動：`--serve-allow-remote`、授權 token（`WEB_AUTH_TOKEN` 或 `--serve-auth-token`）、`--serve-trusted-proxy`（聲明有可信 TLS 反向代理／私有通道）；此模式下所有請求都要 `Authorization: Bearer`，缺一拒絕綁定。反向代理的網域要另外加進 Host allowlist（`--serve-allowed-host dashboard.internal`，或 `WEB_ALLOWED_HOSTS` 逗號分隔），否則非 loopback 綁定只有 loopback 與綁定位址本身可用。
 
 ## Open Notebook 知識庫
 

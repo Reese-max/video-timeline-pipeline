@@ -72,10 +72,16 @@ def _parse_ts(value: str | None) -> datetime.datetime | None:
 
 
 def _safe_error(exc: BaseException | str) -> str:
-    """Trim provider/OS detail out of persisted errors; never keep secrets."""
+    """Trim provider/OS detail out of persisted errors; never keep secrets.
+
+    Provider exceptions can echo request URLs/headers — run the same
+    credential redaction as the read layer before persisting.
+    """
+    import web_services
+
     text = str(exc) if not isinstance(exc, str) else exc
     text = " ".join(text.split())
-    return text[:_MAX_ERROR_CHARS]
+    return (web_services.sanitize_error(text) or "")[:_MAX_ERROR_CHARS]
 
 
 def init_task_schema(conn: sqlite3.Connection) -> None:
@@ -163,6 +169,9 @@ def enqueue_task(
         raise ValueError(f"task type not allowed: {task_type}")
     max_attempts = max(1, min(int(max_attempts), 10))
     safe_payload = payload or {}
+    # Caller-supplied idempotency keys are namespaced per task type — the
+    # same key on another endpoint must not collide with a different task.
+    full_dedup = f"{task_type}:{dedup_key}" if dedup_key else None
     task_id = str(uuid.uuid4())
     now = _iso(_utc_now())
     with closing(_connect(root)) as conn:
@@ -181,14 +190,14 @@ def enqueue_task(
                     job,
                     revision,
                     json.dumps(safe_payload, ensure_ascii=False, sort_keys=True),
-                    dedup_key,
+                    full_dedup,
                     max_attempts,
                     now,
                 ),
             )
         row = conn.execute(
-            "SELECT * FROM operation_tasks WHERE dedup_key = ?" if dedup_key else "SELECT * FROM operation_tasks WHERE task_id = ?",
-            (dedup_key or task_id,),
+            "SELECT * FROM operation_tasks WHERE dedup_key = ?" if full_dedup else "SELECT * FROM operation_tasks WHERE task_id = ?",
+            (full_dedup or task_id,),
         ).fetchone()
     task = _row_to_task(row)
     task["created"] = bool(row["task_id"] == task_id)
@@ -350,44 +359,49 @@ def fail_task(
     *,
     retryable: bool = True,
 ) -> bool:
-    """Fail a claimed task. Retryable errors requeue with exponential backoff."""
+    """Fail a claimed task. Retryable errors requeue with exponential backoff.
+
+    The lease_token predicate lives on the UPDATE itself (single atomic
+    statement) — a stale worker cannot clobber a task reclaimed by another
+    worker between a read-check and the write.
+    """
     now = _utc_now()
     with closing(_connect(root)) as conn:
         if not _table_present(conn):
             return False
-        row = conn.execute(
-            "SELECT attempts, max_attempts, status FROM operation_tasks WHERE task_id = ? AND lease_token = ?",
-            (task_id, lease_token),
-        ).fetchone()
-        if row is None or row["status"] not in ("running", "cancel_requested"):
-            return False
         error = _safe_error(safe_error)
-        attempts_left = int(row["attempts"]) < int(row["max_attempts"])
-        if retryable and attempts_left:
-            backoff = min(_RETRY_BASE_SECONDS * (2 ** max(0, int(row["attempts"]) - 1)), 3600.0)
-            next_at = _iso(now + datetime.timedelta(seconds=backoff))
-            with conn:
-                conn.execute(
+        with conn:
+            row = conn.execute(
+                "SELECT attempts, max_attempts FROM operation_tasks"
+                " WHERE task_id = ? AND lease_token = ? AND status IN ('running','cancel_requested')",
+                (task_id, lease_token),
+            ).fetchone()
+            if row is None:
+                return False
+            attempts_left = int(row["attempts"]) < int(row["max_attempts"])
+            if retryable and attempts_left:
+                backoff = min(_RETRY_BASE_SECONDS * (2 ** max(0, int(row["attempts"]) - 1)), 3600.0)
+                next_at = _iso(now + datetime.timedelta(seconds=backoff))
+                cur = conn.execute(
                     """
                     UPDATE operation_tasks
                     SET status = 'queued', safe_error = ?, next_attempt_at = ?,
                         lease_owner = NULL, lease_token = NULL, lease_expires_at = NULL
-                    WHERE task_id = ?
+                    WHERE task_id = ? AND lease_token = ? AND status IN ('running','cancel_requested')
                     """,
-                    (error, next_at, task_id),
+                    (error, next_at, task_id, lease_token),
                 )
-        else:
-            with conn:
-                conn.execute(
+            else:
+                cur = conn.execute(
                     """
                     UPDATE operation_tasks
                     SET status = 'failed', safe_error = ?, finished_at = ?,
                         lease_owner = NULL, lease_token = NULL, lease_expires_at = NULL
-                    WHERE task_id = ?
+                    WHERE task_id = ? AND lease_token = ? AND status IN ('running','cancel_requested')
                     """,
-                    (error, _iso(now), task_id),
+                    (error, _iso(now), task_id, lease_token),
                 )
-        return True
+        return cur.rowcount == 1
 
 
 def request_cancel(root: Path, task_id: str) -> str:
@@ -395,23 +409,40 @@ def request_cancel(root: Path, task_id: str) -> str:
 
     Cancel stops future steps only — a request already sent to a provider
     may still complete or be billed; callers must not promise refunds (W7).
+    The transition is predicated on the observed status inside one
+    transaction, so a lease-recovery requeue can't strand the task in a
+    state no consumer picks up.
     """
     with closing(_connect(root)) as conn:
         if not _table_present(conn):
             raise ValueError("task store unavailable")
-        row = conn.execute("SELECT status FROM operation_tasks WHERE task_id = ?", (task_id,)).fetchone()
-        if row is None:
-            raise KeyError(task_id)
-        status = row["status"]
-        if status in _TERMINAL_STATUSES:
-            raise ValueError(f"task already terminal: {status}")
-        new_status = "cancelled" if status == "queued" else "cancel_requested"
-        with conn:
-            conn.execute(
-                "UPDATE operation_tasks SET status = ?, finished_at = CASE WHEN ? = 'cancelled' THEN ? ELSE finished_at END WHERE task_id = ?",
-                (new_status, new_status, _iso(_utc_now()), task_id),
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            row = conn.execute("SELECT status FROM operation_tasks WHERE task_id = ?", (task_id,)).fetchone()
+            if row is None:
+                conn.rollback()
+                raise KeyError(task_id)
+            status = row["status"]
+            if status in _TERMINAL_STATUSES:
+                conn.rollback()
+                raise ValueError(f"task already terminal: {status}")
+            new_status = "cancelled" if status == "queued" else "cancel_requested"
+            cur = conn.execute(
+                """
+                UPDATE operation_tasks
+                SET status = ?, finished_at = CASE WHEN ? = 'cancelled' THEN ? ELSE finished_at END
+                WHERE task_id = ? AND status = ?
+                """,
+                (new_status, new_status, _iso(_utc_now()), task_id, status),
             )
-        return new_status
+            if cur.rowcount != 1:
+                conn.rollback()
+                raise ValueError("task status changed concurrently; retry")
+            conn.commit()
+            return new_status
+        except Exception:
+            conn.rollback()
+            raise
 
 
 def recover_expired_leases(root: Path, *, now: datetime.datetime | None = None) -> list[str]:

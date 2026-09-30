@@ -320,15 +320,70 @@ class DefaultHandlerTests(unittest.TestCase):
         conn.execute(
             "INSERT INTO digest_runs (digest_id, schedule_id, type, window_start, window_end, timezone, recipient_id, revision,"
             " selection_snapshot, rendered_payload_hash, status, candidate_count, selected_count, deferred_count, created_at)"
-            " VALUES ('d1','default_daily','daily','2026-01-01','2026-01-02','Asia/Taipei','default',1,'[]','expected','previewed',0,0,0,'2026-01-01')"
+            " VALUES ('d1','default_daily','daily','2026-01-01','2026-01-02','Asia/Taipei','default',1,?,'expected','previewed',0,0,0,'2026-01-01')",
+            (json.dumps({"content_signature": "original-signature"}),),
         )
         conn.commit()
         conn.close()
         with mock.patch.object(digests, "collect_digest_candidates", return_value=[]), mock.patch.object(
             digests, "build_digest_payload", return_value={"rendered_payload_hash": "DIFFERENT", "selected_items": []}
         ):
-            with self.assertRaises(Exception):
+            with self.assertRaisesRegex(ValueError, "stale_payload"):
                 web_tasks.TASK_HANDLERS["digest_send"](self.root, task_payload)
+
+    def test_stale_lease_cannot_fail_reclaimed_task(self) -> None:
+        """fencing: worker A's expired lease must not fail a task reclaimed by B."""
+        task = web_tasks.enqueue_task(self.root, "semantic_search", payload={"query": "q"})
+        claimed_a = web_tasks.claim_next_task(self.root, "worker-A", lease_seconds=0.01)
+        self.assertEqual(claimed_a["task_id"], task["task_id"])
+        import time as _time
+
+        _time.sleep(0.02)
+        recovered = web_tasks.recover_expired_leases(self.root)
+        self.assertIn(task["task_id"], recovered)
+        claimed_b = web_tasks.claim_next_task(self.root, "worker-B", lease_seconds=60)
+        self.assertIsNotNone(claimed_b)
+        self.assertNotEqual(claimed_b["lease_token"], claimed_a["lease_token"])
+        # stale worker tries to fail the task it lost — must be a no-op
+        self.assertFalse(web_tasks.fail_task(self.root, task["task_id"], claimed_a["lease_token"], RuntimeError("x")))
+        self.assertFalse(web_tasks.complete_task(self.root, task["task_id"], claimed_a["lease_token"], result={"x": 1}))
+        current = web_tasks.get_task(self.root, task["task_id"])
+        self.assertEqual(current["status"], "running")
+        self.assertEqual(current["lease_token"], claimed_b["lease_token"])
+
+    def test_safe_error_redacts_credentials(self) -> None:
+        task = web_tasks.enqueue_task(self.root, "semantic_search", payload={"query": "q"}, max_attempts=1)
+        claimed = web_tasks.claim_next_task(self.root, "w1", lease_seconds=30)
+        self.assertEqual(claimed["task_id"], task["task_id"])
+        web_tasks.fail_task(
+            self.root, task["task_id"], claimed["lease_token"],
+            RuntimeError("HTTP 401 https://api.example.com/x?api_key=SECRET123&ok=1"),
+            retryable=False,
+        )
+        stored = web_tasks.get_task(self.root, task["task_id"])
+        self.assertEqual(stored["status"], "failed")
+        self.assertNotIn("SECRET123", stored["safe_error"] or "")
+
+    def test_idempotency_key_namespaced_per_task_type(self) -> None:
+        a = web_tasks.enqueue_task(self.root, "semantic_search", payload={"query": "q"}, dedup_key="same-key")
+        b = web_tasks.enqueue_task(self.root, "rss_item_retry", payload={"item_id": "i1"}, dedup_key="same-key")
+        self.assertNotEqual(a["task_id"], b["task_id"])
+        self.assertEqual(a["type"], "semantic_search")
+        self.assertEqual(b["type"], "rss_item_retry")
+        a2 = web_tasks.enqueue_task(self.root, "semantic_search", payload={"query": "q"}, dedup_key="same-key")
+        self.assertEqual(a2["task_id"], a["task_id"])
+        self.assertFalse(a2["created"])
+
+    def test_cancel_running_then_complete_stays_terminal(self) -> None:
+        """request_cancel is predicated on observed status; a reclaimed task
+        whose lease expired mid-cancel can't end up stranded."""
+        task = web_tasks.enqueue_task(self.root, "semantic_search", payload={"query": "q"})
+        claimed = web_tasks.claim_next_task(self.root, "w1", lease_seconds=30)
+        self.assertEqual(web_tasks.request_cancel(self.root, task["task_id"]), "cancel_requested")
+        # double-cancel on non-terminal -> same request state (idempotent-ish)
+        self.assertEqual(web_tasks.request_cancel(self.root, task["task_id"]), "cancel_requested")
+        web_tasks.fail_task(self.root, task["task_id"], claimed["lease_token"], RuntimeError("boom"), retryable=False)
+        self.assertEqual(web_tasks.get_task(self.root, task["task_id"])["status"], "failed")
 
 
 if __name__ == "__main__":
