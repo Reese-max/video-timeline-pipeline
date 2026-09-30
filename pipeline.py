@@ -6394,6 +6394,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--digest-date", default=None, help="指定摘要基準日期（YYYY-MM-DD）；預設今天")
     parser.add_argument("--notify-test", action="store_true", help="發送一封測試通知以檢驗通道連線狀態")
     parser.add_argument("--notification-retry", action="store_true", help="重試 operations.db 中處於 retry_wait 狀態的通知")
+    parser.add_argument("--ops-reconcile", action="store_true", help="補掃 jobs/ 下已完成但未登記進 operations.db processed_revisions 的影片（標記 backfill，預設不寄歷史內容）")
     parser.add_argument("--score-video", metavar="JOB", default=None, help="評估指定影片的 Importance/Novelty/Relevance 分數")
     parser.add_argument("--rescore", metavar="JOB", default=None, help="以最新規則重新計算指定影片的分數與決策")
     parser.add_argument("--score-explain", metavar="JOB", default=None, help="純讀取並解釋已評分影片的決策依據（零付費）")
@@ -6917,6 +6918,12 @@ def main() -> int:
 
         res = run_notification_retry(args.root.resolve())
         print(f"重試處理結果：{res}")
+        return 0
+    if getattr(args, "ops_reconcile", False):
+        from operations import reconcile_processed_revisions
+
+        res = reconcile_processed_revisions(args.root.resolve())
+        print(f"補掃結果：{res}")
         return 0
     if getattr(args, "score_video", None):
         from scoring import score_video
