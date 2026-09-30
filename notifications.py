@@ -15,6 +15,7 @@ import json
 import os
 import sqlite3
 import uuid
+from contextlib import closing
 from pathlib import Path
 from typing import Any
 
@@ -28,7 +29,11 @@ def get_operations_db(root: Path) -> sqlite3.Connection:
     db_path = root / "operations.db"
     conn = sqlite3.connect(db_path, timeout=30.0)
     conn.row_factory = sqlite3.Row
-    _init_operations_schema(conn)
+    try:
+        _init_operations_schema(conn)
+    except Exception:
+        conn.close()
+        raise
     return conn
 
 
@@ -400,99 +405,99 @@ def run_digest_send(
     text_body, html_body = render_digest_email(payload)
     subject = f"【影片知識庫】{'每日' if digest_type == 'daily' else '每週'}精選摘要（{win_label}）"
 
-    conn = get_operations_db(root)
-    event_key = f"digest:{digest_type}:{win_start.isoformat()}:{win_end.isoformat()}:{recipient}"
-    event_id = record_event(
-        conn,
-        event_type=f"digest.{digest_type}",
-        library_id=None,
-        job=None,
-        analysis_revision=None,
-        payload=payload,
-        dedup_key=event_key,
-    )
-
-    delivery_id = enqueue_delivery(
-        conn,
-        event_id=event_id,
-        channel="email",
-        recipient_id=recipient or "default",
-        provider=active_provider.__class__.__name__,
-        payload_hash=payload["rendered_payload_hash"],
-        idempotency_key=f"digest_{payload['rendered_payload_hash'][:32]}",
-    )
-
-    # Claim and send
-    worker_id = f"worker_{os.getpid()}"
-    claimed = claim_pending_deliveries(conn, worker_id=worker_id, limit=1)
-    if not claimed:
-        return {"status": "already_claimed_or_sent", "delivery_id": delivery_id}
-
-    target = claimed[0]
-    started_at = _utc_now_iso()
-    result = active_provider.send(
-        recipient=target["recipient_id"],
-        subject=subject,
-        text_body=text_body,
-        html_body=html_body,
-        idempotency_key=target["provider_idempotency_key"],
-    )
-
-    update_delivery_status(
-        conn,
-        delivery_id=target["delivery_id"],
-        lease_token=target["lease_token"],
-        result=result,
-        attempt_no=int(target["attempt_count"]) + 1,
-        started_at=started_at,
-    )
-
-    # Record digest run and items
-    digest_id = str(uuid.uuid4())
-    with conn:
-        conn.execute(
-            """
-            INSERT OR REPLACE INTO digest_runs (
-                digest_id, schedule_id, type, window_start, window_end, timezone, recipient_id,
-                revision, selection_snapshot, rendered_payload_hash, status,
-                candidate_count, selected_count, deferred_count, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                digest_id,
-                f"default_{digest_type}",
-                digest_type,
-                win_start.isoformat(),
-                win_end.isoformat(),
-                tz_name,
-                recipient or "default",
-                json.dumps(payload["selected_items"], ensure_ascii=False),
-                payload["rendered_payload_hash"],
-                result.status,
-                payload["candidate_count"],
-                payload["selected_count"],
-                payload["deferred_count"],
-                _utc_now_iso(),
-            ),
+    with closing(get_operations_db(root)) as conn:
+        event_key = f"digest:{digest_type}:{win_start.isoformat()}:{win_end.isoformat()}:{recipient}"
+        event_id = record_event(
+            conn,
+            event_type=f"digest.{digest_type}",
+            library_id=None,
+            job=None,
+            analysis_revision=None,
+            payload=payload,
+            dedup_key=event_key,
         )
-        for rank, item in enumerate(payload["selected_items"], 1):
+
+        delivery_id = enqueue_delivery(
+            conn,
+            event_id=event_id,
+            channel="email",
+            recipient_id=recipient or "default",
+            provider=active_provider.__class__.__name__,
+            payload_hash=payload["rendered_payload_hash"],
+            idempotency_key=f"digest_{payload['rendered_payload_hash'][:32]}",
+        )
+
+        # Claim and send
+        worker_id = f"worker_{os.getpid()}"
+        claimed = claim_pending_deliveries(conn, worker_id=worker_id, limit=1)
+        if not claimed:
+            return {"status": "already_claimed_or_sent", "delivery_id": delivery_id}
+
+        target = claimed[0]
+        started_at = _utc_now_iso()
+        result = active_provider.send(
+            recipient=target["recipient_id"],
+            subject=subject,
+            text_body=text_body,
+            html_body=html_body,
+            idempotency_key=target["provider_idempotency_key"],
+        )
+
+        update_delivery_status(
+            conn,
+            delivery_id=target["delivery_id"],
+            lease_token=target["lease_token"],
+            result=result,
+            attempt_no=int(target["attempt_count"]) + 1,
+            started_at=started_at,
+        )
+
+        # Record digest run and items
+        digest_id = str(uuid.uuid4())
+        with conn:
             conn.execute(
                 """
-                INSERT OR REPLACE INTO digest_items (
-                    digest_id, job, analysis_revision, rank, reason, disposition
-                ) VALUES (?, ?, ?, ?, 'selected_by_time', 'delivered' if ? == 'accepted' else 'pending')
+                INSERT OR REPLACE INTO digest_runs (
+                    digest_id, schedule_id, type, window_start, window_end, timezone, recipient_id,
+                    revision, selection_snapshot, rendered_payload_hash, status,
+                    candidate_count, selected_count, deferred_count, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?)
                 """,
-                (digest_id, item["job"], item.get("analysis_revision", "1"), rank, result.status),
+                (
+                    digest_id,
+                    f"default_{digest_type}",
+                    digest_type,
+                    win_start.isoformat(),
+                    win_end.isoformat(),
+                    tz_name,
+                    recipient or "default",
+                    json.dumps(payload["selected_items"], ensure_ascii=False),
+                    payload["rendered_payload_hash"],
+                    result.status,
+                    payload["candidate_count"],
+                    payload["selected_count"],
+                    payload["deferred_count"],
+                    _utc_now_iso(),
+                ),
             )
+            for rank, item in enumerate(payload["selected_items"], 1):
+                conn.execute(
+                    """
+                    INSERT OR REPLACE INTO digest_items (
+                        digest_id, job, analysis_revision, rank, reason, disposition
+                    ) VALUES (?, ?, ?, ?, 'selected_by_time', 'delivered' if ? == 'accepted' else 'pending')
+                    """,
+                    (digest_id, item["job"], item.get("analysis_revision", "1"), rank, result.status),
+                )
 
-    return {
-        "status": result.status,
-        "delivery_id": delivery_id,
-        "provider_message_id": result.provider_message_id,
-        "selected_count": payload["selected_count"],
-        "deferred_count": payload["deferred_count"],
-        "error": result.safe_error,
-    }
+        return {
+            "status": result.status,
+            "delivery_id": delivery_id,
+            "provider_message_id": result.provider_message_id,
+            "selected_count": payload["selected_count"],
+            "deferred_count": payload["deferred_count"],
+            "error": result.safe_error,
+        }
 
 
 def run_notify_test(root: Path, provider: BaseProvider | None = None) -> dict[str, Any]:
@@ -508,168 +513,168 @@ def run_notify_test(root: Path, provider: BaseProvider | None = None) -> dict[st
         <p><strong>Provider：</strong>{active_provider.__class__.__name__}</p>
     </div>"""
 
-    conn = get_operations_db(root)
-    event_key = f"test:{_utc_now_iso()}"
-    event_id = record_event(
-        conn,
-        event_type="test.notification",
-        library_id=None,
-        job=None,
-        analysis_revision=None,
-        payload={"subject": subject, "text": text},
-        dedup_key=event_key,
-    )
+    with closing(get_operations_db(root)) as conn:
+        event_key = f"test:{_utc_now_iso()}"
+        event_id = record_event(
+            conn,
+            event_type="test.notification",
+            library_id=None,
+            job=None,
+            analysis_revision=None,
+            payload={"subject": subject, "text": text},
+            dedup_key=event_key,
+        )
 
-    delivery_id = enqueue_delivery(
-        conn,
-        event_id=event_id,
-        channel="test",
-        recipient_id=recipient,
-        provider=active_provider.__class__.__name__,
-        payload_hash=hashlib.sha256(text.encode()).hexdigest(),
-    )
+        delivery_id = enqueue_delivery(
+            conn,
+            event_id=event_id,
+            channel="test",
+            recipient_id=recipient,
+            provider=active_provider.__class__.__name__,
+            payload_hash=hashlib.sha256(text.encode()).hexdigest(),
+        )
 
-    claimed = claim_pending_deliveries(conn, worker_id=f"test_{os.getpid()}", limit=1)
-    if not claimed:
-        return {"status": "claim_failed", "delivery_id": delivery_id}
+        claimed = claim_pending_deliveries(conn, worker_id=f"test_{os.getpid()}", limit=1)
+        if not claimed:
+            return {"status": "claim_failed", "delivery_id": delivery_id}
 
-    target = claimed[0]
-    started = _utc_now_iso()
-    result = active_provider.send(
-        recipient=target["recipient_id"],
-        subject=subject,
-        text_body=text,
-        html_body=html,
-        idempotency_key=target["provider_idempotency_key"],
-    )
-
-    update_delivery_status(
-        conn,
-        delivery_id=target["delivery_id"],
-        lease_token=target["lease_token"],
-        result=result,
-        attempt_no=1,
-        started_at=started,
-    )
-
-    return {
-        "status": result.status,
-        "delivery_id": delivery_id,
-        "provider_message_id": result.provider_message_id,
-        "safe_error": result.safe_error,
-    }
-
-
-def run_notification_retry(root: Path, provider: BaseProvider | None = None) -> dict[str, int]:
-    """Retry deliveries that are in retry_wait status."""
-    conn = get_operations_db(root)
-    active_provider = provider or get_configured_provider()
-    worker_id = f"retry_worker_{os.getpid()}"
-
-    claimed = claim_pending_deliveries(conn, worker_id=worker_id, limit=20)
-    retried_count = 0
-    accepted_count = 0
-
-    for item in claimed:
-        retried_count += 1
+        target = claimed[0]
         started = _utc_now_iso()
-        # Parse payload
-        try:
-            payload = json.loads(item["payload_json"])
-            subject = f"【重試通知】{item['event_type']}"
-            text_body = json.dumps(payload, ensure_ascii=False, indent=2)
-            html_body = None
-        except Exception:
-            subject = f"【重試通知】{item['event_type']}"
-            text_body = "無法解碼 payload"
-            html_body = None
-
         result = active_provider.send(
-            recipient=item["recipient_id"],
+            recipient=target["recipient_id"],
             subject=subject,
-            text_body=text_body,
-            html_body=html_body,
-            idempotency_key=item["provider_idempotency_key"],
+            text_body=text,
+            html_body=html,
+            idempotency_key=target["provider_idempotency_key"],
         )
 
         update_delivery_status(
             conn,
-            delivery_id=item["delivery_id"],
-            lease_token=item["lease_token"],
+            delivery_id=target["delivery_id"],
+            lease_token=target["lease_token"],
             result=result,
-            attempt_no=int(item["attempt_count"]) + 1,
+            attempt_no=1,
             started_at=started,
         )
-        if result.status == "accepted":
-            accepted_count += 1
 
-    return {"claimed": len(claimed), "retried": retried_count, "accepted": accepted_count}
+        return {
+            "status": result.status,
+            "delivery_id": delivery_id,
+            "provider_message_id": result.provider_message_id,
+            "safe_error": result.safe_error,
+        }
+
+
+def run_notification_retry(root: Path, provider: BaseProvider | None = None) -> dict[str, int]:
+    """Retry deliveries that are in retry_wait status."""
+    with closing(get_operations_db(root)) as conn:
+        active_provider = provider or get_configured_provider()
+        worker_id = f"retry_worker_{os.getpid()}"
+
+        claimed = claim_pending_deliveries(conn, worker_id=worker_id, limit=20)
+        retried_count = 0
+        accepted_count = 0
+
+        for item in claimed:
+            retried_count += 1
+            started = _utc_now_iso()
+            # Parse payload
+            try:
+                payload = json.loads(item["payload_json"])
+                subject = f"【重試通知】{item['event_type']}"
+                text_body = json.dumps(payload, ensure_ascii=False, indent=2)
+                html_body = None
+            except Exception:
+                subject = f"【重試通知】{item['event_type']}"
+                text_body = "無法解碼 payload"
+                html_body = None
+
+            result = active_provider.send(
+                recipient=item["recipient_id"],
+                subject=subject,
+                text_body=text_body,
+                html_body=html_body,
+                idempotency_key=item["provider_idempotency_key"],
+            )
+
+            update_delivery_status(
+                conn,
+                delivery_id=item["delivery_id"],
+                lease_token=item["lease_token"],
+                result=result,
+                attempt_no=int(item["attempt_count"]) + 1,
+                started_at=started,
+            )
+            if result.status == "accepted":
+                accepted_count += 1
+
+        return {"claimed": len(claimed), "retried": retried_count, "accepted": accepted_count}
 
 
 def record_pipeline_completed_event(root: Path, job_dir: Path, manifest: dict[str, Any]) -> str | None:
     """Invoked when a video pipeline run completes: records event and triggers delivery if configured."""
     try:
-        conn = get_operations_db(root)
-        job = job_dir.name
-        source = manifest.get("source", {})
-        title = source.get("title", job)
-        url = source.get("url", "")
-        revision = manifest.get("analysis_revision", "1")
-        dedup_key = f"video.completed:{job}:{revision}"
+        with closing(get_operations_db(root)) as conn:
+            job = job_dir.name
+            source = manifest.get("source", {})
+            title = source.get("title", job)
+            url = source.get("url", "")
+            revision = manifest.get("analysis_revision", "1")
+            dedup_key = f"video.completed:{job}:{revision}"
 
-        event_payload = {
-            "job": job,
-            "title": title,
-            "url": url,
-            "analysis_revision": revision,
-            "created_at": _utc_now_iso(),
-        }
+            event_payload = {
+                "job": job,
+                "title": title,
+                "url": url,
+                "analysis_revision": revision,
+                "created_at": _utc_now_iso(),
+            }
 
-        event_id = record_event(
-            conn,
-            event_type="video.completed",
-            library_id=manifest.get("library_id"),
-            job=job,
-            analysis_revision=revision,
-            payload=event_payload,
-            dedup_key=dedup_key,
-        )
-
-        # If Webhook or high priority notification is active, enqueue delivery
-        webhook_url = os.getenv("DISCORD_WEBHOOK_URL") or os.getenv("RSS_NOTIFY_WEBHOOK")
-        if webhook_url:
-            delivery_id = enqueue_delivery(
+            event_id = record_event(
                 conn,
-                event_id=event_id,
-                channel="webhook",
-                recipient_id=webhook_url,
-                provider="WebhookProvider",
-                payload_hash=hashlib.sha256(dedup_key.encode()).hexdigest(),
+                event_type="video.completed",
+                library_id=manifest.get("library_id"),
+                job=job,
+                analysis_revision=revision,
+                payload=event_payload,
+                dedup_key=dedup_key,
             )
-            # Dispatch immediately
-            claimed = claim_pending_deliveries(conn, worker_id=f"pipeline_{os.getpid()}", limit=1)
-            if claimed:
-                target = claimed[0]
-                text, html_msg = render_event_email("video.completed", event_payload)
-                provider = get_configured_provider("webhook")
-                started = _utc_now_iso()
-                result = provider.send(
-                    recipient=target["recipient_id"],
-                    subject=f"【影片處理完成】{title}",
-                    text_body=text,
-                    html_body=html_msg,
-                    idempotency_key=target["provider_idempotency_key"],
-                )
-                update_delivery_status(
-                    conn,
-                    delivery_id=target["delivery_id"],
-                    lease_token=target["lease_token"],
-                    result=result,
-                    attempt_no=1,
-                    started_at=started,
-                )
 
-        return event_id
+            # If Webhook or high priority notification is active, enqueue delivery
+            webhook_url = os.getenv("DISCORD_WEBHOOK_URL") or os.getenv("RSS_NOTIFY_WEBHOOK")
+            if webhook_url:
+                delivery_id = enqueue_delivery(
+                    conn,
+                    event_id=event_id,
+                    channel="webhook",
+                    recipient_id=webhook_url,
+                    provider="WebhookProvider",
+                    payload_hash=hashlib.sha256(dedup_key.encode()).hexdigest(),
+                )
+                # Dispatch immediately
+                claimed = claim_pending_deliveries(conn, worker_id=f"pipeline_{os.getpid()}", limit=1)
+                if claimed:
+                    target = claimed[0]
+                    text, html_msg = render_event_email("video.completed", event_payload)
+                    provider = get_configured_provider("webhook")
+                    started = _utc_now_iso()
+                    result = provider.send(
+                        recipient=target["recipient_id"],
+                        subject=f"【影片處理完成】{title}",
+                        text_body=text,
+                        html_body=html_msg,
+                        idempotency_key=target["provider_idempotency_key"],
+                    )
+                    update_delivery_status(
+                        conn,
+                        delivery_id=target["delivery_id"],
+                        lease_token=target["lease_token"],
+                        result=result,
+                        attempt_no=1,
+                        started_at=started,
+                    )
+
+            return event_id
     except Exception as exc:
         # Failsafe: notification failures MUST NEVER ruin pipeline artifacts or throw
         print(f"! 通知佇列寫入異常（不影響影片產物）：{exc}")

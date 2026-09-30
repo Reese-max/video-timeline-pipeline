@@ -15,6 +15,7 @@ import json
 import os
 import sqlite3
 import uuid
+from contextlib import closing
 from pathlib import Path
 from typing import Any, Literal
 
@@ -190,80 +191,80 @@ def check_and_reserve_budget(
     daily_budget_usd = float(os.getenv("DAILY_BUDGET_USD", "0"))
     daily_budget_micro = int(daily_budget_usd * 1_000_000)
 
-    conn = get_operations_db(root)
-    _init_cost_schema(conn)
+    with closing(get_operations_db(root)) as conn:
+        _init_cost_schema(conn)
 
-    period_id = _current_period_id("daily")
+        period_id = _current_period_id("daily")
 
-    with conn:
-        cur = conn.cursor()
-        # Sum settled actual/estimated costs for today
-        cur.execute(
-            """
-            SELECT COALESCE(SUM(estimated_micro_usd), 0)
-            FROM usage_costs
-            WHERE account_scope = ? AND created_at LIKE ? AND status != 'blocked_budget'
-            """,
-            (account_scope, f"{period_id}%"),
-        )
-        settled_micro = int(cur.fetchone()[0])
-
-        # Sum outstanding reservations
-        cur.execute(
-            """
-            SELECT COALESCE(SUM(max_micro_usd), 0)
-            FROM budget_reservations
-            WHERE account_scope = ? AND period_id = ? AND status = 'reserved'
-            """,
-            (account_scope, period_id),
-        )
-        outstanding_micro = int(cur.fetchone()[0])
-
-        total_projected = settled_micro + outstanding_micro + estimated_micro_usd
-
-        if hard_stop and daily_budget_micro > 0 and total_projected > daily_budget_micro:
-            reason = (
-                f"Budget blocked: projected ({total_projected / 1_000_000:.3f} USD) "
-                f"exceeds daily limit ({daily_budget_usd:.2f} USD)"
+        with conn:
+            cur = conn.cursor()
+            # Sum settled actual/estimated costs for today
+            cur.execute(
+                """
+                SELECT COALESCE(SUM(estimated_micro_usd), 0)
+                FROM usage_costs
+                WHERE account_scope = ? AND created_at LIKE ? AND status != 'blocked_budget'
+                """,
+                (account_scope, f"{period_id}%"),
             )
-            # Record blocked usage
+            settled_micro = int(cur.fetchone()[0])
+
+            # Sum outstanding reservations
+            cur.execute(
+                """
+                SELECT COALESCE(SUM(max_micro_usd), 0)
+                FROM budget_reservations
+                WHERE account_scope = ? AND period_id = ? AND status = 'reserved'
+                """,
+                (account_scope, period_id),
+            )
+            outstanding_micro = int(cur.fetchone()[0])
+
+            total_projected = settled_micro + outstanding_micro + estimated_micro_usd
+
+            if hard_stop and daily_budget_micro > 0 and total_projected > daily_budget_micro:
+                reason = (
+                    f"Budget blocked: projected ({total_projected / 1_000_000:.3f} USD) "
+                    f"exceeds daily limit ({daily_budget_usd:.2f} USD)"
+                )
+                # Record blocked usage
+                conn.execute(
+                    """
+                    INSERT INTO usage_costs (
+                        cost_id, operation, provider, status, cost_status,
+                        estimated_micro_usd, started_at, created_at, safe_error
+                    ) VALUES (?, ?, 'system', 'blocked_budget', 'zero_local', ?, ?, ?, ?)
+                    """,
+                    (str(uuid.uuid4()), operation_name, estimated_micro_usd, _utc_now_iso(), _utc_now_iso(), reason),
+                )
+                try:
+                    from notifications import record_event
+
+                    record_event(
+                        conn,
+                        event_type="budget.blocked",
+                        library_id=None,
+                        job=None,
+                        analysis_revision=None,
+                        payload={"reason": reason, "period_id": period_id, "account_scope": account_scope},
+                        dedup_key=f"budget_blocked_{period_id}_{account_scope}",
+                    )
+                except Exception:
+                    pass
+                return False, None, reason
+
+            reservation_id = str(uuid.uuid4())
             conn.execute(
                 """
-                INSERT INTO usage_costs (
-                    cost_id, operation, provider, status, cost_status,
-                    estimated_micro_usd, started_at, created_at, safe_error
-                ) VALUES (?, ?, 'system', 'blocked_budget', 'zero_local', ?, ?, ?, ?)
+                INSERT INTO budget_reservations (
+                    reservation_id, operation_id, account_scope, period_id, max_micro_usd,
+                    status, lease_token, created_at
+                ) VALUES (?, ?, ?, ?, ?, 'reserved', ?, ?)
                 """,
-                (str(uuid.uuid4()), operation_name, estimated_micro_usd, _utc_now_iso(), _utc_now_iso(), reason),
+                (reservation_id, operation_name, account_scope, period_id, estimated_micro_usd, str(uuid.uuid4()), _utc_now_iso()),
             )
-            try:
-                from notifications import record_event
 
-                record_event(
-                    conn,
-                    event_type="budget.blocked",
-                    library_id=None,
-                    job=None,
-                    analysis_revision=None,
-                    payload={"reason": reason, "period_id": period_id, "account_scope": account_scope},
-                    dedup_key=f"budget_blocked_{period_id}_{account_scope}",
-                )
-            except Exception:
-                pass
-            return False, None, reason
-
-        reservation_id = str(uuid.uuid4())
-        conn.execute(
-            """
-            INSERT INTO budget_reservations (
-                reservation_id, operation_id, account_scope, period_id, max_micro_usd,
-                status, lease_token, created_at
-            ) VALUES (?, ?, ?, ?, ?, 'reserved', ?, ?)
-            """,
-            (reservation_id, operation_name, account_scope, period_id, estimated_micro_usd, str(uuid.uuid4()), _utc_now_iso()),
-        )
-
-    return True, reservation_id, "Approved"
+        return True, reservation_id, "Approved"
 
 
 def record_usage(
@@ -285,206 +286,206 @@ def record_usage(
     actual_micro_usd: int | None = None,
 ) -> str:
     """Record a completed or failed operation attempt and settle reservation."""
-    conn = get_operations_db(root)
-    _init_cost_schema(conn)
+    with closing(get_operations_db(root)) as conn:
+        _init_cost_schema(conn)
 
-    cost_id = str(uuid.uuid4())
-    now_iso = _utc_now_iso()
+        cost_id = str(uuid.uuid4())
+        now_iso = _utc_now_iso()
 
-    if cache_hit:
-        estimated_micro = 0
-        cost_status: CostStatus = "zero_local"
-    else:
-        estimated_micro = estimate_operation_cost_micro_usd(provider, model, request_units, response_units)
-        cost_status = "actual" if actual_micro_usd is not None else "estimated"
+        if cache_hit:
+            estimated_micro = 0
+            cost_status: CostStatus = "zero_local"
+        else:
+            estimated_micro = estimate_operation_cost_micro_usd(provider, model, request_units, response_units)
+            cost_status = "actual" if actual_micro_usd is not None else "estimated"
 
-    with conn:
-        conn.execute(
-            """
-            INSERT INTO usage_costs (
-                cost_id, library_id, job, analysis_revision, provider, model, operation,
-                request_units, response_units, started_at, finished_at, latency_ms,
-                cache_hit, status, safe_error, provider_request_id,
-                estimated_micro_usd, actual_micro_usd, cost_status, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                cost_id,
-                library_id,
-                job,
-                analysis_revision,
-                provider,
-                model,
-                operation,
-                request_units,
-                response_units,
-                now_iso,
-                now_iso,
-                latency_ms,
-                1 if cache_hit else 0,
-                status,
-                safe_error,
-                provider_request_id,
-                estimated_micro,
-                actual_micro_usd,
-                cost_status,
-                now_iso,
-            ),
-        )
-
-        # Settle budget reservation if one exists
-        if reservation_id:
+        with conn:
             conn.execute(
                 """
-                UPDATE budget_reservations
-                SET status = 'settled', settled_at = ?
-                WHERE reservation_id = ?
+                INSERT INTO usage_costs (
+                    cost_id, library_id, job, analysis_revision, provider, model, operation,
+                    request_units, response_units, started_at, finished_at, latency_ms,
+                    cache_hit, status, safe_error, provider_request_id,
+                    estimated_micro_usd, actual_micro_usd, cost_status, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
-                (now_iso, reservation_id),
+                (
+                    cost_id,
+                    library_id,
+                    job,
+                    analysis_revision,
+                    provider,
+                    model,
+                    operation,
+                    request_units,
+                    response_units,
+                    now_iso,
+                    now_iso,
+                    latency_ms,
+                    1 if cache_hit else 0,
+                    status,
+                    safe_error,
+                    provider_request_id,
+                    estimated_micro,
+                    actual_micro_usd,
+                    cost_status,
+                    now_iso,
+                ),
             )
 
-    return cost_id
+            # Settle budget reservation if one exists
+            if reservation_id:
+                conn.execute(
+                    """
+                    UPDATE budget_reservations
+                    SET status = 'settled', settled_at = ?
+                    WHERE reservation_id = ?
+                    """,
+                    (now_iso, reservation_id),
+                )
+
+        return cost_id
 
 
 def get_cost_report(root: Path, period_type: str = "daily") -> dict[str, Any]:
     """Compile read-only financial and token usage report."""
-    conn = get_operations_db(root)
-    _init_cost_schema(conn)
+    with closing(get_operations_db(root)) as conn:
+        _init_cost_schema(conn)
 
-    period_id = _current_period_id(period_type)
+        period_id = _current_period_id(period_type)
 
-    cur = conn.cursor()
-    cur.execute(
-        """
-        SELECT provider,
-               COUNT(*) as call_count,
-               SUM(request_units) as total_input_units,
-               SUM(response_units) as total_output_units,
-               SUM(CASE WHEN cache_hit = 1 THEN 1 ELSE 0 END) as cache_hits,
-               SUM(estimated_micro_usd) as total_estimated_uUSD,
-               SUM(COALESCE(actual_micro_usd, 0)) as total_actual_uUSD
-        FROM usage_costs
-        WHERE created_at LIKE ?
-        GROUP BY provider
-        """,
-        (f"{period_id}%",),
-    )
-    rows = cur.fetchall()
-
-    provider_breakdown = []
-    grand_total_uUSD = 0
-
-    for r in rows:
-        est_usd = round(r["total_estimated_uUSD"] / 1_000_000.0, 4)
-        grand_total_uUSD += r["total_estimated_uUSD"]
-        provider_breakdown.append(
-            {
-                "provider": r["provider"],
-                "calls": r["call_count"],
-                "input_units": r["total_input_units"] or 0,
-                "output_units": r["total_output_units"] or 0,
-                "cache_hits": r["cache_hits"],
-                "estimated_usd": est_usd,
-            }
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT provider,
+                   COUNT(*) as call_count,
+                   SUM(request_units) as total_input_units,
+                   SUM(response_units) as total_output_units,
+                   SUM(CASE WHEN cache_hit = 1 THEN 1 ELSE 0 END) as cache_hits,
+                   SUM(estimated_micro_usd) as total_estimated_uUSD,
+                   SUM(COALESCE(actual_micro_usd, 0)) as total_actual_uUSD
+            FROM usage_costs
+            WHERE created_at LIKE ?
+            GROUP BY provider
+            """,
+            (f"{period_id}%",),
         )
+        rows = cur.fetchall()
 
-    return {
-        "period": period_id,
-        "period_type": period_type,
-        "grand_total_estimated_usd": round(grand_total_uUSD / 1_000_000.0, 4),
-        "providers": provider_breakdown,
-    }
+        provider_breakdown = []
+        grand_total_uUSD = 0
+
+        for r in rows:
+            est_usd = round(r["total_estimated_uUSD"] / 1_000_000.0, 4)
+            grand_total_uUSD += r["total_estimated_uUSD"]
+            provider_breakdown.append(
+                {
+                    "provider": r["provider"],
+                    "calls": r["call_count"],
+                    "input_units": r["total_input_units"] or 0,
+                    "output_units": r["total_output_units"] or 0,
+                    "cache_hits": r["cache_hits"],
+                    "estimated_usd": est_usd,
+                }
+            )
+
+        return {
+            "period": period_id,
+            "period_type": period_type,
+            "grand_total_estimated_usd": round(grand_total_uUSD / 1_000_000.0, 4),
+            "providers": provider_breakdown,
+        }
 
 
 def get_budget_status(root: Path) -> dict[str, Any]:
     """Return current budget usage vs limits."""
-    conn = get_operations_db(root)
-    _init_cost_schema(conn)
+    with closing(get_operations_db(root)) as conn:
+        _init_cost_schema(conn)
 
-    period_id = _current_period_id("daily")
-    daily_budget_usd = float(os.getenv("DAILY_BUDGET_USD", "0"))
-    hard_stop = os.getenv("BUDGET_HARD_STOP", "false").lower() in ("true", "1", "yes")
+        period_id = _current_period_id("daily")
+        daily_budget_usd = float(os.getenv("DAILY_BUDGET_USD", "0"))
+        hard_stop = os.getenv("BUDGET_HARD_STOP", "false").lower() in ("true", "1", "yes")
 
-    cur = conn.cursor()
-    cur.execute(
-        """
-        SELECT COALESCE(SUM(estimated_micro_usd), 0)
-        FROM usage_costs
-        WHERE created_at LIKE ? AND status != 'blocked_budget'
-        """,
-        (f"{period_id}%",),
-    )
-    spent_micro = int(cur.fetchone()[0])
-    spent_usd = round(spent_micro / 1_000_000.0, 4)
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT COALESCE(SUM(estimated_micro_usd), 0)
+            FROM usage_costs
+            WHERE created_at LIKE ? AND status != 'blocked_budget'
+            """,
+            (f"{period_id}%",),
+        )
+        spent_micro = int(cur.fetchone()[0])
+        spent_usd = round(spent_micro / 1_000_000.0, 4)
 
-    cur.execute(
-        """
-        SELECT COUNT(*)
-        FROM usage_costs
-        WHERE status = 'blocked_budget' AND created_at LIKE ?
-        """,
-        (f"{period_id}%",),
-    )
-    blocked_count = int(cur.fetchone()[0])
+        cur.execute(
+            """
+            SELECT COUNT(*)
+            FROM usage_costs
+            WHERE status = 'blocked_budget' AND created_at LIKE ?
+            """,
+            (f"{period_id}%",),
+        )
+        blocked_count = int(cur.fetchone()[0])
 
-    remaining_usd = max(0.0, round(daily_budget_usd - spent_usd, 4)) if daily_budget_usd > 0 else None
+        remaining_usd = max(0.0, round(daily_budget_usd - spent_usd, 4)) if daily_budget_usd > 0 else None
 
-    return {
-        "period": period_id,
-        "daily_budget_limit_usd": daily_budget_usd if daily_budget_usd > 0 else "unlimited",
-        "spent_usd": spent_usd,
-        "remaining_usd": remaining_usd,
-        "hard_stop_enabled": hard_stop,
-        "blocked_operations_today": blocked_count,
-    }
+        return {
+            "period": period_id,
+            "daily_budget_limit_usd": daily_budget_usd if daily_budget_usd > 0 else "unlimited",
+            "spent_usd": spent_usd,
+            "remaining_usd": remaining_usd,
+            "hard_stop_enabled": hard_stop,
+            "blocked_operations_today": blocked_count,
+        }
 
 
 def get_provider_health(root: Path) -> dict[str, Any]:
     """Inspect provider error rates and latency stats."""
-    conn = get_operations_db(root)
-    _init_cost_schema(conn)
+    with closing(get_operations_db(root)) as conn:
+        _init_cost_schema(conn)
 
-    cur = conn.cursor()
-    cur.execute(
-        """
-        SELECT provider,
-               COUNT(*) as total_calls,
-               SUM(CASE WHEN status = 'succeeded' THEN 1 ELSE 0 END) as successes,
-               SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END) as failures,
-               AVG(latency_ms) as avg_latency_ms
-        FROM usage_costs
-        GROUP BY provider
-        """
-    )
-    health = []
-    for r in cur.fetchall():
-        total = r["total_calls"] or 1
-        success_rate = round((r["successes"] / total) * 100.0, 1)
-        health.append(
-            {
-                "provider": r["provider"],
-                "total_calls": total,
-                "success_rate_pct": success_rate,
-                "avg_latency_ms": round(r["avg_latency_ms"] or 0, 1),
-                "status": "healthy" if success_rate >= 90.0 else "degraded",
-            }
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT provider,
+                   COUNT(*) as total_calls,
+                   SUM(CASE WHEN status = 'succeeded' THEN 1 ELSE 0 END) as successes,
+                   SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END) as failures,
+                   AVG(latency_ms) as avg_latency_ms
+            FROM usage_costs
+            GROUP BY provider
+            """
         )
+        health = []
+        for r in cur.fetchall():
+            total = r["total_calls"] or 1
+            success_rate = round((r["successes"] / total) * 100.0, 1)
+            health.append(
+                {
+                    "provider": r["provider"],
+                    "total_calls": total,
+                    "success_rate_pct": success_rate,
+                    "avg_latency_ms": round(r["avg_latency_ms"] or 0, 1),
+                    "status": "healthy" if success_rate >= 90.0 else "degraded",
+                }
+            )
 
-    return {"providers": health}
+        return {"providers": health}
 
 
 def get_failed_list(root: Path) -> list[dict[str, Any]]:
     """Return recent failed operations and their safe errors."""
-    conn = get_operations_db(root)
-    _init_cost_schema(conn)
+    with closing(get_operations_db(root)) as conn:
+        _init_cost_schema(conn)
 
-    cur = conn.cursor()
-    cur.execute(
-        """
-        SELECT cost_id, operation, provider, job, safe_error, created_at
-        FROM usage_costs
-        WHERE status IN ('failed', 'blocked_budget')
-        ORDER BY created_at DESC LIMIT 50
-        """
-    )
-    return [dict(r) for r in cur.fetchall()]
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT cost_id, operation, provider, job, safe_error, created_at
+            FROM usage_costs
+            WHERE status IN ('failed', 'blocked_budget')
+            ORDER BY created_at DESC LIMIT 50
+            """
+        )
+        return [dict(r) for r in cur.fetchall()]

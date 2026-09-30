@@ -1,4 +1,7 @@
+import io
+import json
 import tempfile
+import urllib.error
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -35,6 +38,103 @@ class OutputTests(unittest.TestCase):
 class ReleaseTests(unittest.TestCase):
     def test_version_is_semantic(self) -> None:
         self.assertRegex(pipeline.__version__, r"^\d+\.\d+\.\d+$")
+
+
+class ThreadsTests(unittest.TestCase):
+    def _page(self, media: dict) -> str:
+        payload = {"data": {"media": media}}
+        return f'<script type="application/json" data-sjs>{json.dumps(payload)}</script>'
+
+    def test_parse_single_video_chooses_largest_variant(self) -> None:
+        html = self._page(
+            {
+                "code": "POST123",
+                "caption": {"text": "公開影片"},
+                "user": {"username": "creator"},
+                "video_versions": [
+                    {"url": "https://cdn.example/low.mp4", "width": 360, "height": 640},
+                    {"url": "https://cdn.example/high.mp4", "width": 1080, "height": 1920},
+                ],
+            }
+        )
+
+        result = pipeline.parse_threads_post(html, "https://www.threads.com/@creator/post/POST123")
+
+        self.assertEqual(result["title"], "公開影片")
+        self.assertEqual(result["uploader"], "creator")
+        self.assertEqual([item["url"] for item in result["entries"]], ["https://cdn.example/high.mp4"])
+
+    def test_parse_carousel_collects_video_items_only(self) -> None:
+        html = self._page(
+            {
+                "code": "CAROUSEL",
+                "caption": {"text": "混合 carousel"},
+                "user": {"username": "creator"},
+                "carousel_media": [
+                    {"media_type": 1, "image_versions2": {"candidates": [{"url": "https://cdn.example/a.jpg"}]}},
+                    {"media_type": 2, "video_versions": [{"url": "https://cdn.example/a.mp4"}]},
+                    {"media_type": 2, "video_versions": [{"url": "https://cdn.example/b.mp4"}]},
+                ],
+            }
+        )
+
+        result = pipeline.parse_threads_post(html, "https://threads.net/t/CAROUSEL")
+
+        self.assertEqual([item["url"] for item in result["entries"]], [
+            "https://cdn.example/a.mp4",
+            "https://cdn.example/b.mp4",
+        ])
+
+    def test_fetch_retries_http_429(self) -> None:
+        class Response:
+            headers = {}
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+            def read(self, _limit):
+                return b"<html></html>"
+
+        url = "https://www.threads.com/@creator/post/POST123"
+        error = urllib.error.HTTPError(url, 429, "rate limited", {"Retry-After": "0"}, io.BytesIO())
+        with mock.patch.object(
+            pipeline.urllib.request, "urlopen", side_effect=[error, Response()]
+        ) as urlopen, mock.patch.object(pipeline.time, "sleep") as sleep:
+            result = pipeline.fetch_threads_html(url)
+
+        self.assertIn("html", result)
+        self.assertEqual(urlopen.call_count, 2)
+        sleep.assert_called_once_with(0.0)
+
+    def test_download_routes_threads_url(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            job_dir = Path(temporary)
+            expected = job_dir / "source.mp4"
+            with mock.patch.object(pipeline, "download_threads_video", return_value=expected) as download:
+                result = pipeline.download_video("https://threads.com/t/POST123", job_dir)
+
+        self.assertEqual(result, expected)
+        download.assert_called_once()
+
+    def test_silent_video_skips_audio_extraction(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            video = root / "source.mp4"
+            video.write_bytes(b"fixture")
+
+            chunks = pipeline.extract_audio(video, root, 900, has_audio=False)
+
+            self.assertEqual(chunks, [])
+            self.assertEqual(json.loads((root / "audio" / "chunks.json").read_text()), [])
+
+    def test_empty_audio_does_not_call_transcription_provider(self) -> None:
+        transcript, raw = pipeline.transcribe_all([], "key", "model", "auto", 1, Path("unused-cache"))
+
+        self.assertEqual(transcript["provider"], "none")
+        self.assertEqual(raw["reason"], "source has no audio")
 
 
 class FacebookAuthorTests(unittest.TestCase):
@@ -198,24 +298,27 @@ class InstagramAuthorTests(unittest.TestCase):
             "BRIGHTDATA_API_TOKEN": "test-brightdata-token",
             "BRIGHTDATA_RUN_TIMEOUT_SECONDS": "60",
         }
-        with mock.patch.object(
-            pipeline, "post_json", return_value={"snapshot_id": "s_test"}
+        with tempfile.TemporaryDirectory() as root, mock.patch.object(
+            pipeline, "request_json", return_value={"snapshot_id": "s_test"}
         ) as post, mock.patch.object(
             pipeline, "get_json", side_effect=fake_get
-        ), mock.patch.dict(pipeline.os.environ, environment, clear=True):
+        ), mock.patch.dict(pipeline.os.environ, environment):
             feed = pipeline.fetch_instagram_author(
                 "https://www.instagram.com/example/",
                 "2025-01-01",
                 max_items=20,
                 exclude_ids=["already-seen"],
                 allow_paid=True,
+                root=Path(root),
             )
 
         self.assertEqual([item["id"] for item in feed["items"]], ["video-1", "missing-date"])
         self.assertEqual(feed["items"][0]["url"], "https://www.instagram.com/reel/CURRENT/")
         self.assertFalse(feed["instagram"]["date_filter_complete"])
         self.assertEqual(feed["instagram"]["missing_date_count"], 1)
-        trigger_url, headers, body = post.call_args.args[:3]
+        trigger_url, headers = post.call_args.args
+        body = post.call_args.kwargs["body"]
+        self.assertEqual(post.call_args.kwargs["attempts"], 1)
         self.assertNotIn("test-brightdata-token", trigger_url)
         self.assertIn("dataset_id=gd_lyclm20il4r5helnj", trigger_url)
         self.assertIn("type=discover_new", trigger_url)
