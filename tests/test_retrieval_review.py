@@ -11,7 +11,7 @@ from pathlib import Path
 from unittest import mock
 
 import pipeline
-from test_retrieval import seed_library, seed_video
+from test_retrieval import fake_embed, fake_embed_batch, seed_library, seed_vectors, seed_video
 
 
 class ReviewRegressions(unittest.TestCase):
@@ -282,6 +282,183 @@ class ReviewRegressions(unittest.TestCase):
                 result = pipeline.answer_question(root, "question", "fake", "fake-model", 8, filters=pipeline.SearchFilter(since="2026-01-01"))
             self.assertEqual(result["retrieval"]["unknown_dates_excluded"], 1)
             self.assertEqual(result["retrieval"]["date_field"], "published_at")
+
+    def test_hybrid_degrades_on_non_runtime_embed_failures(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            seed_library(root)
+            seed_vectors(root, pipeline.vector_namespace("openrouter", "test-embed"))
+            for failure in (OSError("model cache unreadable"), ValueError("bad config")):
+                with self.subTest(failure=type(failure).__name__), mock.patch.object(
+                    pipeline, "embed_texts", side_effect=failure
+                ):
+                    result = pipeline.hybrid_search(
+                        root, "資安", 10,
+                        embed_key="k", embed_model="test-embed", embed_backend="openrouter",
+                    )
+                self.assertEqual(result["retrieval_mode"], "fts")
+                self.assertEqual(result["degraded_reason"], "embed_failed")
+            with mock.patch.object(pipeline, "embed_texts", side_effect=OSError("disk gone")):
+                with self.assertRaises(OSError):
+                    pipeline.hybrid_search(
+                        root, "資安", 10,
+                        embed_key="k", embed_model="test-embed",
+                        embed_backend="openrouter", strict=True,
+                    )
+
+    def test_audit_counts_distinct_texts_and_ignores_stale_vectors(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            same = [{"timestamp": 1.0, "type": "speech", "text": "同一段逐字稿"}]
+            seed_video(root, "one", timeline=same)
+            seed_video(root, "two", timeline=same)  # 同文：兩個 occurrence 共用一個向量
+            pipeline.build_index(root)
+            seed_vectors(root, pipeline.vector_namespace("openrouter", "m"))
+            with contextlib.redirect_stdout(io.StringIO()):
+                issues = pipeline.audit_library(root)
+            self.assertFalse([i for i in issues if "向量" in i])
+            # 一筆 stale 向量＋一種未嵌入的新文字：stale 不可掩蓋缺口
+            with contextlib.closing(pipeline.index_connection(root)) as db:
+                db.execute(
+                    "INSERT INTO vectors VALUES ('stalehash', ?, 2, ?)",
+                    (pipeline.vector_namespace("openrouter", "m"), pipeline.pack_vector([1.0, 0.0])),
+                )
+                db.commit()
+            seed_video(root, "three", timeline=[{"timestamp": 0.0, "type": "speech", "text": "全新的句子"}])
+            pipeline.build_index(root)
+            with contextlib.redirect_stdout(io.StringIO()):
+                issues = pipeline.audit_library(root)
+            missing = [i for i in issues if "還沒有" in i]
+            self.assertEqual(len(missing), 1)
+            self.assertIn("1 種文字還沒有", missing[0])
+
+    def test_cli_rejects_non_positive_limits(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            seed_library(root)
+            for command in (
+                ["--search", "資安", "--search-limit", "-1"],
+                ["--search", "資安", "--search-limit", "0"],
+                ["--ask", "問題", "--ask-limit", "0"],
+            ):
+                args = pipeline.parse_args(["--root", str(root), *command])
+                stderr = io.StringIO()
+                with self.subTest(command=command), contextlib.ExitStack() as stack:
+                    stack.enter_context(mock.patch.object(pipeline, "parse_args", return_value=args))
+                    stack.enter_context(mock.patch.object(pipeline, "load_dotenv"))
+                    stack.enter_context(contextlib.redirect_stdout(io.StringIO()))
+                    stack.enter_context(contextlib.redirect_stderr(stderr))
+                    self.assertEqual(pipeline.main(), 1)
+                self.assertIn("≥ 1", stderr.getvalue())
+
+    def test_search_json_uses_machine_retrieval_mode(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            seed_library(root)
+            args = pipeline.parse_args(["--root", str(root), "--search", "資安", "--json"])
+            output = io.StringIO()
+            with mock.patch.object(pipeline, "parse_args", return_value=args), mock.patch.object(pipeline, "load_dotenv"), contextlib.redirect_stdout(output):
+                self.assertEqual(pipeline.main(), 0)
+            payload = json.loads(output.getvalue())
+            self.assertEqual(payload["retrieval_mode"], "fts")
+            self.assertIn("mode_label", payload)
+            seed_vectors(root, pipeline.vector_namespace("openrouter", "test-embed"))
+            args = pipeline.parse_args([
+                "--root", str(root), "--search", "資安", "--json",
+                "--semantic", "--embed-model", "test-embed",
+            ])
+            output = io.StringIO()
+            with mock.patch.object(pipeline, "parse_args", return_value=args), mock.patch.object(pipeline, "load_dotenv"), mock.patch.dict(pipeline.os.environ, {"OPENROUTER_API_KEY": "k"}), mock.patch.object(pipeline, "embed_texts", side_effect=fake_embed_batch), contextlib.redirect_stdout(output):
+                self.assertEqual(pipeline.main(), 0)
+            payload = json.loads(output.getvalue())
+            self.assertEqual(payload["retrieval_mode"], "semantic")
+
+    def test_min_similarity_filters_hybrid_vector_leg(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            seed_library(root)
+            model_key = pipeline.vector_namespace("openrouter", "test-embed")
+            seed_vectors(root, model_key)
+            with mock.patch.object(pipeline, "embed_texts", side_effect=fake_embed_batch):
+                baseline = pipeline.hybrid_search(
+                    root, "資安", 10,
+                    embed_key="k", embed_model="test-embed", embed_backend="openrouter",
+                )
+            self.assertGreater(baseline["counts"]["vector"], 0)
+            with mock.patch.object(pipeline, "embed_texts", side_effect=fake_embed_batch):
+                result = pipeline.hybrid_search(
+                    root, "資安", 10,
+                    embed_key="k", embed_model="test-embed", embed_backend="openrouter",
+                    min_similarity=2.0,  # 高於任何 cosine 分數：整條向量腿被門檻濾掉
+                )
+            self.assertEqual(result["counts"]["vector"], 0)
+            self.assertEqual(result["retrieval_mode"], "hybrid")
+
+    def test_citation_reports_max_end_across_merged_ranges(self):
+        block = {
+            "block_index": 1, "occurrence_ids": ["a", "b"], "job": "j", "kind": "speech",
+            "title": "t", "source": "https://example.com/x", "timestamp_kind": "range",
+            "ranges": [(0.0, 100.0), (50.0, 60.0)], "text": "text",
+        }
+        citation = pipeline._evidence_citation(block)
+        self.assertEqual(citation["end"], 100.0)
+
+    def test_rrf_fallback_key_does_not_merge_distinct_hits(self):
+        fts = [dict(job="j", kind="speech", start=0.0, text="甲", occurrence_id=None)]
+        vec = [dict(job="j", kind="speech", start=9.0, text="乙", occurrence_id=None)]
+        fused = pipeline.rrf_fuse({"fts": fts, "vector": vec})
+        self.assertEqual(len(fused), 2)
+        self.assertEqual({h["text"] for h in fused}, {"甲", "乙"})
+        same = dict(job="j", kind="speech", start=0.0, text="甲", occurrence_id=None)
+        fused = pipeline.rrf_fuse({"fts": [same], "vector": [dict(same)]})
+        self.assertEqual(len(fused), 1)
+
+    def test_vector_candidates_dedupe_shared_text_hash(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            same = [{"timestamp": 1.0, "type": "speech", "text": "同一段逐字稿"}]
+            seed_video(root, "one", timeline=same)
+            seed_video(root, "two", timeline=same)
+            pipeline.build_index(root)
+            model_key = pipeline.vector_namespace("openrouter", "test-embed")
+            seed_vectors(root, model_key)
+            with contextlib.closing(pipeline.read_connection(root)) as db:
+                hits = pipeline._vector_candidates(
+                    db, fake_embed("同一段逐字稿"), model_key, pipeline.SearchFilter(), 10
+                )
+            speech_hits = [h for h in hits if h["text"] == "同一段逐字稿"]
+            self.assertEqual(len(speech_hits), 2)
+            self.assertEqual({h["job"] for h in speech_hits}, {"one", "two"})
+            self.assertEqual(speech_hits[0]["score"], speech_hits[1]["score"])
+
+    def test_ask_explain_prints_rank_detail_for_citations(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            seed_library(root)
+            seed_vectors(root, pipeline.vector_namespace("openrouter", "test-embed"))
+            args = pipeline.parse_args([
+                "--root", str(root), "--ask", "時間軸怎麼合併？", "--hybrid", "--explain",
+                "--embed-backend", "openrouter", "--embed-model", "test-embed",
+            ])
+            output = io.StringIO()
+            with mock.patch.object(pipeline, "parse_args", return_value=args), mock.patch.object(pipeline, "load_dotenv"), mock.patch.dict(pipeline.os.environ, {"OPENROUTER_API_KEY": "k"}), mock.patch.object(pipeline, "embed_texts", side_effect=fake_embed_batch), mock.patch.object(pipeline, "minimax_subscription_key", return_value="fake"), mock.patch.object(pipeline, "minimax_model", return_value="model"), mock.patch.object(pipeline, "minimax_chat", return_value="影片提到合併做法 [1]。"), contextlib.redirect_stdout(output):
+                self.assertEqual(pipeline.main(), 0)
+            self.assertIn("排序依據", output.getvalue())
+
+    def test_empty_ask_fails_with_message_not_pipeline(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            args = pipeline.parse_args(["--root", str(root), "--ask", ""])
+            stderr = io.StringIO()
+            with contextlib.ExitStack() as stack:
+                stack.enter_context(mock.patch.object(pipeline, "parse_args", return_value=args))
+                stack.enter_context(mock.patch.object(pipeline, "load_dotenv"))
+                run_pipeline = stack.enter_context(mock.patch.object(pipeline, "run_pipeline"))
+                stack.enter_context(contextlib.redirect_stdout(io.StringIO()))
+                stack.enter_context(contextlib.redirect_stderr(stderr))
+                self.assertEqual(pipeline.main(), 1)
+            self.assertIn("問題", stderr.getvalue())
+            run_pipeline.assert_not_called()
 
     def test_date_field_is_visible_even_when_no_unknown_dates_are_excluded(self):
         with tempfile.TemporaryDirectory() as temporary:

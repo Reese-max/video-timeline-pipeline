@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- 複核修正 r3：hybrid 降級接住所有嵌入錯誤型別、audit 向量覆蓋改按不重複文字計且忽略 stale 向量、`--search-limit`／`--ask-limit` 驗證 ≥ 1、JSON `retrieval_mode` 固定機器 token（人類描述移至 `mode_label`）、`--min-similarity` 延伸到 hybrid 向量腿、合併引用的 end 取最大範圍、RRF 缺 occurrence_id 時改內容 hash 去重、向量候選按 hash 去重搬 blob、`--explain` 支援 `--ask`、`--ask` 空字串明確報錯；新增對應回歸測試。
 - 修正 PR #21 審查缺陷：向量重建原子替換與失敗回復、供應商及快取驗證、FTS 摘錄、有界向量候選、context 預算與單片證據保留、引用拒答、離線旗標及日期中繼資料；新增離線回歸測試。
 - 新增 `occurrences` 證據層：每筆片段有重建不變的 `occurrence_id` 與 `timestamp_kind`（source_level／point／range），引用不再依賴會重排的 FTS rowid。
 - 新增 `--hybrid` 混合檢索：篩選 eligible-set 後全文＋向量候選去重、RRF 融合，語意路不可用時明確降級（`--strict-retrieval` 可改為失敗）。

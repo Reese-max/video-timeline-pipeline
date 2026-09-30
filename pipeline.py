@@ -3599,44 +3599,66 @@ def _vector_candidates(
 ) -> list[dict[str, Any]]:
     """eligible-set 內的向量候選：篩選先於計分，peak RAM 以候選數為界（有界 Top-K heap）。
 
-    文字 hash → 向量的對應在 SQLite 端做（occurrences.content_hash = vectors.text_hash），
-    不整表拉回 Python；只有通過篩選的 hash 才解開向量計分。
+    文字 hash → 向量的對應在 SQLite 端做（occurrences.content_hash = vectors.text_hash）。
+    同一 hash 的向量 blob 只搬一次：先對符合篩選的不重複 hash 計分取 Top-K，
+    再把勝出 hash 對回各自的 occurrence 列——同文多來源不必逐列搬向量。
     """
     clauses, params = _event_filter_sql(filters, "occurrences", "videos")
     where = (" AND " + " AND ".join(clauses)) if clauses else ""
     validate_embedding_vectors([query_vector], 1)
     query_dim = len(query_vector)
-    heap: list[tuple[float, str, tuple[Any, ...]]] = []
-    previous_hash = None
-    score = 0.0
-    for row in connection.execute(
+    hash_heap: list[tuple[float, str]] = []
+    for text_hash, dim, blob in connection.execute(
         f"""
-        SELECT occurrences.occurrence_id, videos.title, videos.source, occurrences.job,
-               occurrences.start, occurrences.end, occurrences.kind, occurrences.text,
-               occurrences.timestamp_kind, occurrences.content_hash, vectors.dim, vectors.vector
-        FROM occurrences
-        JOIN videos ON videos.job = occurrences.job
-        JOIN vectors ON vectors.text_hash = occurrences.content_hash
-        WHERE vectors.model = ?{where}
-        ORDER BY occurrences.content_hash
+        SELECT vectors.text_hash, vectors.dim, vectors.vector
+        FROM vectors
+        WHERE vectors.model = ? AND vectors.text_hash IN (
+            SELECT DISTINCT occurrences.content_hash
+            FROM occurrences
+            JOIN videos ON videos.job = occurrences.job
+            WHERE 1 = 1{where}
+        )
         """,
         [model_key, *params],
     ):
-        if row[9] != previous_hash:
-            if row[10] != query_dim:
-                raise RuntimeError(f"向量維度不符：查詢 {query_dim} 維、文件 {row[10]} 維（{model_key}）。")
-            try:
-                vector = unpack_vector(row[11])
-            except (TypeError, ValueError) as exc:
-                raise RuntimeError("快取向量格式損壞，拒絕比較。") from exc
-            validate_embedding_vectors([vector], 1, query_dim)
-            score = cosine(query_vector, vector)
-            previous_hash = row[9]
-        entry = (score, row[0], row[:9])
-        if len(heap) < limit:
-            heapq.heappush(heap, entry)
-        elif heap and entry > heap[0]:
-            heapq.heapreplace(heap, entry)
+        if dim != query_dim:
+            raise RuntimeError(f"向量維度不符：查詢 {query_dim} 維、文件 {dim} 維（{model_key}）。")
+        try:
+            vector = unpack_vector(blob)
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError("快取向量格式損壞，拒絕比較。") from exc
+        validate_embedding_vectors([vector], 1, query_dim)
+        score = cosine(query_vector, vector)
+        entry = (score, text_hash)
+        if len(hash_heap) < limit:
+            heapq.heappush(hash_heap, entry)
+        elif entry > hash_heap[0]:
+            heapq.heapreplace(hash_heap, entry)
+    scores = {text_hash: score for score, text_hash in hash_heap}
+    if not scores:
+        return []
+    # SQLite 變數上限約 999：大批 hash 分批查；逐列串流進 heap，不留存整批結果
+    hash_list = sorted(scores)
+    heap: list[tuple[float, str, tuple[Any, ...]]] = []
+    for offset in range(0, len(hash_list), 500):
+        batch = hash_list[offset : offset + 500]
+        placeholders = ", ".join("?" for _ in batch)
+        for row in connection.execute(
+            f"""
+            SELECT occurrences.occurrence_id, videos.title, videos.source, occurrences.job,
+                   occurrences.start, occurrences.end, occurrences.kind, occurrences.text,
+                   occurrences.timestamp_kind, occurrences.content_hash
+            FROM occurrences
+            JOIN videos ON videos.job = occurrences.job
+            WHERE occurrences.content_hash IN ({placeholders}){where}
+            """,
+            [*batch, *params],
+        ):
+            entry = (scores[row[9]], row[0], row[:9])
+            if len(heap) < limit:
+                heapq.heappush(heap, entry)
+            elif heap and entry > heap[0]:
+                heapq.heapreplace(heap, entry)
     scored = sorted(heap, key=lambda item: (-item[0], item[1]))
     return [
         {
@@ -3701,7 +3723,13 @@ def rrf_fuse(lists: dict[str, list[dict[str, Any]]], k: int = RRF_K) -> list[dic
     fused: dict[str, dict[str, Any]] = {}
     for source_name, ranked in lists.items():
         for rank, hit in enumerate(ranked, 1):
-            occurrence_id = hit.get("occurrence_id") or f"{hit['job']}:{hit['kind']}:{rank}"
+            # 缺 occurrence_id（舊索引）時用內容身分去重——不能拿 rank 當 key，
+            # 否則兩路第 N 名的不同片段會被誤併成同一筆。
+            occurrence_id = hit.get("occurrence_id") or "legacy:" + hashlib.sha256(
+                "\0".join(
+                    str(hit.get(field) or "") for field in ("job", "kind", "start", "text")
+                ).encode("utf-8")
+            ).hexdigest()[:16]
             entry = fused.setdefault(
                 occurrence_id, {"hit": hit, "rrf": 0.0, "ranks": {}, "vector_score": None}
             )
@@ -3784,6 +3812,7 @@ def hybrid_search(
     rerank_key: str = "",
     rerank_model: str = "",
     candidate_k: int = HYBRID_CANDIDATE_K,
+    min_similarity: float | None = None,
 ) -> dict[str, Any]:
     """metadata eligible-set → FTS 候選＋向量候選 → occurrence 去重 → RRF → 可選 rerank。
 
@@ -3815,13 +3844,15 @@ def hybrid_search(
                 vector_hits = _vector_candidates(
                     connection, query_vector, model_key, filters, candidate_k
                 )
-            except RuntimeError:
+            except Exception:
+                # 語意路不可用就降級：embedder 可能丟出 RuntimeError 以外的
+                # OSError／sqlite3.Error／模型載入錯誤，降級契約都要接住。
                 if strict:
                     raise
                 degraded = "embed_failed"
         # 向量路用同一個相似度門檻去雜訊——低於地板的名次不該佔 RRF 名額
         if vector_hits:
-            cutoff = similarity_cutoff(vector_hits[0]["score"])
+            cutoff = similarity_cutoff(vector_hits[0]["score"], min_similarity)
             vector_hits = [hit for hit in vector_hits if hit["score"] >= cutoff]
         if vector_hits or (embed_backend and model_key and degraded is None):
             fused = rrf_fuse({"fts": fts_hits, "vector": vector_hits})
@@ -3900,6 +3931,7 @@ def _context_block(position: int, hit: dict[str, Any]) -> dict[str, Any]:
         "text": hit.get("text") or "", "title": hit.get("title") or "",
         "source": hit.get("source") or "",
         "timestamp_kind": hit.get("timestamp_kind") or "point",
+        "rank_detail": hit.get("rank_detail"),
         "best": position, "_members": [(position, hit)],
     }
 
@@ -4018,7 +4050,10 @@ def _block_range_label(block: dict[str, Any]) -> str:
 
 
 def _evidence_citation(block: dict[str, Any]) -> dict[str, Any]:
-    start = block["ranges"][0][0] if block.get("ranges") else None
+    ranges = block.get("ranges") or []
+    start = ranges[0][0] if ranges else None
+    # 合併的 ranges 依 start 排序，end 取最大值——後段可能比前段短
+    ends = [end for _, end in ranges if end is not None]
     return {
         "block_index": block["block_index"],
         "occurrence_id": (block["occurrence_ids"] or [None])[0],
@@ -4028,10 +4063,11 @@ def _evidence_citation(block: dict[str, Any]) -> dict[str, Any]:
         "title": block["title"],
         "source": block["source"],
         "start": start,
-        "end": block["ranges"][-1][1] if block.get("ranges") else None,
+        "end": max(ends) if ends else None,
         "timestamp": start if start is not None else 0,
         "timestamp_kind": block["timestamp_kind"],
         "link": source_link(block["source"], start),
+        "rank_detail": block.get("rank_detail"),
         "text": block["text"],
     }
 
@@ -4547,6 +4583,19 @@ def audit_library(root: Path) -> list[str]:
         occurrence_count = connection.execute("SELECT count(*) FROM occurrences").fetchone()[0]
         lengths = [row[0] for row in connection.execute("SELECT length(text) FROM events WHERE kind='speech'")]
         vectors = dict(connection.execute("SELECT model, count(*) FROM vectors GROUP BY model"))
+        # 向量以 (text_hash, model) 去重：覆蓋率要拿「不重複文字」當分母，
+        # 且只計入仍存在於 occurrences 的 hash，否則同文共用或 stale 向量都會誤算。
+        distinct_texts = connection.execute(
+            "SELECT count(DISTINCT content_hash) FROM occurrences"
+        ).fetchone()[0]
+        vector_coverage = {
+            model: connection.execute(
+                "SELECT count(*) FROM vectors WHERE model = ? AND text_hash IN "
+                "(SELECT DISTINCT content_hash FROM occurrences)",
+                (model,),
+            ).fetchone()[0]
+            for model in vectors
+        }
         unknown_published = connection.execute(
             "SELECT count(*) FROM videos WHERE published_at IS NULL"
         ).fetchone()[0]
@@ -4581,9 +4630,12 @@ def audit_library(root: Path) -> list[str]:
 
     if vectors:
         for model, count in vectors.items():
-            print(f"  向量：{count} / {events} 筆（{model}）")
-            if count < events:
-                issues.append(f"{events - count} 筆片段還沒有 {model} 的向量 → python pipeline.py --embed")
+            covered = vector_coverage[model]
+            print(f"  向量：{covered} / {distinct_texts} 種文字覆蓋（{model}，庫內共 {count} 筆）")
+            if covered < distinct_texts:
+                issues.append(
+                    f"{distinct_texts - covered} 種文字還沒有 {model} 的向量 → python pipeline.py --embed"
+                )
     else:
         issues.append("尚未建立向量，--semantic 無法使用 → python pipeline.py --embed")
 
@@ -7445,7 +7497,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     retrieval.add_argument(
         "--explain",
         action="store_true",
-        help="顯示每筆命中的排序依據（讀已儲存的檢索資料，不額外呼叫模型）",
+        help="顯示 --search／--ask 每筆命中或引用的排序依據（讀已儲存的檢索資料，不額外呼叫模型）",
     )
     retrieval.add_argument(
         "--embed-plan",
@@ -8102,7 +8154,7 @@ def main() -> int:
     if (
         args.index
         or args.search is not None  # 空字串是 falsy，用 is not None 才攔得住
-        or args.ask
+        or args.ask is not None
         or args.digest
         or args.embed
         or args.categorize
@@ -8116,10 +8168,10 @@ def main() -> int:
         try:
             cloud_embedding = args.embed_backend != "local" and (
                 args.embed or args.rebuild_embeddings
-                or ((args.search is not None or args.ask) and (args.semantic or args.hybrid))
+                or ((args.search is not None or args.ask is not None) and (args.semantic or args.hybrid))
             )
             if (args.dry_run or args.local_only) and (
-                cloud_embedding or args.ask or args.rerank or args.digest or args.categorize
+                cloud_embedding or args.ask is not None or args.rerank or args.digest or args.categorize
             ):
                 raise RuntimeError("--dry-run／--local-only 不允許雲端檢索、Ask、rerank 或雲端重建。")
             if args.dry_run and (args.embed or args.rebuild_embeddings):
@@ -8128,6 +8180,10 @@ def main() -> int:
                 raise RuntimeError("--hybrid 與 --semantic 只能擇一；hybrid 已含語意路。")
             if args.rerank and not args.hybrid:
                 raise RuntimeError("--rerank 目前只支援 --hybrid 的融合排序。")
+            if args.ask is not None and not args.ask.strip():
+                raise RuntimeError("--ask 需要非空白的問題。")
+            if args.search_limit < 1 or args.ask_limit < 1:
+                raise RuntimeError("--search-limit／--ask-limit 必須 ≥ 1。")
             if args.index:
                 db_path, video_count, event_count = build_index(root)
                 print(f"索引完成：{db_path}（{video_count} 支影片、{event_count} 筆片段）")
@@ -8178,6 +8234,7 @@ def main() -> int:
                         strict=args.strict_retrieval,
                         rerank=args.rerank,
                         rerank_key=embed_key,
+                        min_similarity=args.min_similarity,
                     )
                     hits = hybrid_result["hits"]
                     mode = f"混合檢索：{args.embed_backend}／{embed_model}"
@@ -8201,7 +8258,10 @@ def main() -> int:
                 if args.category:
                     mode += f"，限定「{args.category}」"
                 if args.json:
-                    payload = hybrid_result or {"hits": hits, "retrieval_mode": mode}
+                    # retrieval_mode 一律是機器可讀 token；人類可讀字串走 mode_label
+                    payload = dict(hybrid_result) if hybrid_result else {"hits": hits}
+                    payload.setdefault("retrieval_mode", "semantic" if semantic_backend else "fts")
+                    payload["mode_label"] = mode
                     payload.update(date_field=filters.date_field, unknown_dates_excluded=unknown_date_count(root, filters))
                     print(json.dumps(payload, ensure_ascii=False, indent=2))
                     return 0
@@ -8233,7 +8293,7 @@ def main() -> int:
             if args.digest:
                 digest_path = build_digest(root, minimax_subscription_key(), minimax_model())
                 print(f"總覽已產生：{digest_path}")
-            if args.ask:
+            if args.ask is not None:
                 ask_mode = "hybrid" if args.hybrid else ("semantic" if semantic_backend else "fts")
                 result = answer_question(
                     root,
@@ -8283,6 +8343,8 @@ def main() -> int:
                         excerpt = " ".join(str(hit.get("text") or "").split())
                         if excerpt:
                             print(f"      「{excerpt[:160]}{'…' if len(excerpt) > 160 else ''}」")
+                        if args.explain and hit.get("rank_detail"):
+                            print(f"      排序依據：{json.dumps(hit['rank_detail'], ensure_ascii=False)}")
         except (RuntimeError, ValueError, sqlite3.Error) as exc:
             print(f"錯誤：{exc}", file=sys.stderr)
             return 1

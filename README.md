@@ -530,7 +530,7 @@ python pipeline.py --search '合併' --hybrid --rerank --explain --json
 
 篩選旗標（`--search`／`--ask` 共用）：`--kind speech,visual`、`--job`、`--platform`、`--author`、`--since/--until`（欄位由 `--date-field` 選 `published_at`／`first_completed_at`／`indexed_at`，預設 `published_at`）、`--include-unknown-dates`。套用日期篩選時，日期未知的影片預設排除並提示筆數；JSON 搜尋與 Ask 檢索資訊包含 `unknown_dates_excluded` 與 `date_field`。發布日不拿索引日冒充，完成日不拿建立日代替。分類是 JSON 精確比對，「資安」不會誤命中「資安新聞」。platform／author／published_at 由 manifest（含 RSS 發布日）與 yt-dlp `source.info.json` 可追溯回填，沒有證據就是 NULL。
 
-`--rerank` 是可選的 provider 重排（預設關閉，需 `OPENROUTER_API_KEY`，失效時保留原排序）。`--explain` 顯示每筆的 RRF／各路名次，只讀已存資料、不額外呼叫模型。`--json` 輸出完整結構（含 `occurrence_id`、`rank_detail`、`retrieval_mode`）。
+`--rerank` 是可選的 provider 重排（預設關閉，需 `OPENROUTER_API_KEY`，失效時保留原排序）。`--explain` 顯示每筆命中與 Ask 引用的 RRF／各路名次，只讀已存資料、不額外呼叫模型。`--json` 輸出完整結構（含 `occurrence_id`、`rank_detail`）；`retrieval_mode` 固定為機器可讀 token（`fts`／`semantic`／`hybrid`），人類可讀的檢索描述放在 `mode_label`。`--min-similarity` 同時約束 `--semantic` 與 `--hybrid` 的向量腿。`--search-limit`／`--ask-limit` 必須 ≥ 1；`--ask` 需要非空白問題。
 
 `--dry-run`／`--local-only` 會拒絕雲端 embedding、Ask、rerank、分類與 Digest；純全文搜尋與 `--embed-plan` 可使用。`--dry-run` 也禁止本機向量寫入與重建。離線 fake-provider 評估可重播，但尚未提供人工 golden evidence、FTS／semantic 基準比較或真實供應商驗收，不能據此宣稱完整 RAG 語意品質已驗證。
 
