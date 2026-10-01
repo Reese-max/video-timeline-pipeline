@@ -328,6 +328,69 @@ class TransportCostGuardTests(unittest.TestCase):
                 {"ok": True},
             )
 
+    def test_guard_failure_send_is_retryable_not_unknown(self) -> None:
+        import sqlite3
+
+        import email_providers
+        import notifications
+
+        provider = email_providers.ResendProvider(api_key="re_test_key")
+        with tempfile.TemporaryDirectory() as directory, patch.dict(
+            os.environ,
+            {"DAILY_BUDGET_USD": "100", "BUDGET_HARD_STOP": "true"},
+        ), patch.object(
+            cost_tracker,
+            "check_and_reserve_budget",
+            side_effect=sqlite3.OperationalError("database is locked"),
+        ), patch.object(email_providers.urllib.request, "urlopen") as urlopen:
+            result = notifications._send_with_cost_tracking(
+                Path(directory),
+                provider,
+                recipient="user@example.com",
+                subject="subject",
+                text_body="body",
+                html_body=None,
+                idempotency_key="idem-1",
+            )
+            self.assertEqual(result.status, "retryable_not_accepted")
+            urlopen.assert_not_called()
+
+    def test_usage_records_account_scope_end_to_end(self) -> None:
+        class Response:
+            headers = {}
+
+            def __enter__(self) -> "Response":
+                return self
+
+            def __exit__(self, *args: object) -> None:
+                return None
+
+            def read(self) -> bytes:
+                return b'{"ok": true}'
+
+        with tempfile.TemporaryDirectory() as directory, patch.dict(
+            os.environ,
+            {"DAILY_BUDGET_USD": "100", "BUDGET_HARD_STOP": "true"},
+        ), patch.object(
+            pipeline.urllib.request, "urlopen", return_value=Response()
+        ):
+            root = Path(directory)
+            with cost_tracker.cost_tracking(root, account_scope="tenant-a"):
+                pipeline.post_json(
+                    "https://api.groq.com/openai/v1/audio/transcriptions",
+                    {},
+                    b"{}",
+                    timeout=1,
+                )
+            with cost_tracker.get_operations_db(root) as connection:
+                rows = connection.execute(
+                    "SELECT provider, account_scope, status FROM usage_costs"
+                ).fetchall()
+            self.assertEqual(
+                [(row[0], row[1], row[2]) for row in rows],
+                [("groq", "tenant-a", "succeeded")],
+            )
+
     def test_notifications_importable_as_first_module(self) -> None:
         repo_root = Path(__file__).resolve().parents[1]
         result = subprocess.run(

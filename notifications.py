@@ -134,12 +134,12 @@ def _send_with_cost_tracking(root: Path, provider: BaseProvider, **kwargs: Any) 
     with cost_tracker.cost_tracking(root):
         try:
             return provider.send(**kwargs)
-        except cost_tracker.BudgetBlockedError as exc:
+        except cost_tracker.CostGuardError as exc:
             # The guard proved nothing was sent: pause the delivery for retry
             # instead of recording a misleading "unknown" outcome.
             return DeliveryResult(
                 status="retryable_not_accepted",
-                safe_error=f"Budget blocked before dispatch: {exc.reason}",
+                safe_error=f"Guard blocked before dispatch: {exc}",
                 retry_after_seconds=300,
             )
 

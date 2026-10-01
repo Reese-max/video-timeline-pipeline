@@ -237,6 +237,7 @@ def guarded_call(
                 status=status,
                 safe_error=_safe_transport_error(error),
                 reservation_id=reservation_id,
+                account_scope=scope,
             )
         except Exception:
             # The original provider error is more actionable; the sent
@@ -255,6 +256,7 @@ def guarded_call(
             latency_ms=(time.monotonic() - started) * 1000,
             status="succeeded",
             reservation_id=reservation_id,
+            account_scope=scope,
         )
     except Exception:
         # Telemetry failure must not mislabel a completed transport; the
@@ -525,6 +527,7 @@ def record_usage(
     provider_request_id: str | None = None,
     reservation_id: str | None = None,
     actual_micro_usd: int | None = None,
+    account_scope: str | None = None,
 ) -> str:
     """Record a completed or failed operation attempt and settle reservation."""
     with closing(get_operations_db(root)) as conn:
@@ -544,11 +547,12 @@ def record_usage(
             conn.execute(
                 """
                 INSERT INTO usage_costs (
-                    cost_id, library_id, job, analysis_revision, provider, model, operation,
+                    cost_id, library_id, job, analysis_revision, provider, account_scope,
+                    model, operation,
                     request_units, response_units, started_at, finished_at, latency_ms,
                     cache_hit, status, safe_error, provider_request_id,
                     estimated_micro_usd, actual_micro_usd, cost_status, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     cost_id,
@@ -556,6 +560,7 @@ def record_usage(
                     job,
                     analysis_revision,
                     provider,
+                    account_scope or "default",
                     model,
                     operation,
                     request_units,
