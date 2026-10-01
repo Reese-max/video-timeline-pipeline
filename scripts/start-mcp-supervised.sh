@@ -25,6 +25,11 @@ else
 fi
 
 media_base="${MCP_MEDIA_BASE_URL:-}"
+# Quick-tunnel names rotate independently of this long-running MCP process.
+# Default to the stable public origin; retain quick tunnels as explicit opt-in.
+if [ -z "${media_base}" ] && [ "${MCP_USE_QUICK_TUNNEL:-0}" != "1" ]; then
+	media_base="${public_base}"
+fi
 if [ -z "${media_base}" ] && [ -x "${media_launcher}" ]; then
 	if ! "${media_launcher}" "${group}" >/dev/null 2>&1; then
 		printf 'Media tunnel unavailable; ignoring its stale URL. Starting MCP with its public origin so Drive handoff remains available.\n' >&2

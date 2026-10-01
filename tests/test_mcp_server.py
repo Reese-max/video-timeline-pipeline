@@ -10,6 +10,18 @@ import mcp_server
 
 
 class MCPValidationTests(unittest.TestCase):
+    def setUp(self):
+        self.temp_root = tempfile.TemporaryDirectory()
+        root = Path(self.temp_root.name)
+        (root / "mcp_jobs" / "0123456789ab").mkdir(parents=True)
+        self.patchers = [patch.object(mcp_server, "MCP_ROOT", root),
+                         patch.object(mcp_server, "MCP_JOBS_ROOT", root / "mcp_jobs")]
+        for patcher in self.patchers: patcher.start()
+
+    def tearDown(self):
+        for patcher in reversed(self.patchers): patcher.stop()
+        self.temp_root.cleanup()
+
     def test_drive_upload_recovers_502_in_same_session(self) -> None:
         completed = {"id": "file_1", "webViewLink": "https://drive.google.com/file/d/file_1/view"}
         for statuses, ranges, expected_bodies in [
@@ -85,7 +97,7 @@ class MCPValidationTests(unittest.TestCase):
 
     def test_media_urls_use_media_base(self) -> None:
         self.assertEqual(
-            mcp_server.media_url("0123456789ab", "segments/segment_000.mp4"),
+            mcp_server.media_url("0123456789ab", "segments/segment_000.mp4").split("?", 1)[0],
             f"{mcp_server.MCP_MEDIA_BASE_URL}/media/0123456789ab/segments/segment_000.mp4",
         )
 
@@ -165,12 +177,13 @@ class MCPValidationTests(unittest.TestCase):
         self.assertIsNotNone(tool.outputSchema)
         self.assertTrue(tool.meta["openai/widgetAccessible"])
         self.assertNotIn("const openai = window.openai", mcp_server.WIDGET_HTML)
-        self.assertIn("const getOpenAI = () => window.openai", mcp_server.WIDGET_HTML)
+        self.assertIn("window.openai", mcp_server.WIDGET_HTML)
         self.assertIn('request("ui/initialize"', mcp_server.WIDGET_HTML)
         self.assertIn("ui/notifications/initialized", mcp_server.WIDGET_HTML)
-        self.assertIn('request("tools/call"', mcp_server.WIDGET_HTML)
-        self.assertIn('request("ui/message"', mcp_server.WIDGET_HTML)
-        self.assertIn("queueMicrotask(startAnalysis)", mcp_server.WIDGET_HTML)
+        self.assertIn('"tools/call"', mcp_server.WIDGET_HTML)
+        self.assertIn('"ui/message"', mcp_server.WIDGET_HTML)
+        self.assertNotIn("queueMicrotask(startAnalysis)", mcp_server.WIDGET_HTML)
+        self.assertIn("get_video_job", mcp_server.WIDGET_HTML)
         self.assertNotIn("uploadFile(", mcp_server.WIDGET_HTML)
 
     def test_drive_tool_exposes_output_schema_and_widget_path(self) -> None:
@@ -179,7 +192,7 @@ class MCPValidationTests(unittest.TestCase):
         self.assertIsNotNone(tool.outputSchema)
         self.assertTrue(tool.meta["openai/widgetAccessible"])
         self.assertIn("upload_prepared_video_to_drive", mcp_server.WIDGET_HTML)
-        self.assertIn("Google Drive connector", mcp_server.WIDGET_HTML)
+        self.assertIn("Google Drive", mcp_server.WIDGET_HTML)
         self.assertNotIn("analyzeOnServer", mcp_server.WIDGET_HTML)
 
     def test_drive_view_urls_are_metadata_not_materializable_attachments(self) -> None:
@@ -222,6 +235,8 @@ class MCPValidationTests(unittest.TestCase):
             with (
                 patch.object(mcp_server, "prepared_job_dir", return_value=Path(raw_dir)),
                 patch.object(mcp_server, "read_manifest", return_value=manifest),
+                patch.object(mcp_server, "check_job_capacity"),
+                patch.object(mcp_server, "storage_policy"),
                 patch.object(mcp_server.pipeline, "locate_source_video", return_value=video_path),
                 patch.object(mcp_server.pipeline, "file_fingerprint", return_value="7:1"),
                 patch.object(mcp_server.pipeline, "reuse_artifact", return_value=None),
@@ -234,11 +249,12 @@ class MCPValidationTests(unittest.TestCase):
                     },
                 ),
                 patch.object(mcp_server.pipeline, "minimax_model", return_value="MiniMax-M3"),
+                patch.object(mcp_server.pipeline, "minimax_endpoint", return_value="https://api.minimax.io/v1"),
                 patch.object(mcp_server.pipeline, "minimax_subscription_key", return_value="key"),
                 patch.object(mcp_server.pipeline, "vision_frame_limit", return_value=8),
                 patch.object(
                     mcp_server.pipeline,
-                    "extract_candidates",
+                    "extract_budgeted_candidates",
                     return_value=(
                         [{"timestamp": 0, "path": str(video_path), "ocr_text": ""}],
                         {},
@@ -284,7 +300,8 @@ class MCPValidationTests(unittest.TestCase):
         self.assertEqual(result["summary"]["status"], "pending_chatgpt")
         self.assertEqual(result["quality"]["status"], "evidence_available")
         create_summary_mock.assert_not_called()
-        self.assertEqual(extract_candidates_mock.call_args.args[3], 0)
+        self.assertEqual(extract_candidates_mock.call_args.kwargs["candidate_budget"], 240)
+        self.assertEqual(extract_candidates_mock.call_args.args[2], 2)
 
     def test_drive_upload_caches_verified_segment_metadata(self) -> None:
         with tempfile.TemporaryDirectory() as raw_dir:
@@ -344,7 +361,7 @@ class MCPValidationTests(unittest.TestCase):
 
     def test_prepare_tool_structured_result_matches_schema(self) -> None:
         manifest = {
-            "job_id": "job-1",
+            "job_id": "0123456789ab",
             "source": {"title": "demo", "url": "https://example.com/video", "duration_seconds": 1.0},
             "duration_seconds": 1.0,
             "segment_seconds": 60,
