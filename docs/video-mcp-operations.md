@@ -112,3 +112,8 @@ and fd-based media deletion. The widget browser harness is a mock host, not proo
 that an actual ChatGPT host consumed MP4 bytes or rendered a final answer. A live
 deployment check must separately establish MCP initialization, tool schemas,
 background work, public signed media GET/HEAD/Range, and any real provider calls.
+
+2026-10-01 integration: Linux's 190 tests and 30 mocked-host widget cases pass.
+Windows's pre-existing `test_cancel_kills_descendants` still fails with this
+machine's Python environment; do not treat Windows worker tree cancellation as
+verified. This deployment targets Linux and does not change Windows process control.

@@ -1,4 +1,5 @@
 import json
+from contextlib import closing
 import os
 import sqlite3
 import subprocess
@@ -133,7 +134,7 @@ class RetentionTests(unittest.TestCase):
                 state_dir = root.parent / ".video-state"
                 state_dir.mkdir()
                 db_path = state_dir / "jobs.sqlite3"
-                with sqlite3.connect(db_path) as db:
+                with closing(sqlite3.connect(db_path)) as db, db:
                     db.execute("CREATE TABLE jobs (job_id TEXT,status TEXT)")
                     db.execute("INSERT INTO jobs VALUES (?,?)", (job.name, state if state not in {"live_share", "changed_bytes"} else "completed"))
                 if state == "live_share":
@@ -150,7 +151,7 @@ class RetentionTests(unittest.TestCase):
                 report = retention.cleanup(root, apply=True, now=self.now)
                 self.assertEqual(report["deleted_files"], 7 if state == "completed" else 0)
                 self.assertTrue((job / "analysis/result.json").exists())
-                with sqlite3.connect(db_path) as db:
+                with closing(sqlite3.connect(db_path)) as db:
                     self.assertEqual(db.execute("SELECT count(*) FROM jobs").fetchone()[0], 1)
 
     def test_real_worker_dispatch_respects_cleanup_lock_for_every_operation(self):
