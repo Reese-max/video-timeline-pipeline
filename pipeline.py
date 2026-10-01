@@ -4293,6 +4293,11 @@ def submit_brightdata_once(folder: Path, url: str, headers: dict[str, str], body
             raise RuntimeError(f"上次送出狀態不明，禁止再次計費採集；請核對 {folder} 與 Bright Data。") from None
         try:
             receipt["response"] = request_json(url, headers, method="POST", body=body, timeout=60, attempts=1)
+        except cost_tracker.BudgetBlockedError:
+            # The guard proved the request never dispatched: release the marker
+            # so the submission can be retried once budget allows.
+            (folder / ".submitted").unlink(missing_ok=True)
+            raise
         except Exception as exc:
             receipt["error"] = str(exc)
         receipt["received_at"] = rss_now()

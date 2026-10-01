@@ -196,6 +196,9 @@ class ResendProvider(BaseProvider):
                 status="unknown",
                 safe_error=mask_sensitive(f"Network timeout/disruption during Resend request: {exc}"),
             )
+        except cost_tracker.BudgetBlockedError:
+            # Pre-dispatch budget denial is provably unsent, not "unknown".
+            raise
         except Exception as exc:
             return DeliveryResult(
                 status="unknown",
@@ -272,6 +275,9 @@ class SmtpProvider(BaseProvider):
                 status="unknown",
                 safe_error=mask_sensitive(f"SMTP socket disruption: {exc}"),
             )
+        except cost_tracker.BudgetBlockedError:
+            # Pre-dispatch budget denial is provably unsent, not "unknown".
+            raise
         except Exception as exc:
             return DeliveryResult(
                 status="unknown",
@@ -343,6 +349,9 @@ class WebhookProvider(BaseProvider):
                 status="permanent_failure",
                 safe_error=f"Webhook {exc.code}: {err_body[:200]}",
             )
+        except cost_tracker.BudgetBlockedError:
+            # Pre-dispatch budget denial is provably unsent, not "unknown".
+            raise
         except Exception as exc:
             return DeliveryResult(
                 status="unknown",

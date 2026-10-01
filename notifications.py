@@ -132,7 +132,16 @@ def _utc_now_iso() -> str:
 def _send_with_cost_tracking(root: Path, provider: BaseProvider, **kwargs: Any) -> DeliveryResult:
     """Make direct notification-provider calls inherit the issue #4 guard."""
     with cost_tracker.cost_tracking(root):
-        return provider.send(**kwargs)
+        try:
+            return provider.send(**kwargs)
+        except cost_tracker.BudgetBlockedError as exc:
+            # The guard proved nothing was sent: pause the delivery for retry
+            # instead of recording a misleading "unknown" outcome.
+            return DeliveryResult(
+                status="retryable_not_accepted",
+                safe_error=f"Budget blocked before dispatch: {exc.reason}",
+                retry_after_seconds=300,
+            )
 
 
 def record_event(

@@ -23,8 +23,6 @@ from contextlib import closing
 from pathlib import Path
 from typing import Any, Literal
 
-from notifications import get_operations_db
-
 CostStatus = Literal["actual", "estimated", "confirmed_included", "unknown", "zero_local"]
 UsageStatus = Literal["reserved", "sent", "succeeded", "failed", "unknown", "blocked_budget", "cache_hit"]
 ErrorTaxonomy = Literal[
@@ -48,6 +46,13 @@ class BudgetBlockedError(RuntimeError):
     def __init__(self, reason: str) -> None:
         self.reason = reason
         super().__init__(reason)
+
+
+def get_operations_db(root: Path) -> sqlite3.Connection:
+    """Late-importing wrapper; notifications imports this module for the guard."""
+    from notifications import get_operations_db as _get_operations_db
+
+    return _get_operations_db(root)
 
 
 _COST_ROOT: contextvars.ContextVar[Path | None] = contextvars.ContextVar(
@@ -84,24 +89,28 @@ def run_in_current_context(pool: Any, function: Any, *args: Any, **kwargs: Any) 
     return pool.submit(context.run, function, *args, **kwargs)
 
 
+def _host_matches(hostname: str, domain: str) -> bool:
+    return hostname == domain or hostname.endswith("." + domain)
+
+
 def provider_for_url(url: str) -> str:
     """Map known external hosts to the provider name used by the cost ledger."""
     hostname = (urllib_parse_hostname(url) or "").lower()
-    if hostname.endswith("groq.com"):
+    if _host_matches(hostname, "groq.com"):
         return "groq"
-    if hostname.endswith("minimax.io") or hostname.endswith("minimaxi.com"):
+    if _host_matches(hostname, "minimax.io") or _host_matches(hostname, "minimaxi.com"):
         return "minimax"
-    if hostname.endswith("openrouter.ai"):
+    if _host_matches(hostname, "openrouter.ai"):
         return "openrouter"
-    if hostname.endswith("apify.com"):
+    if _host_matches(hostname, "apify.com"):
         return "apify"
-    if hostname.endswith("brightdata.com"):
+    if _host_matches(hostname, "brightdata.com"):
         return "brightdata"
-    if hostname.endswith("graph.facebook.com"):
+    if _host_matches(hostname, "graph.facebook.com"):
         return "meta"
-    if hostname.endswith("resend.com"):
+    if _host_matches(hostname, "resend.com"):
         return "resend"
-    if hostname.endswith("googleapis.com") or hostname.endswith("oauth2.googleapis.com"):
+    if _host_matches(hostname, "googleapis.com"):
         return "google_drive"
     return "external"
 
@@ -131,8 +140,9 @@ def estimate_transport_cost_micro_usd(provider: str, operation: str) -> int:
 
 def _safe_transport_error(error: Exception) -> str:
     value = str(error)
+    value = re.sub(r"(?i)bearer\s+\S+", "bearer <redacted>", value)
     value = re.sub(
-        r"(?i)(authorization|api[_-]?key|access[_-]?token|password|secret)=?[^\s&,;]+",
+        r"(?i)(authorization|api[_-]?key|access[_-]?token|refresh[_-]?token|token|key|password|secret)\s*[:=]\s*[^\s&,;'\"]+",
         r"\1=<redacted>",
         value,
     )
@@ -185,7 +195,8 @@ def guarded_call(
         else max(0, int(estimated_micro_usd))
     )
     allowed, reservation_id, reason = check_and_reserve_budget(
-        active_root, operation_name=operation, estimated_micro_usd=estimate, account_scope=scope
+        active_root, operation_name=operation, estimated_micro_usd=estimate,
+        account_scope=scope, provider=provider,
     )
     if not allowed:
         raise BudgetBlockedError(reason)
@@ -376,6 +387,7 @@ def check_and_reserve_budget(
     operation_name: str,
     estimated_micro_usd: int,
     account_scope: str = "default",
+    provider: str = "system",
 ) -> tuple[bool, str | None, str]:
     """Check budget limits and atomically reserve funds before external network dispatch.
 
@@ -390,7 +402,12 @@ def check_and_reserve_budget(
 
         period_id = _current_period_id("daily")
 
-        with conn:
+        # BEGIN IMMEDIATE takes the write lock up front so concurrent workers
+        # cannot read the same pre-reservation totals and all reserve past the
+        # limit; the check and the INSERT run under one lock.
+        conn.isolation_level = None
+        conn.execute("BEGIN IMMEDIATE")
+        try:
             cur = conn.cursor()
             # Sum settled actual/estimated costs for today
             cur.execute(
@@ -416,9 +433,11 @@ def check_and_reserve_budget(
             outstanding_micro = int(cur.fetchone()[0])
 
             total_projected = settled_micro + outstanding_micro + estimated_micro_usd
+            blocked_reason: str | None = None
+            reservation_id: str | None = None
 
             if hard_stop and daily_budget_micro > 0 and total_projected > daily_budget_micro:
-                reason = (
+                blocked_reason = (
                     f"Budget blocked: projected ({total_projected / 1_000_000:.3f} USD) "
                     f"exceeds daily limit ({daily_budget_usd:.2f} USD)"
                 )
@@ -428,36 +447,42 @@ def check_and_reserve_budget(
                     INSERT INTO usage_costs (
                         cost_id, operation, provider, status, cost_status,
                         estimated_micro_usd, started_at, created_at, safe_error
-                    ) VALUES (?, ?, 'system', 'blocked_budget', 'zero_local', ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, 'blocked_budget', 'zero_local', ?, ?, ?, ?)
                     """,
-                    (str(uuid.uuid4()), operation_name, estimated_micro_usd, _utc_now_iso(), _utc_now_iso(), reason),
+                    (str(uuid.uuid4()), operation_name, provider, estimated_micro_usd, _utc_now_iso(), _utc_now_iso(), blocked_reason),
                 )
-                try:
-                    from notifications import record_event
+            else:
+                reservation_id = str(uuid.uuid4())
+                conn.execute(
+                    """
+                    INSERT INTO budget_reservations (
+                        reservation_id, operation_id, account_scope, period_id, max_micro_usd,
+                        status, lease_token, created_at
+                    ) VALUES (?, ?, ?, ?, ?, 'reserved', ?, ?)
+                    """,
+                    (reservation_id, operation_name, account_scope, period_id, estimated_micro_usd, str(uuid.uuid4()), _utc_now_iso()),
+                )
+        except BaseException:
+            conn.execute("ROLLBACK")
+            raise
+        conn.execute("COMMIT")
 
-                    record_event(
-                        conn,
-                        event_type="budget.blocked",
-                        library_id=None,
-                        job=None,
-                        analysis_revision=None,
-                        payload={"reason": reason, "period_id": period_id, "account_scope": account_scope},
-                        dedup_key=f"budget_blocked_{period_id}_{account_scope}",
-                    )
-                except Exception:
-                    pass
-                return False, None, reason
+        if blocked_reason is not None:
+            try:
+                from notifications import record_event
 
-            reservation_id = str(uuid.uuid4())
-            conn.execute(
-                """
-                INSERT INTO budget_reservations (
-                    reservation_id, operation_id, account_scope, period_id, max_micro_usd,
-                    status, lease_token, created_at
-                ) VALUES (?, ?, ?, ?, ?, 'reserved', ?, ?)
-                """,
-                (reservation_id, operation_name, account_scope, period_id, estimated_micro_usd, str(uuid.uuid4()), _utc_now_iso()),
-            )
+                record_event(
+                    conn,
+                    event_type="budget.blocked",
+                    library_id=None,
+                    job=None,
+                    analysis_revision=None,
+                    payload={"reason": blocked_reason, "period_id": period_id, "account_scope": account_scope},
+                    dedup_key=f"budget_blocked_{period_id}_{account_scope}",
+                )
+            except Exception:
+                pass
+            return False, None, blocked_reason
 
         return True, reservation_id, "Approved"
 
