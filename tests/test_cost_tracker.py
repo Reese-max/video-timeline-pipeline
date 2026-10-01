@@ -317,6 +317,40 @@ class TimezoneAwarePeriodTests(unittest.TestCase):
         self.assertEqual(by_id[old_id], ("2026-01-16", "reserved"))
         self.assertEqual(by_id[new_id], ("2026-01-17", "reserved"))
 
+    def test_legacy_utc_label_reservation_counts_in_local_day_window(self) -> None:
+        env = {
+            "COST_TIMEZONE": "Asia/Taipei",
+            "DAILY_BUDGET_USD": "0.010",
+            "BUDGET_HARD_STOP": "true",
+        }
+        with patch.dict(os.environ, env):
+            # The old UTC label was Jan 15, but 23:50Z is Jan 16 at 07:50 in Taipei.
+            with freeze_utc("2026-01-15T23:50:00Z"):
+                allowed_old, reservation_id, _ = cost_tracker.check_and_reserve_budget(
+                    self.root, "legacy_utc_reservation", 6000
+                )
+            self.assertTrue(allowed_old)
+            self.assertIsNotNone(reservation_id)
+
+            conn = cost_tracker.get_operations_db(self.root)
+            try:
+                # Simulate a row written by the prior UTC-period implementation.
+                conn.execute(
+                    "UPDATE budget_reservations SET period_id = ? WHERE reservation_id = ?",
+                    ("2026-01-15", reservation_id),
+                )
+            finally:
+                conn.close()
+
+            with freeze_utc("2026-01-15T23:55:00Z"):
+                allowed_new, next_id, reason = cost_tracker.check_and_reserve_budget(
+                    self.root, "after_upgrade", 5000
+                )
+
+        self.assertFalse(allowed_new)
+        self.assertIsNone(next_id)
+        self.assertIn("Budget blocked", reason)
+
     def test_settling_pre_midnight_reservation_after_rollover_preserves_period(self) -> None:
         env = {
             "COST_TIMEZONE": "Asia/Taipei",
