@@ -21,6 +21,8 @@ from dataclasses import dataclass
 from typing import Any, Literal
 from urllib.parse import urlparse
 
+import cost_tracker
+
 ProviderStatus = Literal["accepted", "retryable_not_accepted", "permanent_failure", "unknown"]
 
 
@@ -156,9 +158,12 @@ class ResendProvider(BaseProvider):
         )
 
         try:
-            with urllib.request.urlopen(req, timeout=20) as resp:
-                resp_data = json.loads(resp.read().decode("utf-8"))
-                return DeliveryResult(
+            def send_resend() -> dict[str, Any]:
+                with urllib.request.urlopen(req, timeout=20) as resp:
+                    return json.loads(resp.read().decode("utf-8"))
+
+            resp_data = cost_tracker.guarded_call("resend", "resend:email", send_resend)
+            return DeliveryResult(
                     status="accepted",
                     provider_message_id=resp_data.get("id"),
                 )
@@ -191,6 +196,9 @@ class ResendProvider(BaseProvider):
                 status="unknown",
                 safe_error=mask_sensitive(f"Network timeout/disruption during Resend request: {exc}"),
             )
+        except cost_tracker.CostGuardError:
+            # Pre-dispatch budget denial is provably unsent, not "unknown".
+            raise
         except Exception as exc:
             return DeliveryResult(
                 status="unknown",
@@ -238,16 +246,19 @@ class SmtpProvider(BaseProvider):
 
         try:
             context = ssl.create_default_context() if self.use_tls else None
-            with smtplib.SMTP(self.host, self.port, timeout=25) as server:
-                if self.use_tls:
-                    server.starttls(context=context)
-                if self.username and self.password:
-                    server.login(self.username, self.password)
-                server.send_message(msg)
-                return DeliveryResult(
-                    status="accepted",
-                    provider_message_id=msg["Message-ID"],
-                )
+            def send_smtp() -> DeliveryResult:
+                with smtplib.SMTP(self.host, self.port, timeout=25) as server:
+                    if self.use_tls:
+                        server.starttls(context=context)
+                    if self.username and self.password:
+                        server.login(self.username, self.password)
+                    server.send_message(msg)
+                    return DeliveryResult(
+                        status="accepted",
+                        provider_message_id=msg["Message-ID"],
+                    )
+
+            return cost_tracker.guarded_call("smtp", "smtp:email", send_smtp)
         except smtplib.SMTPAuthenticationError as exc:
             return DeliveryResult(
                 status="permanent_failure",
@@ -264,6 +275,9 @@ class SmtpProvider(BaseProvider):
                 status="unknown",
                 safe_error=mask_sensitive(f"SMTP socket disruption: {exc}"),
             )
+        except cost_tracker.CostGuardError:
+            # Pre-dispatch budget denial is provably unsent, not "unknown".
+            raise
         except Exception as exc:
             return DeliveryResult(
                 status="unknown",
@@ -311,9 +325,12 @@ class WebhookProvider(BaseProvider):
         )
 
         try:
-            with urllib.request.urlopen(req, timeout=15) as resp:
-                resp.read(512)
-                return DeliveryResult(status="accepted", provider_message_id=f"hook_{int(time.time())}")
+            def send_webhook() -> DeliveryResult:
+                with urllib.request.urlopen(req, timeout=15) as resp:
+                    resp.read(512)
+                    return DeliveryResult(status="accepted", provider_message_id=f"hook_{int(time.time())}")
+
+            return cost_tracker.guarded_call("webhook", "webhook:notify", send_webhook)
         except urllib.error.HTTPError as exc:
             err_body = exc.read().decode("utf-8", errors="ignore")
             if exc.code == 429:
@@ -332,6 +349,9 @@ class WebhookProvider(BaseProvider):
                 status="permanent_failure",
                 safe_error=f"Webhook {exc.code}: {err_body[:200]}",
             )
+        except cost_tracker.CostGuardError:
+            # Pre-dispatch budget denial is provably unsent, not "unknown".
+            raise
         except Exception as exc:
             return DeliveryResult(
                 status="unknown",

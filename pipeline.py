@@ -34,6 +34,8 @@ import xml.etree.ElementTree as ET
 from pathlib import Path
 from typing import Any, Callable
 
+import cost_tracker
+
 
 __version__ = "0.2.1"
 
@@ -293,8 +295,11 @@ def fetch_threads_html(url: str) -> str:
     for attempt in range(1, THREADS_REQUEST_ATTEMPTS + 1):
         request = urllib.request.Request(url, headers=headers, method="GET")
         try:
-            with urllib.request.urlopen(request, timeout=30) as response:
-                raw = response.read(THREADS_PAGE_MAX_BYTES + 1)
+            def fetch_page() -> bytes:
+                with urllib.request.urlopen(request, timeout=30) as response:
+                    return response.read(THREADS_PAGE_MAX_BYTES + 1)
+
+            raw = cost_tracker.guarded_call("threads", "threads:post:get", fetch_page)
             if len(raw) > THREADS_PAGE_MAX_BYTES:
                 raise RuntimeError("Threads 頁面超過 16 MB 安全上限。")
             return raw.decode("utf-8", errors="replace")
@@ -458,19 +463,23 @@ def _download_threads_media(
     for attempt in range(1, THREADS_REQUEST_ATTEMPTS + 1):
         request = urllib.request.Request(media_url, headers=headers, method="GET")
         try:
-            with urllib.request.urlopen(request, timeout=60) as response, temporary.open("wb") as output:
-                expected = _threads_number(response.headers.get("Content-Length"))
-                if max_filesize is not None and expected > max_filesize:
-                    raise RuntimeError(f"Threads 影片超過檔案大小上限：{target.name}。")
-                total = 0
-                while True:
-                    chunk = response.read(1024 * 1024)
-                    if not chunk:
-                        break
-                    total += len(chunk)
-                    if max_filesize is not None and total > max_filesize:
+            def download_media() -> int:
+                with urllib.request.urlopen(request, timeout=60) as response, temporary.open("wb") as output:
+                    expected = _threads_number(response.headers.get("Content-Length"))
+                    if max_filesize is not None and expected > max_filesize:
                         raise RuntimeError(f"Threads 影片超過檔案大小上限：{target.name}。")
-                    output.write(chunk)
+                    total = 0
+                    while True:
+                        chunk = response.read(1024 * 1024)
+                        if not chunk:
+                            break
+                        total += len(chunk)
+                        if max_filesize is not None and total > max_filesize:
+                            raise RuntimeError(f"Threads 影片超過檔案大小上限：{target.name}。")
+                        output.write(chunk)
+                    return total
+
+            total = cost_tracker.guarded_call("threads", "threads:media:get", download_media)
             if total <= 0:
                 raise RuntimeError(f"Threads 媒體是空檔案：{target.name}。")
             temporary.replace(target)
@@ -1226,14 +1235,33 @@ def request_json(
     body: bytes | None = None,
     timeout: int,
     attempts: int = 4,
+    cost_root: Path | None = None,
+    provider: str | None = None,
+    operation: str | None = None,
+    model: str | None = None,
 ) -> dict[str, Any]:
     headers = {"User-Agent": USER_AGENT, **headers}
+    provider_name = provider or cost_tracker.provider_for_url(url)
+    url_path = urllib.parse.urlsplit(url).path or "/"
+    operation_name = operation or f"{provider_name}:{method.lower()}:{url_path}"
     delay = 2.0
     for attempt in range(1, attempts + 1):
         request = urllib.request.Request(url, data=body, headers=headers, method=method)
         try:
-            with urllib.request.urlopen(request, timeout=timeout) as response:
-                raw = response.read()
+            def send_request() -> tuple[bytes, dict[str, str]]:
+                with urllib.request.urlopen(request, timeout=timeout) as response:
+                    response_headers = getattr(response, "headers", {})
+                    items = response_headers.items() if hasattr(response_headers, "items") else ()
+                    return response.read(), dict(items)
+
+            raw, _response_headers = cost_tracker.guarded_call(
+                provider_name,
+                operation_name,
+                send_request,
+                root=cost_root,
+                model=model,
+                request_units=len(body or b""),
+            )
             break
         except urllib.error.HTTPError as exc:
             detail = exc.read().decode("utf-8", errors="replace")
@@ -1260,12 +1288,49 @@ def request_json(
         raise RuntimeError(f"API 回應不是 JSON：{raw[:500]!r}") from exc
 
 
-def post_json(url: str, headers: dict[str, str], body: bytes, timeout: int = 180) -> dict[str, Any]:
-    return request_json(url, headers, method="POST", body=body, timeout=timeout)
+def post_json(
+    url: str,
+    headers: dict[str, str],
+    body: bytes,
+    timeout: int = 180,
+    *,
+    cost_root: Path | None = None,
+    provider: str | None = None,
+    operation: str | None = None,
+    model: str | None = None,
+) -> dict[str, Any]:
+    return request_json(
+        url,
+        headers,
+        method="POST",
+        body=body,
+        timeout=timeout,
+        cost_root=cost_root,
+        provider=provider,
+        operation=operation,
+        model=model,
+    )
 
 
-def get_json(url: str, headers: dict[str, str]) -> dict[str, Any]:
-    return request_json(url, headers, method="GET", timeout=30)
+def get_json(
+    url: str,
+    headers: dict[str, str],
+    *,
+    cost_root: Path | None = None,
+    provider: str | None = None,
+    operation: str | None = None,
+    model: str | None = None,
+) -> dict[str, Any]:
+    return request_json(
+        url,
+        headers,
+        method="GET",
+        timeout=30,
+        cost_root=cost_root,
+        provider=provider,
+        operation=operation,
+        model=model,
+    )
 
 
 RSS_MAX_BYTES = 5 * 1024 * 1024
@@ -1324,10 +1389,16 @@ def fetch_rss(url: str, etag: str = "", last_modified: str = "") -> dict[str, An
     for attempt in range(1, 5):
         request = urllib.request.Request(url, headers=headers, method="GET")
         try:
-            with urllib.request.urlopen(request, timeout=30) as response:
-                final_url = require_http_url(response.geturl(), "RSS 重新導向 URL")
-                raw = response.read(RSS_MAX_BYTES + 1)
-                response_headers = getattr(response, "headers", {})
+            def fetch_feed() -> tuple[str, bytes, Any]:
+                with urllib.request.urlopen(request, timeout=30) as response:
+                    final_url = require_http_url(response.geturl(), "RSS 重新導向 URL")
+                    raw = response.read(RSS_MAX_BYTES + 1)
+                    response_headers = getattr(response, "headers", {})
+                return final_url, raw, response_headers
+
+            final_url, raw, response_headers = cost_tracker.guarded_call(
+                "rss", "rss:fetch", fetch_feed
+            )
             if len(raw) > RSS_MAX_BYTES:
                 raise RuntimeError("RSS Feed 超過 5 MB 安全上限。")
             parsed = parse_feed_xml(raw, final_url)
@@ -1585,7 +1656,7 @@ def transcribe_all(
     cache_keys: dict[int, str] = {}
     elapsed: dict[int, float] = {}
     with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, min(workers, 4))) as pool:
-        futures = [pool.submit(one, chunk) for chunk in chunks]
+        futures = [cost_tracker.run_in_current_context(pool, one, chunk) for chunk in chunks]
         for future in concurrent.futures.as_completed(futures):
             index, result, key, hit, seconds = future.result()
             results[index] = result
@@ -2090,7 +2161,7 @@ def analyze_images(
 
     results: dict[int, dict[str, Any]] = {}
     with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, min(workers, 8))) as pool:
-        futures = [pool.submit(one, item) for item in enumerate(candidates)]
+        futures = [cost_tracker.run_in_current_context(pool, one, item) for item in enumerate(candidates)]
         for future in concurrent.futures.as_completed(futures):
             index, observation = future.result()
             results[index] = observation
@@ -2101,8 +2172,8 @@ def run_parallel_stages(
     first_stage: Callable[[], Any], second_stage: Callable[[], Any]
 ) -> tuple[Any, Any]:
     with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
-        first = pool.submit(first_stage)
-        second = pool.submit(second_stage)
+        first = cost_tracker.run_in_current_context(pool, first_stage)
+        second = cost_tracker.run_in_current_context(pool, second_stage)
         return first.result(), second.result()
 
 
@@ -2319,7 +2390,7 @@ def create_summary(
 
         results: dict[int, dict[str, Any]] = {}
         with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, min(workers, 4))) as pool:
-            futures = [pool.submit(summarize_chunk, item) for item in enumerate(chunks, 1)]
+            futures = [cost_tracker.run_in_current_context(pool, summarize_chunk, item) for item in enumerate(chunks, 1)]
             for future in concurrent.futures.as_completed(futures):
                 index, partial = future.result()
                 results[index] = partial
@@ -4222,6 +4293,12 @@ def submit_brightdata_once(folder: Path, url: str, headers: dict[str, str], body
             raise RuntimeError(f"上次送出狀態不明，禁止再次計費採集；請核對 {folder} 與 Bright Data。") from None
         try:
             receipt["response"] = request_json(url, headers, method="POST", body=body, timeout=60, attempts=1)
+        except cost_tracker.CostGuardError:
+            # The guard failed before the transport opened — the request
+            # provably never dispatched: release the marker so the submission
+            # can be retried once the guard clears.
+            (folder / ".submitted").unlink(missing_ok=True)
+            raise
         except Exception as exc:
             receipt["error"] = str(exc)
         receipt["received_at"] = rss_now()
@@ -4274,6 +4351,8 @@ def fetch_social_post(url: str, cache_root: Path, *, allow_paid: bool = False) -
         result = {**state, **normalize_social_post(rows[0], canonical), "fetched_at": rss_now()}
         write_json(checkpoint, result)
         return result
+    except cost_tracker.CostGuardError:
+        raise
     except Exception as exc:
         raise RuntimeError(str(exc).replace(token, "<redacted>")) from None
 
@@ -4346,6 +4425,8 @@ def fetch_instagram_author(
             f"{BRIGHTDATA_API_ROOT}/snapshot/{urllib.parse.quote(snapshot_id, safe='')}?format=json"
         )
         result = get_json(snapshot_url, headers)
+    except cost_tracker.CostGuardError:
+        raise
     except Exception as exc:
         raise RuntimeError(str(exc).replace(token, "<redacted>")) from None
 
@@ -4483,6 +4564,21 @@ def add_rss_subscription(
     tags: list[str] | None = None,
     latest_only: bool = False,
 ) -> tuple[dict[str, Any], dict[str, int]]:
+    with cost_tracker.cost_tracking(root):
+        return _add_rss_subscription(
+            root, url, name=name, keywords=keywords, tags=tags, latest_only=latest_only
+        )
+
+
+def _add_rss_subscription(
+    root: Path,
+    url: str,
+    *,
+    name: str = "",
+    keywords: list[str] | None = None,
+    tags: list[str] | None = None,
+    latest_only: bool = False,
+) -> tuple[dict[str, Any], dict[str, int]]:
     root.mkdir(parents=True, exist_ok=True)
     url = require_http_url(url, "RSS Feed URL")
     state = load_rss_state(root)
@@ -4510,6 +4606,25 @@ def add_rss_subscription(
 
 
 def add_facebook_subscription(
+    root: Path,
+    author: str,
+    *,
+    since: str = "365d",
+    provider: str = "meta",
+    allow_paid: bool = False,
+    name: str = "",
+    keywords: list[str] | None = None,
+    tags: list[str] | None = None,
+    latest_only: bool = False,
+) -> tuple[dict[str, Any], dict[str, int], Path]:
+    with cost_tracker.cost_tracking(root):
+        return _add_facebook_subscription(
+            root, author, since=since, provider=provider, allow_paid=allow_paid,
+            name=name, keywords=keywords, tags=tags, latest_only=latest_only,
+        )
+
+
+def _add_facebook_subscription(
     root: Path,
     author: str,
     *,
@@ -4568,6 +4683,25 @@ def add_instagram_subscription(
     tags: list[str] | None = None,
     latest_only: bool = False,
 ) -> tuple[dict[str, Any], dict[str, int], Path]:
+    with cost_tracker.cost_tracking(root):
+        return _add_instagram_subscription(
+            root, author, since=since, max_items=max_items, allow_paid=allow_paid,
+            name=name, keywords=keywords, tags=tags, latest_only=latest_only,
+        )
+
+
+def _add_instagram_subscription(
+    root: Path,
+    author: str,
+    *,
+    since: str = "365d",
+    max_items: int | None = None,
+    allow_paid: bool = False,
+    name: str = "",
+    keywords: list[str] | None = None,
+    tags: list[str] | None = None,
+    latest_only: bool = False,
+) -> tuple[dict[str, Any], dict[str, int], Path]:
     root.mkdir(parents=True, exist_ok=True)
     username = instagram_username(author)
     state = load_rss_state(root)
@@ -4607,6 +4741,11 @@ def add_instagram_subscription(
 
 
 def refresh_rss(root: Path, workers: int = 4, allow_paid: bool = False) -> dict[str, int]:
+    with cost_tracker.cost_tracking(root):
+        return _refresh_rss(root, workers, allow_paid)
+
+
+def _refresh_rss(root: Path, workers: int = 4, allow_paid: bool = False) -> dict[str, int]:
     state = load_rss_state(root)
     if not state["subscriptions"]:
         raise RuntimeError("尚未加入 RSS 訂閱；先使用 --rss-add。")
@@ -4661,7 +4800,8 @@ def refresh_rss(root: Path, workers: int = 4, allow_paid: bool = False) -> dict[
 
     results: list[tuple[dict[str, Any] | None, Exception | None]] = []
     with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, min(workers, 4, len(enabled) or 1))) as pool:
-        results = list(pool.map(fetch_one, enabled))
+        futures = [cost_tracker.run_in_current_context(pool, fetch_one, item) for item in enabled]
+        results = [future.result() for future in futures]
     for subscription, (feed, error) in zip(enabled, results):
         subscription["last_checked"] = rss_now()
         if error is None and feed is not None:
@@ -5023,8 +5163,13 @@ def send_rss_notification(webhook: str, event: str, item: dict[str, Any]) -> Non
         method="POST",
     )
     try:
-        with urllib.request.urlopen(request, timeout=15) as response:
-            response.read(1024)
+        def send_notification() -> bytes:
+            with urllib.request.urlopen(request, timeout=15) as response:
+                return response.read(1024)
+
+        cost_tracker.guarded_call("rss_webhook", "rss_webhook:post", send_notification)
+    except cost_tracker.CostGuardError:
+        raise
     except Exception as exc:
         detail = sanitize_public_urls(str(exc))
         raise RuntimeError(f"RSS 通知失敗（{public_url(url)}）：{detail}") from exc
@@ -5181,6 +5326,11 @@ def rss_requested(args: argparse.Namespace) -> bool:
 
 
 def run_rss_command(args: argparse.Namespace) -> int:
+    with cost_tracker.cost_tracking(args.root.resolve()):
+        return _run_rss_command(args)
+
+
+def _run_rss_command(args: argparse.Namespace) -> int:
     if args.url or args.video or args.url_file:
         raise ValueError("訂閱指令不可與 --url、--video 或 --url-file 同時使用。")
     if sum(bool(value) for value in (args.rss_add, args.facebook_author, args.instagram_author)) > 1:
@@ -6472,6 +6622,11 @@ def run_batch(args: argparse.Namespace) -> Path:
 
 
 def run_pipeline(args: argparse.Namespace) -> Path:
+    with cost_tracker.cost_tracking(args.root.resolve()):
+        return _run_pipeline(args)
+
+
+def _run_pipeline(args: argparse.Namespace) -> Path:
     root = args.root.resolve()
     root.mkdir(parents=True, exist_ok=True)
     # --root 是輸出目錄，不該綁著設定檔：先讀專案自己的 .env，再讓輸出目錄的 .env 覆蓋。
@@ -6885,6 +7040,13 @@ def run_pipeline(args: argparse.Namespace) -> Path:
 
 def main() -> int:
     args = parse_args()
+    if args.self_test:
+        return _main(args)
+    with cost_tracker.cost_tracking(args.root.resolve()):
+        return _main(args)
+
+
+def _main(args: argparse.Namespace) -> int:
     if args.self_test:
         self_test()
         return 0

@@ -11,15 +11,17 @@ Guarantees:
 from __future__ import annotations
 
 import datetime
+import contextlib
+import contextvars
 import json
 import os
+import re
 import sqlite3
+import time
 import uuid
 from contextlib import closing
 from pathlib import Path
 from typing import Any, Literal
-
-from notifications import get_operations_db
 
 CostStatus = Literal["actual", "estimated", "confirmed_included", "unknown", "zero_local"]
 UsageStatus = Literal["reserved", "sent", "succeeded", "failed", "unknown", "blocked_budget", "cache_hit"]
@@ -36,6 +38,232 @@ ErrorTaxonomy = Literal[
     "content_rejected",
     "unknown",
 ]
+
+
+class CostGuardError(RuntimeError):
+    """The cost guard failed before the transport opened; nothing was dispatched."""
+
+
+class BudgetBlockedError(CostGuardError):
+    """Raised before a provider transport is opened when the budget denies it."""
+
+    def __init__(self, reason: str) -> None:
+        self.reason = reason
+        super().__init__(reason)
+
+
+def get_operations_db(root: Path) -> sqlite3.Connection:
+    """Late-importing wrapper; notifications imports this module for the guard."""
+    from notifications import get_operations_db as _get_operations_db
+
+    return _get_operations_db(root)
+
+
+_COST_ROOT: contextvars.ContextVar[Path | None] = contextvars.ContextVar(
+    "cost_tracker_root", default=None
+)
+_COST_ACCOUNT_SCOPE: contextvars.ContextVar[str] = contextvars.ContextVar(
+    "cost_tracker_account_scope", default="default"
+)
+
+
+@contextlib.contextmanager
+def cost_tracking(root: Path, account_scope: str = "default"):
+    """Enable guarded provider transports for the current call context."""
+    root_token = _COST_ROOT.set(Path(root).resolve())
+    scope_token = _COST_ACCOUNT_SCOPE.set(account_scope)
+    try:
+        yield
+    finally:
+        _COST_ACCOUNT_SCOPE.reset(scope_token)
+        _COST_ROOT.reset(root_token)
+
+
+def current_cost_root() -> Path | None:
+    return _COST_ROOT.get()
+
+
+def current_account_scope() -> str:
+    return _COST_ACCOUNT_SCOPE.get()
+
+
+def run_in_current_context(pool: Any, function: Any, *args: Any, **kwargs: Any) -> Any:
+    """Submit work while preserving the active cost-guard context in a worker."""
+    context = contextvars.copy_context()
+    return pool.submit(context.run, function, *args, **kwargs)
+
+
+def _host_matches(hostname: str, domain: str) -> bool:
+    return hostname == domain or hostname.endswith("." + domain)
+
+
+def provider_for_url(url: str) -> str:
+    """Map known external hosts to the provider name used by the cost ledger."""
+    hostname = (urllib_parse_hostname(url) or "").lower()
+    if _host_matches(hostname, "groq.com"):
+        return "groq"
+    if _host_matches(hostname, "minimax.io") or _host_matches(hostname, "minimaxi.com"):
+        return "minimax"
+    if _host_matches(hostname, "openrouter.ai"):
+        return "openrouter"
+    if _host_matches(hostname, "apify.com"):
+        return "apify"
+    if _host_matches(hostname, "brightdata.com"):
+        return "brightdata"
+    if _host_matches(hostname, "graph.facebook.com"):
+        return "meta"
+    if _host_matches(hostname, "resend.com"):
+        return "resend"
+    if _host_matches(hostname, "googleapis.com"):
+        return "google_drive"
+    return "external"
+
+
+def urllib_parse_hostname(url: str) -> str:
+    # Keep this module independent from pipeline while still handling query strings safely.
+    from urllib.parse import urlsplit
+
+    return urlsplit(url).hostname or ""
+
+
+def estimate_transport_cost_micro_usd(provider: str, operation: str) -> int:
+    """Return a conservative integer reservation for one network attempt."""
+    normalized = operation.lower()
+    if provider == "apify":
+        return 50_000 if any(word in normalized for word in ("start", "trigger", "actor")) else 100
+    if provider == "brightdata":
+        return 50_000 if any(word in normalized for word in ("trigger", "submit")) else 100
+    if provider in {"groq", "minimax", "resend", "email", "smtp", "webhook"}:
+        return 1_000
+    if provider == "openrouter":
+        return 200
+    if provider == "google_drive":
+        return 100
+    return 0
+
+
+def _safe_transport_error(error: Exception) -> str:
+    value = str(error)
+    value = re.sub(r"(?i)bearer\s+\S+", "bearer <redacted>", value)
+    value = re.sub(
+        r"(?i)(authorization|api[_-]?key|access[_-]?token|refresh[_-]?token|token|key|password|secret)\s*[:=]\s*[^\s&,;'\"]+",
+        r"\1=<redacted>",
+        value,
+    )
+    return value[:500]
+
+
+def mark_reservation_sent(root: Path, reservation_id: str) -> None:
+    """Mark a reservation sent immediately before opening the external transport."""
+    with closing(get_operations_db(root)) as conn:
+        with conn:
+            cursor = conn.execute(
+                """
+                UPDATE budget_reservations
+                SET status = 'sent', sent_at = ?
+                WHERE reservation_id = ? AND status = 'reserved'
+                """,
+                (_utc_now_iso(), reservation_id),
+            )
+            if cursor.rowcount != 1:
+                raise RuntimeError("Cost guard reservation disappeared before transport dispatch.")
+
+
+def guarded_call(
+    provider: str,
+    operation: str,
+    function: Any,
+    *args: Any,
+    root: Path | None = None,
+    model: str | None = None,
+    request_units: int = 0,
+    response_units: int = 0,
+    estimated_micro_usd: int | None = None,
+    account_scope: str | None = None,
+    **kwargs: Any,
+) -> Any:
+    """Reserve, send, and record one provider transport attempt.
+
+    The callback is never invoked when the hard budget blocks. Database errors
+    before the callback are intentionally propagated so telemetry failure cannot
+    turn into a fail-open paid request.
+    """
+    active_root = Path(root).resolve() if root is not None else current_cost_root()
+    if active_root is None:
+        return function(*args, **kwargs)
+
+    scope = account_scope or current_account_scope()
+    estimate = (
+        estimate_transport_cost_micro_usd(provider, operation)
+        if estimated_micro_usd is None
+        else max(0, int(estimated_micro_usd))
+    )
+    try:
+        allowed, reservation_id, reason = check_and_reserve_budget(
+            active_root, operation_name=operation, estimated_micro_usd=estimate,
+            account_scope=scope, provider=provider,
+        )
+    except CostGuardError:
+        raise
+    except Exception as exc:
+        # The transport callback has not run: mark the failure as provably
+        # unsent so callers may safely retry instead of treating it as an
+        # uncertain remote submission.
+        raise CostGuardError(f"cost guard failed before dispatch: {exc}") from exc
+    if not allowed:
+        raise BudgetBlockedError(reason)
+    if reservation_id is None:
+        raise CostGuardError("Cost guard approved a transport without a reservation.")
+
+    try:
+        mark_reservation_sent(active_root, reservation_id)
+    except Exception as exc:
+        raise CostGuardError(f"cost guard failed before dispatch: {exc}") from exc
+    started = time.monotonic()
+    try:
+        result = function(*args, **kwargs)
+    except Exception as error:
+        category = classify_error(error)
+        status: UsageStatus = "unknown" if category == "timeout" else "failed"
+        try:
+            record_usage(
+                active_root,
+                provider=provider,
+                operation=operation,
+                model=model,
+                request_units=request_units,
+                response_units=response_units,
+                latency_ms=(time.monotonic() - started) * 1000,
+                status=status,
+                safe_error=_safe_transport_error(error),
+                reservation_id=reservation_id,
+                account_scope=scope,
+            )
+        except Exception:
+            # The original provider error is more actionable; the sent
+            # reservation remains non-reserved if settlement itself failed.
+            pass
+        raise
+
+    try:
+        record_usage(
+            active_root,
+            provider=provider,
+            operation=operation,
+            model=model,
+            request_units=request_units,
+            response_units=response_units,
+            latency_ms=(time.monotonic() - started) * 1000,
+            status="succeeded",
+            reservation_id=reservation_id,
+            account_scope=scope,
+        )
+    except Exception:
+        # Telemetry failure must not mislabel a completed transport; the
+        # reservation stays 'sent' and keeps counting as outstanding risk,
+        # while the next reservation attempt still fails closed on a dead DB.
+        pass
+    return result
 
 
 def classify_error(
@@ -72,7 +300,7 @@ def classify_error(
             return "content_rejected"
         return "invalid_request"
 
-    if "timeout" in combined or "timed out" in combined or status_code in (408, 504):
+    if isinstance(error, TimeoutError) or "timeout" in combined or "timed out" in combined or status_code in (408, 504):
         return "timeout"
 
     if "connection" in combined or "network" in combined or "dns" in combined or "econnrefused" in combined:
@@ -182,6 +410,7 @@ def check_and_reserve_budget(
     operation_name: str,
     estimated_micro_usd: int,
     account_scope: str = "default",
+    provider: str = "system",
 ) -> tuple[bool, str | None, str]:
     """Check budget limits and atomically reserve funds before external network dispatch.
 
@@ -196,14 +425,20 @@ def check_and_reserve_budget(
 
         period_id = _current_period_id("daily")
 
-        with conn:
+        # BEGIN IMMEDIATE takes the write lock up front so concurrent workers
+        # cannot read the same pre-reservation totals and all reserve past the
+        # limit; the check and the INSERT run under one lock.
+        conn.isolation_level = None
+        conn.execute("BEGIN IMMEDIATE")
+        try:
             cur = conn.cursor()
             # Sum settled actual/estimated costs for today
             cur.execute(
                 """
                 SELECT COALESCE(SUM(estimated_micro_usd), 0)
                 FROM usage_costs
-                WHERE account_scope = ? AND created_at LIKE ? AND status != 'blocked_budget'
+                WHERE account_scope = ? AND created_at LIKE ?
+                  AND status NOT IN ('blocked_budget', 'unknown')
                 """,
                 (account_scope, f"{period_id}%"),
             )
@@ -214,16 +449,18 @@ def check_and_reserve_budget(
                 """
                 SELECT COALESCE(SUM(max_micro_usd), 0)
                 FROM budget_reservations
-                WHERE account_scope = ? AND period_id = ? AND status = 'reserved'
+                WHERE account_scope = ? AND period_id = ? AND status IN ('reserved', 'sent', 'unknown')
                 """,
                 (account_scope, period_id),
             )
             outstanding_micro = int(cur.fetchone()[0])
 
             total_projected = settled_micro + outstanding_micro + estimated_micro_usd
+            blocked_reason: str | None = None
+            reservation_id: str | None = None
 
             if hard_stop and daily_budget_micro > 0 and total_projected > daily_budget_micro:
-                reason = (
+                blocked_reason = (
                     f"Budget blocked: projected ({total_projected / 1_000_000:.3f} USD) "
                     f"exceeds daily limit ({daily_budget_usd:.2f} USD)"
                 )
@@ -231,38 +468,44 @@ def check_and_reserve_budget(
                 conn.execute(
                     """
                     INSERT INTO usage_costs (
-                        cost_id, operation, provider, status, cost_status,
+                        cost_id, operation, provider, account_scope, status, cost_status,
                         estimated_micro_usd, started_at, created_at, safe_error
-                    ) VALUES (?, ?, 'system', 'blocked_budget', 'zero_local', ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, 'blocked_budget', 'zero_local', ?, ?, ?, ?)
                     """,
-                    (str(uuid.uuid4()), operation_name, estimated_micro_usd, _utc_now_iso(), _utc_now_iso(), reason),
+                    (str(uuid.uuid4()), operation_name, provider, account_scope, estimated_micro_usd, _utc_now_iso(), _utc_now_iso(), blocked_reason),
                 )
-                try:
-                    from notifications import record_event
+            else:
+                reservation_id = str(uuid.uuid4())
+                conn.execute(
+                    """
+                    INSERT INTO budget_reservations (
+                        reservation_id, operation_id, account_scope, period_id, max_micro_usd,
+                        status, lease_token, created_at
+                    ) VALUES (?, ?, ?, ?, ?, 'reserved', ?, ?)
+                    """,
+                    (reservation_id, operation_name, account_scope, period_id, estimated_micro_usd, str(uuid.uuid4()), _utc_now_iso()),
+                )
+        except BaseException:
+            conn.execute("ROLLBACK")
+            raise
+        conn.execute("COMMIT")
 
-                    record_event(
-                        conn,
-                        event_type="budget.blocked",
-                        library_id=None,
-                        job=None,
-                        analysis_revision=None,
-                        payload={"reason": reason, "period_id": period_id, "account_scope": account_scope},
-                        dedup_key=f"budget_blocked_{period_id}_{account_scope}",
-                    )
-                except Exception:
-                    pass
-                return False, None, reason
+        if blocked_reason is not None:
+            try:
+                from notifications import record_event
 
-            reservation_id = str(uuid.uuid4())
-            conn.execute(
-                """
-                INSERT INTO budget_reservations (
-                    reservation_id, operation_id, account_scope, period_id, max_micro_usd,
-                    status, lease_token, created_at
-                ) VALUES (?, ?, ?, ?, ?, 'reserved', ?, ?)
-                """,
-                (reservation_id, operation_name, account_scope, period_id, estimated_micro_usd, str(uuid.uuid4()), _utc_now_iso()),
-            )
+                record_event(
+                    conn,
+                    event_type="budget.blocked",
+                    library_id=None,
+                    job=None,
+                    analysis_revision=None,
+                    payload={"reason": blocked_reason, "period_id": period_id, "account_scope": account_scope},
+                    dedup_key=f"budget_blocked_{period_id}_{account_scope}",
+                )
+            except Exception:
+                pass
+            return False, None, blocked_reason
 
         return True, reservation_id, "Approved"
 
@@ -284,6 +527,7 @@ def record_usage(
     provider_request_id: str | None = None,
     reservation_id: str | None = None,
     actual_micro_usd: int | None = None,
+    account_scope: str | None = None,
 ) -> str:
     """Record a completed or failed operation attempt and settle reservation."""
     with closing(get_operations_db(root)) as conn:
@@ -303,11 +547,12 @@ def record_usage(
             conn.execute(
                 """
                 INSERT INTO usage_costs (
-                    cost_id, library_id, job, analysis_revision, provider, model, operation,
+                    cost_id, library_id, job, analysis_revision, provider, account_scope,
+                    model, operation,
                     request_units, response_units, started_at, finished_at, latency_ms,
                     cache_hit, status, safe_error, provider_request_id,
                     estimated_micro_usd, actual_micro_usd, cost_status, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     cost_id,
@@ -315,6 +560,7 @@ def record_usage(
                     job,
                     analysis_revision,
                     provider,
+                    account_scope or "default",
                     model,
                     operation,
                     request_units,
@@ -333,15 +579,17 @@ def record_usage(
                 ),
             )
 
-            # Settle budget reservation if one exists
+            # Unknown outcomes retain the reservation as outstanding until a
+            # provider reconciliation can prove what was billed. Definite
+            # success/failure releases the reservation into the usage ledger.
             if reservation_id:
                 conn.execute(
                     """
                     UPDATE budget_reservations
-                    SET status = 'settled', settled_at = ?
+                    SET status = ?, settled_at = CASE WHEN ? = 'unknown' THEN NULL ELSE ? END
                     WHERE reservation_id = ?
                     """,
-                    (now_iso, reservation_id),
+                    ("unknown" if status == "unknown" else "settled", status, now_iso, reservation_id),
                 )
 
         return cost_id

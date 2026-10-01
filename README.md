@@ -456,6 +456,30 @@ python pipeline.py --digest
 
 > 呼叫 MiniMax 一律不設 `max_tokens`。MiniMax-M3 是 reasoning 模型，`<think>` 會先吃掉配額，設了上限常常在真正的答案輸出前就用完，回傳半截 JSON。
 
+## 成本 Guard
+
+所有啟用的外部 transport 都會在開啟網路連線前經過同一個成本 guard：Groq、MiniMax、OpenRouter、Meta、Apify、Bright Data、Open Notebook、RSS／Webhook、通知 Email／SMTP，以及 MCP 的 Google Drive 上傳。每次實際嘗試會先在 `operations.db` 原子預留，再記錄成功、失敗或結果不明的 attempt；timeout 不會自動釋放在途預留。
+
+啟用每日硬上限的例子：
+
+```dotenv
+DAILY_BUDGET_USD=1.00
+BUDGET_HARD_STOP=true
+COST_TIMEZONE=Asia/Taipei
+```
+
+`BUDGET_HARD_STOP=true` 且預估金額超過剩餘預算時，transport callback 不會被呼叫；`--allow-batch-cloud` 仍是另外一層明確的雲端處理開關。預設 `BUDGET_HARD_STOP=false` 會保留用量紀錄但不阻擋，適合先觀察估算值。報表只讀本機資料庫，不會為了查詢成本再次呼叫供應商：
+
+```powershell
+python pipeline.py --cost-report daily
+python pipeline.py --cost-report monthly
+python pipeline.py --budget-status
+python pipeline.py --provider-health
+python pipeline.py --failed-list
+```
+
+本地快取命中不產生新的外部 attempt；供應商實際帳單、共用帳戶的其他程式花費與無法取消的遠端工作仍需以供應商端資料對帳，不能解讀成本報表為完整帳單或絕對零超支保證。
+
 ## 語意檢索
 
 關鍵字檢索只找得到字面相同的詞。補上向量後，「厚皮動物」也能命中講大象的片段：

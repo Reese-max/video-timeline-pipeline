@@ -19,6 +19,7 @@ import urllib.request
 from pathlib import Path
 from typing import Any
 
+import cost_tracker
 from pipeline import write_json
 
 
@@ -94,8 +95,11 @@ def _access_token() -> str:
         method="POST",
     )
     try:
-        with urllib.request.urlopen(request, timeout=30) as response:
-            payload = json.loads(response.read().decode("utf-8"))
+        def refresh_token() -> dict[str, Any]:
+            with urllib.request.urlopen(request, timeout=30) as response:
+                return json.loads(response.read().decode("utf-8"))
+
+        payload = cost_tracker.guarded_call("google_drive", "google_drive:oauth", refresh_token)
     except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError) as exc:
         raise RuntimeError("Google Drive OAuth 更新失敗。") from exc
     token = str(payload.get("access_token") or "").strip()
@@ -120,8 +124,16 @@ def _api_json(
         method=method,
     )
     try:
-        with urllib.request.urlopen(request, timeout=30) as response:
-            result = json.loads(response.read().decode("utf-8"))
+        def request_json() -> dict[str, Any]:
+            with urllib.request.urlopen(request, timeout=30) as response:
+                return json.loads(response.read().decode("utf-8"))
+
+        result = cost_tracker.guarded_call(
+            "google_drive",
+            f"google_drive:{method.lower()}:{urllib.parse.urlsplit(url).path or '/'}",
+            request_json,
+            request_units=len(request.data or b"") if request.data else 0,
+        )
     except urllib.error.HTTPError as exc:
         raise DriveAPIError(exc.code) from exc
     except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as exc:
@@ -206,8 +218,11 @@ def _upload_file(
         method="POST",
     )
     try:
-        with urllib.request.urlopen(init_request, timeout=30) as response:
-            upload_url = str(response.headers.get("Location") or "").strip()
+        def initialize_upload() -> str:
+            with urllib.request.urlopen(init_request, timeout=30) as response:
+                return str(response.headers.get("Location") or "").strip()
+
+        upload_url = cost_tracker.guarded_call("google_drive", "google_drive:upload:init", initialize_upload)
     except urllib.error.HTTPError as exc:
         if exc.code == 409 and file_id:
             return _get_file(token, file_id) or {}
@@ -223,29 +238,37 @@ def _upload_file(
     request_path = parsed.path + (f"?{parsed.query}" if parsed.query else "")
     offset, failures, query_status = 0, 0, False
     while True:
-        connection = http.client.HTTPSConnection(parsed.netloc, timeout=120)
         length = 0 if query_status else min(UPLOAD_CHUNK_BYTES, size - offset)
         status, received = None, ""
+
+        def upload_chunk() -> tuple[int, bytes, str]:
+            connection = http.client.HTTPSConnection(parsed.netloc, timeout=120)
+            try:
+                connection.putrequest("PUT", request_path)
+                connection.putheader("Authorization", f"Bearer {token}")
+                connection.putheader("Content-Type", mime_type)
+                connection.putheader("Content-Length", str(length))
+                connection.putheader("Content-Range", f"bytes */{size}" if query_status
+                                     else f"bytes {offset}-{offset + length - 1}/{size}")
+                connection.endheaders()
+                if length:
+                    with path.open("rb") as source:
+                        source.seek(offset)
+                        connection.send(source.read(length))
+                response = connection.getresponse()
+                return response.status, response.read(), response.getheader("Range") or ""
+            finally:
+                connection.close()
+
         try:
-            connection.putrequest("PUT", request_path)
-            connection.putheader("Authorization", f"Bearer {token}")
-            connection.putheader("Content-Type", mime_type)
-            connection.putheader("Content-Length", str(length))
-            connection.putheader("Content-Range", f"bytes */{size}" if query_status
-                                 else f"bytes {offset}-{offset + length - 1}/{size}")
-            connection.endheaders()
-            if length:
-                with path.open("rb") as source:
-                    source.seek(offset)
-                    connection.send(source.read(length))
-            response = connection.getresponse()
-            raw = response.read()
-            status = response.status
-            received = response.getheader("Range") or ""
+            status, raw, received = cost_tracker.guarded_call(
+                "google_drive",
+                "google_drive:upload:chunk",
+                upload_chunk,
+                request_units=length,
+            )
         except (OSError, http.client.HTTPException):
             pass  # The server may have committed bytes: query before retransmitting.
-        finally:
-            connection.close()
         if status in {200, 201}:
             break
         if status == 409 and file_id:

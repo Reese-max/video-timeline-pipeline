@@ -18,6 +18,7 @@ from urllib.parse import urlsplit
 
 import pipeline
 import drive_storage
+import cost_tracker
 from mcp import types
 from mcp.server.fastmcp import FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
@@ -698,6 +699,11 @@ def analysis_quality(result: dict[str, Any]) -> dict[str, Any]:
 
 
 def analyze_prepared_sync(job_id: str) -> dict[str, Any]:
+    with cost_tracker.cost_tracking(MCP_ROOT):
+        return _analyze_prepared_sync(job_id)
+
+
+def _analyze_prepared_sync(job_id: str) -> dict[str, Any]:
     job_dir = prepared_job_dir(job_id)
     manifest = read_manifest(job_dir)
     if not manifest:
@@ -1394,6 +1400,11 @@ async def upload_prepared_video_to_drive(
 
 
 def upload_prepared_drive_sync(job_id: str) -> dict:
+    with cost_tracker.cost_tracking(MCP_ROOT):
+        return _upload_prepared_drive_sync(job_id)
+
+
+def _upload_prepared_drive_sync(job_id: str) -> dict:
     job_dir = prepared_job_dir(job_id)
     manifest = read_manifest(job_dir)
     if not manifest:
@@ -1405,6 +1416,11 @@ def upload_prepared_drive_sync(job_id: str) -> dict:
 
 
 def collect_social_post_sync(url: str, allow_paid: bool) -> dict[str, Any]:
+    with cost_tracker.cost_tracking(MCP_ROOT):
+        return _collect_social_post_sync(url, allow_paid)
+
+
+def _collect_social_post_sync(url: str, allow_paid: bool) -> dict[str, Any]:
     target = pipeline.social_post_target(url)
     allowed = {pipeline.social_post_target(item.strip())[:2]
                for item in os.getenv("BRIGHTDATA_ALLOWED_POST_URLS", "").split(",") if item.strip()}
