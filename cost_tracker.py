@@ -265,14 +265,16 @@ def check_and_reserve_budget(
             )
             settled_micro = int(cur.fetchone()[0])
 
-            # Sum outstanding reservations
+            # Count outstanding reservations by the same local-day UTC window as settled costs.
+            # This also includes pre-upgrade rows whose period_id used the previous UTC date label.
             cur.execute(
                 """
                 SELECT COALESCE(SUM(max_micro_usd), 0)
                 FROM budget_reservations
-                WHERE account_scope = ? AND period_id = ? AND status = 'reserved'
+                WHERE account_scope = ? AND created_at >= ? AND created_at < ?
+                  AND status = 'reserved'
                 """,
-                (account_scope, period_id),
+                (account_scope, start_utc, end_utc),
             )
             outstanding_micro = int(cur.fetchone()[0])
 
