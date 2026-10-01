@@ -41,11 +41,11 @@ def main():
         operation, args = task["operation"], task["inputs"]
         report_progress("starting", 1, "開始處理")
         if operation == "prepare":
-            result = server.tool_payload(server.prepare_video_sync(**args))
+            result = server.run_job(lambda: server.tool_payload(server.prepare_video_sync(**args)))
         elif operation == "analyze":
-            result = server.analyze_prepared_sync(**args)
+            result = server.run_job(lambda: server.analyze_prepared_sync(**args))
         elif operation == "drive":
-            result = server.upload_prepared_drive_sync(**args)
+            result = server.run_job(lambda: server.upload_prepared_drive_sync(**args))
         else: raise ValueError("Unknown operation")
         report_progress("completed", 100, "處理完成")
         atomic_json(work / "output.json", {"ok": True, "result": result})

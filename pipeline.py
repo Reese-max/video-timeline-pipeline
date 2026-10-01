@@ -706,7 +706,10 @@ def download_video(
     if done.is_file():
         if private_url:
             sanitize_download_info(job_dir / "source.info.json")
-        return locate_source_video(job_dir)
+        try:
+            return locate_source_video(job_dir)
+        except RuntimeError:
+            pass  # Media retention may remove bytes while preserving the job's records.
     job_dir.mkdir(parents=True, exist_ok=True)
     if is_threads_url(url):
         video_path = download_threads_video(
@@ -2118,7 +2121,7 @@ def minimax_chat(
     finish_reason = str(raw_reason).strip().lower() if raw_reason else None
     # finish_reason=length 代表輸出被截斷：即使殘餘內容剛好能 parse 成 JSON，
     # 也不是完整回應，一律 fail-closed，不得交給呼叫端當成完成結果。
-    if finish_reason not in {"stop", "tool_calls"}:
+    if finish_reason != "stop":
         raise MiniMaxIncompleteError(finish_reason, model)
     content = choices[0].get("message", {}).get("content", "")
     if isinstance(content, list):
@@ -2148,6 +2151,62 @@ def parse_json_object(text: str) -> dict[str, Any]:
             except json.JSONDecodeError:
                 pass
     return {"raw": text}
+
+
+VISUAL_NOT_ANALYZED = "尚未執行 MiniMax 視覺理解。"
+VISUAL_OBSERVATION_SCHEMA_VERSION = 1
+
+
+def usable_visual_observation(observation: Any) -> bool:
+    """Only a complete, typed visual response can serve as evidence or reusable cache."""
+    if not isinstance(observation, dict):
+        return False
+    if observation.get("completion_status") not in (None, "complete"):
+        return False
+    if observation.get("visual_schema_version") not in (None, VISUAL_OBSERVATION_SCHEMA_VERSION):
+        return False  # None is the validated legacy cache format (key version 3).
+    if "raw" in observation or "value" in observation:
+        return False
+    if not isinstance(observation.get("screen_type"), str) or not observation["screen_type"].strip():
+        return False
+    summary = observation.get("visual_summary")
+    if not isinstance(summary, str) or not summary.strip() or summary == VISUAL_NOT_ANALYZED:
+        return False
+    for field in ("visible_text", "important_details"):
+        values = observation.get(field)
+        if not isinstance(values, list) or not all(isinstance(value, str) for value in values):
+            return False
+    confidence = observation.get("confidence")
+    return (
+        isinstance(confidence, (int, float))
+        and not isinstance(confidence, bool)
+        and math.isfinite(confidence)
+        and 0 <= confidence <= 1
+    )
+
+
+def reusable_visual_observation(observation: Any, candidate: dict[str, Any]) -> bool:
+    """Check persisted metadata as well as the model's visual schema."""
+    return (
+        usable_visual_observation(observation)
+        and isinstance(observation.get("source_image"), str)
+        and bool(observation["source_image"])
+        and observation.get("timestamp") == candidate.get("timestamp")
+    )
+
+
+def reusable_visual_artifact(observations: Any, candidates: list[dict[str, Any]]) -> bool:
+    """The aggregate cache must cover every selected frame with valid evidence."""
+    return (
+        isinstance(observations, list)
+        and len(observations) == len(candidates)
+        and all(
+            reusable_visual_observation(observation, candidate)
+            and isinstance(candidate.get("path"), (str, Path))
+            and observation["source_image"] == str(candidate["path"])
+            for observation, candidate in zip(observations, candidates)
+        )
+    )
 
 
 def analyze_images(
@@ -2189,16 +2248,11 @@ def analyze_images(
                 separators=(",", ":"),
             )
             cache_path = cache_dir / (hashlib.sha256(material.encode("utf-8")).hexdigest() + ".json")
-            cached = reuse_artifact(cache_path, "visual_summary")
-            if isinstance(cached, dict):
-                if cached.get("completion_status") == "incomplete" or cached.get(
-                    "visual_summary"
-                ) == "尚未執行 MiniMax 視覺理解。":
-                    cached = None
-                else:
-                    cached = dict(cached)
-                    cached["source_image"] = str(image_path)
-                    return index, cached
+            cached = reuse_artifact(cache_path)
+            if reusable_visual_observation(cached, candidate):
+                cached = dict(cached)
+                cached["source_image"] = str(image_path)
+                return index, cached
         observation = uniform_image_observation(image_path)
         if observation is None:
             try:
@@ -2221,29 +2275,30 @@ def analyze_images(
                     "completion_status": "incomplete",
                     "finish_reason": error.finish_reason or "missing",
                 }
-            if "visual_summary" not in observation:
-                # 截斷或內容無法解析的觀察降級為「未執行」，不進快取也不標完成。
+            if not usable_visual_observation(observation):
+                # 截斷或不符 schema 的觀察不能進快取，也不能標成已核對畫面。
                 incomplete = {
                     "screen_type": "候選畫面",
                     "visible_text": [],
-                    "visual_summary": "尚未執行 MiniMax 視覺理解。",
+                    "visual_summary": VISUAL_NOT_ANALYZED,
                     "important_details": [],
                     "confidence": None,
                     "completion_status": "incomplete",
-                    "finish_reason": observation.get("finish_reason"),
+                    "finish_reason": observation.get("finish_reason") or "stop",
                 }
                 if "raw" in observation:
                     incomplete["raw"] = observation["raw"]
                 observation = incomplete
+            else:
+                observation["analysis_method"] = "minimax"
+        if usable_visual_observation(observation):
+            observation["visual_schema_version"] = VISUAL_OBSERVATION_SCHEMA_VERSION
+            observation["completion_status"] = "complete"
         observation["timestamp"] = candidate["timestamp"]
         observation["source_image"] = str(image_path)
         observation["local_ocr_text"] = local_ocr
         observation["local_ocr_confidence"] = candidate.get("ocr_confidence")
-        if (
-            cache_path is not None
-            and observation.get("completion_status") != "incomplete"
-            and observation.get("visual_summary") not in (None, "尚未執行 MiniMax 視覺理解。")
-        ):
+        if cache_path is not None and reusable_visual_observation(observation, candidate):
             write_json(cache_path, observation)
         return index, observation
 
@@ -2736,6 +2791,12 @@ def render_knowledge_markdown(
             detail += f"（畫面：`{image_name}`）"
         lines.append(f"- {stamp} 畫面：{detail}")
 
+    visual_complete = bool(observations) and all(
+        usable_visual_observation(item) for item in observations
+    )
+    minimax_checked = any(
+        item.get("analysis_method") != "local_uniformity_check" for item in observations
+    )
     lines.extend(
         [
             "",
@@ -2745,8 +2806,12 @@ def render_knowledge_markdown(
             f"- 視覺觀察：{len(observations)}",
             (
                 "- 畫面分析：已執行 MiniMax 視覺核對。"
-                if observations and any(item.get("visual_summary") != "尚未執行 MiniMax 視覺理解。" for item in observations)
-                else "- 畫面分析：未完成；摘要不可視為已核對影片畫面。"
+                if visual_complete and minimax_checked
+                else (
+                    "- 畫面分析：已完成本地純色畫面檢查；未呼叫 MiniMax。"
+                    if visual_complete
+                    else "- 畫面分析：未完成；摘要不可視為已核對影片畫面。"
+                )
             ),
             "- 本檔案由影片資料庫管線產生，可重新執行以更新內容。",
             "",
@@ -3761,11 +3826,16 @@ def secure_rss_directory(root: Path) -> Path:
     return directory
 
 
+class WriterBusyError(RuntimeError):
+    pass
+
+
 @contextlib.contextmanager
-def rss_writer_lock(root: Path, timeout: float = 5.0):
-    """同一個 root 同時只允許一個 RSS 寫入者。"""
-    directory = secure_rss_directory(root)
-    path = directory / ".writer.lock"
+def file_writer_lock(path: Path, timeout: float = 0.0):
+    """An OS lock shared by server operations and the retention command."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if path.is_symlink():
+        raise RuntimeError("拒絕使用符號連結作為工作鎖。")
     handle = path.open("a+b")
     handle.seek(0, os.SEEK_END)
     if handle.tell() == 0:
@@ -3788,7 +3858,7 @@ def rss_writer_lock(root: Path, timeout: float = 5.0):
                 locked = True
             except OSError:
                 if time.monotonic() >= deadline:
-                    raise RuntimeError("另一個 RSS 寫入程序仍在執行；本次未開始。") from None
+                    raise WriterBusyError("另一個寫入程序仍在執行；本次未開始。") from None
                 time.sleep(0.1)
         yield
     finally:
@@ -3803,6 +3873,13 @@ def rss_writer_lock(root: Path, timeout: float = 5.0):
 
                 fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
         handle.close()
+
+
+@contextlib.contextmanager
+def rss_writer_lock(root: Path, timeout: float = 5.0):
+    """同一個 root 同時只允許一個 RSS 寫入者。"""
+    with file_writer_lock(secure_rss_directory(root) / ".writer.lock", timeout):
+        yield
 
 
 def load_rss_state(root: Path) -> dict[str, Any]:
@@ -6100,7 +6177,7 @@ def self_test() -> None:
         tag = messages[0]["content"][0]["text"].rsplit("：", 1)[-1]
         vision_barrier.wait(timeout=5)
         time.sleep((count - int(tag[3:])) * 0.02)
-        return json.dumps({"tag": tag, "visual_summary": tag})
+        return json.dumps({"tag": tag, "screen_type": "slide", "visible_text": [], "visual_summary": tag, "important_details": [], "confidence": 0.5})
 
     globals()["minimax_chat"] = parallel_vision_chat
     try:
@@ -6147,7 +6224,7 @@ def self_test() -> None:
         original_chat, original_data_url = minimax_chat, image_data_url
         globals()["image_data_url"] = lambda path: "data:image/jpeg;base64,x"
         globals()["minimax_chat"] = lambda *args, **kwargs: json.dumps(
-            {"screen_type": "slide", "visual_summary": "slide"}
+            {"screen_type": "slide", "visible_text": [], "visual_summary": "slide", "important_details": [], "confidence": 0.5}
         )
         try:
             first = analyze_images(
@@ -6900,7 +6977,7 @@ def run_pipeline(args: argparse.Namespace) -> Path:
                     and previous.get("models", {}).get("visual") == model
                     else None
                 )
-                if isinstance(cached, list):
+                if reusable_visual_artifact(cached, candidates):
                     print("· 重用既有視覺觀察")
                     return cached
                 return analyze_images(
@@ -6916,6 +6993,11 @@ def run_pipeline(args: argparse.Namespace) -> Path:
                 transcribe_stage, visual_stage
             )
             print(f"· 轉錄與畫面分析並行階段：{time.monotonic() - cloud_started:.1f} 秒")
+        # Provider 未完整完成時，整體流程仍可保存逐字稿與部分結果，但視覺狀態須明確。
+        manifest["visual_status"] = (
+            "complete" if observations and all(usable_visual_observation(item) for item in observations)
+            else "incomplete"
+        )
         # 記下每個階段實際由誰產生：換模型後回頭看產物才知道該不該重跑
         manifest["models"] = {
             "transcript": transcript.get("model") if isinstance(transcript, dict) else None,

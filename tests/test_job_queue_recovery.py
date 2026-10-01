@@ -88,6 +88,7 @@ class JobQueueRecoveryTests(unittest.TestCase):
             "    Path(os.environ['FIXTURE_DESCENDANT_PID']).write_text(str(child.pid))\n"
             "    while True: time.sleep(.1)\n"
             "def tool_payload(value): return value\n"
+            "def run_job(operation, *args): return operation(*args)\n"
             "def analysis_error(error): return str(error)\n",
             encoding="utf-8",
         )

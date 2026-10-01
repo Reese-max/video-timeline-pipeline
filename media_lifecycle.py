@@ -371,10 +371,9 @@ class StoragePolicy:
             return report
 
     def cleanup(self, dry_run=True, protected_job_ids=(), now=None) -> dict:
-        """Plan, or explicitly delete, expired unprotected managed jobs only.
+        """Legacy lifecycle plan only. Whole-job deletion is permanently disabled.
 
-        Non-POSIX platforms lacking fd-based rmtree only support dry runs.
-        Service integration must serialize writers with non-dry cleanup.
+        Use media_retention.py for completed-only media deletion; records must survive.
         """
         if not isinstance(dry_run, bool):
             raise ValueError("dry_run must be boolean")
@@ -388,29 +387,8 @@ class StoragePolicy:
                       "skipped": [row for row in report["jobs"] if not row["eligible"]]}
             if dry_run or not candidates:
                 return result
-            if not getattr(shutil.rmtree, "avoids_symlink_attacks", False) or os.name != "posix":
-                result["skipped"].extend({"job_id": row["job_id"], "reason": "unsafe_platform"} for row in candidates)
-                return result
-            fd = os.open(self._root(), os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
-            try:
-                info = os.fstat(fd)
-                if (info.st_dev, info.st_ino) != self._root_identity:
-                    raise StoragePolicyError("Storage root changed")
-                for row in candidates:
-                    job = row["job_id"]
-                    fresh = next((item for item in self.usage(protected, now)["jobs"] if item["job_id"] == job), None)
-                    if not fresh or not fresh["eligible"]:
-                        result["skipped"].append({"job_id": job, "reason": "changed_since_plan"})
-                        continue
-                    try:
-                        shutil.rmtree(job, dir_fd=fd)
-                    except OSError:
-                        result["skipped"].append({"job_id": job, "reason": "delete_failed"})
-                    else:
-                        result["deleted_job_ids"].append(job)
-                        result["reclaimed_bytes"] += fresh["bytes"]
-            finally:
-                os.close(fd)
+            result["skipped"].extend({"job_id": row["job_id"], "reason": "guarded_retention_required"}
+                                     for row in candidates)
             return result
 
 

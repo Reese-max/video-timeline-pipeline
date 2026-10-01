@@ -62,26 +62,36 @@ signature. Successful stage caches can be reused when resuming failed work.
 ## Storage policy and expiring links
 
 Defaults are 20 GiB total managed media storage, 4 GiB per job, 1 GiB minimum free
-space, seven days retention since last use, and 24-hour signed media links. These
+space, a minimum seven-day completed-media retention, and 24-hour signed media links. These
 are serialized preflight and post-stage checks, not a kernel filesystem quota:
 an external program can temporarily exceed its estimate. Source downloads also
 have the existing 512 MiB maximum. Exhaustion produces a visible error.
 
-Only 12-hex ordinary job directories bearing `.media-lifecycle.json` are eligible
-for cleanup. Pre-upgrade jobs are not automatically adopted or deleted. Explicit
-reuse can adopt a job and starts a fresh retention period. Cleanup protects active
-jobs, queued inputs, and media with an unexpired sharing lease. A cross-process
-lock serializes marker updates with cleanup. Symlinks, reparse points and unsafe
-trees are refused. Actual recursive cleanup requires the platform's fd-based,
-symlink-safe deletion support; unsupported platforms return a skipped plan.
+Whole-job deletion is disabled, including the old `MCP_STORAGE_CLEANUP_ENABLED`
+path: `StoragePolicy.cleanup` now only returns a legacy lifecycle plan and cannot
+remove directories. Use the guarded command below, after deploying and restarting
+both MCP and background workers with the shared writer lock:
 
-`MCP_STORAGE_CLEANUP_ENABLED=1` enables cleanup before allocating media. It is off
-by default. Review a dry-run plan first in the service environment:
-
-```python
-import mcp_server
-print(mcp_server.storage_policy().cleanup(dry_run=True))
+```bash
+.venv/bin/python media_retention.py --jobs-root /home/box/video-timeline-pipeline/mcp_jobs
+# Only after reviewing a successful dry run:
+.venv/bin/python media_retention.py --jobs-root /home/box/video-timeline-pipeline/mcp_jobs --apply
 ```
+
+The command deletes only recognized generated media from 12-hex jobs with matching
+completed analysis, usable quality and source SHA-256. Every job file must be older
+than seven days; later writes/use extend retention. Summaries, transcripts, JSON,
+billing receipts, job directories and all Drive files survive. Drive handoffs,
+`.keep-media`, failures, queued/running work, invalid evidence, live sharing leases
+and unsafe paths are retained. Unknown queue ownership fails closed. Cleanup holds
+the shared writer and lifecycle locks plus a SQLite transaction preventing queue
+submissions/status changes during deletion. New `analysis/runs/<hash>/` media are
+covered without removing their evidence caches. Each affected job retains its
+`media-retention.json` receipt. Deleted media cannot be recovered locally; expired
+links require downloading the source again. No paid API is called by cleanup.
+
+Health reports `runtime_sha256`, `writer_busy` and the retention policy for rollout
+verification; healthy status alone is not proof of successful cleanup.
 
 Every generated URL carries an HMAC signature over its exact job, path and expiry.
 GET, HEAD and byte ranges use the same signature. Missing, expired, duplicated or

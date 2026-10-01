@@ -265,14 +265,15 @@ policy.protect_until("0123456789ab", 3000 if phase == "first" else 2000)
 
     @unittest.skipUnless(os.name == "posix" and getattr(shutil.rmtree, "avoids_symlink_attacks", False),
                          "Destructive cleanup requires fd-based POSIX rmtree")
-    def test_explicit_cleanup_deletes_only_expired_unprotected_managed_job(self):
+    def test_legacy_cleanup_cannot_delete_whole_jobs(self):
         self.job()
         other = self.job(OTHER)
         self.policy.mark_managed(JOB, now=0)
         before = self.policy.usage()["total_bytes"]
         result = self.policy.cleanup(dry_run=False, now=100)
-        self.assertEqual(result["deleted_job_ids"], [JOB])
-        self.assertFalse((self.policy.root / JOB).exists())
+        self.assertEqual(result["deleted_job_ids"], [])
+        self.assertTrue((self.policy.root / JOB).exists())
+        self.assertEqual(result["skipped"][-1]["reason"], "guarded_retention_required")
         self.assertTrue(other.exists())
         self.assertEqual(result["reclaimed_bytes"], before - self.policy.usage()["total_bytes"])
 
@@ -293,7 +294,7 @@ policy.protect_until("0123456789ab", 3000 if phase == "first" else 2000)
         with patch.object(self.policy, "usage", side_effect=concurrent_share):
             result = self.policy.cleanup(dry_run=False, now=100)
         self.assertEqual(result["deleted_job_ids"], [])
-        self.assertEqual(result["skipped"][0]["reason"], "changed_since_plan")
+        self.assertEqual(result["skipped"][0]["reason"], "guarded_retention_required")
         self.assertTrue(path.exists())
 
     @unittest.skipUnless(os.name == "posix" and getattr(shutil.rmtree, "avoids_symlink_attacks", False),
@@ -313,9 +314,9 @@ policy.protect_until("0123456789ab", 3000 if phase == "first" else 2000)
         with patch("media_lifecycle.shutil.rmtree", swap_then_remove):
             result = self.policy.cleanup(dry_run=False, now=100)
         self.assertEqual(result["deleted_job_ids"], [])
-        self.assertEqual(result["skipped"][0]["reason"], "delete_failed")
+        self.assertEqual(result["skipped"][0]["reason"], "guarded_retention_required")
         self.assertEqual((outside / "keep.mp4").read_bytes(), b"original")
-        path.unlink()
+        self.assertTrue(path.is_dir())
 
     def test_platform_without_symlink_safe_delete_fails_closed(self):
         path = self.job()
@@ -323,7 +324,7 @@ policy.protect_until("0123456789ab", 3000 if phase == "first" else 2000)
         with patch("media_lifecycle.shutil.rmtree.avoids_symlink_attacks", False, create=True):
             result = self.policy.cleanup(dry_run=False, now=100)
         self.assertEqual(result["deleted_job_ids"], [])
-        self.assertEqual(result["skipped"][0]["reason"], "unsafe_platform")
+        self.assertEqual(result["skipped"][0]["reason"], "guarded_retention_required")
         self.assertTrue(path.exists())
 
 

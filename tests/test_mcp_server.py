@@ -235,8 +235,7 @@ class MCPValidationTests(unittest.TestCase):
             with (
                 patch.object(mcp_server, "prepared_job_dir", return_value=Path(raw_dir)),
                 patch.object(mcp_server, "read_manifest", return_value=manifest),
-                patch.object(mcp_server, "check_job_capacity"),
-                patch.object(mcp_server, "storage_policy"),
+                patch.multiple(mcp_server, check_job_capacity=MagicMock(), storage_policy=MagicMock()),
                 patch.object(mcp_server.pipeline, "locate_source_video", return_value=video_path),
                 patch.object(mcp_server.pipeline, "file_fingerprint", return_value="7:1"),
                 patch.object(mcp_server.pipeline, "reuse_artifact", return_value=None),
@@ -251,7 +250,6 @@ class MCPValidationTests(unittest.TestCase):
                 patch.object(mcp_server.pipeline, "minimax_model", return_value="MiniMax-M3"),
                 patch.object(mcp_server.pipeline, "minimax_endpoint", return_value="https://api.minimax.io/v1"),
                 patch.object(mcp_server.pipeline, "minimax_subscription_key", return_value="key"),
-                patch.object(mcp_server.pipeline, "vision_frame_limit", return_value=8),
                 patch.object(
                     mcp_server.pipeline,
                     "extract_budgeted_candidates",

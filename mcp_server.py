@@ -99,6 +99,8 @@ TRANSPORT_SECURITY = TransportSecuritySettings(
 )
 # ponytail: global lock, per-job locks if concurrent public jobs become necessary.
 JOB_LOCK = threading.Lock()
+RUNTIME_SHA256 = {name: hashlib.sha256((ROOT / name).read_bytes()).hexdigest()
+                  for name in ("mcp_server.py", "pipeline.py", "job_worker.py", "media_retention.py", "media_lifecycle.py")}
 _QUEUE = None
 _QUEUE_INIT_LOCK = threading.Lock()
 
@@ -634,7 +636,11 @@ def run_job(operation, *args):
     if not JOB_LOCK.acquire(blocking=False):
         raise JobBusyError("MCP 正在處理另一個影片工作，請稍後重試；本次未加入背景佇列。")
     try:
-        return operation(*args)
+        # ponytail: one writer across processes; use per-job locks if throughput requires it.
+        with pipeline.file_writer_lock(MCP_JOBS_ROOT / ".writer.lock"):
+            return operation(*args)
+    except pipeline.WriterBusyError:
+        raise JobBusyError("MCP 正在處理另一個影片工作或清理；請稍後重試，本次未加入背景佇列。") from None
     finally:
         JOB_LOCK.release()
 
@@ -1356,7 +1362,9 @@ async def ingest_video_segments(
 async def health(_: Request) -> JSONResponse:
     queue = get_queue()
     return JSONResponse({"status": "ok", "service": "video-timeline-pipeline", "version": 12,
-                         "jobs": queue.stats(), "media_links": "signed", "legacy_media_until": MCP_LEGACY_MEDIA_UNTIL})
+                         "jobs": queue.stats(), "media_links": "signed", "legacy_media_until": MCP_LEGACY_MEDIA_UNTIL,
+                         "writer_busy": JOB_LOCK.locked(), "runtime_sha256": RUNTIME_SHA256,
+                         "retention": {"days": 7, "whole_job_delete": False}})
 
 
 @mcp.custom_route("/media/{job_id}/{filename:path}", methods=["GET", "HEAD"], include_in_schema=False)
