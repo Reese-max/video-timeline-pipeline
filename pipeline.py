@@ -4293,9 +4293,10 @@ def submit_brightdata_once(folder: Path, url: str, headers: dict[str, str], body
             raise RuntimeError(f"上次送出狀態不明，禁止再次計費採集；請核對 {folder} 與 Bright Data。") from None
         try:
             receipt["response"] = request_json(url, headers, method="POST", body=body, timeout=60, attempts=1)
-        except cost_tracker.BudgetBlockedError:
-            # The guard proved the request never dispatched: release the marker
-            # so the submission can be retried once budget allows.
+        except cost_tracker.CostGuardError:
+            # The guard failed before the transport opened — the request
+            # provably never dispatched: release the marker so the submission
+            # can be retried once the guard clears.
             (folder / ".submitted").unlink(missing_ok=True)
             raise
         except Exception as exc:
@@ -4350,6 +4351,8 @@ def fetch_social_post(url: str, cache_root: Path, *, allow_paid: bool = False) -
         result = {**state, **normalize_social_post(rows[0], canonical), "fetched_at": rss_now()}
         write_json(checkpoint, result)
         return result
+    except cost_tracker.CostGuardError:
+        raise
     except Exception as exc:
         raise RuntimeError(str(exc).replace(token, "<redacted>")) from None
 
@@ -4422,6 +4425,8 @@ def fetch_instagram_author(
             f"{BRIGHTDATA_API_ROOT}/snapshot/{urllib.parse.quote(snapshot_id, safe='')}?format=json"
         )
         result = get_json(snapshot_url, headers)
+    except cost_tracker.CostGuardError:
+        raise
     except Exception as exc:
         raise RuntimeError(str(exc).replace(token, "<redacted>")) from None
 
@@ -5163,6 +5168,8 @@ def send_rss_notification(webhook: str, event: str, item: dict[str, Any]) -> Non
                 return response.read(1024)
 
         cost_tracker.guarded_call("rss_webhook", "rss_webhook:post", send_notification)
+    except cost_tracker.CostGuardError:
+        raise
     except Exception as exc:
         detail = sanitize_public_urls(str(exc))
         raise RuntimeError(f"RSS 通知失敗（{public_url(url)}）：{detail}") from exc

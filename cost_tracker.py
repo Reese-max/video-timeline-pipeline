@@ -40,7 +40,11 @@ ErrorTaxonomy = Literal[
 ]
 
 
-class BudgetBlockedError(RuntimeError):
+class CostGuardError(RuntimeError):
+    """The cost guard failed before the transport opened; nothing was dispatched."""
+
+
+class BudgetBlockedError(CostGuardError):
     """Raised before a provider transport is opened when the budget denies it."""
 
     def __init__(self, reason: str) -> None:
@@ -194,16 +198,27 @@ def guarded_call(
         if estimated_micro_usd is None
         else max(0, int(estimated_micro_usd))
     )
-    allowed, reservation_id, reason = check_and_reserve_budget(
-        active_root, operation_name=operation, estimated_micro_usd=estimate,
-        account_scope=scope, provider=provider,
-    )
+    try:
+        allowed, reservation_id, reason = check_and_reserve_budget(
+            active_root, operation_name=operation, estimated_micro_usd=estimate,
+            account_scope=scope, provider=provider,
+        )
+    except CostGuardError:
+        raise
+    except Exception as exc:
+        # The transport callback has not run: mark the failure as provably
+        # unsent so callers may safely retry instead of treating it as an
+        # uncertain remote submission.
+        raise CostGuardError(f"cost guard failed before dispatch: {exc}") from exc
     if not allowed:
         raise BudgetBlockedError(reason)
     if reservation_id is None:
-        raise RuntimeError("Cost guard approved a transport without a reservation.")
+        raise CostGuardError("Cost guard approved a transport without a reservation.")
 
-    mark_reservation_sent(active_root, reservation_id)
+    try:
+        mark_reservation_sent(active_root, reservation_id)
+    except Exception as exc:
+        raise CostGuardError(f"cost guard failed before dispatch: {exc}") from exc
     started = time.monotonic()
     try:
         result = function(*args, **kwargs)
@@ -229,17 +244,23 @@ def guarded_call(
             pass
         raise
 
-    record_usage(
-        active_root,
-        provider=provider,
-        operation=operation,
-        model=model,
-        request_units=request_units,
-        response_units=response_units,
-        latency_ms=(time.monotonic() - started) * 1000,
-        status="succeeded",
-        reservation_id=reservation_id,
-    )
+    try:
+        record_usage(
+            active_root,
+            provider=provider,
+            operation=operation,
+            model=model,
+            request_units=request_units,
+            response_units=response_units,
+            latency_ms=(time.monotonic() - started) * 1000,
+            status="succeeded",
+            reservation_id=reservation_id,
+        )
+    except Exception:
+        # Telemetry failure must not mislabel a completed transport; the
+        # reservation stays 'sent' and keeps counting as outstanding risk,
+        # while the next reservation attempt still fails closed on a dead DB.
+        pass
     return result
 
 
@@ -445,11 +466,11 @@ def check_and_reserve_budget(
                 conn.execute(
                     """
                     INSERT INTO usage_costs (
-                        cost_id, operation, provider, status, cost_status,
+                        cost_id, operation, provider, account_scope, status, cost_status,
                         estimated_micro_usd, started_at, created_at, safe_error
-                    ) VALUES (?, ?, ?, 'blocked_budget', 'zero_local', ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, 'blocked_budget', 'zero_local', ?, ?, ?, ?)
                     """,
-                    (str(uuid.uuid4()), operation_name, provider, estimated_micro_usd, _utc_now_iso(), _utc_now_iso(), blocked_reason),
+                    (str(uuid.uuid4()), operation_name, provider, account_scope, estimated_micro_usd, _utc_now_iso(), _utc_now_iso(), blocked_reason),
                 )
             else:
                 reservation_id = str(uuid.uuid4())

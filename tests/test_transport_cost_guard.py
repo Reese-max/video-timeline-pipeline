@@ -169,6 +169,20 @@ class TransportCostGuardTests(unittest.TestCase):
             self.assertFalse((folder / ".submitted").exists())
             self.assertFalse((folder / "submission.json").exists())
 
+            # The budget-blocked type must survive fetch_social_post's wrapper
+            # so callers can distinguish a provably-unsent denial from an
+            # uncertain remote submission.
+            with patch.dict(os.environ, {"BRIGHTDATA_API_TOKEN": "test-token"}):
+                with cost_tracker.cost_tracking(root):
+                    with self.assertRaises(cost_tracker.BudgetBlockedError):
+                        pipeline.fetch_social_post(
+                            "https://www.instagram.com/p/abc123/",
+                            root / "social",
+                            allow_paid=True,
+                        )
+            urlopen.assert_not_called()
+            self.assertEqual(list((root / "social").rglob(".submitted")), [])
+
             # A provably unsent submission must be retryable once budget allows.
             urlopen.return_value = Response()
             with patch.dict(os.environ, {"DAILY_BUDGET_USD": "100"}):
@@ -227,6 +241,92 @@ class TransportCostGuardTests(unittest.TestCase):
             stored = rows[0][0] or ""
             self.assertNotIn("SECRET987", stored)
             self.assertNotIn("ABC456DEF", stored)
+
+    def test_guard_predispatch_failure_does_not_poison_submission(self) -> None:
+        import sqlite3
+
+        url = "https://api.brightdata.com/datasets/v3/trigger?dataset_id=ds_1"
+        body = b'[{"url": "https://www.instagram.com/p/abc/"}]'
+        headers = {"Authorization": "Bearer test-token", "Content-Type": "application/json"}
+
+        with tempfile.TemporaryDirectory() as directory, patch.dict(
+            os.environ,
+            {"DAILY_BUDGET_USD": "100", "BUDGET_HARD_STOP": "true"},
+        ), patch.object(
+            cost_tracker,
+            "check_and_reserve_budget",
+            side_effect=sqlite3.OperationalError("database is locked"),
+        ), patch.object(pipeline.urllib.request, "urlopen") as urlopen:
+            root = Path(directory)
+            folder = root / "job"
+            with cost_tracker.cost_tracking(root):
+                with self.assertRaises(cost_tracker.CostGuardError):
+                    pipeline.submit_brightdata_once(folder, url, headers, body)
+
+            urlopen.assert_not_called()
+            self.assertFalse((folder / ".submitted").exists())
+            self.assertFalse((folder / "submission.json").exists())
+
+    def test_blocked_usage_records_account_scope(self) -> None:
+        with tempfile.TemporaryDirectory() as directory, patch.dict(
+            os.environ,
+            {"DAILY_BUDGET_USD": "0.000001", "BUDGET_HARD_STOP": "true"},
+        ):
+            root = Path(directory)
+            allowed, _, reason = cost_tracker.check_and_reserve_budget(
+                root,
+                operation_name="test:scoped",
+                estimated_micro_usd=100,
+                account_scope="tenant-a",
+                provider="minimax",
+            )
+            self.assertFalse(allowed)
+            self.assertIn("Budget blocked", reason)
+            with cost_tracker.get_operations_db(root) as connection:
+                rows = connection.execute(
+                    "SELECT provider, account_scope, status FROM usage_costs"
+                ).fetchall()
+            self.assertEqual(
+                [(row[0], row[1], row[2]) for row in rows],
+                [("minimax", "tenant-a", "blocked_budget")],
+            )
+
+    def test_success_result_survives_settlement_failure(self) -> None:
+        class Response:
+            headers = {}
+
+            def __enter__(self) -> "Response":
+                return self
+
+            def __exit__(self, *args: object) -> None:
+                return None
+
+            def read(self) -> bytes:
+                return b'{"ok": true}'
+
+        import sqlite3
+
+        with tempfile.TemporaryDirectory() as directory, patch.dict(
+            os.environ,
+            {"DAILY_BUDGET_USD": "100", "BUDGET_HARD_STOP": "true"},
+        ), patch.object(
+            pipeline.urllib.request, "urlopen", return_value=Response()
+        ), patch.object(
+            cost_tracker,
+            "record_usage",
+            side_effect=sqlite3.OperationalError("database disk image is malformed"),
+        ):
+            root = Path(directory)
+            self.assertEqual(
+                pipeline.post_json(
+                    "https://api.groq.com/openai/v1/audio/transcriptions",
+                    {},
+                    b"{}",
+                    timeout=1,
+                    cost_root=root,
+                ),
+                {"ok": True},
+            )
 
     def test_notifications_importable_as_first_module(self) -> None:
         repo_root = Path(__file__).resolve().parents[1]
