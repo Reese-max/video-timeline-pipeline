@@ -317,6 +317,54 @@ class TimezoneAwarePeriodTests(unittest.TestCase):
         self.assertEqual(by_id[old_id], ("2026-01-16", "reserved"))
         self.assertEqual(by_id[new_id], ("2026-01-17", "reserved"))
 
+    def test_settling_pre_midnight_reservation_after_rollover_preserves_period(self) -> None:
+        env = {
+            "COST_TIMEZONE": "Asia/Taipei",
+            "DAILY_BUDGET_USD": "1.00",
+            "BUDGET_HARD_STOP": "true",
+        }
+        with patch.dict(os.environ, env):
+            # 2026-10-01 15:30 UTC is 23:30 Taipei, before local midnight.
+            with freeze_utc("2026-10-01T15:30:00Z"):
+                allowed_old, old_id, _ = cost_tracker.check_and_reserve_budget(
+                    self.root, "before_midnight_settlement", 5000
+                )
+            # 16:30 UTC is 00:30 Taipei on the next local day.
+            with freeze_utc("2026-10-01T16:30:00Z"):
+                allowed_new, new_id, _ = cost_tracker.check_and_reserve_budget(
+                    self.root, "after_midnight_settlement", 5000
+                )
+                self.assertEqual(cost_tracker.get_budget_status(self.root)["period"], "2026-10-02")
+
+            self.assertTrue(allowed_old)
+            self.assertTrue(allowed_new)
+            self.assertIsNotNone(old_id)
+            self.assertIsNotNone(new_id)
+
+            # Settle the old reservation after rollover; it must retain its
+            # original period label instead of moving into the new day.
+            with freeze_utc("2026-10-01T16:45:00Z"):
+                cost_tracker.record_usage(
+                    self.root,
+                    provider="groq",
+                    operation="transcribe",
+                    reservation_id=old_id,
+                    status="succeeded",
+                )
+
+        conn = cost_tracker.get_operations_db(self.root)
+        try:
+            rows = conn.execute(
+                "SELECT reservation_id, period_id, status FROM budget_reservations "
+                "WHERE reservation_id IN (?, ?)",
+                (old_id, new_id),
+            ).fetchall()
+        finally:
+            conn.close()
+        by_id = {row["reservation_id"]: (row["period_id"], row["status"]) for row in rows}
+        self.assertEqual(by_id[old_id], ("2026-10-01", "settled"))
+        self.assertEqual(by_id[new_id], ("2026-10-02", "reserved"))
+
     def test_monthly_report_uses_local_month_boundaries(self) -> None:
         with patch.dict(os.environ, {"COST_TIMEZONE": "Asia/Taipei"}):
             with freeze_utc("2026-01-31T15:59:00Z"):  # Jan 31, 23:59 Taipei.
