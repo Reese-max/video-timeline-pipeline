@@ -1,6 +1,6 @@
 # 影片資料庫時間軸管線
 
-目前版本 `0.2.0`，採 [MIT License](LICENSE)；版本變更見 [CHANGELOG.md](CHANGELOG.md)。
+目前版本 `0.2.0`，採 [MIT License](LICENSE)；版本變更見 [CHANGELOG.md](CHANGELOG.md)；往「自動影片情報系統」升級的路線圖見 [docs/ROADMAP.md](docs/ROADMAP.md)。
 
 目前實作的流程：
 
