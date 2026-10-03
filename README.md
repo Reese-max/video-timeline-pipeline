@@ -441,6 +441,20 @@ python pipeline.py --search '時間軸'   # 命中 N 筆（索引）
 
 `library.db` 可直接用任何 SQLite 工具開；`videos` 表一支影片一列，`events` 表是全文索引。
 
+## Web Dashboard（唯讀骨架）
+
+選用功能：安裝 `fastapi` 與 `uvicorn` 後可以唯讀模式啟動本機 Dashboard（不會自動啟動下載、轉錄、分析、worker 或寄信）：
+
+```powershell
+python pipeline.py --serve
+python pipeline.py --serve --host 127.0.0.1 --port 8080
+```
+
+- 預設只綁 loopback；非 loopback 位址會被拒絕啟動。
+- 所有請求都經過 Host allowlist（僅 localhost／127.0.0.1／::1），錯誤不回傳 stack trace 或絕對路徑。
+- `GET /api/health` 回傳 `{"status":"ok"}`；`GET /api/stats` 只以唯讀連線讀取 `library.db`，不會執行任何 CREATE／DROP，缺資料時回傳 `unavailable`／`migration_required`。
+- 未安裝 Web 依賴時，既有 CLI 行為不變。
+
 ## 問答與總覽
 
 兩者都需要 `MINIMAX_SUBSCRIPTION_KEY`，不需要額外服務。

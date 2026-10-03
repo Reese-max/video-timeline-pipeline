@@ -6403,6 +6403,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--provider-health", action="store_true", help="檢查各供應商成功率與延遲統計")
     parser.add_argument("--failed-list", action="store_true", help="列出近期失敗或遭預算阻斷的操作紀錄")
     parser.add_argument("--self-test", action="store_true")
+    parser.add_argument("--serve", action="store_true", help="以唯讀模式啟動本機 Web Dashboard")
+    parser.add_argument("--host", default="127.0.0.1", help="Dashboard 綁定位址（預設 loopback）")
+    parser.add_argument("--port", type=int, default=8080, help="Dashboard 連接埠")
     return parser.parse_args()
 
 
@@ -6888,6 +6891,14 @@ def main() -> int:
     if args.self_test:
         self_test()
         return 0
+    if getattr(args, "serve", False):
+        from webapp import run_server
+
+        try:
+            return run_server(args.root.resolve(), args.host, args.port)
+        except RuntimeError as exc:
+            print(f"ERROR: {exc}", file=sys.stderr)
+            return 1
     if getattr(args, "digest_preview", None):
         from notifications import run_digest_preview
 
