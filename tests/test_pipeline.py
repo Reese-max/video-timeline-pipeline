@@ -332,6 +332,50 @@ class InstagramAuthorTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "不可使用單篇"):
             pipeline.instagram_username("https://www.instagram.com/reel/CURRENT/")
 
+    def test_brightdata_discovery_fails_without_finite_budget(self) -> None:
+        with tempfile.TemporaryDirectory() as root, \
+             mock.patch.dict(pipeline.os.environ, {"BRIGHTDATA_API_TOKEN": "test-token"}, clear=True), \
+             mock.patch.object(pipeline, "request_json") as submit:
+            with self.assertRaisesRegex(ValueError, "finite 預算"):
+                pipeline.fetch_instagram_author("testauthor", allow_paid=True, root=Path(root))
+            submit.assert_not_called()
+
+    def test_brightdata_discovery_uses_env_var_when_max_items_not_supplied(self) -> None:
+        with tempfile.TemporaryDirectory() as root, \
+             mock.patch.dict(pipeline.os.environ, {
+                 "BRIGHTDATA_API_TOKEN": "test-token",
+                 "BRIGHTDATA_INSTAGRAM_MAX_ITEMS": "15",
+                 "BRIGHTDATA_RUN_TIMEOUT_SECONDS": "60",
+             }, clear=True), \
+             mock.patch.object(pipeline, "request_json", return_value={"snapshot_id": "s_test"}), \
+             mock.patch.object(pipeline, "get_json", side_effect=[{"status": "ready"}, []]):
+            feed = pipeline.fetch_instagram_author("testauthor", allow_paid=True, root=Path(root))
+            self.assertEqual(feed["instagram"]["max_items"], 15)
+
+    def test_brightdata_discovery_prints_bound_before_triggering(self) -> None:
+        with tempfile.TemporaryDirectory() as root, \
+             mock.patch.dict(pipeline.os.environ, {
+                 "BRIGHTDATA_API_TOKEN": "test-token",
+                 "BRIGHTDATA_INSTAGRAM_MAX_ITEMS": "10",
+                 "BRIGHTDATA_RUN_TIMEOUT_SECONDS": "60",
+             }, clear=True), \
+             mock.patch.object(pipeline, "request_json", return_value={"snapshot_id": "s_test"}) as submit, \
+             mock.patch.object(pipeline, "get_json", side_effect=[{"status": "ready"}, []]):
+            with mock.patch("pipeline.print") as mock_print:
+                pipeline.fetch_instagram_author("testauthor", allow_paid=True, root=Path(root))
+            mock_print.assert_called_once()
+            self.assertIn("10", mock_print.call_args.args[0])
+            submit.assert_called_once()
+
+    def test_run_rss_command_requires_instagram_budget(self) -> None:
+        with mock.patch.dict(pipeline.os.environ, {"BRIGHTDATA_API_TOKEN": "test-token"}, clear=True), \
+             mock.patch.object(pipeline.sys, "argv", [
+                 "pipeline.py", "--instagram-author", "testauthor", "--allow-batch-cloud"
+             ]):
+            args = pipeline.parse_args()
+            with self.assertRaisesRegex(ValueError, "finite 預算"):
+                pipeline.run_rss_command(args)
+
 
 if __name__ == "__main__":
     unittest.main()

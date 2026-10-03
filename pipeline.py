@@ -4297,7 +4297,18 @@ def fetch_instagram_author(
         timeout_seconds = int(os.getenv("BRIGHTDATA_RUN_TIMEOUT_SECONDS", "1800"))
     except ValueError as exc:
         raise ValueError("BRIGHTDATA_RUN_TIMEOUT_SECONDS 必須是整數。") from exc
-    if timeout_seconds <= 0 or (max_items is not None and max_items <= 0):
+    if max_items is None:
+        max_items_str = os.getenv("BRIGHTDATA_INSTAGRAM_MAX_ITEMS", "").strip()
+        if not max_items_str:
+            raise ValueError(
+                "Bright Data Instagram 盤點需要 finite 預算；"
+                "請加上 --instagram-max-items 或設定 BRIGHTDATA_INSTAGRAM_MAX_ITEMS。"
+            )
+        try:
+            max_items = int(max_items_str)
+        except ValueError:
+            raise ValueError("BRIGHTDATA_INSTAGRAM_MAX_ITEMS 必須是正整數。") from None
+    if max_items <= 0 or not math.isfinite(max_items):
         raise ValueError("Bright Data timeout 與 --instagram-max-items 必須大於 0。")
 
     username = instagram_username(author)
@@ -4324,6 +4335,7 @@ def fetch_instagram_author(
     if previous_snapshot_id and not re.fullmatch(r"sd?_[A-Za-z0-9_-]+", previous_snapshot_id):
         raise ValueError("上次已儲存的 snapshot_id 無效。")
     body = json.dumps({"input": [discovery_input]}, sort_keys=True).encode("utf-8")
+    print(f"Bright Data Instagram 盤點：@{username}，本次最大結果數 {max_items} 筆。")
     # Only the caller's persisted success advances the cycle, including empty discoveries.
     folder = secure_rss_directory(root or Path(__file__).resolve().parent) / "brightdata" / job_key(
         f"instagram:{username}:{since}:{previous_snapshot_id}", body.decode("utf-8"))
@@ -5195,6 +5207,11 @@ def run_rss_command(args: argparse.Namespace) -> int:
         raise ValueError("--instagram-since／--instagram-max-items／--instagram-discover-only 必須搭配 --instagram-author。")
     if args.instagram_max_items is not None and args.instagram_max_items <= 0:
         raise ValueError("--instagram-max-items 必須大於 0。")
+    if args.instagram_author and args.instagram_max_items is None and not os.getenv("BRIGHTDATA_INSTAGRAM_MAX_ITEMS", "").strip():
+        raise ValueError(
+            "Bright Data Instagram 盤點需要 finite 預算；"
+            "請加上 --instagram-max-items 或設定 BRIGHTDATA_INSTAGRAM_MAX_ITEMS。"
+        )
     edits = any(value is not None for value in (args.rss_name, args.rss_keywords, args.rss_tags, args.rss_latest_only))
     if edits and not (args.rss_add or args.rss_update or args.facebook_author or args.instagram_author):
         raise ValueError("名稱／關鍵字／標籤／latest-only 設定只可搭配新增或更新訂閱。")
@@ -6285,7 +6302,7 @@ def parse_args() -> argparse.Namespace:
         "--instagram-max-items",
         type=int,
         default=None,
-        help="手動限制本次發現的近期 Reels 數；預設不設上限",
+        help="本次發現的近期 Reels 數上限；未提供時需設定 BRIGHTDATA_INSTAGRAM_MAX_ITEMS",
     )
     rss.add_argument(
         "--instagram-discover-only",
