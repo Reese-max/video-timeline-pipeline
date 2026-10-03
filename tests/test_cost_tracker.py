@@ -11,9 +11,12 @@ Covers:
 
 from __future__ import annotations
 
+import contextlib
 import datetime
+import io
 import json
 import os
+import sys
 import tempfile
 import unittest
 from contextlib import closing
@@ -290,6 +293,97 @@ class BudgetTimezoneAccountingTests(unittest.TestCase):
                 self.assertEqual(cost_tracker._current_period_id("daily"), "2027-01-01")
                 self.assertEqual(cost_tracker._current_period_id("monthly"), "2027-01")
 
+    def test_boundary_spend_belongs_to_the_new_local_period(self) -> None:
+        """The window is half-open: [start, end) in the configured zone.
+
+        Spend stamped exactly at local midnight is simultaneously the end of the
+        outgoing period and the start of the incoming one, so it must be counted
+        exactly once — by the new period.
+        """
+        with patch.dict(os.environ, {"COST_TIMEZONE": "Asia/Taipei"}):
+            # 2026-10-01 15:59:59 UTC == 23:59:59 Taipei on Oct 1
+            with self._freeze(2026, 10, 1, 15, 59, 59):
+                cost_tracker.record_usage(
+                    self.root, provider="groq", operation="t", request_units=60
+                )
+            # 2026-10-01 16:00:00 UTC == 00:00:00 Taipei on Oct 2, the instant
+            # the outgoing window closes and the incoming one opens.
+            with self._freeze(2026, 10, 1, 16, 0, 0):
+                cost_tracker.record_usage(
+                    self.root, provider="groq", operation="t", request_units=60
+                )
+                report = cost_tracker.get_cost_report(self.root, period_type="daily")
+
+        self.assertEqual(report["period"], "2026-10-02")
+        # One row's worth, not zero and not both.
+        self.assertEqual(report["grand_total_estimated_usd"], 0.001)
+
+    def test_reservation_window_filter_is_indexed(self) -> None:
+        """The reservations predicate must stay index-backed on the hot path.
+
+        The filter moved from ``period_id = ?`` to an ``account_scope`` +
+        ``created_at`` window, so the old ``(period_id, status)`` index no longer
+        has a usable leading column and every budget check would full-scan the
+        table.
+        """
+        with patch.dict(os.environ, {"COST_TIMEZONE": "Asia/Taipei"}):
+            cost_tracker.get_budget_status(self.root)
+
+        with closing(cost_tracker.get_operations_db(self.root)) as conn:
+            indexes = {
+                row["name"]: [column["name"] for column in conn.execute(f"PRAGMA index_info({row['name']})")]
+                for row in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = 'budget_reservations'"
+                )
+            }
+            plan = [
+                row[-1]
+                for row in conn.execute(
+                    """
+                    EXPLAIN QUERY PLAN
+                    SELECT COALESCE(SUM(max_micro_usd), 0) FROM budget_reservations
+                    WHERE account_scope = ? AND created_at >= ? AND created_at < ? AND status = 'reserved'
+                    """,
+                    ("default", "2026-01-01T00:00:00+00:00", "2026-01-02T00:00:00+00:00"),
+                )
+            ]
+
+        covering = [
+            name
+            for name, columns in indexes.items()
+            if columns[:2] == ["account_scope", "created_at"] and "status" in columns
+        ]
+        self.assertTrue(
+            covering,
+            f"no (account_scope, created_at, status) index on budget_reservations: {indexes}",
+        )
+        self.assertTrue(
+            any("USING INDEX" in detail or "USING COVERING INDEX" in detail for detail in plan),
+            f"reservation window query is not index-backed: {plan}",
+        )
+
+    def test_cli_reports_invalid_cost_timezone_without_traceback(self) -> None:
+        """The read-only CLI must surface the bad setting, not crash.
+
+        An invalid COST_TIMEZONE is a configuration error the operator has to be
+        able to read; the RSS path already reports it as a one-line message with
+        exit 1, and these two report commands must behave the same way.
+        """
+        import pipeline
+
+        for argv in (["--budget-status"], ["--cost-report", "daily"]):
+            with self.subTest(argv=argv):
+                stderr = io.StringIO()
+                with (
+                    patch.dict(os.environ, {"COST_TIMEZONE": "Not/AZone"}),
+                    patch.object(sys, "argv", ["pipeline.py", "--root", str(self.root), *argv]),
+                    contextlib.redirect_stderr(stderr),
+                ):
+                    exit_code = pipeline.main()
+                self.assertEqual(exit_code, 1)
+                self.assertIn("COST_TIMEZONE", stderr.getvalue())
+                self.assertNotIn("Traceback", stderr.getvalue())
+
     def test_dst_zone_window_bounds_track_iana_offsets(self) -> None:
         """The UTC window must move with the zone, not a frozen offset.
 
@@ -361,8 +455,12 @@ class BudgetTimezoneAccountingTests(unittest.TestCase):
                 self.assertEqual(cost_tracker._current_period_id("daily"), "2026-01-14")
 
     def test_invalid_timezone_fails_explicitly(self) -> None:
+        # Pin the budget variables: check_and_reserve_budget parses
+        # DAILY_BUDGET_USD before resolving the period, so a non-numeric value
+        # would raise ValueError for the wrong reason and mask a broken guard.
+        env = {"COST_TIMEZONE": "", "DAILY_BUDGET_USD": "1.00", "BUDGET_HARD_STOP": "true"}
         for bad_tz in ("Not/AZone", ""):
-            with self.subTest(tz=bad_tz), patch.dict(os.environ, {"COST_TIMEZONE": bad_tz}):
+            with self.subTest(tz=bad_tz), patch.dict(os.environ, {**env, "COST_TIMEZONE": bad_tz}):
                 with self.assertRaises(ValueError):
                     cost_tracker.check_and_reserve_budget(
                         self.root, operation_name="op", estimated_micro_usd=1

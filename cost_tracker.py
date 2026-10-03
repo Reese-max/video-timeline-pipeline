@@ -140,6 +140,10 @@ def _init_cost_schema(conn: sqlite3.Connection) -> None:
             CREATE INDEX IF NOT EXISTS ix_costs_job ON usage_costs(job, provider);
             CREATE INDEX IF NOT EXISTS ix_costs_period ON usage_costs(created_at, provider);
             CREATE INDEX IF NOT EXISTS ix_budget_period ON budget_reservations(period_id, status);
+            -- Outstanding reservations are selected by the configured period
+            -- window, so ix_budget_period's leading column no longer applies.
+            CREATE INDEX IF NOT EXISTS ix_budget_reserved_window
+                ON budget_reservations(account_scope, created_at, status);
             """
         )
 
