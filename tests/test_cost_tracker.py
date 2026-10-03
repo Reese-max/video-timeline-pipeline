@@ -312,6 +312,34 @@ class BudgetTimezoneAccountingTests(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     cost_tracker.get_cost_report(self.root)
 
+    def test_invalid_timezone_fails_before_any_database_side_effect(self) -> None:
+        """A misconfigured COST_TIMEZONE must abort before touching local state.
+
+        ``get_operations_db`` creates operations.db and runs migrations, so
+        resolving the timezone after opening the connection leaves a migrated
+        database behind even though the call failed. Configuration validation
+        has to happen first: a failed guard must not mutate the operator's
+        repository root.
+        """
+        calls = (
+            lambda root: cost_tracker.check_and_reserve_budget(
+                root, operation_name="op", estimated_micro_usd=1
+            ),
+            lambda root: cost_tracker.get_budget_status(root),
+            lambda root: cost_tracker.get_cost_report(root),
+        )
+        for index, call in enumerate(calls):
+            with self.subTest(call=index):
+                with tempfile.TemporaryDirectory() as raw_dir:
+                    root = Path(raw_dir)
+                    with patch.dict(os.environ, {"COST_TIMEZONE": "Not/AZone"}):
+                        with self.assertRaises(ValueError):
+                            call(root)
+                    self.assertFalse(
+                        (root / "operations.db").exists(),
+                        "invalid COST_TIMEZONE must not create operations.db",
+                    )
+
     def test_reservations_stay_bound_to_original_period(self) -> None:
         env = {"COST_TIMEZONE": "Asia/Taipei", "DAILY_BUDGET_USD": "1.00", "BUDGET_HARD_STOP": "true"}
         with patch.dict(os.environ, env):

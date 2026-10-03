@@ -224,10 +224,12 @@ def check_and_reserve_budget(
     daily_budget_usd = float(os.getenv("DAILY_BUDGET_USD", "0"))
     daily_budget_micro = int(daily_budget_usd * 1_000_000)
 
+    # Resolve the accounting period first: an invalid COST_TIMEZONE must fail
+    # before get_operations_db creates/migrates operations.db.
+    period_id, period_start_utc, period_end_utc, tz_key = _current_period("daily")
+
     with closing(get_operations_db(root)) as conn:
         _init_cost_schema(conn)
-
-        period_id, period_start_utc, period_end_utc, tz_key = _current_period("daily")
 
         with conn:
             cur = conn.cursor()
@@ -382,10 +384,10 @@ def record_usage(
 
 def get_cost_report(root: Path, period_type: str = "daily") -> dict[str, Any]:
     """Compile read-only financial and token usage report."""
+    period_id, period_start_utc, period_end_utc, tz_key = _current_period(period_type)
+
     with closing(get_operations_db(root)) as conn:
         _init_cost_schema(conn)
-
-        period_id, period_start_utc, period_end_utc, tz_key = _current_period(period_type)
 
         cur = conn.cursor()
         cur.execute(
@@ -433,12 +435,12 @@ def get_cost_report(root: Path, period_type: str = "daily") -> dict[str, Any]:
 
 def get_budget_status(root: Path) -> dict[str, Any]:
     """Return current budget usage vs limits."""
+    period_id, period_start_utc, period_end_utc, tz_key = _current_period("daily")
+    daily_budget_usd = float(os.getenv("DAILY_BUDGET_USD", "0"))
+    hard_stop = os.getenv("BUDGET_HARD_STOP", "false").lower() in ("true", "1", "yes")
+
     with closing(get_operations_db(root)) as conn:
         _init_cost_schema(conn)
-
-        period_id, period_start_utc, period_end_utc, tz_key = _current_period("daily")
-        daily_budget_usd = float(os.getenv("DAILY_BUDGET_USD", "0"))
-        hard_stop = os.getenv("BUDGET_HARD_STOP", "false").lower() in ("true", "1", "yes")
 
         cur = conn.cursor()
         cur.execute(
