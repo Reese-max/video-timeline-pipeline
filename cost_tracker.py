@@ -150,11 +150,18 @@ def _utc_now_iso() -> str:
 
 def _cost_timezone() -> zoneinfo.ZoneInfo:
     """Resolve COST_TIMEZONE to an IANA timezone; invalid values fail explicitly."""
-    tz_name = os.getenv("COST_TIMEZONE", "Asia/Taipei")
+    tz_name = (os.getenv("COST_TIMEZONE", "Asia/Taipei") or "").strip()
     try:
         return zoneinfo.ZoneInfo(tz_name)
     except (zoneinfo.ZoneInfoNotFoundError, ValueError) as exc:
-        raise ValueError(f"Invalid COST_TIMEZONE {tz_name!r}: {exc}") from exc
+        # A missing system tz database and a misspelled key raise the same
+        # exception; name the remedy so an operator does not keep editing a
+        # valid setting on a host that simply has no IANA data installed.
+        raise ValueError(
+            f"Invalid COST_TIMEZONE {tz_name!r}: {exc}. "
+            "Use an IANA zone name (e.g. Asia/Taipei, UTC); if the name is "
+            "correct, install the IANA database (pip install tzdata)."
+        ) from exc
 
 
 def _current_period(period_type: str = "daily") -> tuple[str, str, str, str]:
@@ -244,14 +251,18 @@ def check_and_reserve_budget(
             )
             settled_micro = int(cur.fetchone()[0])
 
-            # Sum outstanding reservations
+            # Sum outstanding reservations from the same configured period
+            # window as settled spend. Filtering these by their stored
+            # period_id label instead would let an outstanding reservation drop
+            # out of the bucket whenever COST_TIMEZONE changes, because the
+            # label was written under the zone configured at reservation time.
             cur.execute(
                 """
                 SELECT COALESCE(SUM(max_micro_usd), 0)
                 FROM budget_reservations
-                WHERE account_scope = ? AND period_id = ? AND status = 'reserved'
+                WHERE account_scope = ? AND created_at >= ? AND created_at < ? AND status = 'reserved'
                 """,
-                (account_scope, period_id),
+                (account_scope, period_start_utc, period_end_utc),
             )
             outstanding_micro = int(cur.fetchone()[0])
 

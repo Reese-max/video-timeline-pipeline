@@ -290,6 +290,66 @@ class BudgetTimezoneAccountingTests(unittest.TestCase):
                 self.assertEqual(cost_tracker._current_period_id("daily"), "2027-01-01")
                 self.assertEqual(cost_tracker._current_period_id("monthly"), "2027-01")
 
+    def test_dst_zone_window_bounds_track_iana_offsets(self) -> None:
+        """The UTC window must move with the zone, not a frozen offset.
+
+        Asserting only the period *label* leaves the bounds untested: a build
+        that derives the label through ZoneInfo but the bounds from one fixed
+        offset would still label correctly while mis-bucketing an hour of spend
+        on each transition day.
+        """
+        with patch.dict(os.environ, {"COST_TIMEZONE": "America/New_York"}):
+            # 2026-03-08 is the US spring-forward day: the local day is 23h long.
+            with self._freeze(2026, 3, 8, 12, 0):
+                period_id, start, end, tz_key = cost_tracker._current_period("daily")
+                start_utc = datetime.datetime.fromisoformat(start)
+                end_utc = datetime.datetime.fromisoformat(end)
+            self.assertEqual(period_id, "2026-03-08")
+            self.assertEqual(tz_key, "America/New_York")
+            self.assertEqual(start, "2026-03-08T05:00:00+00:00")
+            self.assertEqual(end, "2026-03-09T04:00:00+00:00")
+            self.assertEqual(end_utc - start_utc, datetime.timedelta(hours=23))
+
+            # 2026-11-01 is the US fall-back day: the local day is 25h long.
+            with self._freeze(2026, 11, 1, 12, 0):
+                period_id, start, end, _ = cost_tracker._current_period("daily")
+                start_utc = datetime.datetime.fromisoformat(start)
+                end_utc = datetime.datetime.fromisoformat(end)
+            self.assertEqual(period_id, "2026-11-01")
+            self.assertEqual(start, "2026-11-01T04:00:00+00:00")
+            self.assertEqual(end, "2026-11-02T05:00:00+00:00")
+            self.assertEqual(end_utc - start_utc, datetime.timedelta(hours=25))
+
+    def test_outstanding_reservations_counted_across_timezone_change(self) -> None:
+        """Reservations must be bucketed by the same window as settled spend.
+
+        ``budget_reservations`` was filtered by its stored ``period_id`` label
+        while ``usage_costs`` moved to a UTC-instant window. Changing
+        COST_TIMEZONE relabels new periods but not old rows, so an outstanding
+        reservation could fall out of the bucket entirely and let hard-stop
+        admit a second full budget of paid work.
+        """
+        base_env = {"DAILY_BUDGET_USD": "0.010", "BUDGET_HARD_STOP": "true"}
+        # 2026-09-30 16:30 UTC == 2026-10-01 00:30 Taipei: the labels disagree.
+        with patch.dict(os.environ, {**base_env, "COST_TIMEZONE": "Asia/Taipei"}):
+            with self._freeze(2026, 9, 30, 16, 30):
+                allowed, reservation_id, _ = cost_tracker.check_and_reserve_budget(
+                    self.root, operation_name="op", estimated_micro_usd=9000
+                )
+                self.assertTrue(allowed)
+                self.assertEqual(self._reservation_period(reservation_id), "2026-10-01")
+
+        # Re-read the same instant with a UTC accounting zone: the reservation's
+        # created_at still falls inside the UTC day, so it must still count.
+        with patch.dict(os.environ, {**base_env, "COST_TIMEZONE": "UTC"}):
+            with self._freeze(2026, 9, 30, 20, 0):
+                allowed_again, blocked_id, reason = cost_tracker.check_and_reserve_budget(
+                    self.root, operation_name="op", estimated_micro_usd=5000
+                )
+                self.assertFalse(allowed_again)
+                self.assertIsNone(blocked_id)
+                self.assertIn("Budget blocked", reason)
+
     def test_dst_zone_uses_iana_rules_not_fixed_offset(self) -> None:
         with patch.dict(os.environ, {"COST_TIMEZONE": "America/New_York"}):
             # 2026-07-01 04:30 UTC -> EDT (UTC-4) -> Jul 1 00:30 local.
