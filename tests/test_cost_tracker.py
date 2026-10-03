@@ -331,7 +331,9 @@ class BudgetTimezoneAccountingTests(unittest.TestCase):
 
         with closing(cost_tracker.get_operations_db(self.root)) as conn:
             indexes = {
-                row["name"]: [column["name"] for column in conn.execute(f"PRAGMA index_info({row['name']})")]
+                row["name"]: [
+                    column["name"] for column in conn.execute("SELECT name FROM pragma_index_info(?)", (row["name"],))
+                ]
                 for row in conn.execute(
                     "SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = 'budget_reservations'"
                 )
