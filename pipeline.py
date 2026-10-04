@@ -122,19 +122,28 @@ def run_external(
     print("$ " + redact_values(subprocess.list2cmdline(command), redact))
     if stream:
         sys.stdout.flush()
-    # Create a new process group so we can terminate the entire command tree
-    # (including descendants like FFmpeg spawned by yt-dlp) on timeout/cancellation.
+    # Queue workers already own a supervised group. Their watchdog must still
+    # reach these children on parent death; only synchronous commands detach.
+    owns_tree = os.getenv("VIDEO_JOB_WORKER") != "1"
     popen_kwargs = dict(cwd=cwd)
-    if os.name != "nt":
-        popen_kwargs["start_new_session"] = True
-    else:
-        popen_kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+    if owns_tree:
+        if os.name != "nt":
+            popen_kwargs["start_new_session"] = True
+        else:
+            popen_kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
     with contextlib.ExitStack() as stack:
         # Temporary files avoid a pipe-drain deadlock if a downloader's descendant
         # inherits stdout/stderr after its parent has been killed on timeout.
         output_file = None if stream else stack.enter_context(tempfile.TemporaryFile())
         error_file = None if stream else stack.enter_context(tempfile.TemporaryFile())
         with subprocess.Popen(command, stdout=output_file, stderr=error_file, **popen_kwargs) as process:
+            if owns_tree and os.name == "nt":
+                from job_queue import bind_windows_job, stop_process_tree
+                try:
+                    bind_windows_job(process)
+                except OSError:
+                    stop_process_tree(process)
+                    raise
             try:
                 while True:
                     try:
@@ -144,15 +153,22 @@ def run_external(
                     except subprocess.TimeoutExpired:
                         budget.check()
             except (DeadlineExceeded, ExecutionCancelled):
-                if os.name != "nt":
+                if owns_tree and os.name != "nt":
                     try:
                         os.killpg(process.pid, signal.SIGKILL)
                     except ProcessLookupError:
                         pass
+                elif owns_tree:
+                    stop_process_tree(process)
                 else:
+                    # The queue supervisor cleans the worker group after this
+                    # error receipt; do not kill the worker writing that receipt.
                     process.kill()
-                process.wait()
+                process.wait(timeout=5)
                 raise
+            finally:
+                if owns_tree and os.name == "nt":
+                    stop_process_tree(process)
         stdout = stderr = ""
         if output_file is not None and error_file is not None:
             output_file.seek(0)

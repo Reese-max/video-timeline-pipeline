@@ -51,6 +51,7 @@ class ExecutionControlTests(unittest.TestCase):
         self.assertEqual(len(children), 1)
         self.assertIsNotNone(children[0].poll())
 
+    @unittest.skipUnless(os.name == "posix", "os.fork fixture requires POSIX")
     def test_descendant_processes_killed_on_timeout(self):
         """Test that descendant (grandchild) processes are terminated when timeout occurs."""
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -79,13 +80,16 @@ sys.exit(0)
             with patch.dict(os.environ, {"VIDEO_PROCESS_TIMEOUT_SECONDS": "0.2"}, clear=True):
                 with self.assertRaises(DeadlineExceeded):
                     pipeline.run_external(cmd)
-            time.sleep(0.3)  # Allow time for any surviving grandchild to write
             content = heartbeat_file.read_text()
+            self.assertIn("grandchild", content, "Fixture must start a descendant")
+            time.sleep(0.3)
+            self.assertEqual(heartbeat_file.read_text(), content, "Heartbeat changed after return")
             grandchild_lines = [l for l in content.splitlines() if l.startswith("grandchild")]
             # Should have very few grandchild heartbeats (process group killed quickly)
             self.assertLessEqual(len(grandchild_lines), 3,
                 f"Grandchild continued running after timeout: {len(grandchild_lines)} heartbeats")
 
+    @unittest.skipUnless(os.name == "posix", "os.fork fixture requires POSIX")
     def test_descendant_processes_killed_on_cancellation(self):
         """Test that descendant processes are terminated on cooperative cancellation."""
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -116,8 +120,10 @@ sys.exit(0)
                         pipeline.run_external(cmd)
                 finally:
                     timer.cancel()
-            time.sleep(0.3)
             content = heartbeat_file.read_text()
+            self.assertIn("grandchild", content, "Fixture must start a descendant")
+            time.sleep(0.3)
+            self.assertEqual(heartbeat_file.read_text(), content, "Heartbeat changed after return")
             grandchild_lines = [l for l in content.splitlines() if l.startswith("grandchild")]
             # Allow slightly more heartbeats due to cancellation check interval (0.25s)
             self.assertLessEqual(len(grandchild_lines), 5,
@@ -132,6 +138,23 @@ sys.exit(0)
                     pipeline.run_external([sys.executable, "-c", "import time; time.sleep(30)"])
             finally:
                 timer.cancel()
+
+    def test_timeout_does_not_stop_an_unrelated_process(self):
+        unrelated = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+        try:
+            with patch.dict(os.environ, {"VIDEO_PROCESS_TIMEOUT_SECONDS": "0.1"}, clear=True):
+                with self.assertRaises(DeadlineExceeded):
+                    pipeline.run_external([sys.executable, "-c", "import time; time.sleep(30)"], stream=False)
+            self.assertIsNone(unrelated.poll())
+        finally:
+            unrelated.kill()
+            unrelated.wait(timeout=5)
+
+    def test_normal_command_output_and_failed_exit_mapping_are_preserved(self):
+        with patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(pipeline.run_external([sys.executable, "-c", "print('fixture output')"], stream=False).strip(), "fixture output")
+            with self.assertRaisesRegex(RuntimeError, "fixture error"):
+                pipeline.run_external([sys.executable, "-c", "import sys; print('fixture error', file=sys.stderr); sys.exit(3)"], stream=False)
 
     def test_retry_after_cannot_reset_total_api_budget(self):
         error = urllib.error.HTTPError("https://example.invalid", 429, "busy", {"Retry-After": "120"}, io.BytesIO(b"{}"))
