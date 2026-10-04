@@ -406,12 +406,13 @@ def provider_cost_guard(
     account_scope: str = "default",
     job: str | None = None,
     library_id: str | None = None,
+    provider_enforced_upper_bound_micro_usd: int | None = None,
 ) -> Iterator[GuardOutcome]:
     """Reserve budget before a paid transport send and settle the attempt after.
 
-    Strict mode fails closed: without a ledger root, without a defensible cost
-    bound, or with an exhausted budget, the guard raises `BudgetBlockedError`
-    before the caller can dispatch anything.
+    Strict mode requires a provider-enforced upper bound, a ledger root, and
+    available budget. A modelled estimate alone is not a hard bound and cannot
+    authorize a paid transport in strict mode.
     """
     target = Path(root) if root is not None else get_cost_root()
     strict = guard_is_strict()
@@ -426,17 +427,30 @@ def provider_cost_guard(
         yield GuardOutcome(provider=provider, operation=operation)
         return
 
-    bound = (
+    estimated_bound = (
         int(estimated_micro_usd)
         if estimated_micro_usd is not None
         else estimate_operation_cost_micro_usd(provider, model, request_units, response_units)
     )
-    if bound <= 0 and strict:
-        raise BudgetBlockedError(
-            f"Budget blocked: {provider}/{operation} 沒有可驗證的費用上限，strict 模式拒絕送出。",
-            provider=provider,
-            operation=operation,
-        )
+    if estimated_bound < 0:
+        raise ValueError("estimated_micro_usd must be non-negative.")
+
+    if strict:
+        if provider_enforced_upper_bound_micro_usd is None:
+            raise BudgetBlockedError(
+                f"Budget blocked: {provider}/{operation} 僅有估算、沒有供應商端可執行的費用上限，strict 模式拒絕送出。",
+                provider=provider,
+                operation=operation,
+            )
+        bound = int(provider_enforced_upper_bound_micro_usd)
+        if bound <= 0:
+            raise BudgetBlockedError(
+                f"Budget blocked: {provider}/{operation} 的供應商費用上限無效，strict 模式拒絕送出。",
+                provider=provider,
+                operation=operation,
+            )
+    else:
+        bound = estimated_bound
 
     try:
         allowed, reservation_id, reason = check_and_reserve_budget(
