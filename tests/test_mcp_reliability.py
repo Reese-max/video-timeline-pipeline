@@ -47,12 +47,13 @@ class ReliabilityTests(unittest.TestCase):
         self.assertEqual(server.analysis_quality(good)["status"], "evidence_available", "Silent video is not failed ASR")
 
     def test_cached_analysis_is_rechecked_for_quality(self):
-        cached = {"status": "complete", "source_fingerprint": "same", "audio_status": "complete",
+        cached = {"status": "complete", "source_fingerprint": "same", "cache_signature": "signature", "audio_status": "complete",
                   "visual_status": "complete", "timeline": [], "transcript": {"segments": []}}
         with (patch.object(server, "prepared_job_dir", return_value=Path("unused")),
               patch.object(server, "read_manifest", return_value={"status": "ready"}),
               patch.object(server.pipeline, "locate_source_video", return_value=Path("unused.mp4")),
               patch.object(server.pipeline, "file_fingerprint", return_value="same"),
+              patch.object(server, "analysis_cache_signature", return_value="signature"),
               patch.object(server.pipeline, "reuse_artifact", return_value=cached)):
             result = server.analyze_prepared_sync("0123456789ab")
         self.assertEqual(result["quality"]["status"], "needs_review")
