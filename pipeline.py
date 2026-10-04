@@ -4149,14 +4149,21 @@ def rerank_hits(
             {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
             json.dumps(body, ensure_ascii=False).encode("utf-8"),
         )
+    if not isinstance(response, dict):
+        raise RuntimeError("rerank 回應必須是物件。")
     results = response.get("results") or response.get("data") or []
+    if not isinstance(results, list):
+        raise RuntimeError("rerank 回應必須包含 results/data 陣列。")
     indices: list[int] = []
     for item in results:
-        if not isinstance(item, dict) or not isinstance(item.get("index"), int):
+        if not isinstance(item, dict) or type(item.get("index")) is not int:
             raise RuntimeError("rerank 回應缺少合法的 index。")
         index = int(item["index"])
         if not 0 <= index < len(hits):
             raise RuntimeError(f"rerank 回應 index 越界：{index}（共 {len(hits)} 筆）。")
+        score = item.get("relevance_score", 0.0)
+        if type(score) not in (int, float) or not -sys.float_info.max <= score <= sys.float_info.max:
+            raise RuntimeError("rerank 回應的 relevance_score 必須為有限數值。")
         indices.append(index)
     if len(set(indices)) != len(indices):
         raise RuntimeError("rerank 回應的 index 重複，拒絕採用。")

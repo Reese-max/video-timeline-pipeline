@@ -84,5 +84,25 @@ class RetrievalCostGuardTests(unittest.TestCase):
                 self.assertEqual(reservations[0][0], "reserved" if isinstance(response, Exception) else "settled")
 
 
+class RerankResponseContractTests(unittest.TestCase):
+    def test_invalid_provider_ranking_is_not_applied(self):
+        hits = [{"text": "第一來源"}, {"text": "第二來源"}]
+        invalid = [
+            [],
+            {"results": "not an array"},
+            {"results": [{"index": True, "relevance_score": 1.0}]},
+            {"results": [{"index": 0, "relevance_score": float("nan")}]},
+            {"results": [{"index": 0, "relevance_score": float("inf")}]},
+            {"results": [{"index": 0, "relevance_score": 10 ** 500}]},
+            {"results": [{"index": 0, "relevance_score": True}]},
+            {"results": [{"index": 0, "relevance_score": "high"}]},
+        ]
+        with mock.patch.dict(os.environ, OPEN), cost_tracker.cost_root_scope(None):
+            for payload in invalid:
+                with self.subTest(payload=payload), mock.patch.object(pipeline, "post_json", return_value=payload):
+                    with self.assertRaises(RuntimeError):
+                        pipeline.rerank_hits("Q", hits, "fake", "test-reranker")
+
+
 if __name__ == "__main__":
     unittest.main()
