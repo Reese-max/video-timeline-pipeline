@@ -269,6 +269,10 @@ Instagram 先以無登入方式下載；可用時採用 `curl_cffi` 的 Chrome i
 
 每次實際下載在工作目錄保存 `instagram-download.json`：包含實際 yt-dlp 版本、request handlers、`curl_cffi` 版本、impersonation 能力、User-Agent 設定模式、Python／作業系統／容器標記、是否使用 cookies，以及每次嘗試的結果。失敗也會在 MCP 的錯誤文字回傳相同診斷，保留第一次失敗原因；不輸出 Cookie／Authorization 值或憑證路徑。錯誤不等於影片已刪除；cookies 也不保證能修正上游 extractor／帳戶／網路限制。Regression：`python -m unittest discover -s tests -p test_instagram_download.py -v`。
 
+### Facebook 下載與 cookies
+
+Facebook 單支影片／Reels 同樣走 yt-dlp；可用時採用 `curl_cffi` Chrome impersonation。公開下載失敗（例如部分 Reel 出現 `Cannot parse data`）後，僅在 `YTDLP_FACEBOOK_COOKIE_FILE` 明確設定時嘗試一次 authenticated fallback。變數須指向使用者自行提供的 Netscape cookies 絕對路徑（建議 `/home/box/video-timeline-pipeline/secrets/facebook_cookies.txt`，Unix 權限 `600`）；只複製 Facebook／fb.com 網域 cookies 到私人暫存檔，結束即清理，不覆寫原檔、不讀取瀏覽器。工作目錄會寫入 `facebook-download.json` 診斷（不含 cookie 值）。Regression：`python -m unittest discover -s tests -p test_facebook_download.py -v`。
+
 ### Threads 單篇影片與 carousel
 
 公開 Threads 貼文可直接使用同一個入口，支援 `threads.com`／`threads.net` 的 `/@user/post/<ID>` 與 `/t/<ID>` 連結：
