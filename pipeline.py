@@ -9,6 +9,7 @@ import csv
 import ctypes
 import datetime
 import difflib
+from decimal import Decimal, InvalidOperation, ROUND_CEILING
 import email.utils
 import hashlib
 import http.cookiejar
@@ -3966,12 +3967,16 @@ def fetch_facebook_author_apify(author: str, since: str) -> dict[str, Any]:
         raise ValueError("APIFY_FACEBOOK_ACTOR 必須是 username~actor-name。")
     try:
         results_limit = int(os.getenv("APIFY_FACEBOOK_RESULTS_LIMIT", "1000000"))
-        max_charge = float(apify_setting("APIFY_MAX_TOTAL_CHARGE_USD"))
+        max_charge = Decimal(apify_setting("APIFY_MAX_TOTAL_CHARGE_USD"))
         timeout_seconds = int(os.getenv("APIFY_RUN_TIMEOUT_SECONDS", "1800"))
-    except ValueError as exc:
+    except (InvalidOperation, ValueError) as exc:
         raise ValueError("Apify 數值設定格式錯誤。") from exc
-    if results_limit <= 0 or not math.isfinite(max_charge) or max_charge <= 0 or timeout_seconds <= 0:
+    if results_limit <= 0 or not max_charge.is_finite() or max_charge <= 0 or timeout_seconds <= 0:
         raise ValueError("Apify results limit、費用上限與 timeout 都必須大於 0。")
+    max_charge_micro = int(
+        (max_charge * Decimal(1_000_000)).to_integral_value(rounding=ROUND_CEILING)
+    )
+    max_charge_usd = format(max_charge, "f")
 
     page_id = facebook_page_identifier(author)
     author_url = facebook_author_url(author)
@@ -3986,13 +3991,17 @@ def fetch_facebook_author_apify(author: str, since: str) -> dict[str, Any]:
             since_timestamp, datetime.timezone.utc
         ).isoformat().replace("+00:00", "Z")
     headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
-    query = urllib.parse.urlencode({"waitForFinish": 60, "maxTotalChargeUsd": max_charge})
+    query = urllib.parse.urlencode({"waitForFinish": 60, "maxTotalChargeUsd": max_charge_usd})
     run_url = f"https://api.apify.com/v2/actors/{urllib.parse.quote(actor, safe='~')}/runs?{query}"
     try:
         # 一次 Actor 工作只預留一次：maxTotalChargeUsd 是供應商端真正封頂的金額，
         # 後續 poll／dataset 讀取都屬同一筆遠端工作，不得再當成新的完整 Actor 費用。
         with cost_guard(
-            "apify", "actor.run.start", model=actor, estimated_micro_usd=int(max_charge * 1_000_000)
+            "apify",
+            "actor.run.start",
+            model=actor,
+            estimated_micro_usd=max_charge_micro,
+            provider_enforced_upper_bound_micro_usd=max_charge_micro,
         ) as guard_outcome:
             payload = post_json(run_url, headers, json.dumps(actor_input).encode("utf-8"), timeout=70)
             run = payload.get("data") if isinstance(payload, dict) else None
