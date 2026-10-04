@@ -94,6 +94,106 @@ class IntegrationTests(unittest.TestCase):
             fresh = server.tool_payload(self.manifest)['segments'][0]['url']
             self.assertIn('expires=',fresh)
 
+    def test_retained_records_after_media_cleanup_return_media_expired(self):
+        result_path = self.job / 'analysis' / 'result.json'
+        result_path.parent.mkdir()
+        result = {'status':'complete',
+                  'cache_signature':server.analysis_cache_signature(self.job/'source.mp4',self.manifest)}
+        result_path.write_text(json.dumps(result),encoding='utf-8')
+        # media_retention --apply removes generated media but keeps manifest/analysis records.
+        (self.job / 'source.mp4').unlink()
+        (self.job / 'segments' / 'segment_000.mp4').unlink()
+        queue = JobQueue(self.root / 'queue',autostart=False)
+        with patch.object(server,'get_queue',return_value=queue):
+            snapshot = asyncio.run(server.get_prepared_video(self.job_id))
+        queue.close()
+        self.assertEqual(snapshot['status'],'expired')
+        self.assertEqual(snapshot['error_code'],'MEDIA_EXPIRED')
+        self.assertIsNone(snapshot['prepared'])
+        self.assertIsNone(snapshot['analysis'])
+        self.assertIsNone(snapshot['active_operation'])
+        self.assertIsNone(snapshot['latest_operation'])
+
+    def test_partial_media_cleanup_also_returns_media_expired(self):
+        # An interrupted cleanup can leave the source while segments are already gone.
+        (self.job / 'segments' / 'segment_000.mp4').unlink()
+        queue = JobQueue(self.root / 'queue',autostart=False)
+        with patch.object(server,'get_queue',return_value=queue):
+            snapshot = asyncio.run(server.get_prepared_video(self.job_id))
+        queue.close()
+        self.assertEqual(snapshot['status'],'expired')
+        self.assertEqual(snapshot['error_code'],'MEDIA_EXPIRED')
+        self.assertIsNone(snapshot['prepared'])
+
+    def test_expired_snapshot_reports_live_and_refreshes_stale_operations(self):
+        queue = JobQueue(self.root / 'queue',autostart=False)
+        with patch.object(server,'get_queue',return_value=queue):
+            pending = queue.submit('prepare',{'url':'https://example.test/video'},self.job_id)
+            stale = queue.submit('prepare',{'url':'https://example.test/other'},self.job_id)
+            with queue.connect() as db:
+                db.execute("UPDATE jobs SET status='completed',result=?,created=? WHERE id=?",
+                           (json.dumps(server.tool_payload(self.manifest)),time.time() + 60,stale['operation_id']))
+            (self.job / 'source.mp4').unlink()
+            snapshot = asyncio.run(server.get_prepared_video(self.job_id))
+            self.assertEqual(snapshot['status'],'expired')
+            self.assertEqual(snapshot['error_code'],'MEDIA_EXPIRED')
+            self.assertEqual(snapshot['active_operation']['operation_id'],pending['operation_id'])
+            self.assertEqual(snapshot['latest_operation']['status'],'expired')
+            self.assertEqual(snapshot['latest_operation']['error_code'],'MEDIA_EXPIRED')
+            self.assertIsNone(snapshot['latest_operation']['result'])
+        queue.close()
+
+    def test_unreadable_media_dir_is_not_media_expired(self):
+        if os.name == 'nt' or os.geteuid() == 0:
+            self.skipTest('needs POSIX permission enforcement')
+        (self.job / 'segments').chmod(0)
+        queue = JobQueue(self.root / 'queue',autostart=False)
+        try:
+            with patch.object(server,'get_queue',return_value=queue), self.assertRaises(PermissionError):
+                asyncio.run(server.get_prepared_video(self.job_id))
+        finally:
+            queue.close()
+            (self.job / 'segments').chmod(0o700)
+
+    def test_non_file_source_is_media_expired_not_served(self):
+        (self.job / 'source.mp4').unlink()
+        (self.job / 'source.mp4').mkdir()
+        queue = JobQueue(self.root / 'queue',autostart=False)
+        with patch.object(server,'get_queue',return_value=queue):
+            snapshot = asyncio.run(server.get_prepared_video(self.job_id))
+        queue.close()
+        self.assertEqual(snapshot['error_code'],'MEDIA_EXPIRED')
+        self.assertIsNone(snapshot['prepared'])
+
+    def test_missing_manifest_and_present_source_are_not_media_expired(self):
+        queue = JobQueue(self.root / 'queue',autostart=False)
+        with patch.object(server,'get_queue',return_value=queue):
+            snapshot = asyncio.run(server.get_prepared_video(self.job_id))
+            self.assertEqual(snapshot['prepared']['status'],'ready')
+            self.assertEqual(snapshot['prepared']['job_id'],self.job_id)
+            self.assertNotEqual(snapshot.get('error_code'),'MEDIA_EXPIRED')
+            (self.job / 'manifest.json').unlink()
+            with self.assertRaises(ValueError):
+                asyncio.run(server.get_prepared_video(self.job_id))
+        queue.close()
+
+    def test_completed_prepare_refreshes_to_media_expired_after_source_cleanup(self):
+        queue = JobQueue(self.root / 'queue',autostart=False)
+        with patch.object(server,'get_queue',return_value=queue):
+            operation = queue.submit('prepare',{'url':'https://example.test/video'},self.job_id)
+            with queue.connect() as db:
+                db.execute("UPDATE jobs SET status='completed',result=? WHERE id=?",
+                           (json.dumps(server.tool_payload(self.manifest)),operation['operation_id']))
+            refreshed = server.refreshed_operation(operation['operation_id'])
+            self.assertEqual(refreshed['status'],'completed')
+            self.assertEqual(refreshed['result']['job_id'],self.job_id)
+            (self.job / 'source.mp4').unlink()
+            refreshed = server.refreshed_operation(operation['operation_id'])
+            self.assertEqual(refreshed['status'],'expired')
+            self.assertEqual(refreshed['error_code'],'MEDIA_EXPIRED')
+            self.assertIsNone(refreshed['result'])
+        queue.close()
+
     def test_background_tools_queue_once_and_restore_active_operation(self):
         queue = JobQueue(self.root / 'queue',autostart=False)
         with patch.object(server,'get_queue',return_value=queue):
