@@ -409,6 +409,56 @@ class GuardModeTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.tmp_dir.cleanup()
 
+    def test_strict_mode_rejects_estimates_without_provider_enforced_bound(self) -> None:
+        dispatched: list[str] = []
+        with patch.dict(os.environ, {"BUDGET_HARD_STOP": "true", "DAILY_BUDGET_USD": "5.00"}), (
+            cost_tracker.cost_root_scope(self.root)
+        ):
+            with self.assertRaises(cost_tracker.BudgetBlockedError):
+                with cost_tracker.provider_cost_guard(
+                    "minimax", "summarize", estimated_micro_usd=100
+                ):
+                    dispatched.append("sent")
+        self.assertEqual(dispatched, [])
+
+    def test_strict_mode_accepts_and_reserves_provider_enforced_bound(self) -> None:
+        dispatched: list[str] = []
+        with patch.dict(os.environ, {"BUDGET_HARD_STOP": "true", "DAILY_BUDGET_USD": "5.00"}), (
+            cost_tracker.cost_root_scope(self.root)
+        ):
+            with cost_tracker.provider_cost_guard(
+                "apify",
+                "actor.run.start",
+                estimated_micro_usd=1_000_000,
+                provider_enforced_upper_bound_micro_usd=1_000_000,
+            ) as outcome:
+                self.assertTrue(outcome.enforced)
+                self.assertEqual(outcome.estimated_micro_usd, 1_000_000)
+                dispatched.append("sent")
+        self.assertEqual(dispatched, ["sent"])
+        reservation = rows(self.root, "budget_reservations")[0]
+        self.assertEqual(int(reservation["max_micro_usd"]), 1_000_000)
+        self.assertEqual(reservation["status"], "settled")
+
+    def test_apify_decimal_cap_rounds_up_before_budget_reservation(self) -> None:
+        env = {
+            "BUDGET_HARD_STOP": "true",
+            "DAILY_BUDGET_USD": "0.1",
+            "APIFY_API_TOKEN": "apify-token",
+            "APIFY_MAX_TOTAL_CHARGE_USD": "0.1000001",
+        }
+        with patch.dict(os.environ, env), cost_tracker.cost_root_scope(self.root):
+            with patch.object(urllib.request, "urlopen") as transport:
+                with self.assertRaises(cost_tracker.BudgetBlockedError):
+                    pipeline.fetch_facebook_author_apify(
+                        "https://www.facebook.com/somepage", "365d"
+                    )
+                transport.assert_not_called()
+        usage = rows(self.root, "usage_costs")
+        self.assertEqual(len(usage), 1)
+        self.assertEqual(usage[0]["status"], "blocked_budget")
+        self.assertEqual(int(usage[0]["estimated_micro_usd"]), 100_001)
+
     def test_strict_mode_refuses_operations_without_a_verified_bound(self) -> None:
         with patch.dict(os.environ, BLOCKED_ENV), cost_tracker.cost_root_scope(self.root):
             with self.assertRaises(cost_tracker.BudgetBlockedError):
