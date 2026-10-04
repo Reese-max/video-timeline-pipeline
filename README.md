@@ -577,7 +577,7 @@ OPEN_NOTEBOOK_PASSWORD=不要提交到版本控制
 | RSS 通知 Webhook | `notify` | 每次通知前 |
 | Email（Resend／SMTP／Webhook） | `email.send`、`webhook.post` | 每次寄送前，被拒絕時回 `permanent_failure`（不重試、不遞迴告警） |
 
-沒有價格目錄、也沒有供應商端封頂的操作（Meta Graph、Open Notebook、Webhook、Email）在**嚴格模式**下會被直接拒絕，而不是用一個臆測的「保守數字」冒充硬上限。
+**嚴格模式只放行帶有供應商端可執行上限的操作。** 目前只有 Apify Actor 啟動傳入 `maxTotalChargeUsd`（[Apify Run Actor API](https://docs.apify.com/api/v2/actors-runs-post) 說明該值限制單次 run 的總費用）。Groq、MiniMax、OpenRouter 等路徑目前只有估算，沒有可驗證的供應商端費用上限，因此即使估算值為正，hard-stop 開啟時仍會拒絕；soft mode 的估算只供記錄，不保證實際費用不超出本地預算。
 
 ```text
 DAILY_BUDGET_USD=5.00
