@@ -619,10 +619,14 @@ class GroundedAnswerTests(unittest.TestCase):
             seed_library(root)
             seed_vectors(root, pipeline.vector_namespace("openrouter", "test-embed"))
             result, captured = self._ask(root, "做法是對齊片段 [1]，細節見 [9]。")
-            # [9] 超出 evidence 範圍：從答案剔除並計數，不可假裝有依據
+            # An invalid reference or unbound paraphrase cannot be rescued by
+            # another valid index: reject the answer while retaining evidence.
             self.assertNotIn("[9]", result["answer"])
             self.assertEqual(result["dropped_citations"], 1)
-            self.assertFalse(result["insufficient_evidence"])
+            self.assertTrue(result["insufficient_evidence"])
+            self.assertFalse(result["semantic_support_verified"])
+            self.assertEqual(result["claims"], [])
+            self.assertEqual(result["citations"], [])
             self.assertTrue(result["evidence"])
             for cite in result["citations"]:
                 self.assertTrue(cite["occurrence_id"].startswith("occ_"))
