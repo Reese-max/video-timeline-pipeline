@@ -65,11 +65,19 @@ class FoundationSchemaTests(unittest.TestCase):
         self.assertIn("schema_migrations", tables)
         self.assertIn("library_meta", tables)
         self.assertIn("processed_revisions", tables)
+        for table in (
+            "notification_events",
+            "notification_deliveries",
+            "delivery_attempts",
+            "digest_runs",
+            "digest_items",
+        ):
+            self.assertIn(table, tables)
 
         versions = {
             row[0] for row in self.conn.execute("SELECT version FROM schema_migrations")
         }
-        self.assertIn(1, versions)
+        self.assertEqual(versions, {1, 2})
 
         columns = {
             row[1]
@@ -89,6 +97,51 @@ class FoundationSchemaTests(unittest.TestCase):
 
         # Re-running initialization must succeed without error.
         notifications._init_operations_schema(self.conn)
+
+    def test_legacy_notification_events_are_preserved_when_schema_is_registered(self) -> None:
+        ops = _ops()
+        with tempfile.TemporaryDirectory() as tmp:
+            conn = sqlite3.connect(Path(tmp) / "operations.db")
+            conn.row_factory = sqlite3.Row
+            try:
+                # Older deployments created notification tables before their
+                # schemas were registered. The new migration must adopt those
+                # tables without discarding accepted outbox evidence.
+                conn.execute(
+                    """
+                    CREATE TABLE notification_events (
+                        event_id TEXT PRIMARY KEY,
+                        event_type TEXT NOT NULL,
+                        library_id TEXT,
+                        job TEXT,
+                        analysis_revision TEXT,
+                        payload_version TEXT DEFAULT '1',
+                        payload_json TEXT NOT NULL,
+                        created_at TEXT NOT NULL,
+                        dedup_key TEXT UNIQUE NOT NULL
+                    )
+                    """
+                )
+                conn.execute(
+                    """
+                    INSERT INTO notification_events (
+                        event_id, event_type, payload_json, created_at, dedup_key
+                    ) VALUES ('event-1', 'video.completed', '{}', '2026-10-04T00:00:00+00:00', 'dedup-1')
+                    """
+                )
+
+                notifications._init_operations_schema(conn)
+
+                versions = {
+                    row[0] for row in conn.execute("SELECT version FROM schema_migrations")
+                }
+                self.assertEqual(versions, {1, 2})
+                event = conn.execute(
+                    "SELECT event_type, dedup_key FROM notification_events WHERE event_id = 'event-1'"
+                ).fetchone()
+                self.assertEqual(tuple(event), ("video.completed", "dedup-1"))
+            finally:
+                conn.close()
 
     def test_failed_migration_leaves_no_partial_schema(self) -> None:
         ops = _ops()
@@ -509,7 +562,7 @@ class ReadOnlyContractTests(unittest.TestCase):
                     r[0]
                     for r in conn2.execute("SELECT version FROM schema_migrations")
                 }
-                self.assertEqual(versions, {1})
+                self.assertEqual(versions, {1, 2})
             finally:
                 conn2.close()
 

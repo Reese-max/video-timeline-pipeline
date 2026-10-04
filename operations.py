@@ -29,7 +29,7 @@ from pathlib import Path
 from typing import Any
 
 
-FOUNDATION_SCHEMA_VERSION = 1
+FOUNDATION_SCHEMA_VERSION = 2
 
 # Analysis artifacts whose bytes define the revision. Rendered outputs
 # (notes.md, knowledge.md, *.srt) and bookkeeping (source.json,
@@ -86,7 +86,107 @@ MIGRATIONS: tuple[tuple[int, str, tuple[str, ...]], ...] = (
             """,
         ),
     ),
+    (
+        2,
+        "notification_and_digest_schema",
+        (
+            """
+            CREATE TABLE IF NOT EXISTS notification_events (
+                event_id TEXT PRIMARY KEY,
+                event_type TEXT NOT NULL,
+                library_id TEXT,
+                job TEXT,
+                analysis_revision TEXT,
+                payload_version TEXT DEFAULT '1',
+                payload_json TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                dedup_key TEXT UNIQUE NOT NULL
+            )
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS notification_deliveries (
+                delivery_id TEXT PRIMARY KEY,
+                event_id TEXT NOT NULL,
+                channel TEXT NOT NULL,
+                recipient_id TEXT NOT NULL,
+                provider TEXT NOT NULL,
+                status TEXT NOT NULL,
+                payload_hash TEXT NOT NULL,
+                provider_idempotency_key TEXT,
+                provider_message_id TEXT,
+                attempt_count INTEGER DEFAULT 0,
+                lease_owner TEXT,
+                lease_token TEXT,
+                lease_expires_at TEXT,
+                next_attempt_at TEXT,
+                safe_error TEXT,
+                submitted_at TEXT,
+                accepted_at TEXT,
+                created_at TEXT NOT NULL,
+                FOREIGN KEY(event_id) REFERENCES notification_events(event_id)
+            )
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS delivery_attempts (
+                attempt_id TEXT PRIMARY KEY,
+                delivery_id TEXT NOT NULL,
+                attempt_no INTEGER NOT NULL,
+                request_id TEXT,
+                started_at TEXT NOT NULL,
+                finished_at TEXT,
+                outcome TEXT NOT NULL,
+                safe_error TEXT,
+                FOREIGN KEY(delivery_id) REFERENCES notification_deliveries(delivery_id)
+            )
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS digest_runs (
+                digest_id TEXT PRIMARY KEY,
+                schedule_id TEXT NOT NULL,
+                type TEXT NOT NULL,
+                window_start TEXT NOT NULL,
+                window_end TEXT NOT NULL,
+                timezone TEXT NOT NULL,
+                recipient_id TEXT NOT NULL,
+                revision INTEGER DEFAULT 1,
+                selection_snapshot TEXT NOT NULL,
+                rendered_payload_hash TEXT NOT NULL,
+                status TEXT NOT NULL,
+                candidate_count INTEGER DEFAULT 0,
+                selected_count INTEGER DEFAULT 0,
+                deferred_count INTEGER DEFAULT 0,
+                created_at TEXT NOT NULL
+            )
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS digest_items (
+                digest_id TEXT NOT NULL,
+                job TEXT NOT NULL,
+                analysis_revision TEXT,
+                rank INTEGER NOT NULL,
+                reason TEXT,
+                disposition TEXT NOT NULL,
+                PRIMARY KEY(digest_id, job),
+                FOREIGN KEY(digest_id) REFERENCES digest_runs(digest_id)
+            )
+            """,
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS uq_deliveries
+                ON notification_deliveries(event_id, channel, recipient_id)
+            """,
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS uq_digest_runs
+                ON digest_runs(schedule_id, type, window_start, window_end, recipient_id, revision)
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS ix_deliveries_status
+                ON notification_deliveries(status, next_attempt_at)
+            """,
+        ),
+    ),
 )
+ 
+ 
 
 
 def _utc_now_iso() -> str:
