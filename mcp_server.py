@@ -1270,7 +1270,12 @@ async def get_prepared_video(job_id: str) -> dict[str, Any]:
     def read():
         manifest = read_manifest(prepared_job_dir(job_id))
         if not manifest: raise ValueError("影片尚未準備完成或已過保留期限。")
-        analysis = cached_analysis(job_id, manifest)
+        try:
+            analysis = cached_analysis(job_id, manifest)
+        except pipeline.SourceVideoMissingError:
+            return {"status": "expired", "job_id": job_id, "error_code": "MEDIA_EXPIRED",
+                    "error": "影片已過保留期限，請重新準備影片。", "prepared": None,
+                    "analysis": None, "active_operation": None, "latest_operation": None}
         operations = get_queue().for_job(job_id)
         latest = operations.get("latest_operation") or {}
         invalidated = latest.get("status") == "completed" and latest.get("result_kind") == "analysis" and analysis is None

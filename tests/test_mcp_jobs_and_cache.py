@@ -12,6 +12,7 @@ from starlette.applications import Starlette
 from starlette.routing import Route
 from starlette.testclient import TestClient
 import mcp_server as server
+import media_retention
 from job_queue import JobQueue
 
 
@@ -107,6 +108,60 @@ class IntegrationTests(unittest.TestCase):
             resumed = asyncio.run(server.resume_video_job(one.structuredContent['operation_id']))
             self.assertEqual(resumed['status'],'queued')
         queue.close()
+
+    def test_retention_apply_then_restore_returns_structured_media_expired(self):
+        source = self.job / 'source.mp4'
+        now = time.time()
+        os.utime(source, (now - 8 * 86400,) * 2)
+        fingerprint = server.pipeline.file_fingerprint(source)
+        self.manifest['source']['fingerprint'] = fingerprint
+        (self.job / 'manifest.json').write_text(json.dumps(self.manifest), encoding='utf-8')
+        result_path = self.job / 'analysis' / 'result.json'
+        result_path.parent.mkdir()
+        result = {'status': 'complete', 'job_id': self.job_id,
+                  'source_fingerprint': fingerprint,
+                  'source_sha256': server.pipeline.file_sha256(source),
+                  'cache_signature': server.analysis_cache_signature(source, self.manifest),
+                  'quality': {'status': 'evidence_available'}, 'transcript': 'retained evidence'}
+        result_path.write_text(json.dumps(result), encoding='utf-8')
+        preserved = {path: path.read_bytes() for path in [self.job / 'manifest.json', result_path]}
+        for path in self.job.rglob('*'):
+            if path.is_file(): os.utime(path, (now - 8 * 86400,) * 2)
+        removed = media_retention.cleanup(self.jobs, apply=True, now=now)
+        self.assertEqual(removed['deleted_files'], 2)
+        self.assertEqual(removed['errors'], [])
+        with patch.object(server, 'get_queue') as queue:
+            restored = asyncio.run(server.get_prepared_video(self.job_id))
+            queue.assert_not_called()
+        self.assertEqual(restored['status'], 'expired')
+        self.assertEqual(restored['error_code'], 'MEDIA_EXPIRED')
+        self.assertEqual(restored['job_id'], self.job_id)
+        self.assertIsNone(restored['prepared'])
+        self.assertIsNone(restored['analysis'])
+        self.assertIn('重新準備', restored['error'])
+        for path, content in preserved.items(): self.assertEqual(path.read_bytes(), content)
+
+    def test_restore_missing_manifest_and_other_io_errors_are_not_expiry(self):
+        (self.job / 'manifest.json').unlink()
+        with self.assertRaises(ValueError): asyncio.run(server.get_prepared_video(self.job_id))
+        (self.job / 'manifest.json').write_text(json.dumps(self.manifest), encoding='utf-8')
+        with patch.object(server.pipeline, 'locate_source_video', side_effect=PermissionError('fixture')):
+            with self.assertRaises(PermissionError): asyncio.run(server.get_prepared_video(self.job_id))
+        with patch.object(server, 'cached_analysis', side_effect=RuntimeError('cache read failed')):
+            with self.assertRaisesRegex(RuntimeError, 'cache read failed'):
+                asyncio.run(server.get_prepared_video(self.job_id))
+
+    def test_restore_valid_cached_analysis_still_returns_evidence(self):
+        result_path = self.job / 'analysis' / 'result.json'
+        result_path.parent.mkdir()
+        result = {'status': 'partial', 'job_id': self.job_id, 'timeline': [],
+                  'cache_signature': server.analysis_cache_signature(self.job / 'source.mp4', self.manifest)}
+        result_path.write_text(json.dumps(result), encoding='utf-8')
+        with patch.object(server, 'get_queue') as queue:
+            queue.return_value.for_job.return_value = {'active_operation': None, 'latest_operation': None}
+            restored = asyncio.run(server.get_prepared_video(self.job_id))
+        self.assertEqual(restored['prepared']['status'], 'ready')
+        self.assertEqual(restored['analysis']['status'], 'partial')
 
 
 if __name__ == '__main__': unittest.main()

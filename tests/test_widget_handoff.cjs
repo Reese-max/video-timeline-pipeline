@@ -129,6 +129,17 @@ async function test(name, run) { await run(); count++; console.log('ok ' + count
   await test('media retention expiry requires new preparation', async () => {
     const h = harness({ snapshot: { prepared: job('first'), analysis: null, latest_operation: { ...pending(), status: 'expired', error_code: 'MEDIA_EXPIRED', error: 'fixture retention expiry' } } }); await h.flush(); assert.equal(h.elements.get('resume').hidden, true); assert.match(h.elements.get('status').textContent, /保留期限/); assert.equal(h.calls.length, 1);
   });
+  await test('expired prepared-media snapshot clears stale evidence and disables work', async () => {
+    const h = harness({ snapshot: { status: 'expired', job_id: 'first', error_code: 'MEDIA_EXPIRED', error: '請重新準備影片。', prepared: null, analysis: null, active_operation: null, latest_operation: null }, saved: { privateContent: { jobId: 'first', operationId: 'stale-analysis' } } });
+    await h.flush(); assert.deepEqual(h.calls.map(c => c.name), ['get_prepared_video']);
+    assert.match(h.elements.get('status').textContent, /保留期限/);
+    for (const id of ['analyze', 'drive', 'ask']) assert.equal(h.elements.get(id).disabled, true);
+    for (const id of ['resume', 'media', 'findings', 'drive-handoff']) assert.equal(h.elements.get(id).hidden, true);
+    assert.equal(h.elements.get('player').getAttribute('src'), null);
+    assert.equal(h.openai.widgetState.privateContent.operationId, null);
+    assert.equal(h.prompts.length, 0);
+    await h.click('refresh'); assert.equal(h.calls.at(-1).name, 'get_prepared_video');
+  });
   await test('pending preparation restores without job ID', async () => {
     const h = harness({ output: { ...pending('prepare-1', 'prepare'), job_id: undefined }, respond(name) { assert.equal(name, 'get_video_job'); return completed(job('first'), 'prepared', 'prepare-1'); } }); await h.flush(); await h.poll(); assert.equal(h.elements.get('title').textContent, '影片 first'); assert.equal(h.calls.length, 1); assert.equal(h.elements.get('analyze').disabled, false);
   });

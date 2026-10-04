@@ -361,6 +361,16 @@ async function restoreJob() {
     }
     const snapshot = await callTool("get_prepared_video", { job_id: id }, version);
     checkCurrent(version);
+    if (snapshot.status === "expired" && snapshot.error_code === "MEDIA_EXPIRED") {
+      if (snapshot.job_id !== id) throw new Error("恢復資料的工作不符。");
+      stopPolling(); activeOperation = snapshot; restoredOperationId = null; uncertainStart = false;
+      analysisResult = null; evidenceRows = [];
+      for (const name of ["media", "findings", "drive-handoff"]) $(name).hidden = true;
+      $("drive-prompt").value = ""; $("player").removeAttribute("src"); $("player").load();
+      showOperation(); saveState();
+      status("影片已超過保留期限，請重新準備影片。" + errorText(snapshot.error));
+      return;
+    }
     if (snapshot.prepared?.job_id !== id) throw new Error("恢復資料的工作不符。");
     renderPrepared(snapshot.prepared);
     const restoredVersion = generation;

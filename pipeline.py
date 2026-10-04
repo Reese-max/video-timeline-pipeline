@@ -223,6 +223,10 @@ def artifact_path(path: Path, root: Path) -> str:
         return str(path.resolve())
 
 
+class SourceVideoMissingError(RuntimeError):
+    """No retained source media remains in an existing job directory."""
+
+
 def locate_source_video(job_dir: Path) -> Path:
     candidates = sorted(
         path
@@ -230,7 +234,7 @@ def locate_source_video(job_dir: Path) -> Path:
         if path.suffix.lower() in MEDIA_EXTENSIONS
     )
     if not candidates:
-        raise RuntimeError(f"下載完成但找不到影片檔：{job_dir}")
+        raise SourceVideoMissingError(f"下載完成但找不到影片檔：{job_dir}")
     return candidates[0]
 
 
