@@ -421,6 +421,19 @@ class GuardModeTests(unittest.TestCase):
                 with cost_tracker.provider_cost_guard("minimax", "summarize"):
                     pass
 
+    def test_strict_mode_rejects_invalid_daily_budget_before_dispatch(self) -> None:
+        for raw in ("not-a-number", "-1", "NaN", "Infinity"):
+            with self.subTest(daily_budget_usd=raw):
+                dispatched: list[str] = []
+                with patch.dict(
+                    os.environ,
+                    {"BUDGET_HARD_STOP": "true", "DAILY_BUDGET_USD": raw},
+                ), cost_tracker.cost_root_scope(self.root):
+                    with self.assertRaises(cost_tracker.BudgetBlockedError):
+                        with cost_tracker.provider_cost_guard("minimax", "summarize"):
+                            dispatched.append("sent")
+                self.assertEqual(dispatched, [])
+
     def test_default_mode_is_transparent_and_persists_nothing(self) -> None:
         calls: list[str] = []
         with patch.dict(os.environ, {"BUDGET_HARD_STOP": "false", "DAILY_BUDGET_USD": "0"}), (
