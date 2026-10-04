@@ -16,6 +16,7 @@ import datetime
 import json
 import os
 import sqlite3
+from decimal import Decimal, InvalidOperation
 import time
 import uuid
 from contextlib import closing, contextmanager
@@ -181,6 +182,20 @@ def estimate_operation_cost_micro_usd(provider: str, model: str | None, prompt_t
     return 0
 
 
+def _daily_budget_usd() -> Decimal:
+    """Parse the configured budget exactly and reject invalid or negative values."""
+    raw = os.getenv("DAILY_BUDGET_USD", "0").strip()
+    if not raw:
+        raw = "0"
+    try:
+        budget = Decimal(raw)
+    except InvalidOperation as exc:
+        raise ValueError("DAILY_BUDGET_USD must be a finite, non-negative decimal.") from exc
+    if not budget.is_finite() or budget < 0:
+        raise ValueError("DAILY_BUDGET_USD must be a finite, non-negative decimal.")
+    return budget
+
+
 def check_and_reserve_budget(
     root: Path,
     operation_name: str,
@@ -192,7 +207,7 @@ def check_and_reserve_budget(
     Returns: (allowed, reservation_id, reason)
     """
     hard_stop = os.getenv("BUDGET_HARD_STOP", "false").lower() in ("true", "1", "yes")
-    daily_budget_usd = float(os.getenv("DAILY_BUDGET_USD", "0"))
+    daily_budget_usd = _daily_budget_usd()
     daily_budget_micro = int(daily_budget_usd * 1_000_000)
 
     with closing(get_operations_db(root)) as conn:
@@ -319,9 +334,13 @@ def guard_is_strict() -> bool:
     if os.getenv("BUDGET_HARD_STOP", "false").strip().lower() not in ("true", "1", "yes"):
         return False
     try:
-        return float(os.getenv("DAILY_BUDGET_USD", "0")) > 0
-    except ValueError:
-        return False
+        return _daily_budget_usd() > 0
+    except ValueError as exc:
+        raise BudgetBlockedError(
+            "Budget blocked: DAILY_BUDGET_USD 設定無效，strict 模式 fail-closed。",
+            provider="budget",
+            operation="configuration",
+        ) from exc
 
 
 @dataclass
