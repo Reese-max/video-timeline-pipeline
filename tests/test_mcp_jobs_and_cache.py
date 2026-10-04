@@ -212,6 +212,9 @@ class IntegrationTests(unittest.TestCase):
             (self.job / 'manifest.json').unlink()
             with self.assertRaises(FileNotFoundError):
                 server.refreshed_operation(operation['operation_id'])
+            (self.job / 'manifest.json').write_text('{',encoding='utf-8')
+            with self.assertRaises(json.JSONDecodeError):
+                server.refreshed_operation(operation['operation_id'])
         queue.close()
 
     def test_completed_prepare_refresh_propagates_media_permission_errors(self):
