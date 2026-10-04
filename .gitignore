@@ -27,3 +27,4 @@ __pycache__/
 cookies/
 cookies.txt
 *.cookies.txt
+secrets/

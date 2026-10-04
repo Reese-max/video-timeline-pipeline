@@ -45,6 +45,10 @@ MEDIA_EXTENSIONS = {
 }
 
 THREADS_HOSTS = {"threads.com", "www.threads.com", "threads.net", "www.threads.net"}
+FACEBOOK_HOSTS = {
+    "facebook.com", "www.facebook.com", "web.facebook.com", "m.facebook.com",
+    "fb.watch", "www.fb.watch",
+}
 THREADS_POST_RE = re.compile(r"/(?:@[^/]+/)?(?:post|t)/(?P<id>[^/?#&]+)", re.IGNORECASE)
 THREADS_CRAWLER_USER_AGENT = "facebookexternalhit/1.1"
 THREADS_PAGE_MAX_BYTES = 16 * 1024 * 1024
@@ -288,6 +292,14 @@ def is_threads_url(url: str) -> bool:
     except ValueError:
         return False
     return hostname in THREADS_HOSTS
+
+
+def is_facebook_url(url: str) -> bool:
+    try:
+        hostname = (urllib.parse.urlsplit(url).hostname or "").lower()
+    except ValueError:
+        return False
+    return hostname in FACEBOOK_HOSTS
 
 
 def threads_post_id(url: str) -> str:
@@ -692,6 +704,91 @@ def download_instagram(command: list[str], url: str, job_dir: Path) -> None:
         write_json(job_dir / "instagram-download.json", diagnostics)
 
 
+
+def download_facebook(command: list[str], url: str, job_dir: Path) -> None:
+    """Facebook yt-dlp path: optional Chrome impersonation + cookie fallback.
+
+    Mirrors Instagram: public attempt first; only when YTDLP_FACEBOOK_COOKIE_FILE
+    points at an existing Netscape file do we retry with a scoped temp cookie copy.
+    Never mutates the user-supplied cookie file; never logs cookie values.
+    """
+    diagnostics = instagram_download_diagnostics(yt_dlp_command())
+    cookie_file = os.getenv("YTDLP_FACEBOOK_COOKIE_FILE", "").strip()
+    diagnostics.update(
+        status="error", cookies_configured=bool(cookie_file), cookies_used=False,
+        user_agent="yt-dlp default; curl_cffi-managed when impersonating",
+        attempts=[],
+    )
+    redactions = {url, cookie_file}
+
+    def safe_error(error: Exception) -> str:
+        text = redact_values(str(error), redactions)
+        text = re.sub(r"(?im)\b(authorization|cookie|set-cookie):[^\r\n]*", r"\1: <redacted>", text)
+        return sanitize_public_urls(text)[-800:]
+
+    def attempt(arguments: list[str], mode: str) -> None:
+        try:
+            run_external(arguments, stream=False, redact=redactions)
+            completed = [path for path in job_dir.glob("source.*")
+                         if path.stem == "source" and path.suffix.lower() in MEDIA_EXTENSIONS and path.stat().st_size]
+            if not completed:
+                raise RuntimeError("yt-dlp 未產生完整影片；可能被大小／長度限制略過。")
+        except RuntimeError as error:
+            diagnostics["attempts"].append({"mode": mode, "status": "error", "error": safe_error(error)})
+            raise
+        diagnostics["attempts"].append({"mode": mode, "status": "ok"})
+
+    def facebook_cookie_domain(domain: str) -> bool:
+        host = domain.lstrip(".").lower()
+        return host == "facebook.com" or host.endswith(".facebook.com") or host in {"fb.com", "fb.watch"} or host.endswith(".fb.com") or host.endswith(".fb.watch")
+
+    try:
+        options = ["--ignore-config", "--no-plugin-dirs", "--no-cookies", "--no-cookies-from-browser",
+                   "--socket-timeout", "20", "--retries", "1", "--extractor-retries", "1"]
+        if diagnostics["chrome_impersonation"]:
+            options += ["--impersonate", "chrome"]
+        public_command = command[:-1] + options + [url]
+        try:
+            attempt(public_command, "public")
+        except (DeadlineExceeded, ExecutionCancelled):
+            raise
+        except RuntimeError:
+            if not cookie_file:
+                raise RuntimeError("公開抓取失敗；未設定 YTDLP_FACEBOOK_COOKIE_FILE，未嘗試登入。") from None
+            path = Path(cookie_file)
+            if not path.is_absolute() or not path.is_file() or path.stat().st_size > 1024 * 1024:
+                raise RuntimeError("YTDLP_FACEBOOK_COOKIE_FILE 必須是既有絕對路徑、至多 1 MiB 的 Netscape cookies 檔。")
+            jar = http.cookiejar.MozillaCookieJar(str(path))
+            try:
+                jar.load(ignore_discard=True)
+            except (OSError, http.cookiejar.LoadError):
+                raise RuntimeError("Facebook cookies 無法讀取或不是 Netscape 格式。") from None
+            cookies = [cookie for cookie in jar if facebook_cookie_domain(cookie.domain)]
+            if not cookies:
+                raise RuntimeError("Facebook cookies 沒有 facebook.com／fb.com 網域項目；請由使用者更新授權檔案。")
+            redactions.update(cookie.value for cookie in cookies if cookie.value)
+            # yt-dlp writes back its cookie jar. Never modify the supplied credential file.
+            with tempfile.TemporaryDirectory(prefix="vtp-facebook-") as directory:
+                temporary = Path(directory) / "cookies.txt"
+                redactions.add(str(temporary))
+                scoped = http.cookiejar.MozillaCookieJar(str(temporary))
+                for cookie in cookies:
+                    scoped.set_cookie(cookie)
+                scoped.save(ignore_discard=True)
+                temporary.chmod(0o600)
+                diagnostics["cookies_used"] = True
+                attempt(public_command[:-1] + ["--cookies", str(temporary), url], "authenticated")
+        diagnostics["status"] = "ok"
+    except (DeadlineExceeded, ExecutionCancelled):
+        raise
+    except (OSError, ValueError, RuntimeError) as error:
+        diagnostics["error"] = safe_error(error)
+        raise RuntimeError("Facebook 下載失敗；診斷：" + json.dumps(diagnostics, ensure_ascii=False)) from None
+    finally:
+        sanitize_download_info(job_dir / "source.info.json")
+        write_json(job_dir / "facebook-download.json", diagnostics)
+
+
 def download_video(
     url: str,
     job_dir: Path,
@@ -730,8 +827,11 @@ def download_video(
     if max_duration is not None:
         command += ["--match-filter", f"duration <= {max_duration}"]
     command.append(url)
-    if (urllib.parse.urlsplit(url).hostname or "").lower() in {"instagram.com", "www.instagram.com", "m.instagram.com"}:
+    hostname = (urllib.parse.urlsplit(url).hostname or "").lower()
+    if hostname in {"instagram.com", "www.instagram.com", "m.instagram.com"}:
         download_instagram(command, url, job_dir)
+    elif is_facebook_url(url):
+        download_facebook(command, url, job_dir)
     else:
         run_external(command, stream=not private_url, redact={url} if private_url else None)
     if private_url:
