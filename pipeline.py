@@ -20,6 +20,7 @@ import mimetypes
 import os
 import re
 import shutil
+import signal
 import sqlite3
 import subprocess
 import sys
@@ -121,14 +122,19 @@ def run_external(
     print("$ " + redact_values(subprocess.list2cmdline(command), redact))
     if stream:
         sys.stdout.flush()
-    # Inherit the worker's process group so supervisor cancellation reaches FFmpeg
-    # and downloader children as well. Never detach these processes into a session.
+    # Create a new process group so we can terminate the entire command tree
+    # (including descendants like FFmpeg spawned by yt-dlp) on timeout/cancellation.
+    popen_kwargs = dict(cwd=cwd)
+    if os.name != "nt":
+        popen_kwargs["start_new_session"] = True
+    else:
+        popen_kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
     with contextlib.ExitStack() as stack:
         # Temporary files avoid a pipe-drain deadlock if a downloader's descendant
         # inherits stdout/stderr after its parent has been killed on timeout.
         output_file = None if stream else stack.enter_context(tempfile.TemporaryFile())
         error_file = None if stream else stack.enter_context(tempfile.TemporaryFile())
-        with subprocess.Popen(command, cwd=cwd, stdout=output_file, stderr=error_file) as process:
+        with subprocess.Popen(command, stdout=output_file, stderr=error_file, **popen_kwargs) as process:
             try:
                 while True:
                     try:
@@ -138,7 +144,13 @@ def run_external(
                     except subprocess.TimeoutExpired:
                         budget.check()
             except (DeadlineExceeded, ExecutionCancelled):
-                process.kill()
+                if os.name != "nt":
+                    try:
+                        os.killpg(process.pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                else:
+                    process.kill()
                 process.wait()
                 raise
         stdout = stderr = ""
