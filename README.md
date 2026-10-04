@@ -441,6 +441,18 @@ python pipeline.py --search '時間軸'   # 命中 N 筆（索引）
 
 `library.db` 可直接用任何 SQLite 工具開；`videos` 表一支影片一列，`events` 表是全文索引。
 
+### `operations.db`：永久操作帳本
+
+`library.db` 是可重建的搜尋投影；寄送紀錄、成本、評分與完成登記放進 Git 忽略的 `operations.db`，不綁會被 DROP/REPLACE 的搜尋表。基礎結構由 `operations.py` 提供：
+
+- `schema_migrations`：唯一版本化 migration registry；每個 migration 在單一交易內套用，中途失敗不留半套 schema。
+- `library_meta`：每個資料庫集合的 `library_id` UUID——產生一次後跨重啟保留，搬移或複製 root 不會換新；要另一個獨立資料集需明確初始化。
+- `processed_revisions`：完成登記表。`analysis_revision` 由分析產物內容雜湊得出（不含 `indexed_at`、執行時間或絕對路徑），重跑相同內容仍是同一 revision，不會變成新的可通知影片；內容真的改變才是新 revision。verified completed 產物登記與 outbox 事件在同一個 operations.db 交易內提交。
+- 讀取契約：`open_readonly()`／`foundation_status()` 以 `mode=ro` 開啟、不跑 DDL；未初始化回 `unavailable`、缺表回 `migration_required`，不隱式建庫。
+- `eligible_at`：完成時寫進 manifest 與登記表；digest 候選以登記表為準，補掃到的歷史內容（`backfill=1`、`eligible_at` 為 NULL）預設不寄。
+
+漏登記由 reconciliation 補掃：`python pipeline.py --ops-reconcile` 掃描 `jobs/*/manifest.json`，把已完成但未登記的影片補進 `processed_revisions`；無可靠首次完成時間時不假造，標記 `backfill=1` 且 `eligible_at` 留空。
+
 ## 問答與總覽
 
 兩者都需要 `MINIMAX_SUBSCRIPTION_KEY`，不需要額外服務。

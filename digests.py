@@ -12,6 +12,8 @@ from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
 
+import operations
+
 
 def parse_iso_datetime(value: str | None) -> datetime.datetime | None:
     """Parse ISO datetime string with robust timezone support."""
@@ -79,6 +81,17 @@ def collect_digest_candidates(
     if not jobs_dir.is_dir():
         return []
 
+    # F0.2: when the completion registry exists it is the eligibility
+    # authority. A registered revision with eligible_at NULL is reconciled
+    # historical content and is not sent by default; jobs with no registry
+    # row (or whose manifest revision was never registered) fall back to
+    # manifest fields for backward compatibility — reconciliation
+    # (--ops-reconcile) closes that gap. An unreadable registry fails closed:
+    # better an empty digest than sending on guesswork.
+    eligibility = operations.load_eligibility_index(root)
+    if eligibility is None:
+        return []
+
     candidates: list[dict[str, Any]] = []
 
     for job_path in jobs_dir.iterdir():
@@ -100,16 +113,34 @@ def collect_digest_candidates(
             continue
 
         # Check eligibility timestamp
-        eligible_str = (
-            manifest.get("eligible_at")
-            or manifest.get("created_at")
-            or manifest.get("processing", {}).get("created_at")
-        )
-        eligible_dt = parse_iso_datetime(eligible_str)
-        if not eligible_dt:
-            # Fallback to filesystem mtime
-            mtime = manifest_file.stat().st_mtime
-            eligible_dt = datetime.datetime.fromtimestamp(mtime, tz=datetime.timezone.utc)
+        entry = eligibility.get(job_path.name)
+        if entry is not None:
+            revision = manifest.get("analysis_revision")
+            if revision is None:
+                registered_at = entry["latest"]
+            elif str(revision) in entry["revisions"]:
+                registered_at = entry["revisions"][str(revision)]
+            else:
+                # The manifest's content was never registered — treat as
+                # unregistered and use the manifest fallback below.
+                entry = None
+        if entry is not None:
+            if not registered_at:
+                continue
+            eligible_dt = parse_iso_datetime(registered_at)
+            if not eligible_dt:
+                continue
+        else:
+            eligible_str = (
+                manifest.get("eligible_at")
+                or manifest.get("created_at")
+                or manifest.get("processing", {}).get("created_at")
+            )
+            eligible_dt = parse_iso_datetime(eligible_str)
+            if not eligible_dt:
+                # Fallback to filesystem mtime
+                mtime = manifest_file.stat().st_mtime
+                eligible_dt = datetime.datetime.fromtimestamp(mtime, tz=datetime.timezone.utc)
 
         if window_start_utc <= eligible_dt < window_end_utc:
             source = manifest.get("source", {})

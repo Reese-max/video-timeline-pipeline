@@ -19,6 +19,7 @@ from contextlib import closing
 from pathlib import Path
 from typing import Any
 
+import operations
 from digests import build_digest_payload, collect_digest_candidates, compute_digest_window
 from email_providers import BaseProvider, DeliveryResult, get_configured_provider
 from email_templates import render_digest_email, render_event_email
@@ -38,94 +39,40 @@ def get_operations_db(root: Path) -> sqlite3.Connection:
 
 
 def _init_operations_schema(conn: sqlite3.Connection) -> None:
-    """Idempotently initialize tables for notifications and digest runs."""
-    with conn:
-        conn.executescript(
-            """
-            CREATE TABLE IF NOT EXISTS notification_events (
-                event_id TEXT PRIMARY KEY,
-                event_type TEXT NOT NULL,
-                library_id TEXT,
-                job TEXT,
-                analysis_revision TEXT,
-                payload_version TEXT DEFAULT '1',
-                payload_json TEXT NOT NULL,
-                created_at TEXT NOT NULL,
-                dedup_key TEXT UNIQUE NOT NULL
-            );
-
-            CREATE TABLE IF NOT EXISTS notification_deliveries (
-                delivery_id TEXT PRIMARY KEY,
-                event_id TEXT NOT NULL,
-                channel TEXT NOT NULL,
-                recipient_id TEXT NOT NULL,
-                provider TEXT NOT NULL,
-                status TEXT NOT NULL,
-                payload_hash TEXT NOT NULL,
-                provider_idempotency_key TEXT,
-                provider_message_id TEXT,
-                attempt_count INTEGER DEFAULT 0,
-                lease_owner TEXT,
-                lease_token TEXT,
-                lease_expires_at TEXT,
-                next_attempt_at TEXT,
-                safe_error TEXT,
-                submitted_at TEXT,
-                accepted_at TEXT,
-                created_at TEXT NOT NULL,
-                FOREIGN KEY(event_id) REFERENCES notification_events(event_id)
-            );
-
-            CREATE TABLE IF NOT EXISTS delivery_attempts (
-                attempt_id TEXT PRIMARY KEY,
-                delivery_id TEXT NOT NULL,
-                attempt_no INTEGER NOT NULL,
-                request_id TEXT,
-                started_at TEXT NOT NULL,
-                finished_at TEXT,
-                outcome TEXT NOT NULL,
-                safe_error TEXT,
-                FOREIGN KEY(delivery_id) REFERENCES notification_deliveries(delivery_id)
-            );
-
-            CREATE TABLE IF NOT EXISTS digest_runs (
-                digest_id TEXT PRIMARY KEY,
-                schedule_id TEXT NOT NULL,
-                type TEXT NOT NULL,
-                window_start TEXT NOT NULL,
-                window_end TEXT NOT NULL,
-                timezone TEXT NOT NULL,
-                recipient_id TEXT NOT NULL,
-                revision INTEGER DEFAULT 1,
-                selection_snapshot TEXT NOT NULL,
-                rendered_payload_hash TEXT NOT NULL,
-                status TEXT NOT NULL,
-                candidate_count INTEGER DEFAULT 0,
-                selected_count INTEGER DEFAULT 0,
-                deferred_count INTEGER DEFAULT 0,
-                created_at TEXT NOT NULL
-            );
-
-            CREATE TABLE IF NOT EXISTS digest_items (
-                digest_id TEXT NOT NULL,
-                job TEXT NOT NULL,
-                analysis_revision TEXT,
-                rank INTEGER NOT NULL,
-                reason TEXT,
-                disposition TEXT NOT NULL,
-                PRIMARY KEY(digest_id, job),
-                FOREIGN KEY(digest_id) REFERENCES digest_runs(digest_id)
-            );
-
-            CREATE UNIQUE INDEX IF NOT EXISTS uq_deliveries ON notification_deliveries(event_id, channel, recipient_id);
-            CREATE UNIQUE INDEX IF NOT EXISTS uq_digest_runs ON digest_runs(schedule_id, type, window_start, window_end, recipient_id, revision);
-            CREATE INDEX IF NOT EXISTS ix_deliveries_status ON notification_deliveries(status, next_attempt_at);
-            """
-        )
+    """Initialize the operations store through its single versioned registry."""
+    operations.ensure_foundation_schema(conn)
 
 
 def _utc_now_iso() -> str:
     return datetime.datetime.now(datetime.timezone.utc).isoformat()
+
+
+def _insert_event(
+    conn: sqlite3.Connection,
+    event_type: str,
+    library_id: str | None,
+    job: str | None,
+    analysis_revision: str | None,
+    payload: dict[str, Any],
+    dedup_key: str,
+) -> str:
+    """Insert-or-return an outbox event. Does NOT commit — caller owns the transaction."""
+    event_id = str(uuid.uuid4())
+    payload_json = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+    # INSERT OR IGNORE + re-read converges under racing writers instead of
+    # raising IntegrityError on the dedup_key UNIQUE constraint.
+    conn.execute(
+        """
+        INSERT OR IGNORE INTO notification_events (
+            event_id, event_type, library_id, job, analysis_revision, payload_json, created_at, dedup_key
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (event_id, event_type, library_id, job, analysis_revision, payload_json, _utc_now_iso(), dedup_key),
+    )
+    row = conn.execute(
+        "SELECT event_id FROM notification_events WHERE dedup_key = ?", (dedup_key,)
+    ).fetchone()
+    return str(row["event_id"])
 
 
 def record_event(
@@ -138,24 +85,10 @@ def record_event(
     dedup_key: str,
 ) -> str:
     """Record an outbox event idempotently. Returns event_id."""
-    cur = conn.cursor()
-    cur.execute("SELECT event_id FROM notification_events WHERE dedup_key = ?", (dedup_key,))
-    existing = cur.fetchone()
-    if existing:
-        return str(existing["event_id"])
-
-    event_id = str(uuid.uuid4())
-    payload_json = json.dumps(payload, ensure_ascii=False, sort_keys=True)
     with conn:
-        conn.execute(
-            """
-            INSERT INTO notification_events (
-                event_id, event_type, library_id, job, analysis_revision, payload_json, created_at, dedup_key
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (event_id, event_type, library_id, job, analysis_revision, payload_json, _utc_now_iso(), dedup_key),
+        return _insert_event(
+            conn, event_type, library_id, job, analysis_revision, payload, dedup_key
         )
-    return event_id
 
 
 def enqueue_delivery(
@@ -619,8 +552,14 @@ def record_pipeline_completed_event(root: Path, job_dir: Path, manifest: dict[st
             source = manifest.get("source", {})
             title = source.get("title", job)
             url = source.get("url", "")
-            revision = manifest.get("analysis_revision", "1")
+            library_id = operations.get_or_create_library_id(conn)
+            artifact_hashes = operations.hash_job_artifacts(root, manifest)
+            # F0.2: the revision is derived from the actual artifact bytes, so
+            # a rerun of identical content keeps the same identity instead of
+            # becoming a newly notifiable video.
+            revision = operations.compute_analysis_revision(manifest, artifact_hashes)
             dedup_key = f"video.completed:{job}:{revision}"
+            eligible_at: str | None = None
 
             event_payload = {
                 "job": job,
@@ -630,15 +569,62 @@ def record_pipeline_completed_event(root: Path, job_dir: Path, manifest: dict[st
                 "created_at": _utc_now_iso(),
             }
 
-            event_id = record_event(
-                conn,
-                event_type="video.completed",
-                library_id=manifest.get("library_id"),
-                job=job,
-                analysis_revision=revision,
-                payload=event_payload,
-                dedup_key=dedup_key,
-            )
+            # F0.2: the verified-completion registration and the outbox event
+            # commit in the same operations.db transaction — a crash leaves
+            # neither half behind, and reconciliation backfills the rest.
+            with conn:
+                if manifest.get("status") == "completed":
+                    # A manifest-carried eligible_at is only this content's
+                    # first-completion time when its recorded revision matches
+                    # what we just computed — otherwise it belongs to older
+                    # content and must not backdate the new revision.
+                    recorded_at = (
+                        manifest.get("eligible_at")
+                        if manifest.get("analysis_revision") == revision
+                        else None
+                    ) or _utc_now_iso()
+                    revision_row, _created = operations.register_processed_revision(
+                        conn,
+                        library_id=library_id,
+                        job=job,
+                        analysis_revision=revision,
+                        artifact_hashes=artifact_hashes,
+                        first_completed_at=recorded_at,
+                        eligible_at=recorded_at,
+                        backfill=False,
+                        status="completed",
+                    )
+                    eligible_at = revision_row["eligible_at"]
+
+                event_id = _insert_event(
+                    conn,
+                    event_type="video.completed",
+                    library_id=library_id,
+                    job=job,
+                    analysis_revision=revision,
+                    payload=event_payload,
+                    dedup_key=dedup_key,
+                )
+
+            # Persist the derived identity back into manifest.json so digest,
+            # scoring and Ask readers see real values instead of the legacy
+            # default revision. The file write is intentionally outside the DB
+            # transaction: operations.db and files share no atomicity (F0.1).
+            dirty = False
+            for key, value in (
+                ("library_id", library_id),
+                ("analysis_revision", revision),
+                ("eligible_at", eligible_at),
+            ):
+                if value is not None and manifest.get(key) != value:
+                    manifest[key] = value
+                    dirty = True
+            manifest_file = job_dir / "manifest.json"
+            if dirty and manifest_file.is_file():
+                manifest_file.write_text(
+                    json.dumps(manifest, ensure_ascii=False, indent=2),
+                    encoding="utf-8",
+                )
 
             # If Webhook or high priority notification is active, enqueue delivery
             webhook_url = os.getenv("DISCORD_WEBHOOK_URL") or os.getenv("RSS_NOTIFY_WEBHOOK")
