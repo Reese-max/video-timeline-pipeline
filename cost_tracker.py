@@ -16,8 +16,10 @@ import os
 import sqlite3
 import uuid
 from contextlib import closing
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from notifications import get_operations_db
 
@@ -147,12 +149,63 @@ def _utc_now_iso() -> str:
     return datetime.datetime.now(datetime.timezone.utc).isoformat()
 
 
-def _current_period_id(period_type: str = "daily") -> str:
+@dataclass(frozen=True)
+class _PeriodWindow:
+    period_id: str
+    timezone: str
+    start_utc: datetime.datetime
+    end_utc: datetime.datetime
+
+
+def _current_period_window(
+    period_type: str = "daily",
+    now: datetime.datetime | None = None,
+) -> _PeriodWindow:
+    """Return the configured local calendar period and its half-open UTC window."""
+    if period_type not in {"daily", "monthly"}:
+        raise ValueError(f"Unsupported cost period type: {period_type!r}")
+
     tz_name = os.getenv("COST_TIMEZONE", "Asia/Taipei")
-    now = datetime.datetime.now(datetime.timezone.utc)
-    if period_type == "monthly":
-        return now.strftime("%Y-%m")
-    return now.strftime("%Y-%m-%d")
+    try:
+        tz = ZoneInfo(tz_name)
+    except (ZoneInfoNotFoundError, TypeError, ValueError) as exc:
+        raise ValueError(
+            f"Invalid COST_TIMEZONE {tz_name!r}; set it to a valid IANA timezone name."
+        ) from exc
+
+    current_utc = now or datetime.datetime.now(datetime.timezone.utc)
+    if current_utc.tzinfo is None:
+        raise ValueError("Cost period calculation requires a timezone-aware datetime.")
+    local_now = current_utc.astimezone(tz)
+
+    if period_type == "daily":
+        local_date = local_now.date()
+        period_id = local_date.isoformat()
+        next_date = local_date + datetime.timedelta(days=1)
+        start_local = datetime.datetime(
+            local_date.year, local_date.month, local_date.day, tzinfo=tz
+        )
+        end_local = datetime.datetime(
+            next_date.year, next_date.month, next_date.day, tzinfo=tz
+        )
+    else:
+        period_id = local_now.strftime("%Y-%m")
+        next_year = local_now.year + (1 if local_now.month == 12 else 0)
+        next_month = 1 if local_now.month == 12 else local_now.month + 1
+        start_local = datetime.datetime(local_now.year, local_now.month, 1, tzinfo=tz)
+        end_local = datetime.datetime(next_year, next_month, 1, tzinfo=tz)
+
+    return _PeriodWindow(
+        period_id=period_id,
+        timezone=tz_name,
+        start_utc=start_local.astimezone(datetime.timezone.utc),
+        end_utc=end_local.astimezone(datetime.timezone.utc),
+    )
+
+
+def _current_period_id(period_type: str = "daily") -> str:
+    """Compatibility helper for callers that only need the local period label."""
+    return _current_period_window(period_type).period_id
 
 
 def estimate_operation_cost_micro_usd(provider: str, model: str | None, prompt_tokens: int, completion_tokens: int) -> int:
@@ -190,11 +243,13 @@ def check_and_reserve_budget(
     hard_stop = os.getenv("BUDGET_HARD_STOP", "false").lower() in ("true", "1", "yes")
     daily_budget_usd = float(os.getenv("DAILY_BUDGET_USD", "0"))
     daily_budget_micro = int(daily_budget_usd * 1_000_000)
+    window = _current_period_window("daily")
+    period_id = window.period_id
+    start_utc = window.start_utc.isoformat()
+    end_utc = window.end_utc.isoformat()
 
     with closing(get_operations_db(root)) as conn:
         _init_cost_schema(conn)
-
-        period_id = _current_period_id("daily")
 
         with conn:
             cur = conn.cursor()
@@ -203,20 +258,23 @@ def check_and_reserve_budget(
                 """
                 SELECT COALESCE(SUM(estimated_micro_usd), 0)
                 FROM usage_costs
-                WHERE account_scope = ? AND created_at LIKE ? AND status != 'blocked_budget'
+                WHERE account_scope = ? AND created_at >= ? AND created_at < ?
+                  AND status != 'blocked_budget'
                 """,
-                (account_scope, f"{period_id}%"),
+                (account_scope, start_utc, end_utc),
             )
             settled_micro = int(cur.fetchone()[0])
 
-            # Sum outstanding reservations
+            # Count outstanding reservations by the same local-day UTC window as settled costs.
+            # This also includes pre-upgrade rows whose period_id used the previous UTC date label.
             cur.execute(
                 """
                 SELECT COALESCE(SUM(max_micro_usd), 0)
                 FROM budget_reservations
-                WHERE account_scope = ? AND period_id = ? AND status = 'reserved'
+                WHERE account_scope = ? AND created_at >= ? AND created_at < ?
+                  AND status = 'reserved'
                 """,
-                (account_scope, period_id),
+                (account_scope, start_utc, end_utc),
             )
             outstanding_micro = int(cur.fetchone()[0])
 
@@ -246,8 +304,15 @@ def check_and_reserve_budget(
                         library_id=None,
                         job=None,
                         analysis_revision=None,
-                        payload={"reason": reason, "period_id": period_id, "account_scope": account_scope},
-                        dedup_key=f"budget_blocked_{period_id}_{account_scope}",
+                        payload={
+                            "reason": reason,
+                            "period_id": period_id,
+                            "accounting_timezone": window.timezone,
+                            "period_start_utc": start_utc,
+                            "period_end_utc": end_utc,
+                            "account_scope": account_scope,
+                        },
+                        dedup_key=f"budget_blocked_{window.timezone}_{period_id}_{account_scope}",
                     )
                 except Exception:
                     pass
@@ -349,10 +414,10 @@ def record_usage(
 
 def get_cost_report(root: Path, period_type: str = "daily") -> dict[str, Any]:
     """Compile read-only financial and token usage report."""
+    window = _current_period_window(period_type)
     with closing(get_operations_db(root)) as conn:
         _init_cost_schema(conn)
-
-        period_id = _current_period_id(period_type)
+        period_id = window.period_id
 
         cur = conn.cursor()
         cur.execute(
@@ -365,10 +430,10 @@ def get_cost_report(root: Path, period_type: str = "daily") -> dict[str, Any]:
                    SUM(estimated_micro_usd) as total_estimated_uUSD,
                    SUM(COALESCE(actual_micro_usd, 0)) as total_actual_uUSD
             FROM usage_costs
-            WHERE created_at LIKE ?
+            WHERE created_at >= ? AND created_at < ?
             GROUP BY provider
             """,
-            (f"{period_id}%",),
+            (window.start_utc.isoformat(), window.end_utc.isoformat()),
         )
         rows = cur.fetchall()
 
@@ -392,6 +457,9 @@ def get_cost_report(root: Path, period_type: str = "daily") -> dict[str, Any]:
         return {
             "period": period_id,
             "period_type": period_type,
+            "accounting_timezone": window.timezone,
+            "period_start_utc": window.start_utc.isoformat(),
+            "period_end_utc": window.end_utc.isoformat(),
             "grand_total_estimated_usd": round(grand_total_uUSD / 1_000_000.0, 4),
             "providers": provider_breakdown,
         }
@@ -399,10 +467,12 @@ def get_cost_report(root: Path, period_type: str = "daily") -> dict[str, Any]:
 
 def get_budget_status(root: Path) -> dict[str, Any]:
     """Return current budget usage vs limits."""
+    window = _current_period_window("daily")
+    period_id = window.period_id
+    start_utc = window.start_utc.isoformat()
+    end_utc = window.end_utc.isoformat()
     with closing(get_operations_db(root)) as conn:
         _init_cost_schema(conn)
-
-        period_id = _current_period_id("daily")
         daily_budget_usd = float(os.getenv("DAILY_BUDGET_USD", "0"))
         hard_stop = os.getenv("BUDGET_HARD_STOP", "false").lower() in ("true", "1", "yes")
 
@@ -411,9 +481,9 @@ def get_budget_status(root: Path) -> dict[str, Any]:
             """
             SELECT COALESCE(SUM(estimated_micro_usd), 0)
             FROM usage_costs
-            WHERE created_at LIKE ? AND status != 'blocked_budget'
+            WHERE created_at >= ? AND created_at < ? AND status != 'blocked_budget'
             """,
-            (f"{period_id}%",),
+            (start_utc, end_utc),
         )
         spent_micro = int(cur.fetchone()[0])
         spent_usd = round(spent_micro / 1_000_000.0, 4)
@@ -422,9 +492,9 @@ def get_budget_status(root: Path) -> dict[str, Any]:
             """
             SELECT COUNT(*)
             FROM usage_costs
-            WHERE status = 'blocked_budget' AND created_at LIKE ?
+            WHERE status = 'blocked_budget' AND created_at >= ? AND created_at < ?
             """,
-            (f"{period_id}%",),
+            (start_utc, end_utc),
         )
         blocked_count = int(cur.fetchone()[0])
 
@@ -432,6 +502,9 @@ def get_budget_status(root: Path) -> dict[str, Any]:
 
         return {
             "period": period_id,
+            "accounting_timezone": window.timezone,
+            "period_start_utc": start_utc,
+            "period_end_utc": end_utc,
             "daily_budget_limit_usd": daily_budget_usd if daily_budget_usd > 0 else "unlimited",
             "spent_usd": spent_usd,
             "remaining_usd": remaining_usd,
