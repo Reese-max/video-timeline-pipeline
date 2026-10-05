@@ -1,0 +1,36 @@
+name: Offline cost timezone regressions
+
+on:
+  push:
+    branches: [main, fix/issue-18-cost-timezone]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  offline-regressions:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+      - name: Install local test dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg
+          python -m pip install -r requirements.txt
+      - name: Run full offline Python suite
+        run: python -X utf8 -m unittest discover -s tests -q
+      - name: Run widget regressions
+        run: node tests/test_widget_handoff.cjs
+      - name: Compile and check whitespace
+        run: |
+          python -m compileall -q .
+          git diff --check

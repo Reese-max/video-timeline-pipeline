@@ -19,6 +19,7 @@ import sqlite3
 from decimal import Decimal, InvalidOperation
 import time
 import uuid
+import zoneinfo
 from contextlib import closing, contextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -143,7 +144,12 @@ def _init_cost_schema(conn: sqlite3.Connection) -> None:
 
             CREATE INDEX IF NOT EXISTS ix_costs_job ON usage_costs(job, provider);
             CREATE INDEX IF NOT EXISTS ix_costs_period ON usage_costs(created_at, provider);
-            CREATE INDEX IF NOT EXISTS ix_budget_period ON budget_reservations(period_id, status);
+            -- Outstanding reservations are selected by the configured period
+            -- window, so they are indexed by the same columns the filter uses.
+            -- period_id is kept as a stored audit label (reporting, dedup key)
+            -- but is no longer a predicate, so ix_budget_period is not created.
+            CREATE INDEX IF NOT EXISTS ix_budget_reserved_window
+                ON budget_reservations(account_scope, created_at, status);
             """
         )
 
@@ -152,12 +158,51 @@ def _utc_now_iso() -> str:
     return datetime.datetime.now(datetime.timezone.utc).isoformat()
 
 
-def _current_period_id(period_type: str = "daily") -> str:
-    tz_name = os.getenv("COST_TIMEZONE", "Asia/Taipei")
-    now = datetime.datetime.now(datetime.timezone.utc)
+def _cost_timezone() -> zoneinfo.ZoneInfo:
+    """Resolve COST_TIMEZONE to an IANA timezone; invalid values fail explicitly."""
+    tz_name = (os.getenv("COST_TIMEZONE", "Asia/Taipei") or "").strip()
+    try:
+        return zoneinfo.ZoneInfo(tz_name)
+    except (zoneinfo.ZoneInfoNotFoundError, ValueError) as exc:
+        # A missing system tz database and a misspelled key raise the same
+        # exception; name the remedy so an operator does not keep editing a
+        # valid setting on a host that simply has no IANA data installed.
+        raise ValueError(
+            f"Invalid COST_TIMEZONE {tz_name!r}: {exc}. "
+            "Use an IANA zone name (e.g. Asia/Taipei, UTC); if the name is "
+            "correct, install the IANA database (pip install tzdata)."
+        ) from exc
+
+
+def _current_period(period_type: str = "daily") -> tuple[str, str, str, str]:
+    """Return (period_id, window_start_utc_iso, window_end_utc_iso, tz_key).
+
+    The period is the current local day/month in the configured COST_TIMEZONE;
+    the bounds are the UTC instants of that local window so created_at filters
+    attribute spend to the configured accounting period, not the UTC date.
+    """
+    tz = _cost_timezone()
+    local_today = datetime.datetime.now(datetime.timezone.utc).astimezone(tz).date()
     if period_type == "monthly":
-        return now.strftime("%Y-%m")
-    return now.strftime("%Y-%m-%d")
+        start_date = local_today.replace(day=1)
+        if start_date.month == 12:
+            end_date = start_date.replace(year=start_date.year + 1, month=1)
+        else:
+            end_date = start_date.replace(month=start_date.month + 1)
+        period_id = start_date.strftime("%Y-%m")
+    else:
+        start_date = local_today
+        end_date = local_today + datetime.timedelta(days=1)
+        period_id = local_today.strftime("%Y-%m-%d")
+    start_utc = datetime.datetime.combine(start_date, datetime.time.min, tzinfo=tz).astimezone(datetime.timezone.utc)
+    end_utc = datetime.datetime.combine(end_date, datetime.time.min, tzinfo=tz).astimezone(datetime.timezone.utc)
+    # timespec="seconds" pins the bound format; stored created_at values compare
+    # correctly whether or not they carry a fractional-second component.
+    return period_id, start_utc.isoformat(timespec="seconds"), end_utc.isoformat(timespec="seconds"), tz.key
+
+
+def _current_period_id(period_type: str = "daily") -> str:
+    return _current_period(period_type)[0]
 
 
 def estimate_operation_cost_micro_usd(provider: str, model: str | None, prompt_tokens: int, completion_tokens: int) -> int:
@@ -210,32 +255,38 @@ def check_and_reserve_budget(
     daily_budget_usd = _daily_budget_usd()
     daily_budget_micro = int(daily_budget_usd * 1_000_000)
 
+    # Resolve the accounting period first: an invalid COST_TIMEZONE must fail
+    # before get_operations_db creates/migrates operations.db.
+    period_id, period_start_utc, period_end_utc, tz_key = _current_period("daily")
+
     with closing(get_operations_db(root)) as conn:
         _init_cost_schema(conn)
 
-        period_id = _current_period_id("daily")
-
         with conn:
             cur = conn.cursor()
-            # Sum settled actual/estimated costs for today
+            # Sum settled actual/estimated costs for the current configured period
             cur.execute(
                 """
                 SELECT COALESCE(SUM(estimated_micro_usd), 0)
                 FROM usage_costs
-                WHERE account_scope = ? AND created_at LIKE ? AND status != 'blocked_budget'
+                WHERE account_scope = ? AND created_at >= ? AND created_at < ? AND status != 'blocked_budget'
                 """,
-                (account_scope, f"{period_id}%"),
+                (account_scope, period_start_utc, period_end_utc),
             )
             settled_micro = int(cur.fetchone()[0])
 
-            # Sum outstanding reservations
+            # Sum outstanding reservations from the same configured period
+            # window as settled spend. Filtering these by their stored
+            # period_id label instead would let an outstanding reservation drop
+            # out of the bucket whenever COST_TIMEZONE changes, because the
+            # label was written under the zone configured at reservation time.
             cur.execute(
                 """
                 SELECT COALESCE(SUM(max_micro_usd), 0)
                 FROM budget_reservations
-                WHERE account_scope = ? AND period_id = ? AND status = 'reserved'
+                WHERE account_scope = ? AND created_at >= ? AND created_at < ? AND status = 'reserved'
                 """,
-                (account_scope, period_id),
+                (account_scope, period_start_utc, period_end_utc),
             )
             outstanding_micro = int(cur.fetchone()[0])
 
@@ -265,7 +316,7 @@ def check_and_reserve_budget(
                         library_id=None,
                         job=None,
                         analysis_revision=None,
-                        payload={"reason": reason, "period_id": period_id, "account_scope": account_scope},
+                        payload={"reason": reason, "period_id": period_id, "account_scope": account_scope, "accounting_timezone": tz_key},
                         dedup_key=f"budget_blocked_{period_id}_{account_scope}",
                     )
                 except Exception:
@@ -620,10 +671,10 @@ def record_usage(
 
 def get_cost_report(root: Path, period_type: str = "daily") -> dict[str, Any]:
     """Compile read-only financial and token usage report."""
+    period_id, period_start_utc, period_end_utc, tz_key = _current_period(period_type)
+
     with closing(get_operations_db(root)) as conn:
         _init_cost_schema(conn)
-
-        period_id = _current_period_id(period_type)
 
         cur = conn.cursor()
         cur.execute(
@@ -636,10 +687,10 @@ def get_cost_report(root: Path, period_type: str = "daily") -> dict[str, Any]:
                    SUM(estimated_micro_usd) as total_estimated_uUSD,
                    SUM(COALESCE(actual_micro_usd, 0)) as total_actual_uUSD
             FROM usage_costs
-            WHERE created_at LIKE ?
+            WHERE created_at >= ? AND created_at < ? AND status != 'blocked_budget'
             GROUP BY provider
             """,
-            (f"{period_id}%",),
+            (period_start_utc, period_end_utc),
         )
         rows = cur.fetchall()
 
@@ -663,6 +714,7 @@ def get_cost_report(root: Path, period_type: str = "daily") -> dict[str, Any]:
         return {
             "period": period_id,
             "period_type": period_type,
+            "accounting_timezone": tz_key,
             "grand_total_estimated_usd": round(grand_total_uUSD / 1_000_000.0, 4),
             "providers": provider_breakdown,
         }
@@ -670,21 +722,21 @@ def get_cost_report(root: Path, period_type: str = "daily") -> dict[str, Any]:
 
 def get_budget_status(root: Path) -> dict[str, Any]:
     """Return current budget usage vs limits."""
+    period_id, period_start_utc, period_end_utc, tz_key = _current_period("daily")
+    daily_budget_usd = float(os.getenv("DAILY_BUDGET_USD", "0"))
+    hard_stop = os.getenv("BUDGET_HARD_STOP", "false").lower() in ("true", "1", "yes")
+
     with closing(get_operations_db(root)) as conn:
         _init_cost_schema(conn)
-
-        period_id = _current_period_id("daily")
-        daily_budget_usd = float(os.getenv("DAILY_BUDGET_USD", "0"))
-        hard_stop = os.getenv("BUDGET_HARD_STOP", "false").lower() in ("true", "1", "yes")
 
         cur = conn.cursor()
         cur.execute(
             """
             SELECT COALESCE(SUM(estimated_micro_usd), 0)
             FROM usage_costs
-            WHERE created_at LIKE ? AND status != 'blocked_budget'
+            WHERE created_at >= ? AND created_at < ? AND status != 'blocked_budget'
             """,
-            (f"{period_id}%",),
+            (period_start_utc, period_end_utc),
         )
         spent_micro = int(cur.fetchone()[0])
         spent_usd = round(spent_micro / 1_000_000.0, 4)
@@ -693,9 +745,9 @@ def get_budget_status(root: Path) -> dict[str, Any]:
             """
             SELECT COUNT(*)
             FROM usage_costs
-            WHERE status = 'blocked_budget' AND created_at LIKE ?
+            WHERE status = 'blocked_budget' AND created_at >= ? AND created_at < ?
             """,
-            (f"{period_id}%",),
+            (period_start_utc, period_end_utc),
         )
         blocked_count = int(cur.fetchone()[0])
 
@@ -703,6 +755,7 @@ def get_budget_status(root: Path) -> dict[str, Any]:
 
         return {
             "period": period_id,
+            "accounting_timezone": tz_key,
             "daily_budget_limit_usd": daily_budget_usd if daily_budget_usd > 0 else "unlimited",
             "spent_usd": spent_usd,
             "remaining_usd": remaining_usd,

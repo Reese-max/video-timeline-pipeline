@@ -6,7 +6,7 @@ base="${MCP_BASE_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
 log="${MCP_LOG_FILE:-${base}/mcp-server.log}"
 pidfile="${MCP_PID_FILE:-${base}/mcp-server.pid}"
 lockfile="${MCP_LOCK_FILE:-${base}/mcp-supervisor.lock}"
-public_base="${MCP_PUBLIC_BASE_URL:-https://cursor-grokbot-1.tail930e77.ts.net/video-timeline}"
+public_base="${MCP_PUBLIC_BASE_URL:-https://cursor-grokbot-2.tail930e77.ts.net/video-timeline}"
 media_url_file="${MCP_MEDIA_URL_FILE:-/tmp/video-timeline-media-url}"
 host="${MCP_HOST:-127.0.0.1}"
 port="${MCP_PORT:-8787}"
@@ -25,6 +25,11 @@ else
 fi
 
 media_base="${MCP_MEDIA_BASE_URL:-}"
+# Quick-tunnel names rotate independently of this long-running MCP process.
+# Default to the stable public origin; retain quick tunnels as explicit opt-in.
+if [ -z "${media_base}" ] && [ "${MCP_USE_QUICK_TUNNEL:-0}" != "1" ]; then
+	media_base="${public_base}"
+fi
 if [ -z "${media_base}" ] && [ -x "${media_launcher}" ]; then
 	if ! "${media_launcher}" "${group}" >/dev/null 2>&1; then
 		printf 'Media tunnel unavailable; ignoring its stale URL. Starting MCP with its public origin so Drive handoff remains available.\n' >&2

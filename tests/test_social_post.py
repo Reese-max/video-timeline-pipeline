@@ -132,10 +132,10 @@ class SocialPostTests(unittest.TestCase):
                     patch.object(pipeline, "get_json", side_effect=[{"status": "ready"}, []]) as read:
                 if "/" in snapshot:
                     with self.assertRaisesRegex(RuntimeError, "snapshot_id"):
-                        pipeline.fetch_instagram_author("testauthor", allow_paid=True, root=Path(root))
+                        pipeline.fetch_instagram_author("testauthor", max_items=5, allow_paid=True, root=Path(root))
                     read.assert_not_called()
                 else:
-                    result = pipeline.fetch_instagram_author("testauthor", allow_paid=True, root=Path(root))
+                    result = pipeline.fetch_instagram_author("testauthor", max_items=5, allow_paid=True, root=Path(root))
                     self.assertEqual(result["instagram"]["snapshot_id"], snapshot)
 
     def test_instagram_timeout_posts_once_even_across_restarts(self):
@@ -143,7 +143,7 @@ class SocialPostTests(unittest.TestCase):
                 patch.object(pipeline.urllib.request, "urlopen", side_effect=TimeoutError()) as transport:
             for _ in range(2):
                 with self.assertRaisesRegex(RuntimeError, "禁止重送"):
-                    pipeline.fetch_instagram_author("testauthor", allow_paid=True, root=Path(root))
+                    pipeline.fetch_instagram_author("testauthor", max_items=5, allow_paid=True, root=Path(root))
             transport.assert_called_once()
             receipt = pipeline.json.loads(next(Path(root).rglob("submission.json")).read_text(encoding="utf-8"))
             self.assertIn("error", receipt)
@@ -209,8 +209,8 @@ class SocialPostTests(unittest.TestCase):
                 patch.object(pipeline, "request_json", return_value={"snapshot_id": "sd_test"}) as submit, \
                 patch.object(pipeline, "get_json", side_effect=[RuntimeError("GET timeout"), {"status": "ready"}, []]):
             with self.assertRaisesRegex(RuntimeError, "GET timeout"):
-                pipeline.fetch_instagram_author("testauthor", allow_paid=True, root=Path(root))
-            result = pipeline.fetch_instagram_author("testauthor", allow_paid=True, root=Path(root))
+                pipeline.fetch_instagram_author("testauthor", max_items=5, allow_paid=True, root=Path(root))
+            result = pipeline.fetch_instagram_author("testauthor", max_items=5, allow_paid=True, root=Path(root))
             self.assertEqual(result["instagram"]["snapshot_id"], "sd_test")
             submit.assert_called_once()
 
@@ -218,7 +218,8 @@ class SocialPostTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory, patch.dict(pipeline.os.environ, {"BRIGHTDATA_API_TOKEN": "test-secret"}), \
                 patch.object(pipeline, "request_json", side_effect=[{"snapshot_id": "sd_first"}, {"snapshot_id": "sd_second"}]) as submit, \
                 patch.object(pipeline, "get_json", side_effect=lambda url, headers: {"status": "ready"} if "/progress/" in url else []), \
-                patch.object(pipeline.sys, "argv", ["pipeline.py", "--instagram-author", "testauthor", "--instagram-discover-only",
+                patch.object(pipeline.sys, "argv", ["pipeline.py", "--instagram-author", "testauthor", "--instagram-max-items", "5",
+                                                   "--instagram-discover-only",
                                                    "--allow-batch-cloud", "--root", directory]):
             args = pipeline.parse_args()
             self.assertEqual(pipeline.run_rss_command(args), 0)
@@ -234,8 +235,8 @@ class SocialPostTests(unittest.TestCase):
                 patch.object(pipeline, "get_json", side_effect=lambda url, headers: {"status": "ready"} if "/progress/" in url else []):
             root = Path(directory)
             with patch.object(pipeline, "save_rss_state", side_effect=OSError("disk full")), self.assertRaises(OSError):
-                pipeline.add_instagram_subscription(root, "testauthor", allow_paid=True)
-            pipeline.add_instagram_subscription(root, "testauthor", allow_paid=True)
+                pipeline.add_instagram_subscription(root, "testauthor", max_items=5, allow_paid=True)
+            pipeline.add_instagram_subscription(root, "testauthor", max_items=5, allow_paid=True)
             self.assertEqual(submit.call_count, 1)
             with patch.object(pipeline, "save_rss_state", side_effect=OSError("disk full")), self.assertRaises(OSError):
                 pipeline.refresh_rss(root, allow_paid=True)
