@@ -11,6 +11,7 @@ import datetime
 import difflib
 import email.utils
 import hashlib
+import http.cookiejar
 import importlib.util
 import io
 import json
@@ -19,6 +20,7 @@ import mimetypes
 import os
 import re
 import shutil
+import signal
 import sqlite3
 import subprocess
 import sys
@@ -33,13 +35,26 @@ import xml.etree.ElementTree as ET
 from pathlib import Path
 from typing import Any, Callable
 
+from execution_control import DeadlineExceeded, ExecutionCancelled, OperationBudget, read_response
 
-__version__ = "0.2.0"
+
+__version__ = "0.2.1"
 
 MEDIA_EXTENSIONS = {
     ".mp4", ".mkv", ".webm", ".mov", ".avi", ".m4v",
     ".mp3", ".m4a", ".aac", ".wav", ".flac", ".ogg", ".opus", ".m3u8",
 }
+
+THREADS_HOSTS = {"threads.com", "www.threads.com", "threads.net", "www.threads.net"}
+FACEBOOK_HOSTS = {
+    "facebook.com", "www.facebook.com", "web.facebook.com", "m.facebook.com",
+    "fb.watch", "www.fb.watch",
+}
+THREADS_POST_RE = re.compile(r"/(?:@[^/]+/)?(?:post|t)/(?P<id>[^/?#&]+)", re.IGNORECASE)
+THREADS_CRAWLER_USER_AGENT = "facebookexternalhit/1.1"
+THREADS_PAGE_MAX_BYTES = 16 * 1024 * 1024
+THREADS_REQUEST_ATTEMPTS = 4
+THREADS_MAX_VIDEO_ITEMS = 10
 
 
 # 基礎 I/O、來源下載與影音抽取
@@ -96,30 +111,74 @@ def redact_values(text: str, values: set[str] | None) -> str:
 
 
 def run_external(
-    command: list[str], *, cwd: Path | None = None, stream: bool = False, redact: set[str] | None = None
+    command: list[str], *, cwd: Path | None = None, stream: bool = False,
+    redact: set[str] | None = None, timeout: float | None = None, include_stderr: bool = False,
 ) -> str:
+    budget = OperationBudget("External process", 3600, "VIDEO_PROCESS_TIMEOUT_SECONDS")
+    if timeout is not None:
+        if not math.isfinite(timeout) or timeout <= 0:
+            raise ValueError("timeout must be positive and finite")
+        budget.deadline = min(budget.deadline, time.monotonic() + timeout)
     print("$ " + redact_values(subprocess.list2cmdline(command), redact))
     if stream:
-        # 下載／轉檔動輒數十分鐘，捕捉輸出等於全程無聲，看不出是在跑還是卡死。
-        # 直接讓子行程寫到終端機；失敗時錯誤已經印出來了，不必再回傳 detail。
         sys.stdout.flush()
-        completed = subprocess.run(command, cwd=cwd)
-        if completed.returncode:
-            raise RuntimeError(f"外部指令失敗（{completed.returncode}）：{command[0]}")
-        return ""
-    completed = subprocess.run(
-        command,
-        cwd=cwd,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-    )
-    if completed.returncode:
-        detail = redact_values((completed.stderr or completed.stdout).strip(), redact)
-        raise RuntimeError(f"外部指令失敗（{completed.returncode}）：{detail[-2000:]}")
-    return completed.stdout
+    # Queue workers already own a supervised group. Their watchdog must still
+    # reach these children on parent death; only synchronous commands detach.
+    owns_tree = os.getenv("VIDEO_JOB_WORKER") != "1"
+    popen_kwargs = dict(cwd=cwd)
+    if owns_tree:
+        if os.name != "nt":
+            popen_kwargs["start_new_session"] = True
+        else:
+            popen_kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+    with contextlib.ExitStack() as stack:
+        # Temporary files avoid a pipe-drain deadlock if a downloader's descendant
+        # inherits stdout/stderr after its parent has been killed on timeout.
+        output_file = None if stream else stack.enter_context(tempfile.TemporaryFile())
+        error_file = None if stream else stack.enter_context(tempfile.TemporaryFile())
+        with subprocess.Popen(command, stdout=output_file, stderr=error_file, **popen_kwargs) as process:
+            if owns_tree and os.name == "nt":
+                from job_queue import bind_windows_job, stop_process_tree
+                try:
+                    bind_windows_job(process)
+                except OSError:
+                    stop_process_tree(process)
+                    raise
+            try:
+                while True:
+                    try:
+                        process.wait(timeout=budget.remaining(0.25))
+                        budget.check()
+                        break
+                    except subprocess.TimeoutExpired:
+                        budget.check()
+            except (DeadlineExceeded, ExecutionCancelled):
+                if owns_tree and os.name != "nt":
+                    try:
+                        os.killpg(process.pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                elif owns_tree:
+                    stop_process_tree(process)
+                else:
+                    # The queue supervisor cleans the worker group after this
+                    # error receipt; do not kill the worker writing that receipt.
+                    process.kill()
+                process.wait(timeout=5)
+                raise
+            finally:
+                if owns_tree and os.name == "nt":
+                    stop_process_tree(process)
+        stdout = stderr = ""
+        if output_file is not None and error_file is not None:
+            output_file.seek(0)
+            error_file.seek(0)
+            stdout = output_file.read().decode("utf-8", errors="replace")
+            stderr = error_file.read().decode("utf-8", errors="replace")
+        if process.returncode:
+            detail = command[0] if stream else redact_values((stderr or stdout or "").strip(), redact)[-2000:]
+            raise RuntimeError(f"外部指令失敗（{process.returncode}）：{detail}")
+    return (stdout or "") + ((stderr or "") if include_stderr else "")
 
 
 def require_tool(name: str) -> str:
@@ -130,6 +189,9 @@ def require_tool(name: str) -> str:
 
 
 def yt_dlp_command() -> list[str]:
+    # Use the package we install/update in this service's virtualenv, not an older PATH binary.
+    if sys.prefix != sys.base_prefix and importlib.util.find_spec("yt_dlp"):
+        return [sys.executable, "-m", "yt_dlp"]
     executable = shutil.which("yt-dlp")
     if executable:
         return [executable]
@@ -241,7 +303,8 @@ def sanitize_download_info(path: Path) -> None:
 
     def clean(value: Any) -> Any:
         if isinstance(value, dict):
-            return {key: clean(item) for key, item in value.items()}
+            return {key: clean(item) for key, item in value.items()
+                    if key.lower() not in {"cookie", "cookies", "authorization", "set-cookie"}}
         if isinstance(value, list):
             return [clean(item) for item in value]
         if isinstance(value, str) and value.startswith(("http://", "https://")):
@@ -251,15 +314,534 @@ def sanitize_download_info(path: Path) -> None:
     write_json(path, clean(info))
 
 
-def download_video(url: str, job_dir: Path, *, private_url: bool = False) -> Path:
+def is_threads_url(url: str) -> bool:
+    try:
+        hostname = (urllib.parse.urlsplit(url).hostname or "").lower()
+    except ValueError:
+        return False
+    return hostname in THREADS_HOSTS
+
+
+def is_facebook_url(url: str) -> bool:
+    try:
+        hostname = (urllib.parse.urlsplit(url).hostname or "").lower()
+    except ValueError:
+        return False
+    return hostname in FACEBOOK_HOSTS
+
+
+def threads_post_id(url: str) -> str:
+    value = require_http_url(url, "Threads URL")
+    parsed = urllib.parse.urlsplit(value)
+    if (parsed.hostname or "").lower() not in THREADS_HOSTS:
+        raise ValueError("Threads URL 必須使用 threads.com 或 threads.net。")
+    match = THREADS_POST_RE.search(parsed.path)
+    if not match:
+        raise ValueError("Threads URL 必須包含 /post/<ID> 或 /t/<ID>。")
+    return match.group("id")
+
+
+def fetch_threads_html(url: str) -> str:
+    budget = OperationBudget("Threads page", 900, "VIDEO_API_TIMEOUT_SECONDS")
+    post_id = threads_post_id(url)
+    headers = {
+        "User-Agent": THREADS_CRAWLER_USER_AGENT,
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+    }
+    delay = 2.0
+    for attempt in range(1, THREADS_REQUEST_ATTEMPTS + 1):
+        request = urllib.request.Request(url, headers=headers, method="GET")
+        try:
+            with urllib.request.urlopen(request, timeout=budget.remaining(30)) as response:
+                raw = read_response(response, budget, THREADS_PAGE_MAX_BYTES + 1, read_timeout=30)
+            if len(raw) > THREADS_PAGE_MAX_BYTES:
+                raise RuntimeError("Threads 頁面超過 16 MB 安全上限。")
+            return raw.decode("utf-8", errors="replace")
+        except urllib.error.HTTPError as exc:
+            if exc.code in RETRY_STATUS and attempt < THREADS_REQUEST_ATTEMPTS:
+                wait = retry_delay(exc, delay)
+                print(f"! Threads HTTP {exc.code}，{wait:.0f} 秒後重試（{attempt}/{THREADS_REQUEST_ATTEMPTS - 1}）")
+                budget.sleep(wait)
+                delay *= 2
+                continue
+            raise RuntimeError(f"Threads HTTP {exc.code}（{public_url(url)}）：貼文頁面無法取得。") from exc
+        except (urllib.error.URLError, TimeoutError) as exc:
+            reason = getattr(exc, "reason", None) or type(exc).__name__
+            if attempt < THREADS_REQUEST_ATTEMPTS:
+                print(f"! Threads 網路錯誤（{reason}），{delay:.0f} 秒後重試（{attempt}/{THREADS_REQUEST_ATTEMPTS - 1}）")
+                budget.sleep(delay)
+                delay *= 2
+                continue
+            raise RuntimeError(f"Threads 網路錯誤（{public_url(url)}）：{reason}") from exc
+    raise RuntimeError(f"Threads 貼文頁面取得失敗：{public_url(url)}#{post_id}")
+
+
+def _threads_json_scripts(html_text: str) -> list[Any]:
+    nodes: list[Any] = []
+    for match in re.finditer(r"<script[^>]*data-sjs[^>]*>(.*?)</script\s*>", html_text, re.IGNORECASE | re.DOTALL):
+        try:
+            nodes.append(json.loads(match.group(1).strip()))
+        except json.JSONDecodeError:
+            continue
+    return nodes
+
+
+def _threads_find_post(value: Any, post_id: str) -> dict[str, Any] | None:
+    if isinstance(value, dict):
+        if value.get("code") == post_id:
+            return value
+        for child in value.values():
+            found = _threads_find_post(child, post_id)
+            if found is not None:
+                return found
+    elif isinstance(value, list):
+        for child in value:
+            found = _threads_find_post(child, post_id)
+            if found is not None:
+                return found
+    return None
+
+
+def _threads_number(value: Any) -> int:
+    try:
+        return int(value or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _threads_best_video(media: dict[str, Any]) -> dict[str, Any] | None:
+    candidates: list[tuple[tuple[int, int, int], str, dict[str, Any]]] = []
+    variants = media.get("video_versions")
+    if isinstance(variants, list):
+        for variant in variants:
+            if not isinstance(variant, dict):
+                continue
+            value = variant.get("url") or variant.get("video_url") or variant.get("src")
+            if not isinstance(value, str) or urllib.parse.urlsplit(value).scheme not in {"http", "https"}:
+                continue
+            score = (
+                _threads_number(variant.get("width")) * _threads_number(variant.get("height")),
+                _threads_number(variant.get("bitrate")),
+                _threads_number(variant.get("type")),
+            )
+            candidates.append((score, value, variant))
+    for key in ("video_url", "playback_url"):
+        value = media.get(key)
+        if isinstance(value, str) and urllib.parse.urlsplit(value).scheme in {"http", "https"}:
+            candidates.append(((0, 0, 0), value, media))
+    if not candidates:
+        return None
+    _, value, variant = max(candidates, key=lambda item: item[0])
+    return {
+        "url": value,
+        "width": _threads_number(variant.get("width")),
+        "height": _threads_number(variant.get("height")),
+        "duration": variant.get("duration") or media.get("video_duration"),
+    }
+
+
+def _threads_video_media(value: Any) -> list[dict[str, Any]]:
+    found: list[dict[str, Any]] = []
+
+    def walk(node: Any) -> None:
+        if isinstance(node, dict):
+            if _threads_best_video(node) is not None:
+                found.append(node)
+            for child in node.values():
+                walk(child)
+        elif isinstance(node, list):
+            for child in node:
+                walk(child)
+
+    walk(value)
+    return found
+
+
+def parse_threads_post(html_text: str, url: str) -> dict[str, Any]:
+    post_id = threads_post_id(url)
+    post = None
+    for node in _threads_json_scripts(html_text):
+        post = _threads_find_post(node, post_id)
+        if post is not None:
+            break
+    if post is None:
+        raise RuntimeError(
+            f"Threads 貼文資料未找到（{public_url(url)}）；可能已刪除、需要登入，或頁面格式已變更。"
+        )
+
+    entries: list[dict[str, Any]] = []
+    seen_urls: set[str] = set()
+    for media in _threads_video_media(post):
+        video = _threads_best_video(media)
+        if video is None or video["url"] in seen_urls:
+            continue
+        seen_urls.add(video["url"])
+        entries.append(video)
+    if not entries:
+        raise RuntimeError(f"Threads 貼文沒有可下載的影片：{public_url(url)}。")
+    if len(entries) > THREADS_MAX_VIDEO_ITEMS:
+        raise RuntimeError(f"Threads carousel 影片數量超過 {THREADS_MAX_VIDEO_ITEMS} 段安全上限。")
+
+    caption = post.get("caption") or {}
+    user = post.get("user") or {}
+    title = caption.get("text") if isinstance(caption, dict) else ""
+    return {
+        "id": post_id,
+        "title": str(title or f"Threads post {post_id}"),
+        "uploader": str(user.get("username") or ""),
+        "webpage_url": public_url(url),
+        "entries": entries,
+    }
+
+
+def fetch_threads_post(url: str) -> dict[str, Any]:
+    return parse_threads_post(fetch_threads_html(url), url)
+
+
+def _download_threads_media(
+    media_url: str,
+    target: Path,
+    source_url: str,
+    *,
+    max_filesize: int | None = None,
+) -> None:
+    budget = OperationBudget("Threads media download", 3600, "VIDEO_PROCESS_TIMEOUT_SECONDS")
+    temporary = target.with_name(target.name + ".part")
+    temporary.unlink(missing_ok=True)
+    page = urllib.parse.urlsplit(source_url)
+    headers = {
+        "User-Agent": THREADS_CRAWLER_USER_AGENT,
+        "Accept": "video/mp4,video/*;q=0.9,*/*;q=0.8",
+        "Referer": f"{page.scheme}://{page.netloc}/",
+    }
+    delay = 2.0
+    for attempt in range(1, THREADS_REQUEST_ATTEMPTS + 1):
+        request = urllib.request.Request(media_url, headers=headers, method="GET")
+        try:
+            with urllib.request.urlopen(request, timeout=budget.remaining(60)) as response, temporary.open("wb") as output:
+                expected = _threads_number(response.headers.get("Content-Length"))
+                if max_filesize is not None and expected > max_filesize:
+                    raise RuntimeError(f"Threads 影片超過檔案大小上限：{target.name}。")
+                total = 0
+                while True:
+                    chunk = read_response(response, budget, 1024 * 1024, read_timeout=60)
+                    if not chunk:
+                        break
+                    total += len(chunk)
+                    if max_filesize is not None and total > max_filesize:
+                        raise RuntimeError(f"Threads 影片超過檔案大小上限：{target.name}。")
+                    output.write(chunk)
+            if total <= 0:
+                raise RuntimeError(f"Threads 媒體是空檔案：{target.name}。")
+            temporary.replace(target)
+            return
+        except (DeadlineExceeded, ExecutionCancelled):
+            temporary.unlink(missing_ok=True)
+            raise
+        except urllib.error.HTTPError as exc:
+            temporary.unlink(missing_ok=True)
+            if exc.code in RETRY_STATUS and attempt < THREADS_REQUEST_ATTEMPTS:
+                wait = retry_delay(exc, delay)
+                print(f"! Threads 媒體 HTTP {exc.code}，{wait:.0f} 秒後重試（{attempt}/{THREADS_REQUEST_ATTEMPTS - 1}）")
+                budget.sleep(wait)
+                delay *= 2
+                continue
+            raise RuntimeError(f"Threads 媒體 HTTP {exc.code}（{public_url(source_url)}）。") from exc
+        except (urllib.error.URLError, TimeoutError) as exc:
+            temporary.unlink(missing_ok=True)
+            reason = getattr(exc, "reason", None) or type(exc).__name__
+            if attempt < THREADS_REQUEST_ATTEMPTS:
+                print(f"! Threads 媒體網路錯誤（{reason}），{delay:.0f} 秒後重試（{attempt}/{THREADS_REQUEST_ATTEMPTS - 1}）")
+                budget.sleep(delay)
+                delay *= 2
+                continue
+            raise RuntimeError(f"Threads 媒體網路錯誤（{public_url(source_url)}）：{reason}") from exc
+
+
+def _concat_threads_media(media_paths: list[Path], output: Path, job_dir: Path) -> None:
+    if len(media_paths) == 1:
+        media_paths[0].replace(output)
+        return
+    concat_list = job_dir / "threads.concat.txt"
+    lines = []
+    for path in media_paths:
+        escaped = str(path.resolve()).replace("\\", "/").replace("'", "'\\''")
+        lines.append(f"file '{escaped}'")
+    write_text(concat_list, "\n".join(lines) + "\n")
+    command = [
+        require_tool("ffmpeg"), "-y", "-hide_banner", "-loglevel", "error",
+        "-f", "concat", "-safe", "0", "-i", str(concat_list), "-c", "copy", str(output),
+    ]
+    try:
+        run_external(command)
+    except (DeadlineExceeded, ExecutionCancelled):
+        raise
+    except RuntimeError:
+        output.unlink(missing_ok=True)
+        run_external([
+            require_tool("ffmpeg"), "-y", "-hide_banner", "-loglevel", "error",
+            "-f", "concat", "-safe", "0", "-i", str(concat_list),
+            "-c:v", "libx264", "-c:a", "aac", "-movflags", "+faststart", str(output),
+        ])
+
+
+def download_threads_video(
+    url: str,
+    job_dir: Path,
+    *,
+    max_filesize: int | None = None,
+    max_duration: int | None = None,
+) -> Path:
+    del max_duration  # Threads page metadata does not consistently expose duration.
+    resolved = fetch_threads_post(url)
+    job_dir.mkdir(parents=True, exist_ok=True)
+    output = job_dir / "source.mp4"
+    output.unlink(missing_ok=True)
+    media_paths: list[Path] = []
+    for index, entry in enumerate(resolved["entries"]):
+        target = job_dir / f"threads_media_{index:03d}.mp4"
+        _download_threads_media(entry["url"], target, url, max_filesize=max_filesize)
+        media_paths.append(target)
+    _concat_threads_media(media_paths, output, job_dir)
+    write_json(
+        job_dir / "source.info.json",
+        {
+            "id": resolved["id"],
+            "extractor": "Threads",
+            "title": resolved["title"],
+            "uploader": resolved["uploader"],
+            "webpage_url": resolved["webpage_url"],
+            "playlist_count": len(media_paths),
+            "entries": [
+                {"id": f"{resolved['id']}_{index + 1}", "width": item.get("width"), "height": item.get("height")}
+                for index, item in enumerate(resolved["entries"])
+            ],
+        },
+    )
+    return output
+
+
+def instagram_download_diagnostics(command: list[str]) -> dict[str, Any]:
+    """Read only whitelisted CLI diagnostics; verbose output can contain proxy credentials."""
+    result: dict[str, Any] = {
+        "yt_dlp_version": "unknown", "request_handlers": [], "curl_cffi_version": None,
+        "chrome_impersonation": False, "os": sys.platform, "python": sys.version.split()[0],
+        "container": Path("/.dockerenv").is_file(),
+    }
+    try:
+        probe = subprocess.run(
+            command + ["--ignore-config", "--no-plugin-dirs", "--verbose", "--list-impersonate-targets"],
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+            timeout=OperationBudget("Downloader diagnostics", 20, "VIDEO_PROCESS_TIMEOUT_SECONDS").remaining(20),
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        result["probe_error"] = "yt-dlp diagnostics unavailable"
+        return result
+    output = probe.stdout + "\n" + probe.stderr
+    version = re.search(r"\[debug\] yt-dlp version (\S+)", output)
+    handlers = re.search(r"\[debug\] Request Handlers: ([^\r\n]+)", output)
+    curl = re.search(r"\bcurl_cffi-([\w.]+)", output)
+    result.update(
+        yt_dlp_version=version[1] if version else "unknown",
+        request_handlers=handlers[1].split(", ") if handlers else [],
+        curl_cffi_version=curl[1] if curl else None,
+        chrome_impersonation=bool(re.search(r"^Chrome-\S+\s+\S+\s+curl_cffi\s*$", output, re.MULTILINE)),
+    )
+    return result
+
+
+def download_instagram(command: list[str], url: str, job_dir: Path) -> None:
+    diagnostics = instagram_download_diagnostics(yt_dlp_command())
+    cookie_file = os.getenv("YTDLP_INSTAGRAM_COOKIE_FILE", "").strip()
+    user_agent = os.getenv("YTDLP_INSTAGRAM_USER_AGENT", "").strip()
+    diagnostics.update(
+        status="error", cookies_configured=bool(cookie_file), cookies_used=False,
+        user_agent=user_agent or "yt-dlp default; curl_cffi-managed when impersonating",
+        attempts=[],
+    )
+    redactions = {url, cookie_file}
+
+    def safe_error(error: Exception) -> str:
+        text = redact_values(str(error), redactions)
+        text = re.sub(r"(?im)\b(authorization|cookie|set-cookie):[^\r\n]*", r"\1: <redacted>", text)
+        return sanitize_public_urls(text)[-800:]
+
+    def attempt(arguments: list[str], mode: str) -> None:
+        try:
+            run_external(arguments, stream=False, redact=redactions)
+            completed = [path for path in job_dir.glob("source.*")
+                         if path.stem == "source" and path.suffix.lower() in MEDIA_EXTENSIONS and path.stat().st_size]
+            if not completed:
+                raise RuntimeError("yt-dlp 未產生完整影片；可能被大小／長度限制略過。")
+        except RuntimeError as error:
+            diagnostics["attempts"].append({"mode": mode, "status": "error", "error": safe_error(error)})
+            raise
+        diagnostics["attempts"].append({"mode": mode, "status": "ok"})
+
+    try:
+        if len(user_agent) > 512 or any(character in user_agent for character in "\r\n"):
+            diagnostics["user_agent"] = "invalid"
+            raise ValueError("YTDLP_INSTAGRAM_USER_AGENT 格式無效。")
+        options = ["--ignore-config", "--no-plugin-dirs", "--no-cookies", "--no-cookies-from-browser",
+                   "--socket-timeout", "20", "--retries", "1", "--extractor-retries", "1"]
+        if diagnostics["chrome_impersonation"]:
+            options += ["--impersonate", "chrome"]
+        if user_agent:
+            options += ["--user-agent", user_agent]
+        public_command = command[:-1] + options + [url]
+        try:
+            attempt(public_command, "public")
+        except (DeadlineExceeded, ExecutionCancelled):
+            raise
+        except RuntimeError:
+            if not cookie_file:
+                raise RuntimeError("公開抓取失敗；未設定 YTDLP_INSTAGRAM_COOKIE_FILE，未嘗試登入。") from None
+            path = Path(cookie_file)
+            if not path.is_absolute() or not path.is_file() or path.stat().st_size > 1024 * 1024:
+                raise RuntimeError("YTDLP_INSTAGRAM_COOKIE_FILE 必須是既有絕對路徑、至多 1 MiB 的 Netscape cookies 檔。")
+            jar = http.cookiejar.MozillaCookieJar(str(path))
+            try:
+                jar.load(ignore_discard=True)
+            except (OSError, http.cookiejar.LoadError):
+                raise RuntimeError("Instagram cookies 無法讀取或不是 Netscape 格式。") from None
+            cookies = [cookie for cookie in jar if cookie.domain.lstrip(".").lower() == "instagram.com"
+                       or cookie.domain.lower().endswith(".instagram.com")]
+            if not any(cookie.name == "sessionid" and cookie.value for cookie in cookies):
+                raise RuntimeError("Instagram cookies 沒有未過期的 sessionid；請由使用者更新授權檔案。")
+            redactions.update(cookie.value for cookie in cookies if cookie.value)
+            # yt-dlp writes back its cookie jar. Never modify the supplied credential file.
+            with tempfile.TemporaryDirectory(prefix="vtp-instagram-") as directory:
+                temporary = Path(directory) / "cookies.txt"
+                redactions.add(str(temporary))
+                scoped = http.cookiejar.MozillaCookieJar(str(temporary))
+                for cookie in cookies:
+                    scoped.set_cookie(cookie)
+                scoped.save(ignore_discard=True)
+                temporary.chmod(0o600)
+                diagnostics["cookies_used"] = True
+                attempt(public_command[:-1] + ["--cookies", str(temporary), url], "authenticated")
+        diagnostics["status"] = "ok"
+    except (DeadlineExceeded, ExecutionCancelled):
+        raise
+    except (OSError, ValueError, RuntimeError) as error:
+        diagnostics["error"] = safe_error(error)
+        raise RuntimeError("Instagram 下載失敗；診斷：" + json.dumps(diagnostics, ensure_ascii=False)) from None
+    finally:
+        sanitize_download_info(job_dir / "source.info.json")
+        write_json(job_dir / "instagram-download.json", diagnostics)
+
+
+
+def download_facebook(command: list[str], url: str, job_dir: Path) -> None:
+    """Facebook yt-dlp path: optional Chrome impersonation + cookie fallback.
+
+    Mirrors Instagram: public attempt first; only when YTDLP_FACEBOOK_COOKIE_FILE
+    points at an existing Netscape file do we retry with a scoped temp cookie copy.
+    Never mutates the user-supplied cookie file; never logs cookie values.
+    """
+    diagnostics = instagram_download_diagnostics(yt_dlp_command())
+    cookie_file = os.getenv("YTDLP_FACEBOOK_COOKIE_FILE", "").strip()
+    diagnostics.update(
+        status="error", cookies_configured=bool(cookie_file), cookies_used=False,
+        user_agent="yt-dlp default; curl_cffi-managed when impersonating",
+        attempts=[],
+    )
+    redactions = {url, cookie_file}
+
+    def safe_error(error: Exception) -> str:
+        text = redact_values(str(error), redactions)
+        text = re.sub(r"(?im)\b(authorization|cookie|set-cookie):[^\r\n]*", r"\1: <redacted>", text)
+        return sanitize_public_urls(text)[-800:]
+
+    def attempt(arguments: list[str], mode: str) -> None:
+        try:
+            run_external(arguments, stream=False, redact=redactions)
+            completed = [path for path in job_dir.glob("source.*")
+                         if path.stem == "source" and path.suffix.lower() in MEDIA_EXTENSIONS and path.stat().st_size]
+            if not completed:
+                raise RuntimeError("yt-dlp 未產生完整影片；可能被大小／長度限制略過。")
+        except RuntimeError as error:
+            diagnostics["attempts"].append({"mode": mode, "status": "error", "error": safe_error(error)})
+            raise
+        diagnostics["attempts"].append({"mode": mode, "status": "ok"})
+
+    def facebook_cookie_domain(domain: str) -> bool:
+        host = domain.lstrip(".").lower()
+        return host == "facebook.com" or host.endswith(".facebook.com") or host in {"fb.com", "fb.watch"} or host.endswith(".fb.com") or host.endswith(".fb.watch")
+
+    try:
+        options = ["--ignore-config", "--no-plugin-dirs", "--no-cookies", "--no-cookies-from-browser",
+                   "--socket-timeout", "20", "--retries", "1", "--extractor-retries", "1"]
+        if diagnostics["chrome_impersonation"]:
+            options += ["--impersonate", "chrome"]
+        public_command = command[:-1] + options + [url]
+        try:
+            attempt(public_command, "public")
+        except (DeadlineExceeded, ExecutionCancelled):
+            raise
+        except RuntimeError:
+            if not cookie_file:
+                raise RuntimeError("公開抓取失敗；未設定 YTDLP_FACEBOOK_COOKIE_FILE，未嘗試登入。") from None
+            path = Path(cookie_file)
+            if not path.is_absolute() or not path.is_file() or path.stat().st_size > 1024 * 1024:
+                raise RuntimeError("YTDLP_FACEBOOK_COOKIE_FILE 必須是既有絕對路徑、至多 1 MiB 的 Netscape cookies 檔。")
+            jar = http.cookiejar.MozillaCookieJar(str(path))
+            try:
+                jar.load(ignore_discard=True)
+            except (OSError, http.cookiejar.LoadError):
+                raise RuntimeError("Facebook cookies 無法讀取或不是 Netscape 格式。") from None
+            cookies = [cookie for cookie in jar if facebook_cookie_domain(cookie.domain)]
+            if not cookies:
+                raise RuntimeError("Facebook cookies 沒有 facebook.com／fb.com 網域項目；請由使用者更新授權檔案。")
+            redactions.update(cookie.value for cookie in cookies if cookie.value)
+            # yt-dlp writes back its cookie jar. Never modify the supplied credential file.
+            with tempfile.TemporaryDirectory(prefix="vtp-facebook-") as directory:
+                temporary = Path(directory) / "cookies.txt"
+                redactions.add(str(temporary))
+                scoped = http.cookiejar.MozillaCookieJar(str(temporary))
+                for cookie in cookies:
+                    scoped.set_cookie(cookie)
+                scoped.save(ignore_discard=True)
+                temporary.chmod(0o600)
+                diagnostics["cookies_used"] = True
+                attempt(public_command[:-1] + ["--cookies", str(temporary), url], "authenticated")
+        diagnostics["status"] = "ok"
+    except (DeadlineExceeded, ExecutionCancelled):
+        raise
+    except (OSError, ValueError, RuntimeError) as error:
+        diagnostics["error"] = safe_error(error)
+        raise RuntimeError("Facebook 下載失敗；診斷：" + json.dumps(diagnostics, ensure_ascii=False)) from None
+    finally:
+        sanitize_download_info(job_dir / "source.info.json")
+        write_json(job_dir / "facebook-download.json", diagnostics)
+
+
+def download_video(
+    url: str,
+    job_dir: Path,
+    *,
+    private_url: bool = False,
+    max_filesize: int | None = None,
+    max_duration: int | None = None,
+) -> Path:
     # 只信任完整標記：中斷會留下 source.f<id>.mp4 之類的分軌檔，
     # 直接復用會拿到無音訊的純視訊軌。重跑 yt-dlp 會自行續傳並清掉分軌。
     done = job_dir / ".download-complete"
     if done.is_file():
         if private_url:
             sanitize_download_info(job_dir / "source.info.json")
-        return locate_source_video(job_dir)
+        try:
+            return locate_source_video(job_dir)
+        except RuntimeError:
+            pass  # Media retention may remove bytes while preserving the job's records.
     job_dir.mkdir(parents=True, exist_ok=True)
+    if is_threads_url(url):
+        video_path = download_threads_video(
+            url, job_dir, max_filesize=max_filesize, max_duration=max_duration
+        )
+        done.touch()
+        return video_path
     command = yt_dlp_command()
     if private_url:
         command += ["--quiet", "--no-warnings"]
@@ -270,9 +852,19 @@ def download_video(url: str, job_dir: Path, *, private_url: bool = False) -> Pat
         "mp4",
         "--output",
         str(job_dir / "source.%(ext)s"),
-        url,
     ]
-    run_external(command, stream=not private_url, redact={url} if private_url else None)
+    if max_filesize is not None:
+        command += ["--max-filesize", str(max_filesize)]
+    if max_duration is not None:
+        command += ["--match-filter", f"duration <= {max_duration}"]
+    command.append(url)
+    hostname = (urllib.parse.urlsplit(url).hostname or "").lower()
+    if hostname in {"instagram.com", "www.instagram.com", "m.instagram.com"}:
+        download_instagram(command, url, job_dir)
+    elif is_facebook_url(url):
+        download_facebook(command, url, job_dir)
+    else:
+        run_external(command, stream=not private_url, redact={url} if private_url else None)
     if private_url:
         sanitize_download_info(job_dir / "source.info.json")
     video_path = locate_source_video(job_dir)
@@ -337,12 +929,25 @@ def file_sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
-def extract_audio(video_path: Path, job_dir: Path, chunk_seconds: int) -> list[dict[str, Any]]:
+def extract_audio(
+    video_path: Path,
+    job_dir: Path,
+    chunk_seconds: int,
+    *,
+    has_audio: bool = True,
+) -> list[dict[str, Any]]:
     audio_dir = job_dir / "audio"
     audio_dir.mkdir(parents=True, exist_ok=True)
     done = audio_dir / ".complete"
     chunk_list = audio_dir / "chunks.csv"
     chunk_manifest = audio_dir / "chunks.json"
+    if not has_audio:
+        for stale in audio_dir.glob("audio_*.mp3"):
+            stale.unlink()
+        chunk_list.unlink(missing_ok=True)
+        write_json(chunk_manifest, [])
+        write_text(done, f"v=3;source={file_fingerprint(video_path)};audio=none")
+        return []
     signature = f"v=3;source={file_fingerprint(video_path)};chunk={chunk_seconds};codec=mp3-64k"
     legacy_signature = f"v=2;chunk={chunk_seconds};codec=mp3-64k"
     chunks = sorted(audio_dir.glob("audio_*.mp3"))
@@ -521,24 +1126,60 @@ def extract_candidates(
         all_frames = []
     if not all_frames:
         filter_value = f"fps=1/{interval:g},scale=1280:-2:force_original_aspect_ratio=decrease"
-        run_external(
-            [
-                require_tool("ffmpeg"),
-                "-y",
-                "-hide_banner",
-                "-loglevel",
-                "error",
-                "-stats",
-                "-i",
-                str(video_path),
-                "-vf",
-                filter_value,
-                "-q:v",
-                "3",
-                str(frames_dir / "frame_%06d.jpg"),
-            ],
-            stream=True,
-        )
+        try:
+            run_external(
+                [
+                    require_tool("ffmpeg"),
+                    "-y",
+                    "-hide_banner",
+                    "-loglevel",
+                    "error",
+                    "-stats",
+                    "-i",
+                    str(video_path),
+                    "-vf",
+                    filter_value,
+                    "-q:v",
+                    "3",
+                    str(frames_dir / "frame_%06d.jpg"),
+                ],
+                stream=True,
+            )
+        except (DeadlineExceeded, ExecutionCancelled):
+            raise
+        except RuntimeError:
+            # 短片沒有命中固定取樣點，或來源色彩格式讓 MJPEG encoder 失敗；下方再取第 0 秒。
+            pass
+        all_frames = sorted(frames_dir.glob("frame_*.jpg"))
+    if not all_frames:
+        # 短片可能比固定取樣間隔更短；至少保留第 0 秒，不能把整支影片當成沒有畫面。
+        try:
+            run_external(
+                [
+                    require_tool("ffmpeg"),
+                    "-y",
+                    "-hide_banner",
+                    "-loglevel",
+                    "error",
+                    "-ss",
+                    "0",
+                    "-i",
+                    str(video_path),
+                    "-frames:v",
+                    "1",
+                    "-vf",
+                    "scale=1280:-2:force_original_aspect_ratio=decrease",
+                    "-q:v",
+                    "3",
+                    str(frames_dir / "frame_000001.jpg"),
+                ],
+                stream=True,
+            )
+        except (DeadlineExceeded, ExecutionCancelled):
+            raise
+        except RuntimeError:
+            # 原始 fps filter 對短片／特殊色彩格式可能回傳非零，但 fallback 仍有機會成功。
+            pass
         all_frames = sorted(frames_dir.glob("frame_*.jpg"))
     if not all_frames:
         raise RuntimeError("FFmpeg 沒有產生截圖。")
@@ -587,6 +1228,170 @@ def extract_candidates(
         "method": "fixed_interval_plus_average_hash",
     }
     return candidates, metadata
+
+
+def _showinfo_timestamps(output: str) -> list[float]:
+    return [float(value) for value in re.findall(
+        r"\[Parsed_showinfo_[^\]]+\].*?\bn:\s*\d+.*?\bpts_time:([\d.eE+-]+)", output
+    )]
+
+
+def _select_budgeted_probe_indexes(probes: list[dict[str, Any]], max_frames: int) -> list[int]:
+    """Keep endpoints and one scene-weighted representative per temporal window."""
+    if max_frames <= 0:
+        raise ValueError("max_frames must be positive")
+    if len(probes) <= max_frames:
+        return list(range(len(probes)))
+    if max_frames == 1:
+        return [0]
+    selected = {0, len(probes) - 1}
+    windows = max_frames - 2
+    if windows:
+        duration = max(float(probes[-1]["timestamp"]), 0.000001)
+        for window in range(windows):
+            left, right = duration * window / windows, duration * (window + 1) / windows
+            members = [index for index in range(1, len(probes) - 1)
+                       if left <= float(probes[index]["timestamp"]) < right]
+            if members:
+                middle = (left + right) / 2
+                width = max(right - left, 0.000001)
+                selected.add(max(members, key=lambda index: (
+                    float(probes[index]["scene_score"])
+                    + 0.05 * (1 - abs(float(probes[index]["timestamp"]) - middle) / width),
+                    -index,
+                )))
+    # Sparse/VFR inputs may have empty windows. Fill their capacity deterministically
+    # using change strength and distance from already selected frames.
+    while len(selected) < min(max_frames, len(probes)):
+        remaining = [index for index in range(len(probes)) if index not in selected]
+        selected.add(max(remaining, key=lambda index: (
+            float(probes[index]["scene_score"])
+            + min(abs(index - other) for other in selected) / len(probes), -index,
+        )))
+    return sorted(selected)
+
+
+def extract_budgeted_candidates(
+    video_path: Path,
+    job_dir: Path,
+    duration: float,
+    max_frames: int = 40,
+    candidate_budget: int = 240,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """MCP sampling: bounded grayscale probes, then only selected full-size JPEGs.
+
+    This is deliberately separate from extract_candidates, whose fixed-interval
+    behavior remains available to CLI callers. Sampling is sparse evidence, not a
+    guarantee that every transient event in a long video has been observed.
+    """
+    if not math.isfinite(duration) or duration <= 0:
+        raise ValueError("duration must be positive and finite")
+    if max_frames < 1 or candidate_budget < max_frames or candidate_budget < 2:
+        raise ValueError("candidate_budget must be >= max_frames and >= 2")
+    budget = OperationBudget("Video sampling", 3600, "VIDEO_PROCESS_TIMEOUT_SECONDS")
+    job_dir.mkdir(parents=True, exist_ok=True)
+    frames_dir = job_dir / "budgeted-frames"
+    frames_dir.mkdir(parents=True, exist_ok=True)
+    manifest_path = frames_dir / "sampling.json"
+    signature = {
+        "version": 1, "source": file_fingerprint(video_path),
+        "duration": duration, "max_frames": max_frames, "candidate_budget": candidate_budget,
+    }
+    if manifest_path.is_file():
+        try:
+            cached = json.loads(manifest_path.read_text(encoding="utf-8"))
+            rows = cached["candidates"]
+            if cached.get("signature") == signature and rows and all(
+                Path(row["path"]).is_file() and Path(row["path"]).stat().st_size > 0 for row in rows
+            ):
+                return rows, cached["stats"]
+        except (OSError, ValueError, KeyError, TypeError):
+            pass
+    for stale in frames_dir.glob("frame_*.jpg"):
+        stale.unlink()
+    probe_count = min(candidate_budget, max(2, math.ceil(duration) + 1))
+    interval = duration / (probe_count - 1)
+    pixels = 64 * 36
+    ffmpeg = require_tool("ffmpeg")
+    with tempfile.TemporaryDirectory(prefix="sampling-", dir=job_dir) as temporary:
+        temporary_dir = Path(temporary)
+        probe_path = temporary_dir / "probes.gray"
+        output = run_external([
+            ffmpeg, "-y", "-hide_banner", "-loglevel", "info", "-i", str(video_path),
+            "-vf", f"select='isnan(prev_selected_t)+gte(t-prev_selected_t,{interval:.9f})',scale=64:36,format=gray,showinfo",
+            "-frames:v", str(probe_count - 1), "-fps_mode", "vfr",
+            "-f", "rawvideo", "-pix_fmt", "gray", str(probe_path),
+        ], timeout=budget.remaining(), include_stderr=True)
+        if probe_path.stat().st_size > pixels * (probe_count - 1):
+            raise RuntimeError("FFmpeg sampling exceeded the grayscale probe budget")
+        raw = probe_path.read_bytes()
+        timestamps = _showinfo_timestamps(output)
+        count = len(raw) // pixels
+        if not count or len(raw) % pixels or len(timestamps) < count:
+            raise RuntimeError("FFmpeg sampling probe bytes and timestamps do not match")
+        probe_rows = [(timestamps[index], raw[index * pixels:(index + 1) * pixels]) for index in range(count)]
+        # Decode only the final second at tiny resolution. Reverse after showinfo
+        # emits the actual last frame while retaining its original PTS in the log.
+        tail_path = temporary_dir / "tail.gray"
+        tail_seek = max(0.0, duration - 1.0)
+        output = run_external([
+            ffmpeg, "-y", "-hide_banner", "-loglevel", "info", "-copyts", "-start_at_zero",
+            "-ss", f"{tail_seek:.9f}", "-noaccurate_seek",
+            "-i", str(video_path), "-vf", "scale=64:36,format=gray,showinfo,reverse",
+            "-frames:v", "1", "-fps_mode", "vfr", "-f", "rawvideo", "-pix_fmt", "gray", str(tail_path),
+        ], timeout=budget.remaining(), include_stderr=True)
+        tail = tail_path.read_bytes() if tail_path.stat().st_size == pixels else b""
+        tail_timestamps = _showinfo_timestamps(output)
+        if len(tail) == pixels and tail_timestamps:
+            tail_timestamp = tail_timestamps[-1]
+            if tail_timestamp > probe_rows[-1][0] + 0.000001:
+                probe_rows.append((tail_timestamp, tail))
+        probes: list[dict[str, Any]] = []
+        previous: bytes | None = None
+        for timestamp, gray in probe_rows:
+            budget.check()
+            score = sum(abs(a - b) for a, b in zip(gray, previous)) / (pixels * 255) if previous else 0.0
+            probes.append({"timestamp": timestamp, "scene_score": score})
+            previous = gray
+        selected = _select_budgeted_probe_indexes(probes, max_frames)
+        candidates: list[dict[str, Any]] = []
+        previous_hash = ""
+        for number, index in enumerate(selected, 1):
+            budget.check()
+            probe = probes[index]
+            seek = max(0.0, float(probe["timestamp"]) - 0.001)
+            frame_path = frames_dir / f"frame_{number:06d}.jpg"
+            output = run_external([
+                ffmpeg, "-y", "-hide_banner", "-loglevel", "info", "-copyts", "-start_at_zero", "-ss", f"{seek:.9f}",
+                "-i", str(video_path), "-frames:v", "1", "-vf",
+                "scale=1280:-2:force_original_aspect_ratio=decrease,showinfo", "-q:v", "3", str(frame_path),
+            ], timeout=budget.remaining(), include_stderr=True)
+            actual_pts = _showinfo_timestamps(output)
+            if not frame_path.is_file() or not frame_path.stat().st_size or not actual_pts:
+                raise RuntimeError("FFmpeg did not produce a selected frame with a timestamp")
+            image_hash = average_hash(frame_path)
+            candidates.append({
+                "timestamp": round(actual_pts[0], 6), "path": str(frame_path),
+                "hash": image_hash, "hash_distance": hash_distance(previous_hash, image_hash) if previous_hash else 64,
+                "ocr_text": "", "ocr_confidence": None,
+                "scene_score": round(float(probe["scene_score"]), 6),
+                "reasons": ["time_coverage"] + (["scene_change"] if probe["scene_score"] >= 0.03 else []),
+            })
+            previous_hash = image_hash
+    probe_gaps = [float(right["timestamp"]) - float(left["timestamp"]) for left, right in zip(probes, probes[1:])]
+    stats = {
+        "method": "budgeted_temporal_windows_with_scene_weighting", "sampling_version": 1,
+        "all_frame_count": len(probes), "probe_count": len(probes), "candidate_count": len(candidates),
+        "candidate_budget": candidate_budget, "frame_budget": max_frames,
+        "probe_interval_seconds": round(interval, 6), "duration_seconds": duration,
+        "max_probe_gap_seconds": round(max(probe_gaps, default=0.0), 6),
+        "probe_resolution": [64, 36], "timestamps_source": "ffmpeg_pts",
+        "sparse_sampling": interval > 1.0,
+        "first_sample_seconds": candidates[0]["timestamp"], "last_sample_seconds": candidates[-1]["timestamp"],
+        "ocr": {"enabled": False, "status": "not enabled in budgeted MCP sampling"},
+    }
+    write_json(manifest_path, {"signature": signature, "candidates": candidates, "stats": stats})
+    return candidates, stats
 
 
 def steipete_command() -> list[str]:
@@ -752,35 +1557,46 @@ def request_json(
     timeout: int,
     attempts: int = 4,
 ) -> dict[str, Any]:
+    if attempts < 1 or timeout <= 0:
+        raise ValueError("attempts and timeout must be positive")
+    budget = OperationBudget("API request", 900, "VIDEO_API_TIMEOUT_SECONDS")
     headers = {"User-Agent": USER_AGENT, **headers}
     delay = 2.0
     for attempt in range(1, attempts + 1):
         request = urllib.request.Request(url, data=body, headers=headers, method=method)
         try:
-            with urllib.request.urlopen(request, timeout=timeout) as response:
-                raw = response.read()
+            with urllib.request.urlopen(request, timeout=budget.remaining(timeout)) as response:
+                raw = read_response(response, budget, read_timeout=timeout)
             break
         except urllib.error.HTTPError as exc:
-            detail = exc.read().decode("utf-8", errors="replace")
+            try:
+                detail = read_response(exc, budget, 4096, read_timeout=timeout).decode("utf-8", errors="replace")
+            finally:
+                exc.close()
+            secrets = {value for key, value in headers.items() if key.lower() in {"authorization", "x-api-key", "api-key"}}
+            secrets.update(value.split(" ", 1)[-1] for value in list(secrets))
+            detail = redact_values(detail, secrets)
             if exc.code in RETRY_STATUS and attempt < attempts:
                 wait = retry_delay(exc, delay)
                 print(f"! API HTTP {exc.code}，{wait:.0f} 秒後重試（{attempt}/{attempts - 1}）")
-                time.sleep(wait)
+                budget.sleep(wait)
                 delay *= 2
                 continue
             # 帶上 URL：base_url 被環境變數改掉時，光看「404 page not found」查不出原因。
-            raise RuntimeError(f"API HTTP {exc.code}（{url}）：{detail[:1200]}") from exc
+            raise RuntimeError(f"API HTTP {exc.code}（{public_url(url)}）：{detail[:1200]}") from exc
         # TimeoutError 不是 URLError 的子類，只接 URLError 會讓讀取逾時完全跳過重試
         except (urllib.error.URLError, TimeoutError) as exc:
             reason = getattr(exc, "reason", None) or type(exc).__name__
             if attempt < attempts:
                 print(f"! API 網路錯誤（{reason}），{delay:.0f} 秒後重試（{attempt}/{attempts - 1}）")
-                time.sleep(delay)
+                budget.sleep(delay)
                 delay *= 2
                 continue
             raise RuntimeError(f"API 網路錯誤：{reason}") from exc
     try:
-        return json.loads(raw.decode("utf-8"))
+        result = json.loads(raw.decode("utf-8"))
+        budget.check()
+        return result
     except json.JSONDecodeError as exc:
         raise RuntimeError(f"API 回應不是 JSON：{raw[:500]!r}") from exc
 
@@ -836,6 +1652,7 @@ def require_http_url(url: str, label: str = "URL") -> str:
 
 def fetch_rss(url: str, etag: str = "", last_modified: str = "") -> dict[str, Any]:
     """抓取 RSS/Atom；支援條件式請求，且不把私人 query 寫進錯誤訊息。"""
+    budget = OperationBudget("RSS fetch", 900, "VIDEO_API_TIMEOUT_SECONDS")
     url = require_http_url(url, "RSS Feed URL")
     headers = {
         "User-Agent": USER_AGENT,
@@ -849,9 +1666,9 @@ def fetch_rss(url: str, etag: str = "", last_modified: str = "") -> dict[str, An
     for attempt in range(1, 5):
         request = urllib.request.Request(url, headers=headers, method="GET")
         try:
-            with urllib.request.urlopen(request, timeout=30) as response:
+            with urllib.request.urlopen(request, timeout=budget.remaining(30)) as response:
                 final_url = require_http_url(response.geturl(), "RSS 重新導向 URL")
-                raw = response.read(RSS_MAX_BYTES + 1)
+                raw = read_response(response, budget, RSS_MAX_BYTES + 1, read_timeout=30)
                 response_headers = getattr(response, "headers", {})
             if len(raw) > RSS_MAX_BYTES:
                 raise RuntimeError("RSS Feed 超過 5 MB 安全上限。")
@@ -870,7 +1687,7 @@ def fetch_rss(url: str, etag: str = "", last_modified: str = "") -> dict[str, An
             if exc.code in RETRY_STATUS and attempt < 4:
                 wait = retry_delay(exc, delay)
                 print(f"! RSS HTTP {exc.code}，{wait:.0f} 秒後重試（{attempt}/3）")
-                time.sleep(wait)
+                budget.sleep(wait)
                 delay *= 2
                 continue
             raise RuntimeError(f"RSS HTTP {exc.code}（{public_url(url)}）") from exc
@@ -878,7 +1695,7 @@ def fetch_rss(url: str, etag: str = "", last_modified: str = "") -> dict[str, An
             reason = getattr(exc, "reason", None) or type(exc).__name__
             if attempt < 4:
                 print(f"! RSS 網路錯誤（{reason}），{delay:.0f} 秒後重試（{attempt}/3）")
-                time.sleep(delay)
+                budget.sleep(delay)
                 delay *= 2
                 continue
             raise RuntimeError(f"RSS 網路錯誤（{public_url(url)}）：{reason}") from exc
@@ -1063,6 +1880,17 @@ def transcribe_all(
     cache_dir: Path,
     word_timestamps: bool = False,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
+    if not chunks:
+        return (
+            {
+                "provider": "none",
+                "model": model,
+                "language": language,
+                "segments": [],
+                "cache": {"hits": 0, "misses": 0},
+            },
+            {"provider": "none", "reason": "source has no audio", "chunks": []},
+        )
     cache_dir.mkdir(parents=True, exist_ok=True)
     hits = 0
     misses = 0
@@ -1375,6 +2203,17 @@ def minimax_model() -> str:
     return model
 
 
+class MiniMaxIncompleteError(RuntimeError):
+    """MiniMax 回應的完成狀態不是成功終止（截斷、內容過濾或缺漏）。"""
+
+    def __init__(self, finish_reason: str | None, model: str) -> None:
+        self.finish_reason = finish_reason
+        self.model = model
+        super().__init__(
+            f"MiniMax 回應未完成（finish_reason={finish_reason or 'missing'}，model={model}）。"
+        )
+
+
 def minimax_chat(
     messages: list[dict[str, Any]],
     api_key: str,
@@ -1406,6 +2245,12 @@ def minimax_chat(
     choices = raw.get("choices") or []
     if not choices:
         raise RuntimeError(f"MiniMax 回應缺少 choices：{raw}")
+    raw_reason = choices[0].get("finish_reason")
+    finish_reason = str(raw_reason).strip().lower() if raw_reason else None
+    # finish_reason=length 代表輸出被截斷：即使殘餘內容剛好能 parse 成 JSON，
+    # 也不是完整回應，一律 fail-closed，不得交給呼叫端當成完成結果。
+    if finish_reason != "stop":
+        raise MiniMaxIncompleteError(finish_reason, model)
     content = choices[0].get("message", {}).get("content", "")
     if isinstance(content, list):
         content = "".join(str(part.get("text", "")) for part in content if isinstance(part, dict))
@@ -1434,6 +2279,62 @@ def parse_json_object(text: str) -> dict[str, Any]:
             except json.JSONDecodeError:
                 pass
     return {"raw": text}
+
+
+VISUAL_NOT_ANALYZED = "尚未執行 MiniMax 視覺理解。"
+VISUAL_OBSERVATION_SCHEMA_VERSION = 1
+
+
+def usable_visual_observation(observation: Any) -> bool:
+    """Only a complete, typed visual response can serve as evidence or reusable cache."""
+    if not isinstance(observation, dict):
+        return False
+    if observation.get("completion_status") not in (None, "complete"):
+        return False
+    if observation.get("visual_schema_version") not in (None, VISUAL_OBSERVATION_SCHEMA_VERSION):
+        return False  # None is the validated legacy cache format (key version 3).
+    if "raw" in observation or "value" in observation:
+        return False
+    if not isinstance(observation.get("screen_type"), str) or not observation["screen_type"].strip():
+        return False
+    summary = observation.get("visual_summary")
+    if not isinstance(summary, str) or not summary.strip() or summary == VISUAL_NOT_ANALYZED:
+        return False
+    for field in ("visible_text", "important_details"):
+        values = observation.get(field)
+        if not isinstance(values, list) or not all(isinstance(value, str) for value in values):
+            return False
+    confidence = observation.get("confidence")
+    return (
+        isinstance(confidence, (int, float))
+        and not isinstance(confidence, bool)
+        and math.isfinite(confidence)
+        and 0 <= confidence <= 1
+    )
+
+
+def reusable_visual_observation(observation: Any, candidate: dict[str, Any]) -> bool:
+    """Check persisted metadata as well as the model's visual schema."""
+    return (
+        usable_visual_observation(observation)
+        and isinstance(observation.get("source_image"), str)
+        and bool(observation["source_image"])
+        and observation.get("timestamp") == candidate.get("timestamp")
+    )
+
+
+def reusable_visual_artifact(observations: Any, candidates: list[dict[str, Any]]) -> bool:
+    """The aggregate cache must cover every selected frame with valid evidence."""
+    return (
+        isinstance(observations, list)
+        and len(observations) == len(candidates)
+        and all(
+            reusable_visual_observation(observation, candidate)
+            and isinstance(candidate.get("path"), (str, Path))
+            and observation["source_image"] == str(candidate["path"])
+            for observation, candidate in zip(observations, candidates)
+        )
+    )
 
 
 def analyze_images(
@@ -1475,32 +2376,57 @@ def analyze_images(
                 separators=(",", ":"),
             )
             cache_path = cache_dir / (hashlib.sha256(material.encode("utf-8")).hexdigest() + ".json")
-            cached = reuse_artifact(cache_path, "source_image")
-            if isinstance(cached, dict):
+            cached = reuse_artifact(cache_path)
+            if reusable_visual_observation(cached, candidate):
                 cached = dict(cached)
                 cached["source_image"] = str(image_path)
                 return index, cached
         observation = uniform_image_observation(image_path)
         if observation is None:
-            response = minimax_chat(
-                [
-                    {
-                        "role": "user",
-                        "content": [
-                            {"type": "text", "text": prompt},
-                            {"type": "image_url", "image_url": {"url": image_data_url(image_path)}},
-                        ],
-                    }
-                ],
-                api_key,
-                model,
-            )
-            observation = parse_json_object(response)
+            try:
+                response = minimax_chat(
+                    [
+                        {
+                            "role": "user",
+                            "content": [
+                                {"type": "text", "text": prompt},
+                                {"type": "image_url", "image_url": {"url": image_data_url(image_path)}},
+                            ],
+                        }
+                    ],
+                    api_key,
+                    model,
+                )
+                observation = parse_json_object(response)
+            except MiniMaxIncompleteError as error:
+                observation = {
+                    "completion_status": "incomplete",
+                    "finish_reason": error.finish_reason or "missing",
+                }
+            if not usable_visual_observation(observation):
+                # 截斷或不符 schema 的觀察不能進快取，也不能標成已核對畫面。
+                incomplete = {
+                    "screen_type": "候選畫面",
+                    "visible_text": [],
+                    "visual_summary": VISUAL_NOT_ANALYZED,
+                    "important_details": [],
+                    "confidence": None,
+                    "completion_status": "incomplete",
+                    "finish_reason": observation.get("finish_reason") or "stop",
+                }
+                if "raw" in observation:
+                    incomplete["raw"] = observation["raw"]
+                observation = incomplete
+            else:
+                observation["analysis_method"] = "minimax"
+        if usable_visual_observation(observation):
+            observation["visual_schema_version"] = VISUAL_OBSERVATION_SCHEMA_VERSION
+            observation["completion_status"] = "complete"
         observation["timestamp"] = candidate["timestamp"]
         observation["source_image"] = str(image_path)
         observation["local_ocr_text"] = local_ocr
         observation["local_ocr_confidence"] = candidate.get("ocr_confidence")
-        if cache_path is not None:
+        if cache_path is not None and reusable_visual_observation(observation, candidate):
             write_json(cache_path, observation)
         return index, observation
 
@@ -1993,6 +2919,12 @@ def render_knowledge_markdown(
             detail += f"（畫面：`{image_name}`）"
         lines.append(f"- {stamp} 畫面：{detail}")
 
+    visual_complete = bool(observations) and all(
+        usable_visual_observation(item) for item in observations
+    )
+    minimax_checked = any(
+        item.get("analysis_method") != "local_uniformity_check" for item in observations
+    )
     lines.extend(
         [
             "",
@@ -2002,8 +2934,12 @@ def render_knowledge_markdown(
             f"- 視覺觀察：{len(observations)}",
             (
                 "- 畫面分析：已執行 MiniMax 視覺核對。"
-                if observations and any(item.get("visual_summary") != "尚未執行 MiniMax 視覺理解。" for item in observations)
-                else "- 畫面分析：未完成；摘要不可視為已核對影片畫面。"
+                if visual_complete and minimax_checked
+                else (
+                    "- 畫面分析：已完成本地純色畫面檢查；未呼叫 MiniMax。"
+                    if visual_complete
+                    else "- 畫面分析：未完成；摘要不可視為已核對影片畫面。"
+                )
             ),
             "- 本檔案由影片資料庫管線產生，可重新執行以更新內容。",
             "",
@@ -3018,11 +3954,16 @@ def secure_rss_directory(root: Path) -> Path:
     return directory
 
 
+class WriterBusyError(RuntimeError):
+    pass
+
+
 @contextlib.contextmanager
-def rss_writer_lock(root: Path, timeout: float = 5.0):
-    """同一個 root 同時只允許一個 RSS 寫入者。"""
-    directory = secure_rss_directory(root)
-    path = directory / ".writer.lock"
+def file_writer_lock(path: Path, timeout: float = 0.0):
+    """An OS lock shared by server operations and the retention command."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if path.is_symlink():
+        raise RuntimeError("拒絕使用符號連結作為工作鎖。")
     handle = path.open("a+b")
     handle.seek(0, os.SEEK_END)
     if handle.tell() == 0:
@@ -3045,7 +3986,7 @@ def rss_writer_lock(root: Path, timeout: float = 5.0):
                 locked = True
             except OSError:
                 if time.monotonic() >= deadline:
-                    raise RuntimeError("另一個 RSS 寫入程序仍在執行；本次未開始。") from None
+                    raise WriterBusyError("另一個寫入程序仍在執行；本次未開始。") from None
                 time.sleep(0.1)
         yield
     finally:
@@ -3060,6 +4001,13 @@ def rss_writer_lock(root: Path, timeout: float = 5.0):
 
                 fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
         handle.close()
+
+
+@contextlib.contextmanager
+def rss_writer_lock(root: Path, timeout: float = 5.0):
+    """同一個 root 同時只允許一個 RSS 寫入者。"""
+    with file_writer_lock(secure_rss_directory(root) / ".writer.lock", timeout):
+        yield
 
 
 def load_rss_state(root: Path) -> dict[str, Any]:
@@ -3496,6 +4444,194 @@ def instagram_feed_item(record: dict[str, Any]) -> dict[str, str] | None:
     }
 
 
+def social_post_target(url: str) -> tuple[str, str, str, str]:
+    """Return platform, public post ID, canonical URL and a fixed provider dataset."""
+    parsed = urllib.parse.urlsplit(require_http_url(url, "貼文 URL"))
+    if parsed.username or parsed.password or parsed.port not in {None, 443} or parsed.scheme != "https":
+        raise ValueError("貼文必須是無帳密的標準 HTTPS 網址。")
+    host = (parsed.hostname or "").lower()
+    if host in {"instagram.com", "www.instagram.com", "m.instagram.com"}:
+        match = re.fullmatch(r"/(?:[A-Za-z0-9_.]+/)?(p|reel|reels)/([A-Za-z0-9_-]+)/?", parsed.path)
+        if match:
+            kind, post_id = match.groups()
+            kind = "p" if kind == "p" else "reel"
+            dataset = "gd_lk5ns7kz21pck8jpis" if kind == "p" else BRIGHTDATA_INSTAGRAM_REELS_DATASET_ID
+            return "instagram", post_id, f"https://www.instagram.com/{kind}/{post_id}/", dataset
+    elif host in THREADS_HOSTS:
+        match = re.fullmatch(r"/(@[A-Za-z0-9_.]+/post|t)/([A-Za-z0-9_-]+)/?", parsed.path)
+        if match:
+            prefix, post_id = match.groups()
+            return "threads", post_id, f"https://www.threads.com/{prefix}/{post_id}", "gd_md75myxy14rihbjksa"
+    elif host in {"facebook.com", "www.facebook.com", "m.facebook.com", "web.facebook.com"}:
+        query = urllib.parse.parse_qs(parsed.query, keep_blank_values=True, max_num_fields=20)
+        if "comment_id" in query or "reply_comment_id" in query:
+            raise ValueError("請提供 FB 貼文本身的網址，不接受留言網址。")
+        dataset = "gd_lyclm1571iy3mv57zw"
+        post_pattern = r"(?:[0-9]+|pfbid[A-Za-z0-9]+)"
+        match = re.fullmatch(r"/[A-Za-z0-9.]+/posts/(" + post_pattern + r")/?", parsed.path)
+        if match:
+            return "facebook", match[1], f"https://www.facebook.com{parsed.path.rstrip('/')}/", dataset
+        if parsed.path in {"/story.php", "/permalink.php"}:
+            post_ids, owners = query.get("story_fbid", []), query.get("id", [])
+            if (len(post_ids) == len(owners) == 1 and re.fullmatch(post_pattern, post_ids[0])
+                    and re.fullmatch(r"[0-9]+", owners[0])):
+                canonical = "https://www.facebook.com/permalink.php?" + urllib.parse.urlencode(
+                    {"story_fbid": post_ids[0], "id": owners[0]})
+                return "facebook", post_ids[0], canonical, dataset
+        match = re.fullmatch(r"/share/([pv])/([A-Za-z0-9]+)/?", parsed.path)
+        if match:
+            kind, token = match.groups()
+            # ponytail: opaque share tokens cannot be equated to post IDs without verified resolution.
+            return "facebook", f"share:{kind}:{token}", f"https://www.facebook.com/share/{kind}/{token}/", dataset
+    raise ValueError("僅支援公開 IG／Threads／Facebook 單篇貼文；FB 不接受首頁、社團、留言或 reel/watch 網址。")
+
+
+def normalize_social_post(record: dict[str, Any], url: str) -> dict[str, Any]:
+    platform, post_id, canonical, _ = social_post_target(url)
+    if record.get("error") or record.get("error_code") or record.get("is_private"):
+        raise RuntimeError("供應商無法取得公開貼文；可能需要登入、已刪除或無法存取。")
+    if social_post_target(str(record.get("url") or ""))[:2] != (platform, post_id):
+        raise RuntimeError("供應商回傳了不同的貼文，停止交接。")
+    if (platform == "facebook" and post_id.isdigit() and record.get("post_id") is not None
+            and str(record["post_id"]) != post_id):
+        raise RuntimeError("供應商的 FB post_id 與請求不符，停止交接。")
+    text = record.get({"instagram": "description", "threads": "post_content", "facebook": "content"}[platform])
+    text = text if isinstance(text, str) else ""
+    images, videos = [], []
+
+    def collect(value: Any, output: list[str]) -> None:
+        for item in value if isinstance(value, list) else [value]:
+            candidate = item.get("url") if isinstance(item, dict) else item
+            if not isinstance(candidate, str):
+                continue
+            try:
+                parsed = urllib.parse.urlsplit(candidate)
+                host, port = (parsed.hostname or "").lower(), parsed.port
+            except ValueError:
+                continue
+            if (parsed.scheme == "https" and not parsed.username and not parsed.password
+                    and port in {None, 443}
+                    and any(host == domain or host.endswith("." + domain)
+                            for domain in ("fbcdn.net", "cdninstagram.com", "fbsbx.com"))
+                    and candidate not in output):
+                output.append(candidate)
+
+    collect(record.get("photos"), images)
+    collect(record.get("images"), images)
+    collect(record.get("videos"), videos)
+    collect(record.get("video_url"), videos)
+    # IG post_content is a carousel; Threads post_content is text, not media.
+    for media in record.get("post_content", []) if isinstance(record.get("post_content"), list) else []:
+        if isinstance(media, dict) and media.get("type") in {"Photo", "Video"}:
+            collect(media, images if media["type"] == "Photo" else videos)
+    if platform == "facebook":
+        attachments = record.get("attachments")
+        for media in attachments if isinstance(attachments, list) else []:
+            if not isinstance(media, dict):
+                continue
+            kind = str(media.get("type") or "").lower()
+            if kind == "video":
+                collect(media.get("video_url"), videos)
+            elif kind in {"photo", "image"}:
+                collect(media.get("attachment_url"), images)
+    if not text.strip() and not images and not videos:
+        raise RuntimeError("貼文沒有可用文字或媒體；不以作者或互動數字代替內容。")
+    if platform == "facebook":
+        post_id = str(record.get("post_id") or ("" if post_id.startswith("share:") else post_id))
+    return {"status": "ready", "platform": platform, "post_id": post_id, "url": canonical,
+            "text": text, "author": str(record.get("user_posted") or record.get("profile_name")
+                                       or record.get("user_username_raw") or record.get("profile_handle") or ""),
+            "published_at": str(record.get("date_posted") or record.get("post_time") or ""),
+            "image_urls": images, "video_urls": videos, "media_analyzed": False,
+            "metrics": {key: record[field] for key, field in
+                        (("likes", "likes"), ("comments", "num_comments"), ("shares", "num_shares"))
+                        if type(record.get(field)) is int and record[field] >= 0},
+            "limitations": ["文字來自公開貼文採集；圖片／影片僅為網址，尚未解碼或分析。",
+                            "不保證完整留言、私人內容或所有 carousel 媒體；不自動刷新可能過期的 CDN 網址。"]}
+
+
+def submit_brightdata_once(folder: Path, url: str, headers: dict[str, str], body: bytes) -> str:
+    """Persist a billable submission receipt before interpreting it; never retry the POST."""
+    folder.mkdir(parents=True, exist_ok=True, mode=0o700)
+    receipt_path = folder / "submission.json"
+    fingerprint = hashlib.sha256(body).hexdigest()
+    token = headers.get("Authorization", "").removeprefix("Bearer ")
+    if receipt_path.exists():
+        try:
+            receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+            if receipt["request_url"] != url or receipt["request_sha256"] != fingerprint:
+                raise ValueError("request mismatch")
+        except (OSError, ValueError, KeyError, TypeError):
+            raise RuntimeError(f"採集回執損壞或請求不符；禁止重送，請核對 {receipt_path}。") from None
+    else:
+        receipt = {"request_url": url, "request_sha256": fingerprint,
+                   "input": json.loads(body), "submitted_at": rss_now()}
+        # ponytail: uncertain submissions stay blocked; provider-side reconciliation is manual.
+        try:
+            with (folder / ".submitted").open("x", encoding="utf-8") as marker:
+                json.dump(receipt, marker, ensure_ascii=False)
+                marker.flush()
+                os.fsync(marker.fileno())
+        except FileExistsError:
+            raise RuntimeError(f"上次送出狀態不明，禁止再次計費採集；請核對 {folder} 與 Bright Data。") from None
+        try:
+            receipt["response"] = request_json(url, headers, method="POST", body=body, timeout=60, attempts=1)
+        except Exception as exc:
+            receipt["error"] = str(exc)
+        receipt["received_at"] = rss_now()
+        receipt = json.loads(redact_values(json.dumps(receipt, ensure_ascii=False),
+                                          {json.dumps(token, ensure_ascii=False)[1:-1]}))
+        write_json(receipt_path, receipt)
+    response = receipt.get("response")
+    snapshot = response.get("snapshot_id") if isinstance(response, dict) else None
+    if not isinstance(snapshot, str) or not re.fullmatch(r"sd?_[A-Za-z0-9_-]+", snapshot):
+        raise RuntimeError(f"採集回應 snapshot_id 缺少或格式無效；禁止重送，請核對回執 {receipt_path} 與 Bright Data。")
+    return snapshot
+
+
+def fetch_social_post(url: str, cache_root: Path, *, allow_paid: bool = False) -> dict[str, Any]:
+    platform, post_id, canonical, dataset = social_post_target(url)
+    if not allow_paid:
+        raise RuntimeError("Bright Data 可能計費；本次尚未送出採集，需先授權。")
+    folder = cache_root / job_key(f"{platform}:{post_id}")
+    checkpoint = folder / "brightdata.json"
+    state = reuse_artifact(checkpoint)
+    if state and state.get("status") == "ready":
+        return state
+    token = os.getenv("BRIGHTDATA_API_TOKEN", "").strip()
+    if not token:
+        raise RuntimeError("缺少 BRIGHTDATA_API_TOKEN；請在主機安全設定，不要貼到對話。")
+    headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+    try:
+        if not state:
+            query = urllib.parse.urlencode({"dataset_id": dataset, "include_errors": "true", "format": "json"})
+            snapshot = submit_brightdata_once(
+                folder, f"{BRIGHTDATA_API_ROOT}/trigger?{query}", headers,
+                json.dumps([{"url": canonical}]).encode())
+            state = {"status": "pending", "url": canonical, "snapshot_id": snapshot,
+                     "dataset_id": dataset, "provider": "brightdata"}
+            write_json(checkpoint, state)
+        snapshot = state["snapshot_id"]
+        if not re.fullmatch(r"sd?_[A-Za-z0-9_-]+", snapshot):
+            raise RuntimeError("快取 snapshot_id 無效。")
+        progress = get_json(f"{BRIGHTDATA_API_ROOT}/progress/{snapshot}", headers)
+        status = progress.get("status") if isinstance(progress, dict) else None
+        if status == "failed":
+            raise RuntimeError("Bright Data 採集失敗；保留 snapshot，不自動重建計費工作。")
+        if status != "ready":
+            return {**state, "retry_after_seconds": 10}
+        rows = get_json(f"{BRIGHTDATA_API_ROOT}/snapshot/{snapshot}?format=json", headers)
+        if isinstance(rows, dict):
+            rows = rows.get("data")
+        if not isinstance(rows, list) or len(rows) != 1 or not isinstance(rows[0], dict):
+            raise RuntimeError("預期單篇貼文結果；收到空白或多筆資料，停止交接。")
+        result = {**state, **normalize_social_post(rows[0], canonical), "fetched_at": rss_now()}
+        write_json(checkpoint, result)
+        return result
+    except Exception as exc:
+        raise RuntimeError(str(exc).replace(token, "<redacted>")) from None
+
+
 def fetch_instagram_author(
     author: str,
     since: str = "365d",
@@ -3503,9 +4639,19 @@ def fetch_instagram_author(
     max_items: int | None = None,
     exclude_ids: list[str] | None = None,
     allow_paid: bool = False,
+    root: Path | None = None,
+    previous_snapshot_id: str = "",
 ) -> dict[str, Any]:
     if not allow_paid:
         raise RuntimeError("Bright Data 可能計費；確認帳戶額度後加上 --allow-batch-cloud。")
+    if max_items is None:
+        raise ValueError(
+            "Instagram/Bright Data 付費盤點需要有限的結果預算：請用 --instagram-max-items "
+            "指定正整數（例如 20）；--allow-batch-cloud 只代表允許雲端花費，不代表花費上限。"
+            "--instagram-since 只是在本機依發佈時間篩選，不會限制供應商計費範圍。"
+        )
+    if isinstance(max_items, bool) or not isinstance(max_items, int) or max_items <= 0:
+        raise ValueError("--instagram-max-items 必須是正整數。")
     token = os.getenv("BRIGHTDATA_API_TOKEN", "").strip()
     if not token:
         raise RuntimeError("缺少 BRIGHTDATA_API_TOKEN；請在專案 .env 本機填入。")
@@ -3513,16 +4659,14 @@ def fetch_instagram_author(
         timeout_seconds = int(os.getenv("BRIGHTDATA_RUN_TIMEOUT_SECONDS", "1800"))
     except ValueError as exc:
         raise ValueError("BRIGHTDATA_RUN_TIMEOUT_SECONDS 必須是整數。") from exc
-    if timeout_seconds <= 0 or (max_items is not None and max_items <= 0):
-        raise ValueError("Bright Data timeout 與 --instagram-max-items 必須大於 0。")
+    if timeout_seconds <= 0:
+        raise ValueError("BRIGHTDATA_RUN_TIMEOUT_SECONDS 必須大於 0。")
 
     username = instagram_username(author)
     author_url = instagram_author_url(username)
     since_timestamp = parse_instagram_since(since)
-    discovery_input: dict[str, Any] = {"url": author_url}
-    if max_items is not None:
-        discovery_input["num_of_posts"] = max_items
-    excluded = list(dict.fromkeys(str(item).strip() for item in (exclude_ids or []) if str(item).strip()))
+    discovery_input: dict[str, Any] = {"url": author_url, "num_of_posts": max_items}
+    excluded = sorted({str(item).strip() for item in (exclude_ids or []) if str(item).strip()})
     if excluded:
         discovery_input["posts_to_not_include"] = excluded
 
@@ -3537,16 +4681,14 @@ def fetch_instagram_author(
         }
     )
     trigger_url = f"{BRIGHTDATA_API_ROOT}/trigger?{query}"
+    if previous_snapshot_id and not re.fullmatch(r"sd?_[A-Za-z0-9_-]+", previous_snapshot_id):
+        raise ValueError("上次已儲存的 snapshot_id 無效。")
+    body = json.dumps({"input": [discovery_input]}, sort_keys=True).encode("utf-8")
+    # Only the caller's persisted success advances the cycle, including empty discoveries.
+    folder = secure_rss_directory(root or Path(__file__).resolve().parent) / "brightdata" / job_key(
+        f"instagram:{username}:{since}:{previous_snapshot_id}", body.decode("utf-8"))
     try:
-        payload = post_json(
-            trigger_url,
-            headers,
-            json.dumps({"input": [discovery_input]}).encode("utf-8"),
-            timeout=60,
-        )
-        snapshot_id = str(payload.get("snapshot_id") or "") if isinstance(payload, dict) else ""
-        if not re.fullmatch(r"s_[A-Za-z0-9_-]+", snapshot_id):
-            raise RuntimeError("Bright Data 啟動回應缺少有效 snapshot_id。")
+        snapshot_id = submit_brightdata_once(folder, trigger_url, headers, body)
         deadline = time.monotonic() + timeout_seconds
         status = ""
         while status != "ready":
@@ -3564,8 +4706,8 @@ def fetch_instagram_author(
             f"{BRIGHTDATA_API_ROOT}/snapshot/{urllib.parse.quote(snapshot_id, safe='')}?format=json"
         )
         result = get_json(snapshot_url, headers)
-    except RuntimeError as exc:
-        raise RuntimeError(str(exc).replace(token, "<redacted>")) from exc
+    except Exception as exc:
+        raise RuntimeError(str(exc).replace(token, "<redacted>")) from None
 
     if isinstance(result, list):
         raw_items = [item for item in result if isinstance(item, dict)]
@@ -3796,7 +4938,7 @@ def add_instagram_subscription(
     ):
         raise RuntimeError("這個 Instagram 作者已經訂閱。")
     feed = fetch_instagram_author(
-        username, since, max_items=max_items, allow_paid=allow_paid
+        username, since, max_items=max_items, allow_paid=allow_paid, root=root
     )
     newest = next((item["published"] for item in feed["items"] if item.get("published")), "")
     snapshot = write_instagram_discovery(root, feed)
@@ -3809,6 +4951,7 @@ def add_instagram_subscription(
         "instagram_max_items": max_items,
         "instagram_last_published": newest,
         "instagram_last_discovery": snapshot.name,
+        "instagram_last_snapshot_id": feed["instagram"]["snapshot_id"],
         "name": name.strip() or str(feed["title"]),
         "enabled": True,
         "latest_only": latest_only,
@@ -3865,6 +5008,8 @@ def refresh_rss(root: Path, workers: int = 4, allow_paid: bool = False) -> dict[
                     max_items=subscription.get("instagram_max_items"),
                     exclude_ids=known_ids,
                     allow_paid=allow_paid,
+                    root=root,
+                    previous_snapshot_id=str(subscription.get("instagram_last_snapshot_id") or ""),
                 ), None
             return fetch_rss(
                 str(subscription["url"]),
@@ -3898,6 +5043,7 @@ def refresh_rss(root: Path, workers: int = 4, allow_paid: bool = False) -> dict[
                 elif kind == "instagram-author":
                     snapshot = write_instagram_discovery(root, feed)
                     subscription["instagram_last_discovery"] = snapshot.name
+                    subscription["instagram_last_snapshot_id"] = feed["instagram"]["snapshot_id"]
                     newest = next((item["published"] for item in feed["items"] if item.get("published")), "")
                     if newest:
                         subscription["instagram_last_published"] = newest
@@ -3933,11 +5079,22 @@ def update_rss_subscription(
     tags: list[str] | None = None,
     latest_only: bool | None = None,
     enabled: bool | None = None,
+    instagram_max_items: int | None = None,
 ) -> dict[str, Any]:
     state = load_rss_state(root)
     subscription = next((item for item in state["subscriptions"] if item.get("id") == subscription_id), None)
     if subscription is None:
         raise RuntimeError(f"找不到 RSS 訂閱：{subscription_id}")
+    if instagram_max_items is not None:
+        if str(subscription.get("kind") or "rss") != "instagram-author":
+            raise ValueError("--instagram-max-items 只能用於 Instagram 作者訂閱。")
+        if (
+            isinstance(instagram_max_items, bool)
+            or not isinstance(instagram_max_items, int)
+            or instagram_max_items <= 0
+        ):
+            raise ValueError("--instagram-max-items 必須是正整數。")
+        subscription["instagram_max_items"] = instagram_max_items
     if name is not None:
         subscription["name"] = name.strip() or subscription.get("name") or subscription_id
     if keywords is not None:
@@ -4401,17 +5558,33 @@ def run_rss_command(args: argparse.Namespace) -> int:
         raise ValueError("--rss-add、--facebook-author 與 --instagram-author 一次只能使用一個。")
     if (args.facebook_since is not None or args.facebook_provider is not None or args.facebook_discover_only) and not args.facebook_author:
         raise ValueError("--facebook-since／--facebook-provider／--facebook-discover-only 必須搭配 --facebook-author。")
+    instagram_budget_update = (
+        args.rss_update
+        and args.instagram_max_items is not None
+        and args.instagram_since is None
+        and not args.instagram_discover_only
+    )
     if (
         args.instagram_since is not None
         or args.instagram_max_items is not None
         or args.instagram_discover_only
-    ) and not args.instagram_author:
+    ) and not args.instagram_author and not instagram_budget_update:
         raise ValueError("--instagram-since／--instagram-max-items／--instagram-discover-only 必須搭配 --instagram-author。")
-    if args.instagram_max_items is not None and args.instagram_max_items <= 0:
-        raise ValueError("--instagram-max-items 必須大於 0。")
-    edits = any(value is not None for value in (args.rss_name, args.rss_keywords, args.rss_tags, args.rss_latest_only))
+    if args.instagram_max_items is not None and (
+        isinstance(args.instagram_max_items, bool)
+        or not isinstance(args.instagram_max_items, int)
+        or args.instagram_max_items <= 0
+    ):
+        raise ValueError("--instagram-max-items 必須是正整數。")
+    if args.instagram_author and args.instagram_max_items is None:
+        raise ValueError(
+            "Instagram/Bright Data 付費盤點需要有限的結果預算：請用 --instagram-max-items "
+            "指定正整數（例如 20）；--allow-batch-cloud 只代表允許雲端花費，不代表花費上限。"
+            "--instagram-since 只是在本機依發佈時間篩選，不會限制供應商計費範圍。"
+        )
+    edits = any(value is not None for value in (args.rss_name, args.rss_keywords, args.rss_tags, args.rss_latest_only, args.instagram_max_items))
     if edits and not (args.rss_add or args.rss_update or args.facebook_author or args.instagram_author):
-        raise ValueError("名稱／關鍵字／標籤／latest-only 設定只可搭配新增或更新訂閱。")
+        raise ValueError("名稱／關鍵字／標籤／latest-only／Instagram 結果預算設定只可搭配新增或更新訂閱。")
     if args.rss_update and not edits:
         raise ValueError("--rss-update 至少要搭配一個要修改的設定。")
     if args.rss_list_items and not args.rss_list:
@@ -4487,14 +5660,24 @@ def run_rss_command(args: argparse.Namespace) -> int:
             )
     if args.instagram_author:
         since = args.instagram_since or "365d"
+        print(
+            "Instagram/Bright Data 本次供應商請求上限："
+            f"num_of_posts={args.instagram_max_items}；"
+            f"--instagram-since {since} 僅為本機時間篩選，不限制供應商計費範圍。"
+        )
         if args.instagram_discover_only:
-            feed = fetch_instagram_author(
-                args.instagram_author,
-                since,
-                max_items=args.instagram_max_items,
-                allow_paid=bool(args.allow_batch_cloud),
-            )
-            snapshot = write_instagram_discovery(root, feed)
+            with rss_writer_lock(root):
+                username = instagram_username(args.instagram_author)
+                previous = reuse_artifact(root / "rss" / f"instagram-{job_key(username)}-latest.json") or {}
+                feed = fetch_instagram_author(
+                    args.instagram_author,
+                    since,
+                    max_items=args.instagram_max_items,
+                    allow_paid=bool(args.allow_batch_cloud),
+                    root=root,
+                    previous_snapshot_id=str(previous.get("instagram", {}).get("snapshot_id") or ""),
+                )
+                snapshot = write_instagram_discovery(root, feed)
             incomplete = (
                 f"；{feed['instagram']['missing_date_count']} 筆缺發佈日期，無法驗證回溯範圍"
                 if feed["instagram"]["missing_date_count"]
@@ -4532,6 +5715,7 @@ def run_rss_command(args: argparse.Namespace) -> int:
                 keywords=csv_values(args.rss_keywords) if args.rss_keywords is not None else None,
                 tags=csv_values(args.rss_tags) if args.rss_tags is not None else None,
                 latest_only=args.rss_latest_only,
+                instagram_max_items=args.instagram_max_items,
             )
         print(f"已更新 RSS：{subscription['name']}（ID {subscription['id']}）")
     for subscription_id, enabled in ((args.rss_enable, True), (args.rss_disable, False)):
@@ -4632,7 +5816,7 @@ def self_test() -> None:
 
     def capture_minimax_payload(url: str, headers: dict[str, str], body: bytes, timeout: int) -> dict[str, Any]:
         captured_payload.update(json.loads(body.decode("utf-8")))
-        return {"choices": [{"message": {"content": "{}"}}]}
+        return {"choices": [{"message": {"content": "{}"}, "finish_reason": "stop"}]}
 
     globals()["post_json"] = capture_minimax_payload
     globals()["minimax_endpoint"] = lambda: "https://example.invalid/v1/chat/completions"
@@ -5160,7 +6344,7 @@ def self_test() -> None:
         tag = messages[0]["content"][0]["text"].rsplit("：", 1)[-1]
         vision_barrier.wait(timeout=5)
         time.sleep((count - int(tag[3:])) * 0.02)
-        return json.dumps({"tag": tag})
+        return json.dumps({"tag": tag, "screen_type": "slide", "visible_text": [], "visual_summary": tag, "important_details": [], "confidence": 0.5})
 
     globals()["minimax_chat"] = parallel_vision_chat
     try:
@@ -5206,7 +6390,9 @@ def self_test() -> None:
         image.write_bytes(b"frame")
         original_chat, original_data_url = minimax_chat, image_data_url
         globals()["image_data_url"] = lambda path: "data:image/jpeg;base64,x"
-        globals()["minimax_chat"] = lambda *args, **kwargs: json.dumps({"screen_type": "slide"})
+        globals()["minimax_chat"] = lambda *args, **kwargs: json.dumps(
+            {"screen_type": "slide", "visible_text": [], "visual_summary": "slide", "important_details": [], "confidence": 0.5}
+        )
         try:
             first = analyze_images(
                 [{"timestamp": 1, "path": str(image), "ocr_text": "OCR"}],
@@ -5409,7 +6595,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="影片語音＋畫面時間軸摘要管線")
     parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     source = parser.add_mutually_exclusive_group()
-    source.add_argument("--url", help="YouTube／Facebook 等 yt-dlp 支援的影片 URL")
+    source.add_argument("--url", help="YouTube／Facebook／Instagram／Threads 等支援的影片 URL")
     source.add_argument("--video", help="本機影片路徑")
     source.add_argument("--url-file", type=Path, help="批次 URL 清單；每行一個影片 URL")
     parser.add_argument("--root", type=Path, default=Path(__file__).resolve().parent)
@@ -5423,7 +6609,7 @@ def parse_args() -> argparse.Namespace:
     rss = parser.add_argument_group("RSS 訂閱")
     rss.add_argument("--rss-add", metavar="FEED_URL", help="加入 RSS/Atom Feed，並立即把新項目排入本機佇列")
     rss.add_argument("--rss-remove", metavar="ID", help="移除訂閱與佇列紀錄；不刪除既有 jobs")
-    rss.add_argument("--rss-update", metavar="ID", help="修改既有訂閱的名稱、關鍵字、標籤或 latest-only")
+    rss.add_argument("--rss-update", metavar="ID", help="修改既有訂閱的名稱、關鍵字、標籤、latest-only 或 Instagram 結果預算")
     rss.add_argument("--rss-enable", metavar="ID", help="啟用既有訂閱")
     rss.add_argument("--rss-disable", metavar="ID", help="暫停既有訂閱")
     rss.add_argument("--rss-requeue", metavar="ITEM_ID", help="將 failed/dead-letter 項目重排並清除嘗試次數")
@@ -5492,7 +6678,7 @@ def parse_args() -> argparse.Namespace:
         "--instagram-max-items",
         type=int,
         default=None,
-        help="手動限制本次發現的近期 Reels 數；預設不設上限",
+        help="本次發現的供應商結果預算（num_of_posts，正整數，必填）；--instagram-since 只是在本機依發佈時間篩選，不限制供應商計費範圍",
     )
     rss.add_argument(
         "--instagram-discover-only",
@@ -5868,7 +7054,13 @@ def run_pipeline(args: argparse.Namespace) -> Path:
 
             local_started = time.monotonic()
             audio_chunks, (candidates, frame_meta, frame_cache_key) = run_parallel_stages(
-                lambda: extract_audio(video_path, job_dir, args.chunk_seconds), frame_stage
+                lambda: extract_audio(
+                    video_path,
+                    job_dir,
+                    args.chunk_seconds,
+                    has_audio=any(stream.get("codec_type") == "audio" for stream in probe.get("streams", [])),
+                ),
+                frame_stage,
             )
             write_json(
                 job_dir / "frame_candidates.json",
@@ -5952,7 +7144,7 @@ def run_pipeline(args: argparse.Namespace) -> Path:
                     and previous.get("models", {}).get("visual") == model
                     else None
                 )
-                if isinstance(cached, list):
+                if reusable_visual_artifact(cached, candidates):
                     print("· 重用既有視覺觀察")
                     return cached
                 return analyze_images(
@@ -5968,6 +7160,11 @@ def run_pipeline(args: argparse.Namespace) -> Path:
                 transcribe_stage, visual_stage
             )
             print(f"· 轉錄與畫面分析並行階段：{time.monotonic() - cloud_started:.1f} 秒")
+        # Provider 未完整完成時，整體流程仍可保存逐字稿與部分結果，但視覺狀態須明確。
+        manifest["visual_status"] = (
+            "complete" if observations and all(usable_visual_observation(item) for item in observations)
+            else "incomplete"
+        )
         # 記下每個階段實際由誰產生：換模型後回頭看產物才知道該不該重跑
         manifest["models"] = {
             "transcript": transcript.get("model") if isinstance(transcript, dict) else None,
@@ -6141,13 +7338,21 @@ def main() -> int:
     if getattr(args, "cost_report", None) is not None:
         from cost_tracker import get_cost_report
 
-        res = get_cost_report(args.root.resolve(), period_type=args.cost_report)
+        try:
+            res = get_cost_report(args.root.resolve(), period_type=args.cost_report)
+        except (RuntimeError, ValueError, OSError) as exc:
+            print(f"成本報告 ERROR: {exc}", file=sys.stderr)
+            return 1
         print(f"成本與用量報告：\n{json.dumps(res, ensure_ascii=False, indent=2)}")
         return 0
     if getattr(args, "budget_status", False):
         from cost_tracker import get_budget_status
 
-        res = get_budget_status(args.root.resolve())
+        try:
+            res = get_budget_status(args.root.resolve())
+        except (RuntimeError, ValueError, OSError) as exc:
+            print(f"預算狀態 ERROR: {exc}", file=sys.stderr)
+            return 1
         print(f"預算狀態：\n{json.dumps(res, ensure_ascii=False, indent=2)}")
         return 0
     if getattr(args, "provider_health", False):

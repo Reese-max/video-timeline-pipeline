@@ -68,6 +68,82 @@ python pipeline.py --video 'D:\path\to\video.mp4' --dry-run --slide-extractor st
 
 `--dry-run` 不會下載、不會上傳、不會呼叫雲端 API，但會用本機 `ffprobe`／`ffmpeg` 產生音訊片段與候選截圖。輸出在 `jobs\<12字元雜湊>\`。
 
+## ChatGPT 網頁 MCP 影片摘要
+
+`mcp_server.py` 是 ChatGPT Apps/MCP 入口：公開影片 URL → 既有下載器 → FFmpeg 分段 → Groq 語音辨識／MiniMax 抽樣畫面分析 → ChatGPT 根據工具證據整理時間軸。v12 widget 透過「開始分析」建立持久背景工作，再由「交給 ChatGPT 整理」送出整理要求；重新開啟不會自動重跑或重送。CLI 的 MiniMax 摘要流程不變；MCP 不另呼叫 MiniMax 產生摘要。影片放在 Git 忽略的 `mcp_jobs\`，工作佇列及簽章金鑰在私有 `.video-state/`。
+
+### v12：背景工作、可核對證據與儲存管理
+
+準備／分析／Drive 工具支援 `background=true`；可用 `get_video_job` 查進度，`cancel_video_job` 取消，`resume_video_job` 續跑，`get_prepared_video` 恢復結果及更新下載網址。新介面使用背景模式，舊客戶端的同步預設仍相容。Drive 僅在明確點選時上傳，不因證據不足而自動執行。
+
+長片最多使用 240 個低解析度探針、40 張入選影格；時間窗與場景變化兼顧全片範圍。快取比對來源 SHA-256、模型、語言、後端、取樣設定及程式版本。介面可切換逐字稿／畫面觀察、點時間碼核對原片，並顯示抽樣與缺漏限制。
+
+簽名下載網址預設 24 小時有效；受管媒體預設保留七天，總量 20 GiB、單工作 4 GiB、保留至少 1 GiB 空間。清理需 `MCP_STORAGE_CLEANUP_ENABLED=1`，只處理已明確納管且到期的工作，保護執行中工作及有效分享。舊工作不會在部署時被批次納管。設定、相容性及驗證界線詳見 [操作說明](docs/video-mcp-operations.md)。
+
+UI URI 已升為 `ui://video-timeline-pipeline/v12-<媒體網址 hash>.html`。更新服務後需重新整理外掛動作並產生新 widget；歷史 widget 不會自動更新。以下 v8–v11 段落保留歷史修復紀錄，操作以 v12 說明為準。
+
+### MCP 影音暫存保留 7 天
+
+`media_retention.py` 預設只預覽；加 `--apply` 才刪除。只處理準備及分析皆完成、來源指紋一致、品質為 `evidence_available`，且工作內最後檔案寫入已**超過 7 天**的工作。這是保守的完成時間判定，後續寫入會重新延長保留期。失敗、未完成、需要覆核、有 Drive 交接紀錄、`.keep-media`、下載暫存或連結的工作全部保留。
+
+```bash
+cd /home/box/video-timeline-pipeline
+.venv/bin/python media_retention.py --jobs-root /home/box/video-timeline-pipeline/mcp_jobs
+.venv/bin/python media_retention.py --jobs-root /home/box/video-timeline-pipeline/mcp_jobs --apply
+```
+
+只刪除明確命名的來源影片、MP4 分段、音訊與影格檔案；不刪工作目錄、摘要、逐字稿、JSON 紀錄、付費回執或 Google Drive 檔案。刪除紀錄留在各工作的 `media-retention.json`；刪除無法復原，原有媒體網址會失效，可重新下載來源影片。清理與 MCP 共用跨程序工作鎖，忙碌時跳過、不排隊。**啟用排程前必須先部署並重啟新版 MCP**，不可讓不認識共享鎖的舊程序與清理同時執行。可排每日台灣時間 03:00 先預覽再執行；程式本身不會安裝排程。安全回歸：`python -m unittest discover -s tests -p test_media_retention.py -v`。
+
+先在隔離環境安裝依賴（FFmpeg／ffprobe 仍需在 PATH）：
+
+```powershell
+cd 'C:\Users\Administrator\video-timeline-pipeline'
+python -m venv .venv
+.\.venv\Scripts\python -m pip install -r requirements.txt
+```
+
+啟動本機 MCP：
+
+```powershell
+$env:MCP_PUBLIC_BASE_URL = 'https://你的 HTTPS tunnel 網址'
+$env:MCP_MEDIA_BASE_URL = 'https://可由 ChatGPT 存取的公開 HTTPS 網址'
+$env:MCP_HOST = '127.0.0.1'
+$env:MCP_PORT = '8787'
+.\.venv\Scripts\python mcp_server.py
+```
+
+本機檢查：`Invoke-RestMethod http://127.0.0.1:8787/health`；ChatGPT Developer Mode 則新增 MCP app，填入 MCP tunnel 網址加 `/mcp`。需在 MCP 主機設定既有的 `GROQ_API_KEY` 與 `MINIMAX_SUBSCRIPTION_KEY`。`MCP_MEDIA_BASE_URL` 僅供預覽／分段連結使用；主流程不透過瀏覽器抓取 MP4。分析工具回傳來源大小／SHA-256、逐字稿與抽樣畫面時間軸，再由 widget 送出 ChatGPT 整理要求；這不是 ChatGPT 親自讀取 MP4。`ingest_video_segments` 保留舊 API 相容，但新 widget 不呼叫它。
+
+v11 的 `quality` 是保守證據檢查，不是準確率評分：分析階段失敗、有音軌卻無可用逐字稿、缺畫面描述、未完成回應，或畫面自報信心缺漏／不高於 0.5，會回傳 `needs_review`。沒有音軌不是 ASR 失敗。模型自報信心未經校準，即使 `evidence_available` 也不保證內容正確；畫面是抽樣，非逐幀檢視。品質不足時不送出一般摘要要求，改將分段存到私有 Drive，顯示原片覆核交接內容；正常結果則可手動按「存到 Drive／交給 ChatGPT 檢視原片（選用）」。若 ChatGPT 整理時發現矛盾或使用者認為品質差，也走此入口。工具例外或 Drive 失敗時明確停止，保留重試入口，不把 metadata 當成讀取成功。
+
+v9 修正 developer MCP 與官方 Drive 的交接邊界：不在原對話送出 Drive 讀取／摘要 follow-up；先開啟未啟用 developer MCP 的一般 ChatGPT 對話，選擇官方 Google Drive，再貼上 widget 的交接內容（job ID、全部檔案 ID／網址／大小與原片分段時間）。新對話須實際取得 bytes、記錄大小／SHA-256 並解碼，不能把 `drive_ready` 當成讀取成功。一般對話連結不會自動改變帳號的 developer mode 或連線設定，使用者需確認對話類型。登入、OAuth、Drive 檔案權限均未變更。UI URI 含媒體網址 SHA-256 前 12 碼，避免換網址後仍使用舊 CSP 快取。
+
+分析與 Drive 未取得單程序工作鎖時回傳 `status=busy`、`error_code=MCP_BUSY`、`retry_after_seconds=5`，不是成功，也不加入背景佇列。widget 僅對此忙碌狀態（或舊 host 包裝後的同一忙碌訊息）等待 5、10、20 秒，各重試一次；最多四次呼叫。仍忙碌就停止並保留手動重試入口。Drive 或 ChatGPT follow-up 失敗時沿用同一 widget 的分析結果，不重跑付費分析。其他錯誤不在 widget 自動重試；Drive 儲存層原有的續傳重試仍保留。切換 job 後不再重試舊工作，也不讓資料型通知覆寫目前分段。這不是持久化佇列，也沒有解除 ChatGPT 原生 `Unsupported file type` 限制。依 [官方 UI 快取規則](https://developers.openai.com/plugins/build/chatgpt-ui#embed-the-component-in-the-server-response)，UI URI 升為 `ui://video-timeline-pipeline/v11-<媒體網址 SHA-256 前 12 碼>.html`；部署後必須重新整理外掛動作並產生新 widget，歷史 widget 不會自動更新。`node tests/test_widget_handoff.cjs` 驗證流程與競態；不代表真實模型品質或網頁端驗收通過。
+
+監督啟動器預設讓媒體網址沿用固定的 `MCP_PUBLIC_BASE_URL`，避免 Cloudflare Quick Tunnel 換名後，長時間運作的 MCP 仍回傳已失效的影片網址。既有 `MCP_MEDIA_BASE_URL` 明確設定仍優先；需要 Quick Tunnel 時可明確設 `MCP_USE_QUICK_TUNNEL=1`，此模式仍需要在網址變更後受控重載 MCP 並建立新 widget。歷史 widget 的舊網址不會自動更新。
+
+新 tunnel 啟動會給遠端 DNS 負快取傳播時間：`MCP_MEDIA_STARTUP_ATTEMPTS` 預設 300 次（允許 1–900），每次失敗間隔 1 秒、單次連線最多 10 秒。不再僅因啟動頭一分鐘尚未解析就換掉已註冊的 tunnel。這是啟動等待，不會放寬 TLS 驗證，也不會改寫系統 DNS。
+
+媒體 tunnel worker 現在會驗證 DNS／TLS 後才發佈網址，每 30 秒檢查公開 `/health`；連續三次失敗才重建自己的 cloudflared 子行程。來源服務尚未啟動／故障或公開端 HTTP 429 不會觸發無效的 tunnel 重建。tunnel 不可用時，啟動器忽略舊網址並退回 MCP 原有公開 origin，保留 MCP／Drive 功能，不宣稱原生附件已恢復；現有 MCP 若仍持有不同的媒體網址，啟動器回傳非零，不強制中斷正在處理的影片。網址更換後，仍須受控重載 MCP、重新整理 ChatGPT 動作並 prepare 新 widget，才能更新確切的 CSP 網域；舊 widget 須使用 Drive 交接。回歸檢查（Linux／WSL）：`python3 -m unittest discover -s tests -p test_media_tunnel.py -v`。這不等於外部 ChatGPT 能下載 MP4 的驗收；[Quick Tunnels 官方不提供 SLA，僅供開發測試](https://developers.cloudflare.com/cloudflare-one/networks/connectors/cloudflare-tunnel/do-more-with-tunnels/trycloudflare/)，固定網域部署需另行設定 named tunnel。本次不新增網域或更動公開入口。
+
+v7 修正跨工作狀態：切換 job 時立即替換 model context、清除舊附件 ID，並以工作快照及遞增版本隔離非同步結果（包含 A → B → A）。舊作業回傳或失敗不得覆寫目前 context、送出摘要要求或改寫目前錯誤；待舊呼叫結束後僅啟動最新工作。已送出的上傳可能在遠端完成，但過期結果會被丟棄，不刪除已建立的檔案。Drive 回應的 job_id 必須吻合；資料型交接回應不會當成新影片。回歸測試：`node tests/test_widget_handoff.cjs`。UI URI 按 [官方快取規則](https://developers.openai.com/plugins/build/chatgpt-ui#embed-the-component-in-the-server-response) 升版為 `ui://video-timeline-pipeline/v7.html`。
+
+v8 保留 v7 的工作隔離，下載期限改為涵蓋 HTTP 回應與完整 `blob()` 讀取；內容串流卡住也會在 30 秒中止並走 Drive fallback。UI URI 為 `ui://video-timeline-pipeline/v8.html`。時間軸改讀 FFmpeg `segments.csv` 的實際 muxer 起訖（非 `index × segment_seconds`），並停用負時間戳自動平移，避免編碼延遲造成偏移；manifest 升為 v2，重新 prepare 時會重建舊估算快取。超過 999 的分段使用數字排序，媒體與預覽路由亦接受較長索引。
+
+Drive 上傳以 1 MiB 分塊；遇到斷線、HTTP 429／5xx，最多退避重試三次，先查詢同一 resumable session 的已接收範圍，再續傳，避免盲目重建檔案。回歸檢查：`node tests/test_widget_handoff.cjs` 與 `python -m unittest discover -s tests -p test_mcp_server.py -v`。
+
+跨呼叫重試也保留進度：採 [Google Drive 預先配置 ID](https://developers.google.com/workspace/drive/api/guides/manage-uploads#use_a_pre-generated_id_to_upload_files)，先原子保存 ID 再建立資料夾／影片。每次重用都重新讀取 Drive，確認未進垃圾桶、大小、SHA-256 與父資料夾；403／網路錯誤會停止，不把它當成不存在。已刪除或被修改的檔案會建立新 ID，不覆寫原檔。只有全部驗證成功才標示 `drive_ready`。舊版未記錄的孤立上傳不會自動刪除。此實作使用單程序鎖與 JSON checkpoint；多程序部署需先換成共享鎖，大量分段若 checkpoint 寫入成為瓶頸，再改成增量日誌。
+
+可用環境變數：`MCP_MAX_SOURCE_MB`（預設 512）、`MCP_MAX_SEGMENT_SECONDS`（預設 600）、`MCP_MAX_SEGMENTS`（預設 0，不限段數；設為正整數後，省略 `max_segments` 也不會繞過伺服器上限）、`MCP_MIN_FREE_MB`（預設保留 1024 MiB）、`MCP_ROOT`（預設 repo 根目錄）、`TRANSCRIBE_BACKEND`（`groq` 或 `local`）、`GROQ_ASR_MODEL`、`MINIMAX_MODEL`。工具的 `max_segments` 預設仍不設上限。
+
+容量保護是事前檢查：下載前預留來源上限，切割／分析前至少再預留一份來源大小與最低剩餘空間；轉碼大小不固定，這不是磁碟配額保證。準備、分析、Drive 上傳共用單程序工作鎖；忙碌時立即回傳可重試錯誤，不讓背景執行緒無限排隊。仍採同步處理；持久化長片佇列、Drive 配額管理、定期刪除未實作。沒有保留天數授權時不刪除任何既有影片。
+
+Drive fallback 另需 `GOOGLE_DRIVE_FOLDER_ID`（可留白表示根目錄）及 `GOOGLE_DRIVE_REFRESH_TOKEN`、`GOOGLE_DRIVE_CLIENT_ID`、`GOOGLE_DRIVE_CLIENT_SECRET`；`GOOGLE_DRIVE_ACCESS_TOKEN` 僅適合短期測試。這些憑證只放在 MCP 主機環境，不提交到 Git；OAuth 使用者必須能讀取該資料夾，否則 ChatGPT 的 Google Drive connector 無法取回影片。Drive OAuth 僅處理儲存端授權，**不代表 MCP 公開入口已驗證呼叫者**；本版沒有更動入口驗證設定。
+
+可靠性回歸：`python -m unittest discover -s tests -p test_mcp_reliability.py -v` 含實際 FFmpeg 影音切割／解碼、非整秒影格邊界、快取失效、Drive 中斷／重試／校驗、段數限制、容量與 SQLite 關閉檢查。Drive 部分使用模擬 API；不等於已完成線上 Drive 或 ChatGPT 新版 widget 驗收。
+
+Drive 工具只回傳結構化檔案資訊與文字說明，不把私有 `webViewLink` 包裝成 MP4 `resource_link`。檢視頁回傳的是 HTML；必須在未啟用 developer MCP 的一般對話，由已授權的 Google Drive connector 執行 `fetch(download_raw_file=true, include_base64=false)` 取得原始影片，避免在 developer MCP 對話觸發 `FORBIDDEN`，或把檢視頁誤當影片。
+
 ## 批次建立頻道知識庫
 
 先建立 URL 清單；每行一個影片 URL，空白行與 `#` 開頭的註解會忽略，重複 URL 會去除：
@@ -147,15 +223,23 @@ BRIGHTDATA_RUN_TIMEOUT_SECONDS=1800
 python pipeline.py --instagram-author 'https://www.instagram.com/<USERNAME>/' --instagram-max-items 3 --instagram-discover-only --allow-batch-cloud
 ```
 
-確認後加入佇列。預設不設結果筆數上限；`--instagram-since 365d` 會在本機依供應商實際回傳的發佈時間保留近一年結果：
+確認後加入佇列。`--instagram-max-items` 是必填的供應商結果預算（`num_of_posts`，正整數），沒有它即使加了 `--allow-batch-cloud` 也會在送出前拒絕；`--instagram-since 365d` 只會在本機依供應商實際回傳的發佈時間保留近一年結果，不會限制供應商計費範圍：
 
 ```powershell
-python pipeline.py --instagram-author '<USERNAME>' --instagram-since 365d --rss-all-items --allow-batch-cloud
+python pipeline.py --instagram-author '<USERNAME>' --instagram-max-items 20 --instagram-since 365d --rss-all-items --allow-batch-cloud
 python pipeline.py --rss-refresh --allow-batch-cloud
 python pipeline.py --rss-process --rss-max-items 4 --allow-batch-cloud
 ```
 
+舊訂閱若沒有結果預算（`instagram_max_items` 為空），刷新會直接失敗並保留原訂閱，不會送出計費請求；用以下命令補上有限預算即可繼續，不需刪除重建：
+
+```powershell
+python pipeline.py --rss-update '<SUBSCRIPTION_ID>' --instagram-max-items 20
+```
+
 盤點快照保存在 Git 忽略且受 ACL 保護的 `rss\instagram-<雜湊>-latest.json`，包含原始 Bright Data 結果與 snapshot provenance。刷新時會把已見 Post ID 傳入 `posts_to_not_include`，本機佇列仍以穩定 ID 去重。Bright Data 的 Reel discovery 目前不支援伺服器端日期篩選；若某筆沒有 `date_posted`，工具會保留並在快照及盤點訊息標示「無法驗證回溯範圍」，不會假裝近一年盤點完整。私人／登入限定內容不處理，平台可見性與供應商回傳仍可能造成缺漏。請參考 [Instagram Scraper API](https://docs.brightdata.com/datasets/scrapers/instagram/introduction)、[Reel discovery](https://docs.brightdata.com/api-reference/scrapers/social-media-apis/instagram-reels-discover-by-url) 與 [非同步 snapshot 流程](https://docs.brightdata.com/api-reference/rest-api/scraper/asynchronous-requests)。
+
+每輪作者採集的 POST 僅送一次，回執保存在所選 `--root` 的 `rss/brightdata/<雜湊>/`。相同輸入在輪詢、下載或本機儲存失敗後重試，沿用原 snapshot；只有訂閱狀態（或 `--instagram-discover-only` 的快照）成功儲存，後續明確允許的刷新才會開始新一輪採集，空結果亦同。回應不明時停止，不以重送嘗試恢復；改輸入／root 屬於另一個請求，不應用來繞過此保護。
 
 單篇公開 Reel／影片貼文不需要先建立作者訂閱，可直接走既有入口：
 
@@ -163,7 +247,49 @@ python pipeline.py --rss-process --rss-max-items 4 --allow-batch-cloud
 python pipeline.py --url 'https://www.instagram.com/reel/<SHORTCODE>/'
 ```
 
-Bright Data 只負責作者內容發現；實際下載仍由 yt-dlp 完成，之後才是 Groq 時間戳轉錄與 MiniMax 摘要。免費額度與餘額續用行為依帳戶主控台為準，程式無法保證不扣款，因此所有 Bright Data 盤點都要求明確加上 `--allow-batch-cloud`。
+此 CLI 作者盤點流程的 Bright Data 只負責內容發現；實際下載仍由 yt-dlp 完成，之後才是 Groq 時間戳轉錄與 MiniMax 摘要。免費額度與餘額續用行為依帳戶主控台為準，程式無法保證不扣款，因此所有 Bright Data 盤點都要求明確加上 `--allow-batch-cloud`，且作者盤點另須以 `--instagram-max-items` 給出有限的供應商結果預算。
+
+### MCP 公開 IG／Threads／Facebook 單篇貼文
+
+`collect_social_post(url, allow_paid=false)` 使用 Bright Data 官方的 [Instagram Posts API](https://docs.brightdata.com/api-reference/scrapers/social-media-apis/instagram-posts-collect-by-url)、[Reels API](https://docs.brightdata.com/api-reference/scrapers/social-media-apis/instagram-reels-collect-by-url)、[Threads Posts API](https://brightdata.com/products/web-scraper/threads) 或 [Facebook Posts API](https://docs.brightdata.com/api-reference/scrapers/social-media-apis/facebook-posts-collect-by-url)，取得公開單篇文字、作者、發佈時間、可用互動數，以及供應商實際回傳的圖片／影片 CDN 網址。支援 IG `/p/`、`/reel/` 和 Threads `.com`／`.net` 單篇網址，不是任意社群通用閱讀器；不保證私人、已刪除內容、完整留言或所有 carousel 媒體。
+
+Facebook 支援 `/<作者>/posts/<數字 ID 或 pfbid>`、`story.php`／`permalink.php`（必須同時有 `story_fbid` 與 `id`）及 `/share/p/`、`/share/v/`。`www`／`m`／`web` 網域及同一明確貼文 ID 共用快取；不解析任意重新導向或接受首頁、社團、留言網址。FB `/reel/`、`/watch/`、`/share/r/` 仍走既有影片準備流程，不送到貼文 dataset。分享 token 無法離線證明等同某個 post ID，因此分享與原始貼文網址不合併；請固定使用同一網址，避免另建採集。若供應商把分享網址換成無法核對的另一種網址，會停止交接，不猜測它是同一篇。
+
+FB 回應的 `content` 是貼文文字；`attachments` 的照片與影片分開回傳，影片縮圖不當成 MP4。只有通過 HTTPS／Meta CDN 網域檢查的媒體網址會保留。這些網址仍未被下載、辨識或轉錄；互動數為供應商回傳的快照，不代表即時或完整留言。
+
+此工具預設拒絕計費採集。管理員須在主機安全設定 `BRIGHTDATA_API_TOKEN`，並將人工核准的單篇網址放入 `BRIGHTDATA_ALLOWED_POST_URLS`（逗號分隔）；呼叫者另須取得使用者明確同意才設定 `allow_paid=true`。網址核准清單不等於呼叫者身分驗證，也不是金額上限，仍須在供應商設定支出控制。本版不改 MCP 登入設定；憑證不要貼到對話或提交 Git。
+
+回傳 `pending` 時依 `retry_after_seconds` 等待，再以相同網址呼叫，會沿用同一 snapshot；`ready` 後重用本機快取。首次送出僅嘗試一次，回應遺失或供應商失敗時不自動重建計費工作，須人工到 Bright Data 核對。狀態保存在 Git 忽略的 `mcp_jobs/social-posts/`，不要為了重試直接刪除；CDN 網址可能過期，工具不自動付費刷新。
+
+兩條 Bright Data 路徑共用提交保護：送出前在 `.submitted` 寫入時間、請求 URL／輸入與 SHA-256，送出後先存 `submission.json` 的回應或錯誤診斷，再解析 snapshot。回執不保存請求 headers，並遮蔽 API token；有效 snapshot 可在 checkpoint 寫入失敗後恢復。未知格式、損壞回執、舊版空白 `.submitted` 或回執未寫成時一律禁止重送，請依該目錄資料與供應商紀錄人工核對，不要刪除標記。
+
+貼文文字可交給 ChatGPT 整理；`image_urls`／`video_urls` 只是媒體參照，`media_analyzed=false`，不能宣稱已看過畫面。ChatGPT 可再將 `video_urls` 逐支交給既有 `prepare_video_for_chatgpt` → Groq／MiniMax 分析 → ChatGPT 整理，並保留原始貼文網址作為來源；這不是 `download_video` 裡的隱式付費 fallback。圖片尚未自動送入視覺模型，Drive 仍為選用儲存。
+
+不計費回歸：`python -m unittest discover -s tests -p test_social_post.py -v`。測試使用模擬供應商回應，不代表真實 Bright Data 採集、媒體下載或 ChatGPT 網頁端驗收已通過；部署新增工具後須重新整理 ChatGPT 外掛動作。
+
+### Instagram 下載與診斷
+
+在執行 Pipeline 的虛擬環境安裝／更新：`python -m pip install -U "yt-dlp[default,curl-cffi]"`。虛擬環境內已安裝的套件優先於 PATH／VidBee 的獨立執行檔，避免更新了錯誤的版本。依 [yt-dlp 官方更新通道與 impersonation 文件](https://github.com/yt-dlp/yt-dlp#update-channels)，如需比較 nightly，請先在獨立測試環境使用 `python -m pip install -U --pre "yt-dlp[default,curl-cffi]"`，不要在每次下載時自動更新。
+
+Instagram 先以無登入方式下載；可用時採用 `curl_cffi` 的 Chrome impersonation，忽略外部 yt-dlp 設定與外掛，避免暗中帶入 cookies。公開下載失敗後，僅在 `YTDLP_INSTAGRAM_COOKIE_FILE` 明確設定時嘗試一次 authenticated fallback。此變數須指向使用者自行提供、位於 repo 外的 Netscape cookies 絕對路徑（建議 Unix 權限 `600`）；只複製 Instagram 網域且未過期的 cookies 到私人暫存檔，結束即清理，不覆寫原檔、不讀取瀏覽器、不傳送憑證給 ChatGPT。需要時可設定 `YTDLP_INSTAGRAM_USER_AGENT`，通常留白交給 impersonation 管理。
+
+每次實際下載在工作目錄保存 `instagram-download.json`：包含實際 yt-dlp 版本、request handlers、`curl_cffi` 版本、impersonation 能力、User-Agent 設定模式、Python／作業系統／容器標記、是否使用 cookies，以及每次嘗試的結果。失敗也會在 MCP 的錯誤文字回傳相同診斷，保留第一次失敗原因；不輸出 Cookie／Authorization 值或憑證路徑。錯誤不等於影片已刪除；cookies 也不保證能修正上游 extractor／帳戶／網路限制。Regression：`python -m unittest discover -s tests -p test_instagram_download.py -v`。
+
+### Facebook 下載與 cookies
+
+Facebook 單支影片／Reels 同樣走 yt-dlp；可用時採用 `curl_cffi` Chrome impersonation。公開下載失敗（例如部分 Reel 出現 `Cannot parse data`）後，僅在 `YTDLP_FACEBOOK_COOKIE_FILE` 明確設定時嘗試一次 authenticated fallback。變數須指向使用者自行提供的 Netscape cookies 絕對路徑（建議 `/home/box/video-timeline-pipeline/secrets/facebook_cookies.txt`，Unix 權限 `600`）；只複製 Facebook／fb.com 網域 cookies 到私人暫存檔，結束即清理，不覆寫原檔、不讀取瀏覽器。工作目錄會寫入 `facebook-download.json` 診斷（不含 cookie 值）。Regression：`python -m unittest discover -s tests -p test_facebook_download.py -v`。
+
+### Threads 單篇影片與 carousel
+
+公開 Threads 貼文可直接使用同一個入口，支援 `threads.com`／`threads.net` 的 `/@user/post/<ID>` 與 `/t/<ID>` 連結：
+
+```powershell
+python pipeline.py --url 'https://www.threads.com/@zuck/post/DHV7vTivqWD'
+```
+
+Threads 不依賴 yt-dlp extractor；管線會以公開 crawler headers 取得 `data-sjs` 頁面資料，解析 `video_versions`／影片 CDN URL，再交回既有 FFmpeg、Groq 與 MiniMax 流程。影片 carousel 會下載其中的影片項目並串成一支 MP4，圖片項目會略過。頁面與媒體請求會尊重 `Retry-After`，對 HTTP 429／5xx 做有限次退避重試；私人、登入限定、已刪除或純文字／圖片貼文會明確失敗，不會要求遠端 MCP 保存 Threads 登入憑證。
+
+沒有音訊的 Threads 影片會略過語音轉錄、保留視覺摘要；短於取樣間隔的影片會至少保留第 0 秒影格。
 
 訂閱可修改、暫停、恢復，也可顯示逐筆狀態：
 
@@ -224,10 +350,10 @@ JSON 狀態仍是最短且可備份的方案；`--rss-cleanup-days` 會清掉舊
 
 ## 完整流程
 
-本機會優先重用 VidBee 隨附的 `yt-dlp.exe`；只有沒有 VidBee 時才需另裝：
+虛擬環境內優先使用已安裝的 yt-dlp 套件；其他情況仍可重用 PATH／VidBee 隨附的 `yt-dlp.exe`。Instagram 建議安裝：
 
 ```powershell
-python -m pip install yt-dlp
+python -m pip install -U "yt-dlp[default,curl-cffi]"
 ```
 
 複製 `.env.example` 為 `.env`，填入 Groq 金鑰、MiniMax Token Plan Subscription Key、帳戶平台 Base URL 與已確認可用的模型。`.env` 已由 Git 忽略；Windows 可用下列命令限制 ACL：

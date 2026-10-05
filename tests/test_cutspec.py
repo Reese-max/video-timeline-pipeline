@@ -272,6 +272,31 @@ class InterchangeTests(unittest.TestCase):
 
 @unittest.skipUnless(HAS_FFMPEG, "ffmpeg/ffprobe required for runtime verification")
 class VerificationTests(unittest.TestCase):
+    @unittest.skipUnless(cutspec._otio_module() is not None, "official OpenTimelineIO parser unavailable")
+    def test_official_frozen_matrix_roundtrip_and_source_ranges(self) -> None:
+        for fixture in MANIFEST["fixtures"]:
+            path = FIXTURE_DIR / fixture["file"]
+            before = pipeline.file_sha256(path)
+            self.assertEqual(before, fixture["sha256"])
+            spec = make_spec(fixture["file"])
+            for kind in ("csv", "otio"):
+                with self.subTest(fixture=fixture["file"], format=kind):
+                    text = (cutspec.cutspec_to_csv(spec, redact_paths=True) if kind == "csv"
+                            else cutspec.cutspec_to_otio_json(spec, redact_paths=True))
+                    receipt = cutspec.verify_export(spec, path, text, kind)
+                    self.assertEqual(receipt["status"], "verified", receipt)
+                    self.assertEqual(receipt["mismatches"], 0)
+                    self.assertEqual(receipt["externalApiCalls"], 0)
+                    self.assertEqual(receipt["nleImport"], "NLE_IMPORT_UNVERIFIED")
+                    if kind == "otio":
+                        self.assertTrue(receipt["parser"].startswith("opentimelineio-"))
+                    self.assertEqual(pipeline.file_sha256(path), before)
+                    print("CUTSPEC_MATRIX", json.dumps({
+                        "fixture": fixture["file"], "source_sha256": before,
+                        "timebase": spec.source.timebase, "vfr": spec.source.vfr,
+                        "spec_hash": spec.specHash, "receipt": receipt,
+                    }, sort_keys=True))
+
     def test_frozen_fixtures_match_manifest(self) -> None:
         for entry in MANIFEST["fixtures"]:
             path = FIXTURE_DIR / entry["file"]

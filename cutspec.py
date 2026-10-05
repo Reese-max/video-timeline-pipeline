@@ -286,7 +286,12 @@ def build_cutspec(source: SourceInfo, segments: List[CutSegment]) -> CutSpec:
 
 
 def _finite(value: Any) -> bool:
-    return isinstance(value, (int, float)) and math.isfinite(value)
+    if not isinstance(value, (int, float)) or isinstance(value, bool):
+        return False
+    try:
+        return math.isfinite(value)
+    except OverflowError:
+        return False
 
 
 def validate_cutspec(
@@ -609,14 +614,20 @@ def _opt_float(value: str) -> Optional[float]:
 
 def cutspec_from_csv(text: str) -> CutSpec:
     reader = csv.DictReader(io.StringIO(text))
+    if reader.fieldnames is None or len(reader.fieldnames) != len(CSV_COLUMNS) or set(reader.fieldnames) != set(CSV_COLUMNS):
+        raise ValueError("cut spec CSV has unexpected columns")
     source_row: Optional[dict] = None
     segments: List[CutSegment] = []
     spec_hash = ""
     for row in reader:
         if row.get("record") == "source":
+            if source_row is not None or segments:
+                raise ValueError("cut spec CSV must have one leading source row")
             source_row = row
             spec_hash = row.get("specHash", "")
         elif row.get("record") == "segment":
+            if source_row is None or row.get("specHash") != spec_hash:
+                raise ValueError("cut spec CSV segment has no matching source identity")
             segments.append(
                 CutSegment(
                     segmentId=row.get("segmentId", ""),
@@ -635,6 +646,8 @@ def cutspec_from_csv(text: str) -> CutSpec:
                     note=row.get("note", ""),
                 )
             )
+        else:
+            raise ValueError("cut spec CSV has an unknown record")
     if source_row is None:
         raise ValueError("cut spec CSV has no source row")
     source = SourceInfo(
@@ -760,6 +773,28 @@ def otio_clip_ranges(otio_json: str) -> List[Dict[str, Any]]:
     canary); falls back to a structural JSON walk otherwise, which the receipt
     records as an unverified parser.
     """
+    data = json.loads(otio_json)
+    stack = data.get("tracks", {})
+    tracks = stack.get("children", [])
+    if (data.get("OTIO_SCHEMA") != "Timeline.1" or stack.get("OTIO_SCHEMA") != "Stack.1"
+            or len(tracks) != 1 or tracks[0].get("OTIO_SCHEMA") != "Track.1"
+            or tracks[0].get("kind") != "Video"):
+        raise ValueError("unsupported OTIO timeline layout")
+    for container in (data, stack, tracks[0]):
+        if container.get("source_range") is not None or container.get("effects", []):
+            raise ValueError("OTIO container trims or effects are not verified")
+    # Validate JSON numeric types before a native parser can coerce booleans,
+    # and before division or delta comparisons can propagate NaN/Infinity.
+    for track in tracks:
+        for clip in track.get("children", []):
+            if (clip.get("OTIO_SCHEMA") != "Clip.2" or clip.get("enabled", True) is not True
+                    or clip.get("effects", [])):
+                raise ValueError("unsupported OTIO timeline element")
+            for field in ("start_time", "duration"):
+                rational = clip["source_range"][field]
+                if (not _finite(rational.get("value"))
+                        or not _finite(rational.get("rate")) or rational["rate"] <= 0):
+                    raise ValueError("OTIO clip timing must be finite numeric values at a positive rate")
     otio = _otio_module()
     ranges: List[Dict[str, Any]] = []
     if otio is not None:
@@ -777,11 +812,12 @@ def otio_clip_ranges(otio_json: str) -> List[Dict[str, Any]]:
                         "sourceEndSec": source_range.end_time_exclusive().to_seconds(),
                         "timelineStartSec": timeline_range.start_time.to_seconds(),
                         "timelineEndSec": timeline_range.end_time_exclusive().to_seconds(),
+                        "evidence": dict(clip.metadata.get("cutspec_segment", {})),
+                        "targetUrl": getattr(clip.media_reference, "target_url", None),
                     }
                 )
         return ranges
 
-    data = json.loads(otio_json)
     cursor = 0.0
     for track in data.get("tracks", {}).get("children", []):
         for clip in track.get("children", []):
@@ -799,6 +835,10 @@ def otio_clip_ranges(otio_json: str) -> List[Dict[str, Any]]:
                     "sourceEndSec": start + duration,
                     "timelineStartSec": cursor,
                     "timelineEndSec": cursor + duration,
+                    "evidence": clip.get("metadata", {}).get("cutspec_segment", {}),
+                    "targetUrl": clip.get("media_references", {}).get(
+                        clip.get("active_media_reference_key", "DEFAULT_MEDIA"), {}
+                    ).get("target_url"),
                 }
             )
             cursor += duration
@@ -915,6 +955,18 @@ def verify_export(
         ],
     }
 
+    def refuse(status: str, detail: str) -> Dict[str, Any]:
+        receipt.update(status=status, stillNeedsHumanFix=True, failure=detail, mismatches=1)
+        receipt["receiptId"] = hashlib.sha256(
+            json.dumps(receipt, sort_keys=True).encode("utf-8")
+        ).hexdigest()[:16]
+        return receipt
+
+    if not _finite(tolerance) or tolerance < 0:
+        return refuse("INVALID_TOLERANCE", "tolerance must be finite and non-negative")
+    if any(issue["severity"] == REJECT for issue in receipt["specIssues"]):
+        return refuse("INVALID_SPEC", "rejected spec cannot be verified")
+
     if spec.compute_spec_hash() != spec.specHash:
         receipt["status"] = "SPEC_HASH_MISMATCH"
         receipt["stillNeedsHumanFix"] = True
@@ -945,29 +997,52 @@ def verify_export(
         ).hexdigest()[:16]
         return receipt
 
-    if export_format == "otio":
-        receipt["parser"] = (
-            f"opentimelineio-{_otio_module().__version__}"
-            if _otio_module() is not None
-            else "internal-json/1"
-        )
-        imported = {r["segmentId"]: r for r in otio_clip_ranges(export_text)}
+    try:
+        if export_format == "otio":
+            receipt["parser"] = (
+                f"opentimelineio-{_otio_module().__version__}"
+                if _otio_module() is not None
+                else "internal-json/1"
+            )
+            parsed = cutspec_from_otio_json(export_text)
+            imported_rows = otio_clip_ranges(export_text)
+        elif export_format == "csv":
+            parsed = cutspec_from_csv(export_text)
+            imported_rows = [{
+                "segmentId": segment.segmentId,
+                "sourceStartSec": segment.sourceRange.get("startSec"),
+                "sourceEndSec": segment.sourceRange.get("endSec"),
+                "timelineStartSec": segment.timelineRange.get("startSec"),
+                "timelineEndSec": segment.timelineRange.get("endSec"),
+            } for segment in parsed.segments]
+            receipt["parser"] = "cutspec-csv/1"
+        else:
+            raise ValueError(f"unknown export format: {export_format}")
         receipt["adapterVersion"] = receipt["parser"]
-    elif export_format == "csv":
-        parsed = cutspec_from_csv(export_text)
-        imported = {
-            s.segmentId: {
-                "sourceStartSec": s.sourceRange.get("startSec"),
-                "sourceEndSec": s.sourceRange.get("endSec"),
-                "timelineStartSec": s.timelineRange.get("startSec"),
-                "timelineEndSec": s.timelineRange.get("endSec"),
-            }
-            for s in parsed.segments
-        }
-        receipt["parser"] = "cutspec-csv/1"
-        receipt["adapterVersion"] = "cutspec-csv/1"
-    else:
-        raise ValueError(f"unknown export format: {export_format}")
+        if not is_exportable(validate_cutspec(parsed)):
+            return refuse("INVALID_EXPORT", "parsed export has a rejected spec")
+        # Compare the actual parsed export, not only its claimed specHash.
+        # Numeric int/float representations compare equally; source locators
+        # remain excluded by the documented canonical identity contract.
+        if (parsed.specHash != spec.specHash
+                or parsed.canonical_payload() != spec.canonical_payload()):
+            return refuse("EXPORT_SPEC_MISMATCH", "parsed export changed source or evidence identity")
+        if [row["segmentId"] for row in imported_rows] != [segment.segmentId for segment in spec.segments]:
+            return refuse("EXPORT_SEGMENTS_MISMATCH", "export changed clip order, count, or identity")
+        if export_format == "otio":
+            for segment, row in zip(spec.segments, imported_rows):
+                evidence = {
+                    "evidenceRef": segment.evidenceRef, "selection": segment.selection,
+                    "reason": segment.reason, "confidence": segment.confidence,
+                    "note": segment.note,
+                }
+                if row["evidence"] != evidence or row["targetUrl"] not in {
+                    spec.source.videoPath, _export_path(spec.source.videoPath, True)
+                }:
+                    return refuse("EXPORT_PROVENANCE_MISMATCH", "clip reference differs from its source evidence")
+        imported = {row["segmentId"]: row for row in imported_rows}
+    except (TypeError, ValueError, KeyError, AttributeError, OverflowError):
+        return refuse("INVALID_EXPORT", "export could not be parsed with its declared contract")
 
     has_video = any(
         s.get("codec_type") == "video" for s in probe.get("streams", [])
@@ -988,6 +1063,14 @@ def verify_export(
         if got is None:
             entry["status"] = "failed"
             entry["failure"] = "segment missing from parsed export"
+        elif (not all(_finite(got.get(field)) for field in (
+                "sourceStartSec", "sourceEndSec", "timelineStartSec", "timelineEndSec"))
+              or got["sourceStartSec"] < 0
+              or got["sourceEndSec"] <= got["sourceStartSec"]
+              or got["timelineStartSec"] < 0
+              or got["timelineEndSec"] <= got["timelineStartSec"]):
+            entry["status"] = "failed"
+            entry["failure"] = "parsed export has invalid numeric ranges"
         else:
             deltas = [
                 abs(got["sourceStartSec"] - intended_start),
