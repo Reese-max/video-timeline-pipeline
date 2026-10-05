@@ -80,13 +80,11 @@ class JobQueueRecoveryTests(unittest.TestCase):
         work.mkdir()
         (work / "input.json").write_text(json.dumps({"operation": "prepare", "inputs": {}}))
         (fixture / "mcp_server.py").write_text(
-            "import os,subprocess,sys,time\n"
+            "import os,subprocess,sys,time,pipeline\n"
             "from pathlib import Path\n"
             "def prepare_video_sync(**kwargs):\n"
-            "    child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(90)'], "
-            "stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)\n"
-            "    Path(os.environ['FIXTURE_DESCENDANT_PID']).write_text(str(child.pid))\n"
-            "    while True: time.sleep(.1)\n"
+            "    script = \"import os,time; from pathlib import Path; Path(os.environ['FIXTURE_DESCENDANT_PID']).write_text(str(os.getpid())); time.sleep(90)\"\n"
+            "    return pipeline.run_external([sys.executable, '-c', script], stream=False)\n"
             "def tool_payload(value): return value\n"
             "def run_job(operation, *args): return operation(*args)\n"
             "def analysis_error(error): return str(error)\n",
@@ -157,7 +155,8 @@ class JobQueueRecoveryTests(unittest.TestCase):
                     try:
                         if os.getpgid(member) == worker_pid:
                             os.killpg(worker_pid, signal.SIGKILL)
-                            break
+                        else:
+                            os.kill(member, signal.SIGKILL)
                     except ProcessLookupError:
                         pass
 

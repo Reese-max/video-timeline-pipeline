@@ -412,11 +412,13 @@ def safe_media_path(job_id: str, relative_name: str) -> Path | None:
     return candidate if candidate.is_file() else None
 
 
-def read_manifest(job_dir: Path) -> dict | None:
+def read_manifest(job_dir: Path, *, strict: bool = False) -> dict | None:
     path = job_dir / "manifest.json"
     try:
         value = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
+        if strict:
+            raise
         return None
     return value if isinstance(value, dict) and value.get("status") == "ready" else None
 
@@ -438,6 +440,31 @@ def manifest_is_ready(
         if preview and not (video_path.parent / "previews" / str(preview)).is_file():
             return False
     return bool(manifest.get("segments"))
+
+
+def _file_missing(path: Path) -> bool:
+    """Absent or non-regular means cleaned up; other I/O errors must propagate."""
+    try:
+        path.stat()
+    except FileNotFoundError:
+        return True
+    return not path.is_file()
+
+
+def prepared_media_path(job_dir: Path, manifest: dict) -> Path | None:
+    """Source path while the prepared media set still exists, else None after cleanup."""
+    try:
+        video_path = pipeline.locate_source_video(job_dir)
+    except RuntimeError:
+        list(job_dir.iterdir())  # Surface listing failures instead of mislabeling them as cleanup.
+        return None
+    files = [video_path]
+    for item in manifest.get("segments") or []:
+        files.append(job_dir / "segments" / str(item.get("filename", "")))
+        preview = item.get("preview_filename")
+        if preview:
+            files.append(job_dir / "previews" / str(preview))
+    return None if any(_file_missing(path) for path in files) else video_path
 
 
 def split_video(video_path: Path, segment_dir: Path, segment_seconds: int) -> list[tuple[Path, float, float]]:
@@ -633,6 +660,8 @@ def prepare_video_locked(url: str, segment_seconds: int, max_segments: int | Non
 
 
 def run_job(operation, *args):
+    # MCP 工具會直接呼叫 pipeline 的付費傳輸，執行前先把成本帳本綁到 MCP_ROOT。
+    pipeline.bind_cost_root(MCP_ROOT)
     if not JOB_LOCK.acquire(blocking=False):
         raise JobBusyError("MCP 正在處理另一個影片工作，請稍後重試；本次未加入背景佇列。")
     try:
@@ -805,9 +834,9 @@ def analysis_cache_signature(video_path: Path, manifest: dict) -> str:
     return hashlib.sha256(json.dumps(configuration, sort_keys=True).encode()).hexdigest()
 
 
-def cached_analysis(job_id: str, manifest: dict) -> dict | None:
+def cached_analysis(job_id: str, manifest: dict, video_path: Path | None = None) -> dict | None:
     job_dir = prepared_job_dir(job_id)
-    video_path = pipeline.locate_source_video(job_dir)
+    video_path = video_path or pipeline.locate_source_video(job_dir)
     cached = pipeline.reuse_artifact(job_dir / "analysis" / "result.json")
     if isinstance(cached, dict) and cached.get("cache_signature") == analysis_cache_signature(video_path, manifest):
         return {**cached, "quality": analysis_quality(cached)}
@@ -831,6 +860,7 @@ def analyze_prepared_sync(job_id: str) -> dict[str, Any]:
         and cached.get("status") == "complete"
         and cached.get("cache_signature") == cache_signature
     ):
+        pipeline.record_cost_cache_hit("pipeline", "analysis", job=job_id, root=MCP_ROOT)
         return {**cached, "quality": analysis_quality(cached)}
 
     storage_policy().mark_managed(job_id)
@@ -1225,12 +1255,13 @@ def operation_tool_result(payload: dict) -> types.CallToolResult:
 def refreshed_operation(operation_id: str) -> dict:
     payload = get_queue().get(operation_id)
     if payload.get("status") == "completed" and payload.get("result_kind") == "prepared":
-        try:
-            manifest = read_manifest(prepared_job_dir(payload["result"]["job_id"]))
-            if not manifest: raise ValueError("missing manifest")
-            payload["result"] = tool_payload(manifest)
-        except (RuntimeError, ValueError, OSError):
-            payload = {**payload, "status": "expired", "error_code": "MEDIA_EXPIRED", "error": "影片已過保留期限，請重新準備。", "result": None}
+        job_dir = prepared_job_dir(payload["result"]["job_id"])
+        manifest = read_manifest(job_dir, strict=True)
+        if not manifest:
+            raise ValueError("missing or invalid manifest")
+        if prepared_media_path(job_dir, manifest) is None:
+            return {**payload, "status": "expired", "error_code": "MEDIA_EXPIRED", "error": "影片已過保留期限，請重新準備。", "result": None}
+        payload["result"] = tool_payload(manifest)
     return payload
 
 
@@ -1268,11 +1299,20 @@ async def resume_video_job(operation_id: str) -> dict[str, Any]:
 async def get_prepared_video(job_id: str) -> dict[str, Any]:
     """Read saved preparation/evidence, refresh expiring media links, and return active operation for widget restore."""
     def read():
-        manifest = read_manifest(prepared_job_dir(job_id))
+        job_dir = prepared_job_dir(job_id)
+        manifest = read_manifest(job_dir)
         if not manifest: raise ValueError("影片尚未準備完成或已過保留期限。")
-        analysis = cached_analysis(job_id, manifest)
         operations = get_queue().for_job(job_id)
         latest = operations.get("latest_operation") or {}
+        video_path = prepared_media_path(job_dir, manifest)
+        if video_path is None:
+            # Retention keeps manifest/analysis records but deletes the prepared media.
+            if latest.get("status") == "completed":
+                operations["latest_operation"] = refreshed_operation(latest["operation_id"])
+            return {"status": "expired", "error_code": "MEDIA_EXPIRED", "job_id": job_id,
+                    "error": "影片已過保留期限，請重新準備。", "prepared": None, "analysis": None,
+                    "analysis_invalidated": False, **operations}
+        analysis = cached_analysis(job_id, manifest, video_path)
         invalidated = latest.get("status") == "completed" and latest.get("result_kind") == "analysis" and analysis is None
         if invalidated:
             operations["latest_operation"] = None

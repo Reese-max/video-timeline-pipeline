@@ -1,6 +1,6 @@
 # C2PA local MP4 validation research — 2026-10-05
 
-This is a bounded research receipt for issue #20. The result supports **NARROW: local original-file inspection only**. It does not enable a product admission gate, establish social-URL support, or satisfy the research issue's production signer, source attribution, and user-friction acceptance.
+This is a bounded research receipt for issue #20. The result supports **NARROW: local original-file inspection only**. The research conclusion is NARROW, with explicit trust and coverage limits. Product admission, social-URL support, conforming-signer validation, and measured user-friction reduction remain unproved; they would be requirements for a subsequent BUILD decision.
 
 The previous UUID-shaped metadata experiment was not cryptographic validation. This study uses the real public `c2patool 0.28.1` executable and an existing signed SDK MP4. No media or signing keys are redistributed. Product code and configuration are unchanged.
 
@@ -47,9 +47,13 @@ Exact main source `5ae653179e780c80c1d79324caae52c5bac2b4e1` ran its actual `fil
 
 The first helper invocation hit an environmental error because its readonly sandbox had no writable temporary directory. Retrying with an owned writable `TMPDIR` retained network isolation and passed; this was not a source failure.
 
-## Reproduction and remaining acceptance
+## Current-main revalidation
 
-Use only the fixed public URLs/hashes in the receipt. Verify the archive's digest before extraction. Create the three explicit settings files by inserting the recorded public PEM data into `trust.anchors`; compare each resulting settings hash. For each original/control/owned derivative, run:
+The [independent revalidation receipt](c2pa-local-revalidation-2026-10-05.json) preserves the historical receipt above and replays the same 15 real-validator cases using identical tool, asset, PEM, and settings SHA256 values. All status-code axes match the historical observations. Actual current main `cb060a7e53a30efe6dff0acaf2fb242532881f4c` again runs `file_fingerprint`, `probe_video`, and `video_duration` on the five local MP4s, including successful cache readback, inside a network-isolated namespace with an owned writable `TMPDIR`. The original and controls remain byte-identical. Public pinned tool, fixture, and trust-list downloads precede validation; validation itself makes no provider or external-network requests.
+
+## Reproduction and future BUILD requirements
+
+Use only the fixed public URLs/hashes in the receipt. Verify the archive's digest before extraction. Create the three explicit settings files by inserting the recorded public PEM data into `trust.anchors`; use UTF-8 `json.dumps(settings, indent=2)` without a trailing newline and compare each resulting settings hash. Each anchor stores the PEM in `trust_anchors`. For each original/control/owned derivative, run:
 
 ```sh
 bwrap --unshare-net --ro-bind / / --dev /dev --proc /proc \
@@ -60,4 +64,4 @@ bwrap --unshare-net --ro-bind / / --dev /dev --proc /proc \
 
 Repeat with `offline-empty.json` and `offline-test.json`, recording stdout/stderr and checking the actual status codes rather than only process exit. The machine receipt contains all fifteen exact observed command/result pairs with `$STUDY` substituting the owned study directory. Raw reports are retained in the audit artifact, not media.
 
-This fills the missing real-tool cryptographic readback/tamper/absence receipts. It does **not** supply a production/conforming-signer trusted MP4 with independently established artifact-specific original-footage attribution, a same-source supported-platform derivative, preservation across arbitrary transforms, or measured user time-saving. Those inputs remain concrete acceptance gaps. The supported conclusion is a possible local-original inspection spike with explicit absent/unknown/untrusted states; automatic social-URL evidence admission and BUILD remain unproved. Issue #20 should remain open for the owner's research decision.
+This fills the missing real-tool cryptographic readback/tamper/absence receipts. It does **not** supply a production/conforming-signer trusted MP4 with independently established artifact-specific original-footage attribution, a same-source supported-platform derivative, preservation across arbitrary transforms, or measured user time-saving. Those inputs remain requirements for a future BUILD decision. Local/original inputs preserve the studied manifests; one owned FFmpeg remux loses them. This is evidence for that specific transformation, not a measured frequency claim about social platforms or the user's corpus. The research conclusion is NARROW: any subsequent proposal must restrict inspection to direct/local originals and display absent, unknown, untrusted, and invalid-binding reasons separately. Automatic social-URL evidence admission and BUILD remain unproved; this change activates no product integration.

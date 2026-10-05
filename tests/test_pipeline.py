@@ -238,7 +238,7 @@ class FacebookAuthorTests(unittest.TestCase):
         }
         with mock.patch.object(
             pipeline,
-            "post_json",
+            "request_json",
             return_value={"data": {"id": "run-1", "status": "RUNNING"}},
         ) as post, mock.patch.object(pipeline, "get_json", side_effect=fake_get), mock.patch.dict(
             pipeline.os.environ, environment, clear=True
@@ -250,7 +250,10 @@ class FacebookAuthorTests(unittest.TestCase):
         self.assertEqual([item["id"] for item in feed["items"]], ["video-1"])
         self.assertEqual(feed["items"][0]["url"], "https://www.facebook.com/example/videos/123/")
         self.assertEqual(feed["facebook"]["provider"], "apify")
-        run_url, run_headers, run_body = post.call_args.args[:3]
+        run_url, run_headers = post.call_args.args[:2]
+        run_body = post.call_args.kwargs["body"]
+        self.assertEqual(post.call_args.kwargs["method"], "POST")
+        self.assertEqual(post.call_args.kwargs["attempts"], 1)
         self.assertNotIn("test-apify-token", run_url)
         self.assertEqual(run_headers["Authorization"], "Bearer test-apify-token")
         self.assertIn("maxTotalChargeUsd=1.0", run_url)

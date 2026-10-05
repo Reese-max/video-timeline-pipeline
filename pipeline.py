@@ -9,6 +9,7 @@ import csv
 import ctypes
 import datetime
 import difflib
+from decimal import Decimal, InvalidOperation, ROUND_CEILING
 import email.utils
 import hashlib
 import http.cookiejar
@@ -20,6 +21,7 @@ import mimetypes
 import os
 import re
 import shutil
+import signal
 import sqlite3
 import subprocess
 import sys
@@ -121,14 +123,28 @@ def run_external(
     print("$ " + redact_values(subprocess.list2cmdline(command), redact))
     if stream:
         sys.stdout.flush()
-    # Inherit the worker's process group so supervisor cancellation reaches FFmpeg
-    # and downloader children as well. Never detach these processes into a session.
+    # Queue workers already own a supervised group. Their watchdog must still
+    # reach these children on parent death; only synchronous commands detach.
+    owns_tree = os.getenv("VIDEO_JOB_WORKER") != "1"
+    popen_kwargs = dict(cwd=cwd)
+    if owns_tree:
+        if os.name != "nt":
+            popen_kwargs["start_new_session"] = True
+        else:
+            popen_kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
     with contextlib.ExitStack() as stack:
         # Temporary files avoid a pipe-drain deadlock if a downloader's descendant
         # inherits stdout/stderr after its parent has been killed on timeout.
         output_file = None if stream else stack.enter_context(tempfile.TemporaryFile())
         error_file = None if stream else stack.enter_context(tempfile.TemporaryFile())
-        with subprocess.Popen(command, cwd=cwd, stdout=output_file, stderr=error_file) as process:
+        with subprocess.Popen(command, stdout=output_file, stderr=error_file, **popen_kwargs) as process:
+            if owns_tree and os.name == "nt":
+                from job_queue import bind_windows_job, stop_process_tree
+                try:
+                    bind_windows_job(process)
+                except OSError:
+                    stop_process_tree(process)
+                    raise
             try:
                 while True:
                     try:
@@ -138,9 +154,22 @@ def run_external(
                     except subprocess.TimeoutExpired:
                         budget.check()
             except (DeadlineExceeded, ExecutionCancelled):
-                process.kill()
-                process.wait()
+                if owns_tree and os.name != "nt":
+                    try:
+                        os.killpg(process.pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                elif owns_tree:
+                    stop_process_tree(process)
+                else:
+                    # The queue supervisor cleans the worker group after this
+                    # error receipt; do not kill the worker writing that receipt.
+                    process.kill()
+                process.wait(timeout=5)
                 raise
+            finally:
+                if owns_tree and os.name == "nt":
+                    stop_process_tree(process)
         stdout = stderr = ""
         if output_file is not None and error_file is not None:
             output_file.seek(0)
@@ -1520,6 +1549,52 @@ def retry_delay(exc: urllib.error.HTTPError, fallback: float) -> float:
     return fallback
 
 
+def cost_guard(provider: str, operation: str, **kwargs: Any):
+    """成本守衛（#4）：送出前預留、拒絕時不開連線、送出後入帳。
+
+    lazy import：cost_tracker 會 import notifications，避免在最上層形成循環依賴。
+    """
+    from cost_tracker import provider_cost_guard
+
+    return provider_cost_guard(provider, operation, **kwargs)
+
+
+def budget_blocked_error() -> type[RuntimeError]:
+    """Lazy handle on the guard exception so redaction wrappers can pass it through."""
+    from cost_tracker import BudgetBlockedError
+
+    return BudgetBlockedError
+
+
+def bind_cost_root(root: Path) -> None:
+    """把這次執行綁到該專案的 operations.db 成本帳本（#4）。"""
+    from cost_tracker import set_cost_root
+
+    set_cost_root(root)
+
+
+def record_cost_cache_hit(provider: str, operation: str, **kwargs: Any) -> None:
+    from cost_tracker import record_provider_cache_hit
+
+    record_provider_cache_hit(provider, operation, **kwargs)
+
+
+class ApiRequestError(RuntimeError):
+    """供應商 HTTP／傳輸失敗，帶著供應商自己的狀態碼與回應內容。
+
+    成本守衛與錯誤分類要靠它讀 HTTP status 與業務碼；訊息文字維持與原本的
+    RuntimeError 完全相同，既有呼叫端與測試不受影響。
+    """
+
+    def __init__(self, message: str, *, status_code: int | None = None, response_body: str = "",
+                 provider_outcome_unknown: bool = False, retry_after: float | None = None) -> None:
+        super().__init__(message)
+        self.status_code = status_code
+        self.response_body = response_body
+        self.provider_outcome_unknown = provider_outcome_unknown
+        self.retry_after = retry_after
+
+
 def request_json(
     url: str,
     headers: dict[str, str],
@@ -1537,40 +1612,50 @@ def request_json(
     for attempt in range(1, attempts + 1):
         request = urllib.request.Request(url, data=body, headers=headers, method=method)
         try:
-            with urllib.request.urlopen(request, timeout=budget.remaining(timeout)) as response:
-                raw = read_response(response, budget, read_timeout=timeout)
+            from cost_tracker import classify_error, is_retryable, provider_transport_attempt
+
+            with provider_transport_attempt():
+                try:
+                    with urllib.request.urlopen(request, timeout=budget.remaining(timeout)) as response:
+                        raw = read_response(response, budget, read_timeout=timeout)
+                except urllib.error.HTTPError as exc:
+                    try:
+                        detail = read_response(exc, budget, 4096, read_timeout=timeout).decode("utf-8", errors="replace")
+                    finally:
+                        exc.close()
+                    secrets = {value for key, value in headers.items() if key.lower() in {"authorization", "x-api-key", "api-key"}}
+                    secrets.update(value.split(" ", 1)[-1] for value in list(secrets))
+                    detail = redact_values(detail, secrets)
+                    # Classify only after reading and masking the provider's
+                    # business code, while this attempt still owns its reserve.
+                    raise ApiRequestError(
+                        f"API HTTP {exc.code}（{public_url(url)}）：{detail[:1200]}",
+                        status_code=exc.code, response_body=detail, retry_after=retry_delay(exc, delay),
+                    ) from exc
+                except (urllib.error.URLError, TimeoutError) as exc:
+                    reason = getattr(exc, "reason", None) or type(exc).__name__
+                    raise ApiRequestError(f"API 網路錯誤：{reason}", provider_outcome_unknown=True) from exc
             break
-        except urllib.error.HTTPError as exc:
-            try:
-                detail = read_response(exc, budget, 4096, read_timeout=timeout).decode("utf-8", errors="replace")
-            finally:
-                exc.close()
-            secrets = {value for key, value in headers.items() if key.lower() in {"authorization", "x-api-key", "api-key"}}
-            secrets.update(value.split(" ", 1)[-1] for value in list(secrets))
-            detail = redact_values(detail, secrets)
-            if exc.code in RETRY_STATUS and attempt < attempts:
-                wait = retry_delay(exc, delay)
-                print(f"! API HTTP {exc.code}，{wait:.0f} 秒後重試（{attempt}/{attempts - 1}）")
+        except ApiRequestError as exc:
+            category = classify_error(exc, exc.status_code, exc.response_body)
+            if exc.status_code in RETRY_STATUS and is_retryable(category) and attempt < attempts:
+                wait = exc.retry_after if exc.retry_after is not None else delay
+                print(f"! API HTTP {exc.status_code}，{wait:.0f} 秒後重試（{attempt}/{attempts - 1}）")
                 budget.sleep(wait)
                 delay *= 2
                 continue
-            # 帶上 URL：base_url 被環境變數改掉時，光看「404 page not found」查不出原因。
-            raise RuntimeError(f"API HTTP {exc.code}（{public_url(url)}）：{detail[:1200]}") from exc
-        # TimeoutError 不是 URLError 的子類，只接 URLError 會讓讀取逾時完全跳過重試
-        except (urllib.error.URLError, TimeoutError) as exc:
-            reason = getattr(exc, "reason", None) or type(exc).__name__
-            if attempt < attempts:
-                print(f"! API 網路錯誤（{reason}），{delay:.0f} 秒後重試（{attempt}/{attempts - 1}）")
+            if exc.status_code is None and exc.provider_outcome_unknown and attempt < attempts:
+                print(f"! API 網路錯誤，{delay:.0f} 秒後重試（{attempt}/{attempts - 1}）")
                 budget.sleep(delay)
                 delay *= 2
                 continue
-            raise RuntimeError(f"API 網路錯誤：{reason}") from exc
+            raise
     try:
         result = json.loads(raw.decode("utf-8"))
         budget.check()
         return result
     except json.JSONDecodeError as exc:
-        raise RuntimeError(f"API 回應不是 JSON：{raw[:500]!r}") from exc
+        raise ApiRequestError(f"API 回應不是 JSON：{raw[:500]!r}") from exc
 
 
 def post_json(url: str, headers: dict[str, str], body: bytes, timeout: int = 180) -> dict[str, Any]:
@@ -1833,14 +1918,15 @@ def groq_transcribe(
     if language and language != "auto":
         fields["language"] = language
     body, boundary = multipart_body(fields, "file", audio_path)
-    return post_json(
-        "https://api.groq.com/openai/v1/audio/transcriptions",
-        {
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": f"multipart/form-data; boundary={boundary}",
-        },
-        body,
-    )
+    with cost_guard("groq", "audio.transcriptions", model=model, request_units=audio_path.stat().st_size // 1000):
+        return post_json(
+            "https://api.groq.com/openai/v1/audio/transcriptions",
+            {
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": f"multipart/form-data; boundary={boundary}",
+            },
+            body,
+        )
 
 
 def transcribe_all(
@@ -1889,6 +1975,7 @@ def transcribe_all(
         cache_path = cache_dir / f"{key}.json"
         cached = reuse_artifact(cache_path)
         if isinstance(cached, dict) and (cached.get("segments") or cached.get("text")):
+            record_cost_cache_hit("groq", "audio.transcriptions", model=model)
             return int(chunk["index"]), cached, key, True, 0.0
         started = time.monotonic()
         result = groq_transcribe(path, api_key, model, language, word_timestamps)
@@ -2194,6 +2281,7 @@ def minimax_chat(
     timeout: int = 180,
     *,
     thinking: str | None = None,
+    operation: str = "chat.completions",
 ) -> str:
     # 預設不設上限：MiniMax-M3 是 reasoning 模型，<think> 會先吃掉配額，
     # 給定的預算常常在真正的答案輸出前就用完，回傳半截 JSON。
@@ -2208,12 +2296,21 @@ def minimax_chat(
     if max_tokens:
         payload["max_tokens"] = max_tokens
     started = time.monotonic()
-    raw = post_json(
-        minimax_endpoint(),
-        {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
-        json.dumps(payload, ensure_ascii=False).encode("utf-8"),
-        timeout,
-    )
+    # 粗估輸入 token：送出前必須先拿到預算上限，不能等回應才知道花多少。
+    prompt_units = len(json.dumps(messages, ensure_ascii=False)) // 4
+    with cost_guard(
+        "minimax",
+        operation,
+        model=model,
+        request_units=prompt_units,
+        response_units=int(max_tokens or 0),
+    ):
+        raw = post_json(
+            minimax_endpoint(),
+            {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+            json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+            timeout,
+        )
     choices = raw.get("choices") or []
     if not choices:
         raise RuntimeError(f"MiniMax 回應缺少 choices：{raw}")
@@ -2350,6 +2447,7 @@ def analyze_images(
             cache_path = cache_dir / (hashlib.sha256(material.encode("utf-8")).hexdigest() + ".json")
             cached = reuse_artifact(cache_path)
             if reusable_visual_observation(cached, candidate):
+                record_cost_cache_hit("minimax", "vision.analyze_images", model=model)
                 cached = dict(cached)
                 cached["source_image"] = str(image_path)
                 return index, cached
@@ -2368,6 +2466,7 @@ def analyze_images(
                     ],
                     api_key,
                     model,
+                    operation="vision.analyze_images",
                 )
                 observation = parse_json_object(response)
             except MiniMaxIncompleteError as error:
@@ -2551,11 +2650,13 @@ def cached_minimax_summary(
     cache_path = cache_dir / (hashlib.sha256(material.encode("utf-8")).hexdigest() + ".json")
     cached = reuse_artifact(cache_path, "short_summary")
     if valid(cached):
+        record_cost_cache_hit("minimax", f"summarize.{kind}", model=model)
         return cached
-    result = parse_json_object(minimax_chat(messages, api_key, model, thinking="disabled"))
+    operation = f"summarize.{kind}"
+    result = parse_json_object(minimax_chat(messages, api_key, model, thinking="disabled", operation=operation))
     if not valid(result):
         print("! MiniMax 摘要格式不完整，重試一次")
-        result = parse_json_object(minimax_chat(messages, api_key, model, thinking="disabled"))
+        result = parse_json_object(minimax_chat(messages, api_key, model, thinking="disabled", operation=operation))
     if not valid(result):
         raise RuntimeError("MiniMax 摘要重試後仍不符合輸出格式。")
     write_json(cache_path, result)
@@ -2939,29 +3040,26 @@ def open_notebook_sync(
     auth_headers = {"Authorization": f"Bearer {password}", "X-Password": password}
 
     replaced = False
-    if replace_source_id:
-        # 重跑同一支影片時先撤掉上次的條目，否則 notebook 會積出一排同名 source。
-        try:
-            request_json(
-                f"{base_url}/api/sources/{replace_source_id}",
-                auth_headers,
-                method="DELETE",
-                timeout=30,
-            )
-            replaced = True
-        except RuntimeError as exc:
-            # 使用者可能已經在 UI 手動刪掉了，那不是錯誤。
-            if "HTTP 404" not in str(exc):
-                raise
-
     fields = {"type": "upload", "notebook_id": notebook_id, "async_processing": "true"}
     if title:
         # 不傳的話 Open Notebook 拿檔名當標題，整個 notebook 會是一排 knowledge.md
         fields["title"] = title
     body, boundary = multipart_body(fields, "file", knowledge_path)
     headers = {**auth_headers, "Content-Type": f"multipart/form-data; boundary={boundary}"}
-    response = post_json(sources_url, headers, body)
-    source_id = response.get("id") or ""
+    # 拒絕同步時也不得先刪除舊 source。建立與替換都先通過守衛。
+    with cost_guard("open_notebook", "sources.sync") as guard_outcome:
+        if replace_source_id:
+            try:
+                request_json(f"{base_url}/api/sources/{replace_source_id}", auth_headers,
+                             method="DELETE", timeout=30)
+                replaced = True
+            except RuntimeError as exc:
+                if "HTTP 404" not in str(exc):
+                    raise
+        response = post_json(sources_url, headers, body)
+        source_id = response.get("id") or ""
+        if source_id:
+            guard_outcome.provider_operation_id = str(source_id)
     command_id = response.get("command_id") or response.get("commandId")
     if not command_id:
         return {"status": "accepted", "source_id": source_id, "replaced": replaced, "response": response}
@@ -3303,11 +3401,13 @@ def embed_texts(texts: list[str], api_key: str, model: str, backend: str = "open
 
 def embed_texts_openrouter(texts: list[str], api_key: str, model: str) -> list[list[float]]:
     """OpenRouter 的 embeddings 端點。模型清單查不到它、文件也沒寫，但實測可用。"""
-    response = post_json(
-        os.getenv("EMBED_BASE_URL", "https://openrouter.ai/api/v1").rstrip("/") + "/embeddings",
-        {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
-        json.dumps({"model": model, "input": texts}, ensure_ascii=False).encode("utf-8"),
-    )
+    prompt_units = sum(len(text) for text in texts) // 4
+    with cost_guard("openrouter", "embeddings", model=model, request_units=prompt_units):
+        response = post_json(
+            os.getenv("EMBED_BASE_URL", "https://openrouter.ai/api/v1").rstrip("/") + "/embeddings",
+            {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+            json.dumps({"model": model, "input": texts}, ensure_ascii=False).encode("utf-8"),
+        )
     items = response.get("data") or []
     if len(items) != len(texts):
         raise RuntimeError(f"embedding 回傳數量不符：送 {len(texts)} 筆、收 {len(items)} 筆")
@@ -3459,8 +3559,13 @@ def question_keywords(question: str, api_key: str, model: str) -> list[str]:
         "去掉「請問」「怎麼」「嗎」「如何」這類疑問詞。\n\n問題：" + question
     )
     try:
-        data = parse_json_object(minimax_chat([{"role": "user", "content": prompt}], api_key, model))
+        data = parse_json_object(
+            minimax_chat([{"role": "user", "content": prompt}], api_key, model, operation="query.keywords")
+        )
         keywords = [str(item).strip() for item in (data.get("keywords") or []) if str(item).strip()]
+    except budget_blocked_error():
+        # 預算拒絕不是「查不到關鍵詞」：必須讓上層看到這是被守衛擋下的。
+        raise
     except RuntimeError:
         keywords = []
     return keywords or [question]
@@ -3516,7 +3621,7 @@ def answer_question(
         "回答用繁體中文，並在每個論點後標註引用編號如 [1]、[3]。\n\n"
         f"問題：{question}\n\n片段：\n{context}"
     )
-    answer = minimax_chat([{"role": "user", "content": prompt}], api_key, model)
+    answer = minimax_chat([{"role": "user", "content": prompt}], api_key, model, operation="query.answer")
     return {"question": question, "keywords": keywords, "answer": answer, "citations": hits}
 
 
@@ -3563,7 +3668,9 @@ def build_digest(root: Path, api_key: str, model: str, max_chars: int = 90000) -
                 ensure_ascii=False,
             )[:max_chars]
         )
-        report = minimax_chat([{"role": "user", "content": prompt}], api_key, model, timeout=900)
+        report = minimax_chat(
+            [{"role": "user", "content": prompt}], api_key, model, timeout=900, operation="digest.report"
+        )
         header = f"# 影片知識庫總覽\n\n- 影片數：{len(entries)}\n- 分類數：{len(grouped)}\n\n"
         output = root / "digest.md"
         write_text(output, header + report.rstrip() + "\n\n## 主題分群\n" + grouping + "\n")
@@ -3590,7 +3697,9 @@ def build_digest(root: Path, api_key: str, model: str, max_chars: int = 90000) -
         + json.dumps(entries, ensure_ascii=False, indent=2)
     )
     # 總覽要輸出上百個標題與連結，reasoning 模型會跑很久，180 秒的預設值不夠
-    report = minimax_chat([{"role": "user", "content": prompt}], api_key, model, timeout=900)
+    report = minimax_chat(
+        [{"role": "user", "content": prompt}], api_key, model, timeout=900, operation="digest.report"
+    )
 
     # 模型會自行取捨，實測 142 支裡漏掉 8 支且毫無提示。與其重跑，不如補在末尾——
     # 「總覽」漏了東西卻不說，比列得不夠漂亮嚴重得多。
@@ -3665,7 +3774,11 @@ def categorize_library(root: Path, api_key: str, model: str) -> tuple[list[str],
             "分類要粒度一致、彼此可區分、合起來能涵蓋全部影片；用繁體中文，技術名詞保留原文。"
             "不要用「其他」「雜項」這種收納類。\n\n" + json.dumps(overview, ensure_ascii=False)
         )
-        data = parse_json_object(minimax_chat([{"role": "user", "content": prompt}], api_key, model, timeout=600))
+        data = parse_json_object(
+            minimax_chat(
+                [{"role": "user", "content": prompt}], api_key, model, timeout=600, operation="library.classify"
+            )
+        )
         categories = [str(c).strip() for c in (data.get("categories") or []) if str(c).strip()]
         if not categories:
             raise RuntimeError("模型沒有回傳分類清單。")
@@ -3695,7 +3808,11 @@ def categorize_library(root: Path, api_key: str, model: str) -> tuple[list[str],
             + '\n\n只輸出 JSON：{"results": [{"job": "...", "categories": ["..."], "level": "入門|中階|進階"}]}\n\n'
             + json.dumps(payload, ensure_ascii=False)
         )
-        data = parse_json_object(minimax_chat([{"role": "user", "content": prompt}], api_key, model, timeout=600))
+        data = parse_json_object(
+            minimax_chat(
+                [{"role": "user", "content": prompt}], api_key, model, timeout=600, operation="library.classify"
+            )
+        )
         by_job = {str(r.get("job")): r for r in (data.get("results") or []) if isinstance(r, dict)}
         for item in batch:
             result = by_job.get(item["job"])
@@ -4094,7 +4211,11 @@ def facebook_graph_version() -> str:
 
 def facebook_graph_payload(url: str, token: str) -> dict[str, Any]:
     try:
-        payload = get_json(url, {"Authorization": f"Bearer {token}"})
+        # 每頁分頁都是一次外部請求：逐次經過同一個守衛，不因分頁而漏記。
+        with cost_guard("meta", "graph.query"):
+            payload = get_json(url, {"Authorization": f"Bearer {token}"})
+    except budget_blocked_error():
+        raise
     except RuntimeError as exc:
         raise RuntimeError(str(exc).replace(url, public_url(url))) from exc
     if not isinstance(payload, dict):
@@ -4213,12 +4334,16 @@ def fetch_facebook_author_apify(author: str, since: str) -> dict[str, Any]:
         raise ValueError("APIFY_FACEBOOK_ACTOR 必須是 username~actor-name。")
     try:
         results_limit = int(os.getenv("APIFY_FACEBOOK_RESULTS_LIMIT", "1000000"))
-        max_charge = float(apify_setting("APIFY_MAX_TOTAL_CHARGE_USD"))
+        max_charge = Decimal(apify_setting("APIFY_MAX_TOTAL_CHARGE_USD"))
         timeout_seconds = int(os.getenv("APIFY_RUN_TIMEOUT_SECONDS", "1800"))
-    except ValueError as exc:
+    except (InvalidOperation, ValueError) as exc:
         raise ValueError("Apify 數值設定格式錯誤。") from exc
-    if results_limit <= 0 or not math.isfinite(max_charge) or max_charge <= 0 or timeout_seconds <= 0:
+    if results_limit <= 0 or not max_charge.is_finite() or max_charge <= 0 or timeout_seconds <= 0:
         raise ValueError("Apify results limit、費用上限與 timeout 都必須大於 0。")
+    max_charge_micro = int(
+        (max_charge * Decimal(1_000_000)).to_integral_value(rounding=ROUND_CEILING)
+    )
+    max_charge_usd = format(max_charge, "f")
 
     page_id = facebook_page_identifier(author)
     author_url = facebook_author_url(author)
@@ -4233,13 +4358,32 @@ def fetch_facebook_author_apify(author: str, since: str) -> dict[str, Any]:
             since_timestamp, datetime.timezone.utc
         ).isoformat().replace("+00:00", "Z")
     headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
-    query = urllib.parse.urlencode({"waitForFinish": 60, "maxTotalChargeUsd": max_charge})
+    query = urllib.parse.urlencode({"waitForFinish": 60, "maxTotalChargeUsd": max_charge_usd})
     run_url = f"https://api.apify.com/v2/actors/{urllib.parse.quote(actor, safe='~')}/runs?{query}"
     try:
-        payload = post_json(run_url, headers, json.dumps(actor_input).encode("utf-8"), timeout=70)
-        run = payload.get("data") if isinstance(payload, dict) else None
-        if not isinstance(run, dict) or not run.get("id"):
-            raise RuntimeError("Apify 啟動回應缺少 run ID。")
+        # 一次 Actor 工作只預留一次：maxTotalChargeUsd 是供應商端真正封頂的金額，
+        # 後續 poll／dataset 讀取都屬同一筆遠端工作，不得再當成新的完整 Actor 費用。
+        with cost_guard(
+            "apify",
+            "actor.run.start",
+            model=actor,
+            estimated_micro_usd=max_charge_micro,
+            provider_enforced_upper_bound_micro_usd=max_charge_micro,
+        ) as guard_outcome:
+            # Actor starts are not idempotent: a timeout/5xx may still have
+            # created a charged run. Send once and retain its risk for manual
+            # reconciliation instead of multiplying runs under one reservation.
+            try:
+                payload = request_json(run_url, headers, method="POST",
+                                       body=json.dumps(actor_input).encode("utf-8"), timeout=70, attempts=1)
+            except ApiRequestError as exc:
+                uncertain = exc.status_code is None or exc.status_code == 408 or exc.status_code >= 500
+                raise ApiRequestError(str(exc), status_code=exc.status_code, response_body=exc.response_body,
+                                      provider_outcome_unknown=uncertain) from exc
+            run = payload.get("data") if isinstance(payload, dict) else None
+            if not isinstance(run, dict) or not run.get("id"):
+                raise RuntimeError("Apify 啟動回應缺少 run ID。")
+            guard_outcome.provider_operation_id = str(run["id"])
         deadline = time.monotonic() + timeout_seconds
         while str(run.get("status") or "") not in APIFY_TERMINAL_STATUSES:
             if time.monotonic() >= deadline:
@@ -4269,6 +4413,8 @@ def fetch_facebook_author_apify(author: str, since: str) -> dict[str, Any]:
             if len(page) < page_size:
                 break
             offset += len(page)
+    except budget_blocked_error():
+        raise
     except RuntimeError as exc:
         raise RuntimeError(str(exc).replace(token, "<redacted>")) from exc
 
@@ -4522,6 +4668,18 @@ def normalize_social_post(record: dict[str, Any], url: str) -> dict[str, Any]:
                             "不保證完整留言、私人內容或所有 carousel 媒體；不自動刷新可能過期的 CDN 網址。"]}
 
 
+class SubmissionUncertainError(RuntimeError):
+    """送出結果不明（timeout／斷線）；回照流程保留，之後要對帳不得重送。
+
+    保留供應商狀態碼與回應內容，讓成本守衛判斷這是已知失敗還是必須保留預留的 unknown。
+    """
+
+    def __init__(self, message: str, *, status_code: int | None = None, response_body: str = "") -> None:
+        super().__init__(message)
+        self.status_code = status_code
+        self.response_body = response_body
+
+
 def submit_brightdata_once(folder: Path, url: str, headers: dict[str, str], body: bytes) -> str:
     """Persist a billable submission receipt before interpreting it; never retry the POST."""
     folder.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -4538,18 +4696,42 @@ def submit_brightdata_once(folder: Path, url: str, headers: dict[str, str], body
     else:
         receipt = {"request_url": url, "request_sha256": fingerprint,
                    "input": json.loads(body), "submitted_at": rss_now()}
-        # ponytail: uncertain submissions stay blocked; provider-side reconciliation is manual.
+        marker_path = folder / ".submitted"
+        if marker_path.exists():
+            # 上次已送出但結果不明：不得為了這一次查詢再預留、也不得重建付費工作。
+            raise RuntimeError(f"上次送出狀態不明，禁止再次計費採集；請核對 {folder} 與 Bright Data。")
+        # 預留在寫 .submitted 標記之前：被拒絕時代表完全沒送出，不該留下
+        # 「送出狀態不明」的回執擋住後續對帳。
         try:
-            with (folder / ".submitted").open("x", encoding="utf-8") as marker:
-                json.dump(receipt, marker, ensure_ascii=False)
-                marker.flush()
-                os.fsync(marker.fileno())
-        except FileExistsError:
-            raise RuntimeError(f"上次送出狀態不明，禁止再次計費採集；請核對 {folder} 與 Bright Data。") from None
-        try:
-            receipt["response"] = request_json(url, headers, method="POST", body=body, timeout=60, attempts=1)
-        except Exception as exc:
-            receipt["error"] = str(exc)
+            with cost_guard("brightdata", "datasets.trigger") as guard_outcome:
+                # ponytail: uncertain submissions stay blocked; provider-side reconciliation is manual.
+                try:
+                    with marker_path.open("x", encoding="utf-8") as marker:
+                        json.dump(receipt, marker, ensure_ascii=False)
+                        marker.flush()
+                        os.fsync(marker.fileno())
+                except FileExistsError:
+                    raise RuntimeError(f"上次送出狀態不明，禁止再次計費採集；請核對 {folder} 與 Bright Data。") from None
+                try:
+                    receipt["response"] = request_json(url, headers, method="POST", body=body, timeout=60, attempts=1)
+                except Exception as exc:
+                    receipt["error"] = str(exc)
+                    raise SubmissionUncertainError(
+                        str(exc),
+                        status_code=getattr(exc, "status_code", None),
+                        response_body=getattr(exc, "response_body", ""),
+                    ) from exc
+                snapshot_hint = receipt["response"].get("snapshot_id")
+                if not (isinstance(snapshot_hint, str) and re.fullmatch(r"sd?_[A-Za-z0-9_-]+", snapshot_hint)):
+                    # 供應商可能已接受這筆計費工作，卻沒給可對帳的 snapshot：
+                    # 記成 unknown 並保留預留，不能當成成功結清。
+                    raise SubmissionUncertainError(
+                        "採集回應 snapshot_id 缺少或格式無效",
+                        response_body=json.dumps(receipt["response"], ensure_ascii=False)[:500],
+                    )
+                guard_outcome.provider_operation_id = snapshot_hint
+        except SubmissionUncertainError:
+            pass
         receipt["received_at"] = rss_now()
         receipt = json.loads(redact_values(json.dumps(receipt, ensure_ascii=False),
                                           {json.dumps(token, ensure_ascii=False)[1:-1]}))
@@ -4600,6 +4782,8 @@ def fetch_social_post(url: str, cache_root: Path, *, allow_paid: bool = False) -
         result = {**state, **normalize_social_post(rows[0], canonical), "fetched_at": rss_now()}
         write_json(checkpoint, result)
         return result
+    except budget_blocked_error():
+        raise
     except Exception as exc:
         raise RuntimeError(str(exc).replace(token, "<redacted>")) from None
 
@@ -4616,6 +4800,14 @@ def fetch_instagram_author(
 ) -> dict[str, Any]:
     if not allow_paid:
         raise RuntimeError("Bright Data 可能計費；確認帳戶額度後加上 --allow-batch-cloud。")
+    if max_items is None:
+        raise ValueError(
+            "Instagram/Bright Data 付費盤點需要有限的結果預算：請用 --instagram-max-items "
+            "指定正整數（例如 20）；--allow-batch-cloud 只代表允許雲端花費，不代表花費上限。"
+            "--instagram-since 只是在本機依發佈時間篩選，不會限制供應商計費範圍。"
+        )
+    if isinstance(max_items, bool) or not isinstance(max_items, int) or max_items <= 0:
+        raise ValueError("--instagram-max-items 必須是正整數。")
     token = os.getenv("BRIGHTDATA_API_TOKEN", "").strip()
     if not token:
         raise RuntimeError("缺少 BRIGHTDATA_API_TOKEN；請在專案 .env 本機填入。")
@@ -4623,15 +4815,13 @@ def fetch_instagram_author(
         timeout_seconds = int(os.getenv("BRIGHTDATA_RUN_TIMEOUT_SECONDS", "1800"))
     except ValueError as exc:
         raise ValueError("BRIGHTDATA_RUN_TIMEOUT_SECONDS 必須是整數。") from exc
-    if timeout_seconds <= 0 or (max_items is not None and max_items <= 0):
-        raise ValueError("Bright Data timeout 與 --instagram-max-items 必須大於 0。")
+    if timeout_seconds <= 0:
+        raise ValueError("BRIGHTDATA_RUN_TIMEOUT_SECONDS 必須大於 0。")
 
     username = instagram_username(author)
     author_url = instagram_author_url(username)
     since_timestamp = parse_instagram_since(since)
-    discovery_input: dict[str, Any] = {"url": author_url}
-    if max_items is not None:
-        discovery_input["num_of_posts"] = max_items
+    discovery_input: dict[str, Any] = {"url": author_url, "num_of_posts": max_items}
     excluded = sorted({str(item).strip() for item in (exclude_ids or []) if str(item).strip()})
     if excluded:
         discovery_input["posts_to_not_include"] = excluded
@@ -4672,6 +4862,8 @@ def fetch_instagram_author(
             f"{BRIGHTDATA_API_ROOT}/snapshot/{urllib.parse.quote(snapshot_id, safe='')}?format=json"
         )
         result = get_json(snapshot_url, headers)
+    except budget_blocked_error():
+        raise
     except Exception as exc:
         raise RuntimeError(str(exc).replace(token, "<redacted>")) from None
 
@@ -5045,11 +5237,22 @@ def update_rss_subscription(
     tags: list[str] | None = None,
     latest_only: bool | None = None,
     enabled: bool | None = None,
+    instagram_max_items: int | None = None,
 ) -> dict[str, Any]:
     state = load_rss_state(root)
     subscription = next((item for item in state["subscriptions"] if item.get("id") == subscription_id), None)
     if subscription is None:
         raise RuntimeError(f"找不到 RSS 訂閱：{subscription_id}")
+    if instagram_max_items is not None:
+        if str(subscription.get("kind") or "rss") != "instagram-author":
+            raise ValueError("--instagram-max-items 只能用於 Instagram 作者訂閱。")
+        if (
+            isinstance(instagram_max_items, bool)
+            or not isinstance(instagram_max_items, int)
+            or instagram_max_items <= 0
+        ):
+            raise ValueError("--instagram-max-items 必須是正整數。")
+        subscription["instagram_max_items"] = instagram_max_items
     if name is not None:
         subscription["name"] = name.strip() or subscription.get("name") or subscription_id
     if keywords is not None:
@@ -5349,14 +5552,18 @@ def send_rss_notification(webhook: str, event: str, item: dict[str, Any]) -> Non
         method="POST",
     )
     try:
-        with urllib.request.urlopen(request, timeout=15) as response:
-            response.read(1024)
+        with cost_guard("rss_webhook", "notify"):
+            with urllib.request.urlopen(request, timeout=15) as response:
+                response.read(1024)
+    except budget_blocked_error():
+        raise
     except Exception as exc:
         detail = sanitize_public_urls(str(exc))
         raise RuntimeError(f"RSS 通知失敗（{public_url(url)}）：{detail}") from exc
 
 
 def process_rss_queue(args: argparse.Namespace) -> dict[str, int]:
+    bind_cost_root(args.root.resolve())
     if args.rss_max_items <= 0:
         raise ValueError("--rss-max-items 必須大於 0。")
     if not (args.dry_run or args.local_only or args.allow_batch_cloud):
@@ -5513,17 +5720,33 @@ def run_rss_command(args: argparse.Namespace) -> int:
         raise ValueError("--rss-add、--facebook-author 與 --instagram-author 一次只能使用一個。")
     if (args.facebook_since is not None or args.facebook_provider is not None or args.facebook_discover_only) and not args.facebook_author:
         raise ValueError("--facebook-since／--facebook-provider／--facebook-discover-only 必須搭配 --facebook-author。")
+    instagram_budget_update = (
+        args.rss_update
+        and args.instagram_max_items is not None
+        and args.instagram_since is None
+        and not args.instagram_discover_only
+    )
     if (
         args.instagram_since is not None
         or args.instagram_max_items is not None
         or args.instagram_discover_only
-    ) and not args.instagram_author:
+    ) and not args.instagram_author and not instagram_budget_update:
         raise ValueError("--instagram-since／--instagram-max-items／--instagram-discover-only 必須搭配 --instagram-author。")
-    if args.instagram_max_items is not None and args.instagram_max_items <= 0:
-        raise ValueError("--instagram-max-items 必須大於 0。")
-    edits = any(value is not None for value in (args.rss_name, args.rss_keywords, args.rss_tags, args.rss_latest_only))
+    if args.instagram_max_items is not None and (
+        isinstance(args.instagram_max_items, bool)
+        or not isinstance(args.instagram_max_items, int)
+        or args.instagram_max_items <= 0
+    ):
+        raise ValueError("--instagram-max-items 必須是正整數。")
+    if args.instagram_author and args.instagram_max_items is None:
+        raise ValueError(
+            "Instagram/Bright Data 付費盤點需要有限的結果預算：請用 --instagram-max-items "
+            "指定正整數（例如 20）；--allow-batch-cloud 只代表允許雲端花費，不代表花費上限。"
+            "--instagram-since 只是在本機依發佈時間篩選，不會限制供應商計費範圍。"
+        )
+    edits = any(value is not None for value in (args.rss_name, args.rss_keywords, args.rss_tags, args.rss_latest_only, args.instagram_max_items))
     if edits and not (args.rss_add or args.rss_update or args.facebook_author or args.instagram_author):
-        raise ValueError("名稱／關鍵字／標籤／latest-only 設定只可搭配新增或更新訂閱。")
+        raise ValueError("名稱／關鍵字／標籤／latest-only／Instagram 結果預算設定只可搭配新增或更新訂閱。")
     if args.rss_update and not edits:
         raise ValueError("--rss-update 至少要搭配一個要修改的設定。")
     if args.rss_list_items and not args.rss_list:
@@ -5599,6 +5822,11 @@ def run_rss_command(args: argparse.Namespace) -> int:
             )
     if args.instagram_author:
         since = args.instagram_since or "365d"
+        print(
+            "Instagram/Bright Data 本次供應商請求上限："
+            f"num_of_posts={args.instagram_max_items}；"
+            f"--instagram-since {since} 僅為本機時間篩選，不限制供應商計費範圍。"
+        )
         if args.instagram_discover_only:
             with rss_writer_lock(root):
                 username = instagram_username(args.instagram_author)
@@ -5649,6 +5877,7 @@ def run_rss_command(args: argparse.Namespace) -> int:
                 keywords=csv_values(args.rss_keywords) if args.rss_keywords is not None else None,
                 tags=csv_values(args.rss_tags) if args.rss_tags is not None else None,
                 latest_only=args.rss_latest_only,
+                instagram_max_items=args.instagram_max_items,
             )
         print(f"已更新 RSS：{subscription['name']}（ID {subscription['id']}）")
     for subscription_id, enabled in ((args.rss_enable, True), (args.rss_disable, False)):
@@ -6542,7 +6771,7 @@ def parse_args() -> argparse.Namespace:
     rss = parser.add_argument_group("RSS 訂閱")
     rss.add_argument("--rss-add", metavar="FEED_URL", help="加入 RSS/Atom Feed，並立即把新項目排入本機佇列")
     rss.add_argument("--rss-remove", metavar="ID", help="移除訂閱與佇列紀錄；不刪除既有 jobs")
-    rss.add_argument("--rss-update", metavar="ID", help="修改既有訂閱的名稱、關鍵字、標籤或 latest-only")
+    rss.add_argument("--rss-update", metavar="ID", help="修改既有訂閱的名稱、關鍵字、標籤、latest-only 或 Instagram 結果預算")
     rss.add_argument("--rss-enable", metavar="ID", help="啟用既有訂閱")
     rss.add_argument("--rss-disable", metavar="ID", help="暫停既有訂閱")
     rss.add_argument("--rss-requeue", metavar="ITEM_ID", help="將 failed/dead-letter 項目重排並清除嘗試次數")
@@ -6611,7 +6840,7 @@ def parse_args() -> argparse.Namespace:
         "--instagram-max-items",
         type=int,
         default=None,
-        help="手動限制本次發現的近期 Reels 數；預設不設上限",
+        help="本次發現的供應商結果預算（num_of_posts，正整數，必填）；--instagram-since 只是在本機依發佈時間篩選，不限制供應商計費範圍",
     )
     rss.add_argument(
         "--instagram-discover-only",
@@ -6798,6 +7027,7 @@ def run_batch(args: argparse.Namespace) -> Path:
 
 
 def run_pipeline(args: argparse.Namespace) -> Path:
+    bind_cost_root(args.root.resolve())
     root = args.root.resolve()
     root.mkdir(parents=True, exist_ok=True)
     # --root 是輸出目錄，不該綁著設定檔：先讀專案自己的 .env，再讓輸出目錄的 .env 覆蓋。
@@ -7211,6 +7441,8 @@ def run_pipeline(args: argparse.Namespace) -> Path:
 
 def main() -> int:
     args = parse_args()
+    # 成本守衛要綁到這次執行的專案根目錄，否則 strict 模式會拒絕所有付費傳輸。
+    bind_cost_root(args.root.resolve())
     if args.self_test:
         self_test()
         return 0
@@ -7271,13 +7503,21 @@ def main() -> int:
     if getattr(args, "cost_report", None) is not None:
         from cost_tracker import get_cost_report
 
-        res = get_cost_report(args.root.resolve(), period_type=args.cost_report)
+        try:
+            res = get_cost_report(args.root.resolve(), period_type=args.cost_report)
+        except (RuntimeError, ValueError, OSError) as exc:
+            print(f"成本報告 ERROR: {exc}", file=sys.stderr)
+            return 1
         print(f"成本與用量報告：\n{json.dumps(res, ensure_ascii=False, indent=2)}")
         return 0
     if getattr(args, "budget_status", False):
         from cost_tracker import get_budget_status
 
-        res = get_budget_status(args.root.resolve())
+        try:
+            res = get_budget_status(args.root.resolve())
+        except (RuntimeError, ValueError, OSError) as exc:
+            print(f"預算狀態 ERROR: {exc}", file=sys.stderr)
+            return 1
         print(f"預算狀態：\n{json.dumps(res, ensure_ascii=False, indent=2)}")
         return 0
     if getattr(args, "provider_health", False):
