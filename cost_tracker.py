@@ -416,7 +416,7 @@ def get_cost_report(root: Path, period_type: str = "daily") -> dict[str, Any]:
                    SUM(estimated_micro_usd) as total_estimated_uUSD,
                    SUM(COALESCE(actual_micro_usd, 0)) as total_actual_uUSD
             FROM usage_costs
-            WHERE created_at >= ? AND created_at < ?
+            WHERE created_at >= ? AND created_at < ? AND status != 'blocked_budget'
             GROUP BY provider
             """,
             (period_start_utc, period_end_utc),
