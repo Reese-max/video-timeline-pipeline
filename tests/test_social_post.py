@@ -127,7 +127,7 @@ class SocialPostTests(unittest.TestCase):
     def test_instagram_discovery_snapshot_formats(self):
         for snapshot in ["s_test", "sd_test", "sd_../escape"]:
             with self.subTest(snapshot=snapshot), tempfile.TemporaryDirectory() as root, \
-                    patch.dict(pipeline.os.environ, {"BRIGHTDATA_API_TOKEN": "test-secret"}), \
+                    patch.dict(pipeline.os.environ, {"BRIGHTDATA_API_TOKEN": "test-secret", "BRIGHTDATA_INSTAGRAM_MAX_ITEMS": "10"}), \
                     patch.object(pipeline, "request_json", return_value={"snapshot_id": snapshot}), \
                     patch.object(pipeline, "get_json", side_effect=[{"status": "ready"}, []]) as read:
                 if "/" in snapshot:
@@ -138,8 +138,16 @@ class SocialPostTests(unittest.TestCase):
                     result = pipeline.fetch_instagram_author("testauthor", allow_paid=True, root=Path(root))
                     self.assertEqual(result["instagram"]["snapshot_id"], snapshot)
 
+    def test_instagram_discovery_fails_without_finite_budget(self):
+        with tempfile.TemporaryDirectory() as root, \
+             patch.dict(pipeline.os.environ, {"BRIGHTDATA_API_TOKEN": "test-token"}, clear=True), \
+             patch.object(pipeline, "request_json") as submit:
+            with self.assertRaisesRegex(ValueError, "finite 預算"):
+                pipeline.fetch_instagram_author("testauthor", allow_paid=True, root=Path(root))
+            submit.assert_not_called()
+
     def test_instagram_timeout_posts_once_even_across_restarts(self):
-        with tempfile.TemporaryDirectory() as root, patch.dict(pipeline.os.environ, {"BRIGHTDATA_API_TOKEN": "test-secret"}), \
+        with tempfile.TemporaryDirectory() as root, patch.dict(pipeline.os.environ, {"BRIGHTDATA_API_TOKEN": "test-secret", "BRIGHTDATA_INSTAGRAM_MAX_ITEMS": "10"}), \
                 patch.object(pipeline.urllib.request, "urlopen", side_effect=TimeoutError()) as transport:
             for _ in range(2):
                 with self.assertRaisesRegex(RuntimeError, "禁止重送"):
@@ -205,7 +213,7 @@ class SocialPostTests(unittest.TestCase):
                 self.assertEqual(submit.call_count, 0 if failure == "before_post" else 1)
 
     def test_instagram_poll_failure_resumes_snapshot(self):
-        with tempfile.TemporaryDirectory() as root, patch.dict(pipeline.os.environ, {"BRIGHTDATA_API_TOKEN": "test-secret"}), \
+        with tempfile.TemporaryDirectory() as root, patch.dict(pipeline.os.environ, {"BRIGHTDATA_API_TOKEN": "test-secret", "BRIGHTDATA_INSTAGRAM_MAX_ITEMS": "10"}), \
                 patch.object(pipeline, "request_json", return_value={"snapshot_id": "sd_test"}) as submit, \
                 patch.object(pipeline, "get_json", side_effect=[RuntimeError("GET timeout"), {"status": "ready"}, []]):
             with self.assertRaisesRegex(RuntimeError, "GET timeout"):
@@ -215,11 +223,11 @@ class SocialPostTests(unittest.TestCase):
             submit.assert_called_once()
 
     def test_instagram_cli_uses_saved_snapshot_and_custom_root(self):
-        with tempfile.TemporaryDirectory() as directory, patch.dict(pipeline.os.environ, {"BRIGHTDATA_API_TOKEN": "test-secret"}), \
+        with tempfile.TemporaryDirectory() as directory, patch.dict(pipeline.os.environ, {"BRIGHTDATA_API_TOKEN": "test-secret", "BRIGHTDATA_INSTAGRAM_MAX_ITEMS": "10"}), \
                 patch.object(pipeline, "request_json", side_effect=[{"snapshot_id": "sd_first"}, {"snapshot_id": "sd_second"}]) as submit, \
                 patch.object(pipeline, "get_json", side_effect=lambda url, headers: {"status": "ready"} if "/progress/" in url else []), \
                 patch.object(pipeline.sys, "argv", ["pipeline.py", "--instagram-author", "testauthor", "--instagram-discover-only",
-                                                   "--allow-batch-cloud", "--root", directory]):
+                                                   "--instagram-max-items", "10", "--allow-batch-cloud", "--root", directory]):
             args = pipeline.parse_args()
             self.assertEqual(pipeline.run_rss_command(args), 0)
             with patch.object(pipeline, "write_instagram_discovery", side_effect=OSError("disk full")), self.assertRaises(OSError):
@@ -229,7 +237,7 @@ class SocialPostTests(unittest.TestCase):
             self.assertEqual(len(list(Path(directory).rglob("submission.json"))), 2)
 
     def test_instagram_refresh_advances_only_after_state_saved_including_empty_result(self):
-        with tempfile.TemporaryDirectory() as directory, patch.dict(pipeline.os.environ, {"BRIGHTDATA_API_TOKEN": "test-secret"}), \
+        with tempfile.TemporaryDirectory() as directory, patch.dict(pipeline.os.environ, {"BRIGHTDATA_API_TOKEN": "test-secret", "BRIGHTDATA_INSTAGRAM_MAX_ITEMS": "10"}), \
                 patch.object(pipeline, "request_json", side_effect=[{"snapshot_id": "sd_first"}, {"snapshot_id": "sd_second"}]) as submit, \
                 patch.object(pipeline, "get_json", side_effect=lambda url, headers: {"status": "ready"} if "/progress/" in url else []):
             root = Path(directory)

@@ -633,6 +633,8 @@ def prepare_video_locked(url: str, segment_seconds: int, max_segments: int | Non
 
 
 def run_job(operation, *args):
+    # MCP 工具會直接呼叫 pipeline 的付費傳輸，執行前先把成本帳本綁到 MCP_ROOT。
+    pipeline.bind_cost_root(MCP_ROOT)
     if not JOB_LOCK.acquire(blocking=False):
         raise JobBusyError("MCP 正在處理另一個影片工作，請稍後重試；本次未加入背景佇列。")
     try:

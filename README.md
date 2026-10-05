@@ -215,6 +215,7 @@ Apify Token 一律放在 `Authorization` header，不放 URL、輸出或 Git。A
 ```dotenv
 BRIGHTDATA_API_TOKEN=
 BRIGHTDATA_RUN_TIMEOUT_SECONDS=1800
+BRIGHTDATA_INSTAGRAM_MAX_ITEMS=3
 ```
 
 先用少量結果盤點；這只取得公開 Reel metadata，不下載影片，也不呼叫 Groq／MiniMax：
@@ -223,10 +224,12 @@ BRIGHTDATA_RUN_TIMEOUT_SECONDS=1800
 python pipeline.py --instagram-author 'https://www.instagram.com/<USERNAME>/' --instagram-max-items 3 --instagram-discover-only --allow-batch-cloud
 ```
 
-確認後加入佇列。預設不設結果筆數上限；`--instagram-since 365d` 會在本機依供應商實際回傳的發佈時間保留近一年結果：
+確認後加入佇列。未提供 `--instagram-max-items` 時需設定 `BRIGHTDATA_INSTAGRAM_MAX_ITEMS`；`--instagram-since 365d` 會在本機依供應商實際回傳的發佈時間保留近一年結果，與供應商側結果上限不同：
+
+有效上限必須是正整數，逾時秒數也必須大於 0；專案與所選 `--root` 的 `.env` 會先載入，再驗證上限。送出前 stderr 顯示本次傳給供應商的 `num_of_posts`，不印 Token。結果筆數上限不是美元硬上限，也未代替供應商實際計費／上限執行驗證；啟用嚴格美元成本守衛時，Bright Data 仍因缺少可驗證的供應商費用上限而拒絕送出。
 
 ```powershell
-python pipeline.py --instagram-author '<USERNAME>' --instagram-since 365d --rss-all-items --allow-batch-cloud
+python pipeline.py --instagram-author '<USERNAME>' --instagram-since 365d --instagram-max-items 1000 --rss-all-items --allow-batch-cloud
 python pipeline.py --rss-refresh --allow-batch-cloud
 python pipeline.py --rss-process --rss-max-items 4 --allow-batch-cloud
 ```
@@ -234,6 +237,8 @@ python pipeline.py --rss-process --rss-max-items 4 --allow-batch-cloud
 盤點快照保存在 Git 忽略且受 ACL 保護的 `rss\instagram-<雜湊>-latest.json`，包含原始 Bright Data 結果與 snapshot provenance。刷新時會把已見 Post ID 傳入 `posts_to_not_include`，本機佇列仍以穩定 ID 去重。Bright Data 的 Reel discovery 目前不支援伺服器端日期篩選；若某筆沒有 `date_posted`，工具會保留並在快照及盤點訊息標示「無法驗證回溯範圍」，不會假裝近一年盤點完整。私人／登入限定內容不處理，平台可見性與供應商回傳仍可能造成缺漏。請參考 [Instagram Scraper API](https://docs.brightdata.com/datasets/scrapers/instagram/introduction)、[Reel discovery](https://docs.brightdata.com/api-reference/scrapers/social-media-apis/instagram-reels-discover-by-url) 與 [非同步 snapshot 流程](https://docs.brightdata.com/api-reference/rest-api/scraper/asynchronous-requests)。
 
 每輪作者採集的 POST 僅送一次，回執保存在所選 `--root` 的 `rss/brightdata/<雜湊>/`。相同輸入在輪詢、下載或本機儲存失敗後重試，沿用原 snapshot；只有訂閱狀態（或 `--instagram-discover-only` 的快照）成功儲存，後續明確允許的刷新才會開始新一輪採集，空結果亦同。回應不明時停止，不以重送嘗試恢復；改輸入／root 屬於另一個請求，不應用來繞過此保護。
+
+離線回歸：`python -m unittest discover -s tests -p test_instagram_budget_recovery.py -q`。測試使用模擬 HTTP 傳輸、暫存回執與 SQLite 帳本，驗證拒絕前零呼叫及中斷恢復；不代表真實 Bright Data 帳單或供應商端上限已驗收。
 
 單篇公開 Reel／影片貼文不需要先建立作者訂閱，可直接走既有入口：
 
@@ -586,3 +591,46 @@ OPEN_NOTEBOOK_PASSWORD=不要提交到版本控制
 重跑同一支影片是**替換**而非新增：`manifest.json` 的 `open_notebook.source_id` 記著上次建立的條目，下次同步會先刪掉它再上傳，`replaced` 旗標會標示有沒有真的替換掉。少了這層，每次重跑都會在 notebook 疊一份同名 source。
 
 兩個前提：`manifest.json` 不能刪（那是唯一的對應記錄），以及若你在 Open Notebook 介面手動刪過該條目，這次同步會刪不到（404 會被忽略）而新增一份。手動刪掉的孤兒條目只能自己在介面清。
+
+## 成本守衛（#4）
+
+所有已啟用的對外傳輸都經過同一道守衛：送出前先在 `operations.db` 原子預留金額，送出後入帳並結清預留。CLI、背景排程、MCP 工具與內建重試都走同一條路徑，不存在只寫在文件、實際沒接上的開關。
+
+已接入的傳輸：
+
+| 供應商 | 操作 | 預留時機 |
+|---|---|---|
+| Groq | `audio.transcriptions` | 每個音訊片段送出前（命中本機快取時不預留、不產生新費用） |
+| MiniMax | `vision.analyze_images`、`summarize.*`、`query.keywords`、`query.answer`、`digest.report`、`library.classify` | 每次送出前，同一則 `finish_reason` 重試會各自入帳 |
+| OpenRouter | `embeddings` | 每個 batch 送出前（向量已存在時不送出、不預留） |
+| Meta Graph | `graph.query` | 每次分頁請求 |
+| Apify | `actor.run.start` | 一次 Actor 工作只預留一次，金額以供應商端 `APIFY_MAX_TOTAL_CHARGE_USD` 封頂；後續 poll／dataset 讀取屬同一筆遠端工作，不重複計完整 Actor 費用 |
+| Bright Data | `datasets.trigger` | 寫入 `.submitted` 回執前；被拒絕時不會留下「送出狀態不明」的標記 |
+| Open Notebook | `sources.sync` | 建立 source 前 |
+| RSS 通知 Webhook | `notify` | 每次通知前 |
+| Email（Resend／SMTP／Webhook） | `email.send`、`webhook.post` | 每次寄送前，被拒絕時回 `permanent_failure`（不重試、不遞迴告警） |
+
+**嚴格模式只放行帶有供應商端可執行上限的操作。** 目前只有 Apify Actor 啟動傳入 `maxTotalChargeUsd`（[Apify Run Actor API](https://docs.apify.com/api/v2/actors-runs-post) 說明該值限制單次 run 的總費用）。Groq、MiniMax、OpenRouter 等路徑目前只有估算，沒有可驗證的供應商端費用上限，因此即使估算值為正，hard-stop 開啟時仍會拒絕；soft mode 的估算只供記錄，不保證實際費用不超出本地預算。
+
+```text
+DAILY_BUDGET_USD=5.00
+BUDGET_HARD_STOP=true
+COST_TIMEZONE=Asia/Taipei
+```
+
+* `DAILY_BUDGET_USD` 留空或 `0`：不設上限，守衛只記帳。
+* `BUDGET_HARD_STOP=true` **且** `DAILY_BUDGET_USD>0`：嚴格模式。`已花費 + 未結清預留 + 本次上限` 超過每日上限時，傳輸在開連線前就被拒絕（`Budget blocked:`），並記一筆 `blocked_budget`。
+* 嚴格模式下成本帳本不可寫（唯讀、損壞、磁碟滿）一律 fail-closed，不會因為記帳失敗就放行付費請求。
+* 超時、連線中斷或結果不明的 attempt 記為 `unknown` 且**不結清**預留，避免遠端仍在跑的工作看起來免費；之後要用 `provider_operation_id`（Apify run、Bright Data snapshot）對帳。
+* 沒有開嚴格模式時，守衛是諮詢性的：帳本寫不進去（唯讀、磁碟滿、被鎖住）只會印一行 `!` 警告並照常送出，但該 attempt 的預留會留在 `reserved`，不會因為沒記到帳就當成沒花錢。要「記不到就不准花」，請開 `BUDGET_HARD_STOP=true` 並設定 `DAILY_BUDGET_USD`。
+* 目前沒有自動釋出／對帳 `reserved` 預留的工具；unknown attempt 的遠端工作要人工用 `provider_operation_id` 對帳（規劃中的統一對帳屬 #7 範圍）。
+
+```powershell
+python pipeline.py --cost-report daily
+python pipeline.py --budget-status
+python pipeline.py --provider-health
+```
+
+報表只讀本機 `operations.db`，不會為了查成本再發任何付費請求；「本程式、指定帳戶範圍、截至 as_of」不等於供應商帳單。`unknown` 不會被當成 0。
+
+**邊界**：本地守衛只能攔截「這個程式送出去的新請求」。供應商晚計費、同一帳戶被其他工具共用、無法取消的遠端工作，與沒有可驗證價格的操作，都不在這個保證裡；要真正的零超支，仍需要供應商端的額度控制。
