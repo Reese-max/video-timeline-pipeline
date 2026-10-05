@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- 補齊 issue #5 的 library／analysis revision 引用命名空間、原始 segment IDs、完整起訖／未知時間與完整 SHA-256；用本機原文安全遷移可證明的短雜湊向量，隔離歧義並比較快取實際原文。相同原文仍共用向量，遷移不呼叫模型；A5 語意與 A9 人工／供應商驗收仍未完成。
 - 將既有 PR #37 成本守衛整合到 retrieval 候選，保留目前 main 的佇列／媒體安全；新增 rerank 邊界守衛，query embedding 或 rerank 遭預算拒絕時不吞掉錯誤或嘗試另一個 provider。完整 suite 以假傳輸驗證，真 API／部署驗收未執行。
 
 - Ask 回應改用完整來源原文的嚴格 JSON 契約：保留合併前片段邊界並綁定 occurrence IDs，程式呈現來源類型；改寫、截去日期／否定詞、非法引用或模型來源 URL 使回答拒絕。合法引用不再自動表示主張受支持，`semantic_support_verified` 明確維持 false；不增加 provider 呼叫。A5 語意評估與 A9 人工 golden dataset 仍待完成。
@@ -19,6 +20,7 @@
 - 新增 MCP 影音暫存 7 天清理指令（預設 dry-run），只移除完成且不需覆核工作的已知影音產物，保留摘要、逐字稿、回執與 Drive；沿用既有 OS 鎖阻擋清理／MCP 競態，媒體清除後仍可重新下載。
 - 成本守衛接到每一條已啟用的付費傳輸（#4）：Groq 轉錄、MiniMax 視覺／摘要／關鍵詞／問答／digest／分類、OpenRouter embeddings、Meta Graph 分頁、Apify Actor 啟動、Bright Data trigger、Open Notebook 同步、RSS 通知 Webhook 與 Resend／SMTP／Webhook 寄送。送出前原子預留、超額時不開連線、送出後入帳；超時或結果不明不結清預留。嚴格模式（`BUDGET_HARD_STOP=true` 且 `DAILY_BUDGET_USD>0`）只放行帶供應商端可執行上限的操作：目前僅 Apify Actor run 傳入 `maxTotalChargeUsd`；Groq、MiniMax、OpenRouter 等估算不冒充硬上限而會被拒絕；未開嚴格模式時守衛只記錄估算、不保證不超出供應商費用。
 
+- 修正 #18：預算期間改以 `COST_TIMEZONE`（IANA 時區，預設 Asia/Taipei）的本地日／月為界；無效時區明確失敗而非退回 UTC。預算狀態與成本報告輸出 `accounting_timezone` 供稽核；新增凍結時鐘測試涵蓋台北跨 UTC 日界、本地午夜 rollover 與 DST 時區。無效時區在開啟／初始化 operations.db 之前就明確失敗，不留下已遷移的資料庫。未結清的預算保留與已入帳費用改用同一段 UTC 時間窗過濾，因此變更 `COST_TIMEZONE` 時未結清金額不會脫離當期預算；新增 `(account_scope, created_at, status)` 索引維持該查詢走索引。無效時區時 `--budget-status`／`--cost-report` 以一行訊息與 exit 1 回報，不再丟出 traceback。離線驗證 `python3 -m pytest -q`：140 項通過（另 88 個 subtests）；`python3 -m compileall -q .` 通過，皆 exit 0。全程僅用凍結時鐘與本機 SQLite，未呼叫任何供應商或網路。`requirements.txt` 新增 `tzdata`，供沒有系統 IANA 資料庫的環境（如 Windows）讓 `zoneinfo` 正常運作。
 - MiniMax 僅接受完整的 `finish_reason=stop`；截斷或欄位不完整的畫面觀察保留未完成狀態，不寫入可重用快取。逐張與整批視覺快取均檢查 schema，知識檔與 manifest 明確標示視覺完成狀態；以假回應驗證，真實 MiniMax 尚待實測。
 - 2026-09-24：統一 Bright Data 單篇與 IG 作者採集的單次提交／持久回執；未知回應禁止重送，已知 snapshot 可續跑，作者下一輪以成功落盤的 snapshot 推進。基於 `703e649`，本批尚未推送或部署；離線驗證 `python -X utf8 -m unittest discover -s tests -q`：116 項、114 通過／2 項平台略過；`node tests/test_widget_handoff.cjs`：21 項通過；`git diff --check` 通過，皆 exit 0。下一驗收為審閱、推送與部署後的非新增計費 smoke test；不沿用先前部署的線上驗收。
 - 新增 ChatGPT MP4 檔案引用交接工具 `ingest_video_segments`：驗證 `download_url`／`file_id`、暴露完整 `_meta["openai/fileParams"]` 與 `outputSchema`，未完成交接時不啟動摘要。

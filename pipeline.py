@@ -22,6 +22,7 @@ import mimetypes
 import os
 import re
 import shutil
+import signal
 import sqlite3
 import subprocess
 import sys
@@ -124,14 +125,28 @@ def run_external(
     print("$ " + redact_values(subprocess.list2cmdline(command), redact))
     if stream:
         sys.stdout.flush()
-    # Inherit the worker's process group so supervisor cancellation reaches FFmpeg
-    # and downloader children as well. Never detach these processes into a session.
+    # Queue workers already own a supervised group. Their watchdog must still
+    # reach these children on parent death; only synchronous commands detach.
+    owns_tree = os.getenv("VIDEO_JOB_WORKER") != "1"
+    popen_kwargs = dict(cwd=cwd)
+    if owns_tree:
+        if os.name != "nt":
+            popen_kwargs["start_new_session"] = True
+        else:
+            popen_kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
     with contextlib.ExitStack() as stack:
         # Temporary files avoid a pipe-drain deadlock if a downloader's descendant
         # inherits stdout/stderr after its parent has been killed on timeout.
         output_file = None if stream else stack.enter_context(tempfile.TemporaryFile())
         error_file = None if stream else stack.enter_context(tempfile.TemporaryFile())
-        with subprocess.Popen(command, cwd=cwd, stdout=output_file, stderr=error_file) as process:
+        with subprocess.Popen(command, stdout=output_file, stderr=error_file, **popen_kwargs) as process:
+            if owns_tree and os.name == "nt":
+                from job_queue import bind_windows_job, stop_process_tree
+                try:
+                    bind_windows_job(process)
+                except OSError:
+                    stop_process_tree(process)
+                    raise
             try:
                 while True:
                     try:
@@ -141,9 +156,22 @@ def run_external(
                     except subprocess.TimeoutExpired:
                         budget.check()
             except (DeadlineExceeded, ExecutionCancelled):
-                process.kill()
-                process.wait()
+                if owns_tree and os.name != "nt":
+                    try:
+                        os.killpg(process.pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                elif owns_tree:
+                    stop_process_tree(process)
+                else:
+                    # The queue supervisor cleans the worker group after this
+                    # error receipt; do not kill the worker writing that receipt.
+                    process.kill()
+                process.wait(timeout=5)
                 raise
+            finally:
+                if owns_tree and os.name == "nt":
+                    stop_process_tree(process)
         stdout = stderr = ""
         if output_file is not None and error_file is not None:
             output_file.seek(0)
@@ -1547,6 +1575,12 @@ def bind_cost_root(root: Path) -> None:
     set_cost_root(root)
 
 
+def record_cost_cache_hit(provider: str, operation: str, **kwargs: Any) -> None:
+    from cost_tracker import record_provider_cache_hit
+
+    record_provider_cache_hit(provider, operation, **kwargs)
+
+
 class ApiRequestError(RuntimeError):
     """供應商 HTTP／傳輸失敗，帶著供應商自己的狀態碼與回應內容。
 
@@ -1554,10 +1588,13 @@ class ApiRequestError(RuntimeError):
     RuntimeError 完全相同，既有呼叫端與測試不受影響。
     """
 
-    def __init__(self, message: str, *, status_code: int | None = None, response_body: str = "") -> None:
+    def __init__(self, message: str, *, status_code: int | None = None, response_body: str = "",
+                 provider_outcome_unknown: bool = False, retry_after: float | None = None) -> None:
         super().__init__(message)
         self.status_code = status_code
         self.response_body = response_body
+        self.provider_outcome_unknown = provider_outcome_unknown
+        self.retry_after = retry_after
 
 
 def request_json(
@@ -1577,37 +1614,44 @@ def request_json(
     for attempt in range(1, attempts + 1):
         request = urllib.request.Request(url, data=body, headers=headers, method=method)
         try:
-            with urllib.request.urlopen(request, timeout=budget.remaining(timeout)) as response:
-                raw = read_response(response, budget, read_timeout=timeout)
+            from cost_tracker import classify_error, is_retryable, provider_transport_attempt
+
+            with provider_transport_attempt():
+                try:
+                    with urllib.request.urlopen(request, timeout=budget.remaining(timeout)) as response:
+                        raw = read_response(response, budget, read_timeout=timeout)
+                except urllib.error.HTTPError as exc:
+                    try:
+                        detail = read_response(exc, budget, 4096, read_timeout=timeout).decode("utf-8", errors="replace")
+                    finally:
+                        exc.close()
+                    secrets = {value for key, value in headers.items() if key.lower() in {"authorization", "x-api-key", "api-key"}}
+                    secrets.update(value.split(" ", 1)[-1] for value in list(secrets))
+                    detail = redact_values(detail, secrets)
+                    # Classify only after reading and masking the provider's
+                    # business code, while this attempt still owns its reserve.
+                    raise ApiRequestError(
+                        f"API HTTP {exc.code}（{public_url(url)}）：{detail[:1200]}",
+                        status_code=exc.code, response_body=detail, retry_after=retry_delay(exc, delay),
+                    ) from exc
+                except (urllib.error.URLError, TimeoutError) as exc:
+                    reason = getattr(exc, "reason", None) or type(exc).__name__
+                    raise ApiRequestError(f"API 網路錯誤：{reason}", provider_outcome_unknown=True) from exc
             break
-        except urllib.error.HTTPError as exc:
-            try:
-                detail = read_response(exc, budget, 4096, read_timeout=timeout).decode("utf-8", errors="replace")
-            finally:
-                exc.close()
-            secrets = {value for key, value in headers.items() if key.lower() in {"authorization", "x-api-key", "api-key"}}
-            secrets.update(value.split(" ", 1)[-1] for value in list(secrets))
-            detail = redact_values(detail, secrets)
-            if exc.code in RETRY_STATUS and attempt < attempts:
-                wait = retry_delay(exc, delay)
-                print(f"! API HTTP {exc.code}，{wait:.0f} 秒後重試（{attempt}/{attempts - 1}）")
+        except ApiRequestError as exc:
+            category = classify_error(exc, exc.status_code, exc.response_body)
+            if exc.status_code in RETRY_STATUS and is_retryable(category) and attempt < attempts:
+                wait = exc.retry_after if exc.retry_after is not None else delay
+                print(f"! API HTTP {exc.status_code}，{wait:.0f} 秒後重試（{attempt}/{attempts - 1}）")
                 budget.sleep(wait)
                 delay *= 2
                 continue
-            # 帶上 URL：base_url 被環境變數改掉時，光看「404 page not found」查不出原因。
-            raise ApiRequestError(
-                f"API HTTP {exc.code}（{public_url(url)}）：{detail[:1200]}",
-                status_code=exc.code, response_body=detail
-            ) from exc
-        # TimeoutError 不是 URLError 的子類，只接 URLError 會讓讀取逾時完全跳過重試
-        except (urllib.error.URLError, TimeoutError) as exc:
-            reason = getattr(exc, "reason", None) or type(exc).__name__
-            if attempt < attempts:
-                print(f"! API 網路錯誤（{reason}），{delay:.0f} 秒後重試（{attempt}/{attempts - 1}）")
+            if exc.status_code is None and exc.provider_outcome_unknown and attempt < attempts:
+                print(f"! API 網路錯誤，{delay:.0f} 秒後重試（{attempt}/{attempts - 1}）")
                 budget.sleep(delay)
                 delay *= 2
                 continue
-            raise ApiRequestError(f"API 網路錯誤：{reason}") from exc
+            raise
     try:
         result = json.loads(raw.decode("utf-8"))
         budget.check()
@@ -1933,6 +1977,7 @@ def transcribe_all(
         cache_path = cache_dir / f"{key}.json"
         cached = reuse_artifact(cache_path)
         if isinstance(cached, dict) and (cached.get("segments") or cached.get("text")):
+            record_cost_cache_hit("groq", "audio.transcriptions", model=model)
             return int(chunk["index"]), cached, key, True, 0.0
         started = time.monotonic()
         result = groq_transcribe(path, api_key, model, language, word_timestamps)
@@ -2404,6 +2449,7 @@ def analyze_images(
             cache_path = cache_dir / (hashlib.sha256(material.encode("utf-8")).hexdigest() + ".json")
             cached = reuse_artifact(cache_path)
             if reusable_visual_observation(cached, candidate):
+                record_cost_cache_hit("minimax", "vision.analyze_images", model=model)
                 cached = dict(cached)
                 cached["source_image"] = str(image_path)
                 return index, cached
@@ -2606,6 +2652,7 @@ def cached_minimax_summary(
     cache_path = cache_dir / (hashlib.sha256(material.encode("utf-8")).hexdigest() + ".json")
     cached = reuse_artifact(cache_path, "short_summary")
     if valid(cached):
+        record_cost_cache_hit("minimax", f"summarize.{kind}", model=model)
         return cached
     operation = f"summarize.{kind}"
     result = parse_json_object(minimax_chat(messages, api_key, model, thinking="disabled", operation=operation))
@@ -2729,6 +2776,10 @@ def format_timestamp(value: Any) -> str:
     hours, remainder = divmod(total, 3600)
     minutes, seconds = divmod(remainder, 60)
     return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+
+
+def format_hit_timestamp(hit: dict[str, Any]) -> str:
+    return "—" if hit.get("timestamp") is None else format_timestamp(hit["timestamp"])
 
 
 def format_srt_timestamp(value: Any) -> str:
@@ -2995,29 +3046,22 @@ def open_notebook_sync(
     auth_headers = {"Authorization": f"Bearer {password}", "X-Password": password}
 
     replaced = False
-    if replace_source_id:
-        # 重跑同一支影片時先撤掉上次的條目，否則 notebook 會積出一排同名 source。
-        try:
-            request_json(
-                f"{base_url}/api/sources/{replace_source_id}",
-                auth_headers,
-                method="DELETE",
-                timeout=30,
-            )
-            replaced = True
-        except RuntimeError as exc:
-            # 使用者可能已經在 UI 手動刪掉了，那不是錯誤。
-            if "HTTP 404" not in str(exc):
-                raise
-
     fields = {"type": "upload", "notebook_id": notebook_id, "async_processing": "true"}
     if title:
         # 不傳的話 Open Notebook 拿檔名當標題，整個 notebook 會是一排 knowledge.md
         fields["title"] = title
     body, boundary = multipart_body(fields, "file", knowledge_path)
     headers = {**auth_headers, "Content-Type": f"multipart/form-data; boundary={boundary}"}
-    # 只有建立 source 會讓對外服務開始處理；後面的 command poll 屬同一筆工作。
+    # 拒絕同步時也不得先刪除舊 source。建立與替換都先通過守衛。
     with cost_guard("open_notebook", "sources.sync") as guard_outcome:
+        if replace_source_id:
+            try:
+                request_json(f"{base_url}/api/sources/{replace_source_id}", auth_headers,
+                             method="DELETE", timeout=30)
+                replaced = True
+            except RuntimeError as exc:
+                if "HTTP 404" not in str(exc):
+                    raise
         response = post_json(sources_url, headers, body)
         source_id = response.get("id") or ""
         if source_id:
@@ -3070,7 +3114,13 @@ def index_connection(root: Path) -> sqlite3.Connection:
 
     唯讀檢索請走 `read_connection()`——搜尋不該隱式執行 DDL 或 legacy DROP。
     """
+    library_id = ensure_library_id(root)
     connection = sqlite3.connect(root / "library.db")
+    # Capture old local text before a derived FTS migration can drop it.
+    try:
+        legacy_texts = [row[0] for row in connection.execute("SELECT DISTINCT text FROM events")]
+    except sqlite3.OperationalError:
+        legacy_texts = []
     # tokenize='trigram'：unicode61 會把整句中文吃成單一 token，中文查詢一律落空。
     connection.executescript(
         """
@@ -3114,8 +3164,27 @@ def index_connection(root: Path) -> sqlite3.Connection:
         );
         CREATE INDEX IF NOT EXISTS occurrences_job_idx ON occurrences(job);
         CREATE INDEX IF NOT EXISTS occurrences_hash_idx ON occurrences(content_hash);
+        CREATE TABLE IF NOT EXISTS occurrence_provenance (
+            occurrence_id TEXT PRIMARY KEY,
+            library_id TEXT NOT NULL,
+            analysis_revision TEXT NOT NULL,
+            original_segment_ids TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS vector_texts (
+            content_hash TEXT PRIMARY KEY,
+            text TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS library_identity (
+            singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+            library_id TEXT NOT NULL
+        );
         """
     )
+    stored = connection.execute("SELECT library_id FROM library_identity WHERE singleton = 1").fetchone()
+    if stored and stored[0] != library_id:
+        connection.close()
+        raise RuntimeError("library 身分與索引不符；還原原本 library-id.json，勿重新配發引用身分。")
+    connection.execute("INSERT OR IGNORE INTO library_identity VALUES (1, ?)", (library_id,))
     migrated = False
     # videos 加了 categories 欄位；舊表直接重建（--index 幾秒就跑完，不值得寫搬遷）
     video_columns = {row[1] for row in connection.execute("PRAGMA table_info(videos)")}
@@ -3176,6 +3245,11 @@ def index_connection(root: Path) -> sqlite3.Connection:
         migrated = True
     if migrated:
         connection.execute("DELETE FROM index_state")
+    connection.execute(
+        "DELETE FROM index_state WHERE job IN (SELECT job FROM occurrences o "
+        "LEFT JOIN occurrence_provenance p ON p.occurrence_id=o.occurrence_id "
+        "WHERE p.occurrence_id IS NULL)"
+    )
     # 以文字內容的 hash 當鍵，不是 events.rowid——
     # --index 會對每個 job 做 DELETE+INSERT，FTS5 的 rowid 因此全部重新分配，
     # 綁 rowid 的話每加一支新影片都得把全部向量重算（實測 5,418 筆要 218 秒）。
@@ -3195,6 +3269,11 @@ def index_connection(root: Path) -> sqlite3.Connection:
         """
     )
     remap_legacy_vectors(connection)
+    try:
+        migrate_vector_hashes(connection, legacy_texts)
+    except Exception:
+        connection.close()
+        raise
     return connection
 
 
@@ -3213,6 +3292,24 @@ def read_connection(root: Path) -> sqlite3.Connection:
     if "occurrence_id" not in event_columns:
         connection.close()
         raise RuntimeError("索引是舊格式（缺少 occurrence_id）：請先執行 `--index` 重建。")
+    tables = {row[0] for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+    if not {"occurrence_provenance", "vector_texts", "library_identity"} <= tables:
+        connection.close()
+        raise RuntimeError("索引是舊格式（缺少 library/revision 身分）：請先執行 `--index` 重建。")
+    unmapped = connection.execute(
+        "SELECT 1 FROM events e LEFT JOIN occurrence_provenance p "
+        "ON p.occurrence_id=e.occurrence_id WHERE p.occurrence_id IS NULL LIMIT 1"
+    ).fetchone()
+    if unmapped:
+        connection.close()
+        raise RuntimeError("索引有未綁定 library/revision 的證據；請先執行 `--index` 重建。")
+    mismatch = connection.execute(
+        "SELECT 1 FROM vector_texts t JOIN occurrences o ON o.content_hash=t.content_hash "
+        "WHERE t.text<>o.text LIMIT 1"
+    ).fetchone()
+    if mismatch:
+        connection.close()
+        raise RuntimeError("content hash collision：快取原文與目前證據不同，拒絕重用。")
     return connection
 
 
@@ -3269,13 +3366,115 @@ def resolve_vector_key(connection: sqlite3.Connection, backend: str, model: str)
 
 
 def text_hash(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def ensure_library_id(root: Path) -> str:
+    """Persist outside the derived DB: moves/rebuilds retain citation identity.
+
+    An exclusive write never silently rotates a malformed or competing identity.
+    A copied library with this sidecar remains the same logical library.
+    """
+    identity_path = root / "library-id.json"
+    if not identity_path.exists():
+        identity = "lib_" + uuid.uuid4().hex
+        if (root / "library.db").is_file():
+            with contextlib.closing(sqlite3.connect(root / "library.db")) as existing:
+                try:
+                    stored = existing.execute("SELECT library_id FROM library_identity WHERE singleton=1").fetchone()
+                except sqlite3.OperationalError:
+                    stored = None
+                if stored:
+                    identity = stored[0]
+        try:
+            with identity_path.open("x", encoding="utf-8") as handle:
+                json.dump({"library_id": identity}, handle)
+                handle.flush()
+                os.fsync(handle.fileno())
+        except FileExistsError:
+            pass
+    try:
+        value = json.loads(identity_path.read_text(encoding="utf-8"))
+        identity = value["library_id"]
+        if not isinstance(identity, str) or not re.fullmatch(r"lib_[0-9a-f]{32}", identity):
+            raise ValueError("invalid identity")
+        return identity
+    except (OSError, ValueError, TypeError, KeyError) as exc:
+        raise RuntimeError("library 身分無法讀取；還原 library-id.json，勿重新配發引用身分。") from exc
+
+
+def checked_text_hash(text: str) -> str:
+    """Compare actual content; a shortened/incorrect hash cannot reuse a vector."""
+    digest = text_hash(text)
+    if digest != hashlib.sha256(text.encode("utf-8")).hexdigest():
+        raise RuntimeError("content hash collision／雜湊契約不符，拒絕重用快取。")
+    return digest
+
+
+def _text_catalog(connection: sqlite3.Connection) -> dict[str, str]:
+    texts: dict[str, str] = {}
+    for (text,) in connection.execute("SELECT DISTINCT text FROM events WHERE length(text)>0"):
+        digest = checked_text_hash(text)
+        if digest in texts and texts[digest] != text:
+            raise RuntimeError("content hash collision：不同原文不可共用向量。")
+        texts[digest] = text
+    return texts
+
+
+def _verified_vector_hashes(connection: sqlite3.Connection, model_key: str,
+                            texts: dict[str, str]) -> set[str]:
+    # Full hashes without a historical proof can be bound only to unambiguous
+    # local originals. Generated vectors always keep the actual input text.
+    tables = {row[0] for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+    proofs = dict(connection.execute("SELECT content_hash, text FROM vector_texts")) if "vector_texts" in tables else {}
+    if any(digest in proofs and proofs[digest] != text for digest, text in texts.items()):
+        raise RuntimeError("content hash collision：快取原文與目前原文不同。")
+    reusable: set[str] = set()
+    for (digest,) in connection.execute("SELECT text_hash FROM vectors WHERE model=?", (model_key,)):
+        if digest not in texts:
+            continue
+        if digest in proofs and proofs[digest] != texts[digest]:
+            raise RuntimeError("content hash collision：快取原文與目前原文不同。")
+        reusable.add(digest)
+    return reusable
+
+
+def _legacy_text_hash(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
 
 
-def make_occurrence_id(job: str, kind: str, start: Any, content_hash: str, ordinal: int = 0) -> str:
-    """Deterministic 引用 ID：同一輸入重建後保持不變，不依賴 FTS rowid。"""
-    basis = f"{job}\x00{kind}\x00{start!r}\x00{content_hash}\x00{ordinal}"
-    return "occ_" + hashlib.sha256(basis.encode("utf-8")).hexdigest()[:20]
+def migrate_vector_hashes(connection: sqlite3.Connection, extra_texts=()) -> None:
+    """Only locally provable legacy keys migrate; ambiguous/orphan rows survive.
+
+    No provider calls, no replacement of an existing full-key vector, and no
+    assumption that a 16-hex key proves equality of two original texts.
+    """
+    originals: dict[str, set[str]] = {}
+    for text in extra_texts:
+        if isinstance(text, str) and text:
+            originals.setdefault(_legacy_text_hash(text), set()).add(text)
+    for (text,) in connection.execute("SELECT DISTINCT text FROM events WHERE length(text)>0"):
+        originals.setdefault(_legacy_text_hash(text), set()).add(text)
+    for legacy, model, dim, vector in connection.execute("SELECT * FROM vectors WHERE length(text_hash)=16").fetchall():
+        matching = originals.get(legacy, set())
+        if len(matching) != 1:
+            continue
+        text = next(iter(matching)); digest = checked_text_hash(text)
+        proof = connection.execute("SELECT text FROM vector_texts WHERE content_hash=?", (digest,)).fetchone()
+        if proof and proof[0] != text:
+            raise RuntimeError("content hash collision：遷移原文與快取原文不同。")
+        connection.execute("INSERT OR IGNORE INTO vectors VALUES (?, ?, ?, ?)", (digest, model, dim, vector))
+        connection.execute("INSERT OR IGNORE INTO vector_texts VALUES (?, ?)", (digest, text))
+
+
+def make_occurrence_id(library_id: str, job: str, analysis_revision: str, kind: str,
+                       start: Any, end: Any, timestamp_kind: str, content_hash: str,
+                       original_segment_ids: list[str], ordinal: int = 0) -> str:
+    """Bind complete evidence identity, never an FTS rowid or a truncated hash."""
+    basis = json.dumps([library_id, job, analysis_revision, kind, start, end,
+                        timestamp_kind, content_hash, CHUNKER_VERSION,
+                        original_segment_ids, ordinal], ensure_ascii=False, separators=(",", ":"))
+    return "occ_" + hashlib.sha256(basis.encode("utf-8")).hexdigest()
 
 
 # occurrence 產生器的版本：分段策略改變時遞增，引用可回溯是哪版規則切出來的
@@ -3353,6 +3552,8 @@ def index_job(connection: sqlite3.Connection, job_dir: Path) -> int:
     if (manifest.get("status") or "") == "failed":
         # 失敗的 job 沒有內容，留在索引裡只會讓「共幾支影片」這個數字說謊。
         # 目錄本身保留（manifest 記著錯誤原因，可用來診斷）。
+        connection.execute("DELETE FROM occurrence_provenance WHERE occurrence_id IN "
+                           "(SELECT occurrence_id FROM occurrences WHERE job=?)", (job,))
         connection.execute("DELETE FROM events WHERE job = ?", (job,))
         connection.execute("DELETE FROM occurrences WHERE job = ?", (job,))
         connection.execute("DELETE FROM videos WHERE job = ?", (job,))
@@ -3362,10 +3563,27 @@ def index_job(connection: sqlite3.Connection, job_dir: Path) -> int:
     timeline_path = job_dir / "timeline.json"
     summary_path = job_dir / "summary.json"
     meta = video_source_meta(job_dir, manifest)
-    signature = text_hash(
+    library_id = connection.execute("SELECT library_id FROM library_identity WHERE singleton=1").fetchone()[0]
+    # A revision describes the original analysis artifacts/source, not their
+    # mtime, current directory or derived FTS allocation. Legacy jobs are bound
+    # from their actual local originals without regenerating paid analysis.
+    analysis_revision = "analysis_" + checked_text_hash(json.dumps({
+        "source": source.get("url") or source.get("video") or "",
+        "source_sha256": manifest.get("source_sha256"),
+        "declared_revision": manifest.get("analysis_revision"),
+        "models": manifest.get("models") or {},
+        "analysis_config": {key: value for key, value in (manifest.get("config") or {}).items()
+                            if key not in {"workers", "vision_workers", "sync_open_notebook", "notebook_id"}},
+        "timeline": file_sha256(timeline_path) if timeline_path.is_file() else None,
+        "summary": file_sha256(summary_path) if summary_path.is_file() else None,
+    }, ensure_ascii=False, sort_keys=True, separators=(",", ":")))
+    signature = checked_text_hash(
         json.dumps(
             {
-                "version": 1,
+                "version": 3,
+                "library_id": library_id,
+                "analysis_revision": analysis_revision,
+                "chunker_version": CHUNKER_VERSION,
                 "source": {
                     "title": source.get("title"),
                     "url": source.get("url"),
@@ -3389,6 +3607,8 @@ def index_job(connection: sqlite3.Connection, job_dir: Path) -> int:
     if indexed is not None:
         return int(indexed[0])
     # 向量以文字 hash 為鍵，不隨 events／occurrences 重建而失效，所以這裡只清片段
+    connection.execute("DELETE FROM occurrence_provenance WHERE occurrence_id IN "
+                       "(SELECT occurrence_id FROM occurrences WHERE job=?)", (job,))
     connection.execute("DELETE FROM events WHERE job = ?", (job,))
     connection.execute("DELETE FROM occurrences WHERE job = ?", (job,))
     connection.execute(
@@ -3417,13 +3637,18 @@ def index_job(connection: sqlite3.Connection, job_dir: Path) -> int:
     # FTS rowid 重建會重排所以不可當引用身分；向量則另以 (content_hash, model) 共用。
     rows: list[tuple[str, Any, str, str, str]] = []
     occurrences: list[tuple[str, str, int, str, Any, Any, str, str, str, str]] = []
+    provenance: list[tuple[str, str, str, str]] = []
     used_ids: set[str] = set()
 
-    def add_occurrence(kind: str, start: Any, end: Any, timestamp_kind: str, text: str) -> None:
-        digest = text_hash(text)
+    def add_occurrence(kind: str, start: Any, end: Any, timestamp_kind: str, text: str,
+                       original_segment_ids: list[str] | None = None) -> None:
+        original_segment_ids = original_segment_ids or []
+        digest = checked_text_hash(text)
         ordinal = 0
         while True:
-            occurrence_id = make_occurrence_id(job, kind, start, digest, ordinal)
+            occurrence_id = make_occurrence_id(library_id, job, analysis_revision, kind,
+                                              start, end, timestamp_kind, digest,
+                                              original_segment_ids, ordinal)
             if occurrence_id not in used_ids:
                 break
             ordinal += 1
@@ -3432,9 +3657,19 @@ def index_job(connection: sqlite3.Connection, job_dir: Path) -> int:
         occurrences.append(
             (occurrence_id, job, seq, kind, start, end, timestamp_kind, text, digest, CHUNKER_VERSION)
         )
-        # events.timestamp 沿用舊語意（沒有精準時間就是 0）；真正的 start/end
-        # 與 timestamp_kind 在 occurrences 表，引用一律走 occurrence_id。
-        rows.append((job, 0 if start is None else start, kind, occurrence_id, text))
+        provenance.append((occurrence_id, library_id, analysis_revision,
+                           json.dumps(original_segment_ids, ensure_ascii=False)))
+        # Unknown/source-level time remains NULL, distinct from a real zero.
+        rows.append((job, start, kind, occurrence_id, text))
+
+    def original_ids(item: dict[str, Any]) -> list[str]:
+        values = item.get("source_ids") or []
+        if not isinstance(values, list):
+            values = []
+        for name in ("segment_id", "id"):
+            if isinstance(item.get(name), str) and item[name]:
+                values = [*values, item[name]]
+        return list(dict.fromkeys(value for value in values if isinstance(value, str) and value))
 
     if source.get("title"):  # 用影片名找片是最直覺的查法，標題也得進全文索引
         # 標題是影片級中繼資料，timestamp=0 不是證據時間——標 source_level 且 start 為 NULL
@@ -3456,8 +3691,8 @@ def index_job(connection: sqlite3.Connection, job_dir: Path) -> int:
             start = event.get("timestamp")
             end = event.get("end")
             # 沒有 end 不捏造；只有時間點就標 point
-            timestamp_kind = "range" if end is not None else "point"
-            add_occurrence(str(event.get("type", "")), start, end, timestamp_kind, text)
+            timestamp_kind = "unknown" if start is None else "range" if end is not None else "point"
+            add_occurrence(str(event.get("type", "")), start, end, timestamp_kind, text, original_ids(event))
 
     if summary_path.is_file():
         try:
@@ -3468,7 +3703,7 @@ def index_job(connection: sqlite3.Connection, job_dir: Path) -> int:
             text = flatten_text(summary).strip()
             if text:
                 # 整份摘要無法對應單一時間點：source_level，不產生假時間
-                add_occurrence("summary", None, None, "source_level", text)
+                add_occurrence("summary", None, None, "source_level", text, original_ids(summary))
             # 章節另外建一筆：整份摘要沒有精準時間，命中了也跳不回影片；
             # 章節自帶 start，而且範圍夠窄，向量比整份摘要聚焦得多。
             for chapter in summary.get("chapters") or []:
@@ -3478,13 +3713,16 @@ def index_job(connection: sqlite3.Connection, job_dir: Path) -> int:
                 start = chapter.get("start")
                 end = chapter.get("end")
                 add_occurrence(
-                    "chapter", start, end, "range" if end is not None else "point", detail
+                    "chapter", start, end,
+                    "unknown" if start is None else "range" if end is not None else "point",
+                    detail, original_ids(chapter)
                 )
 
     connection.executemany("INSERT INTO events VALUES (?, ?, ?, ?, ?)", rows)
     connection.executemany(
         "INSERT INTO occurrences VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", occurrences
     )
+    connection.executemany("INSERT INTO occurrence_provenance VALUES (?, ?, ?, ?)", provenance)
     connection.execute(
         "INSERT OR REPLACE INTO index_state VALUES (?, ?, ?)", (job, signature, len(rows))
     )
@@ -3496,6 +3734,7 @@ def build_index(root: Path) -> tuple[Path, int, int]:
     try:
         job_dirs = sorted(path.parent for path in root.glob("jobs/*/manifest.json"))
         total = sum(index_job(connection, job_dir) for job_dir in job_dirs)
+        migrate_vector_hashes(connection)
         connection.commit()
         # 回報實際進索引的支數，不是掃到的目錄數——失敗的 job 有目錄但沒內容。
         indexed = connection.execute("SELECT count(*) FROM videos").fetchone()[0]
@@ -3673,20 +3912,21 @@ def unknown_date_count(root: Path, filters: SearchFilter) -> int:
 def _hit_from_row(row: tuple[Any, ...], query: str, scan: bool) -> dict[str, Any]:
     timestamp_kind = row[10] or ("source_level" if not row[3] else "point")
     start = row[8]
-    if start is None and timestamp_kind != "source_level":
-        start = row[3]
     return {
         "occurrence_id": row[7],
         "title": row[0],
         "source": row[1],
         "job": row[2],
-        "timestamp": row[3],
+        "timestamp": start,
         "kind": row[4],
         "snippet": make_snippet(row[5], query) if scan else row[5],
         "text": row[6],  # 完整原文：snippet 只有 16 字窗口，餵給 LLM 不夠用
         "start": start,
         "end": row[9],
         "timestamp_kind": timestamp_kind,
+        "library_id": row[11],
+        "analysis_revision": row[12],
+        "original_segment_ids": json.loads(row[13] or "[]"),
         "mode": "scan" if scan else "index",
     }
 
@@ -3723,10 +3963,12 @@ def _search_events(
         f"""
         SELECT videos.title, videos.source, events.job, events.timestamp,
                events.kind, {snippet_column}, events.text, events.occurrence_id,
-               occurrences.start, occurrences.end, occurrences.timestamp_kind
+               occurrences.start, occurrences.end, occurrences.timestamp_kind,
+               p.library_id, p.analysis_revision, p.original_segment_ids
         FROM events
         JOIN videos ON videos.job = events.job
         LEFT JOIN occurrences ON occurrences.occurrence_id = events.occurrence_id
+        LEFT JOIN occurrence_provenance p ON p.occurrence_id=events.occurrence_id
         WHERE {where}{extra_where}
         ORDER BY {order}
         LIMIT ?
@@ -3877,16 +4119,17 @@ def _build_embeddings(
     batch_size: int = EMBED_BATCH_SIZE, *, commit_batches: bool = True,
 ) -> tuple[int, int]:
     model_key = resolve_vector_key(connection, backend, model) or vector_namespace(backend, model)
-    have = {row[0] for row in connection.execute("SELECT text_hash FROM vectors WHERE model = ?", (model_key,))}
+    texts = _text_catalog(connection)
+    have = _verified_vector_hashes(connection, model_key, texts)
+    connection.execute("CREATE TABLE IF NOT EXISTS vector_texts (content_hash TEXT PRIMARY KEY, text TEXT NOT NULL)")
     dimensions = {row[0] for row in connection.execute("SELECT DISTINCT dim FROM vectors WHERE model = ?", (model_key,))}
     if len(dimensions) > 1:
         raise RuntimeError("既有 embedding 契約含有不一致的維度，請先修復或重建。")
     dim = next(iter(dimensions), None)
     pending: dict[str, str] = {}
-    for (text,) in connection.execute("SELECT text FROM events WHERE length(text) > 0"):
-        digest = text_hash(text)
+    for digest, text in texts.items():
         if digest not in have:
-            pending.setdefault(digest, text)
+            pending[digest] = text
     items = list(pending.items())
     done = 0
     for start in range(0, len(items), batch_size):
@@ -3899,6 +4142,7 @@ def _build_embeddings(
             "INSERT OR REPLACE INTO vectors VALUES (?, ?, ?, ?)",
             [(digest, model_key, dim, pack_vector(vector)) for (digest, _), vector in zip(batch, vectors)],
         )
+        connection.executemany("INSERT OR IGNORE INTO vector_texts VALUES (?, ?)", batch)
         if commit_batches:
             connection.commit()
         done += len(batch)
@@ -3914,16 +4158,9 @@ def plan_embeddings(root: Path, backend: str, model: str, *, rebuild: bool = Fal
         model_key = resolve_vector_key(connection, backend, model) or vector_namespace(
             backend, model
         )
-        texts = {
-            text_hash(row[0])
-            for row in connection.execute("SELECT text FROM events WHERE length(text) > 0")
-        }
-        have = {
-            row[0]
-            for row in connection.execute(
-                "SELECT text_hash FROM vectors WHERE model = ?", (model_key,)
-            )
-        }
+        catalog = _text_catalog(connection)
+        texts = set(catalog)
+        have = _verified_vector_hashes(connection, model_key, catalog)
         pending = texts if rebuild else texts - have
         return {
             "model": model_key,
@@ -3980,6 +4217,7 @@ def _vector_candidates(
     clauses, params = _event_filter_sql(filters, "occurrences", "videos")
     where = (" AND " + " AND ".join(clauses)) if clauses else ""
     validate_embedding_vectors([query_vector], 1)
+    connection.create_function("verified_content_hash", 1, checked_text_hash, deterministic=True)
     query_dim = len(query_vector)
     hash_heap: list[tuple[float, str]] = []
     for text_hash, dim, blob in connection.execute(
@@ -3990,7 +4228,10 @@ def _vector_candidates(
             SELECT DISTINCT occurrences.content_hash
             FROM occurrences
             JOIN videos ON videos.job = occurrences.job
-            WHERE 1 = 1{where}
+            WHERE occurrences.content_hash=verified_content_hash(occurrences.text)
+              AND NOT EXISTS (SELECT 1 FROM vector_texts t
+                              WHERE t.content_hash=occurrences.content_hash AND t.text<>occurrences.text)
+              {where}
         )
         """,
         [model_key, *params],
@@ -4021,14 +4262,16 @@ def _vector_candidates(
             f"""
             SELECT occurrences.occurrence_id, videos.title, videos.source, occurrences.job,
                    occurrences.start, occurrences.end, occurrences.kind, occurrences.text,
-                   occurrences.timestamp_kind, occurrences.content_hash
+                   occurrences.timestamp_kind, occurrences.content_hash,
+                   p.library_id, p.analysis_revision, p.original_segment_ids
             FROM occurrences
             JOIN videos ON videos.job = occurrences.job
+            LEFT JOIN occurrence_provenance p ON p.occurrence_id=occurrences.occurrence_id
             WHERE occurrences.content_hash IN ({placeholders}){where}
             """,
             [*batch, *params],
         ):
-            entry = (scores[row[9]], row[0], row[:9])
+            entry = (scores[row[9]], row[0], row)
             if len(heap) < limit:
                 heapq.heappush(heap, entry)
             elif heap and entry > heap[0]:
@@ -4045,7 +4288,10 @@ def _vector_candidates(
             "kind": row[6],
             "text": row[7],
             "timestamp_kind": row[8] or "point",
-            "timestamp": row[4] or 0,
+            "timestamp": row[4],
+            "library_id": row[10],
+            "analysis_revision": row[11],
+            "original_segment_ids": json.loads(row[12] or "[]"),
             "snippet": row[7][:120],
             "score": score,
             "mode": "semantic",
@@ -4315,6 +4561,9 @@ def _context_block(position: int, hit: dict[str, Any]) -> dict[str, Any]:
     start = hit.get("start")
     return {
         "job": hit["job"], "kind": hit["kind"],
+        "library_id": hit.get("library_id"),
+        "analysis_revision": hit.get("analysis_revision"),
+        "original_segment_ids": hit.get("original_segment_ids") or [],
         "occurrence_ids": [hit.get("occurrence_id")],
         "ranges": [(start, hit.get("end"))] if start is not None else [],
         "text": hit.get("text") or "", "title": hit.get("title") or "",
@@ -4326,6 +4575,7 @@ def _context_block(position: int, hit: dict[str, Any]) -> dict[str, Any]:
             "occurrence_id": hit.get("occurrence_id"),
             "text": hit.get("text") or "",
             "start": start, "end": hit.get("end"),
+            "original_segment_ids": hit.get("original_segment_ids") or [],
         }],
         "rank_detail": hit.get("rank_detail"),
         "best": position, "_members": [(position, hit)],
@@ -4340,12 +4590,12 @@ def pack_context(
 ) -> dict[str, Any]:
     """把命中片段裝進有界 context：同影片相鄰段合併（保留全部 occurrence_id 與
     ranges），跨影片問題可用 per_job_cap 保留多樣性；超預算的省略要說明原因。"""
-    groups: dict[tuple[str, str], list[tuple[int, dict[str, Any]]]] = {}
+    groups: dict[tuple[Any, ...], list[tuple[int, dict[str, Any]]]] = {}
     for position, hit in enumerate(hits):
-        groups.setdefault((hit["job"], hit["kind"]), []).append((position, hit))
+        groups.setdefault((hit.get("library_id"), hit["job"], hit.get("analysis_revision"), hit["kind"]), []).append((position, hit))
 
     candidates: list[dict[str, Any]] = []
-    for (job, kind), members in groups.items():
+    for (_, job, _, kind), members in groups.items():
         members.sort(key=lambda pair: (pair[1].get("start") or -1, pair[0]))
         current: dict[str, Any] | None = None
         for position, hit in members:
@@ -4363,10 +4613,13 @@ def pack_context(
                     **current,
                     "ranges": [*current["ranges"], (start, end)],
                     "text": f"{current['text']} … {hit['text']}",
+                    "original_segment_ids": list(dict.fromkeys([
+                        *current["original_segment_ids"], *(hit.get("original_segment_ids") or [])])),
                     "occurrences": [*current["occurrences"], {
                         "occurrence_id": hit.get("occurrence_id"),
                         "text": hit.get("text") or "",
                         "start": start, "end": end,
+                        "original_segment_ids": hit.get("original_segment_ids") or [],
                     }],
                     "_members": [*current["_members"], (position, hit)],
                 }
@@ -4548,12 +4801,15 @@ def _evidence_citation(block: dict[str, Any]) -> dict[str, Any]:
         "occurrence_id": (block["occurrence_ids"] or [None])[0],
         "occurrence_ids": block["occurrence_ids"],
         "job": block["job"],
+        "library_id": block.get("library_id"),
+        "analysis_revision": block.get("analysis_revision"),
+        "original_segment_ids": block.get("original_segment_ids") or [],
         "kind": block["kind"],
         "title": block["title"],
         "source": block["source"],
         "start": start,
         "end": max(ends) if ends else None,
-        "timestamp": start if start is not None else 0,
+        "timestamp": start,
         "timestamp_kind": block["timestamp_kind"],
         "link": source_link(block["source"], start),
         "rank_detail": block.get("rank_detail"),
@@ -4579,6 +4835,8 @@ def _quoted_evidence_citation(
         "occurrence_ids": [item["occurrence_id"] for item in originals],
         "text": " … ".join(item["text"] for item in originals),
         "ranges": [(item["start"], item["end"]) for item in originals if item["start"] is not None],
+        "original_segment_ids": list(dict.fromkeys(
+            segment for item in originals for segment in item.get("original_segment_ids", []))),
     }
     citation = _evidence_citation(selected)
     citation["ranges"] = selected["ranges"]
@@ -5569,7 +5827,16 @@ def fetch_facebook_author_apify(author: str, since: str) -> dict[str, Any]:
             estimated_micro_usd=max_charge_micro,
             provider_enforced_upper_bound_micro_usd=max_charge_micro,
         ) as guard_outcome:
-            payload = post_json(run_url, headers, json.dumps(actor_input).encode("utf-8"), timeout=70)
+            # Actor starts are not idempotent: a timeout/5xx may still have
+            # created a charged run. Send once and retain its risk for manual
+            # reconciliation instead of multiplying runs under one reservation.
+            try:
+                payload = request_json(run_url, headers, method="POST",
+                                       body=json.dumps(actor_input).encode("utf-8"), timeout=70, attempts=1)
+            except ApiRequestError as exc:
+                uncertain = exc.status_code is None or exc.status_code == 408 or exc.status_code >= 500
+                raise ApiRequestError(str(exc), status_code=exc.status_code, response_body=exc.response_body,
+                                      provider_outcome_unknown=uncertain) from exc
             run = payload.get("data") if isinstance(payload, dict) else None
             if not isinstance(run, dict) or not run.get("id"):
                 raise RuntimeError("Apify 啟動回應缺少 run ID。")
@@ -5990,6 +6257,14 @@ def fetch_instagram_author(
 ) -> dict[str, Any]:
     if not allow_paid:
         raise RuntimeError("Bright Data 可能計費；確認帳戶額度後加上 --allow-batch-cloud。")
+    if max_items is None:
+        raise ValueError(
+            "Instagram/Bright Data 付費盤點需要有限的結果預算：請用 --instagram-max-items "
+            "指定正整數（例如 20）；--allow-batch-cloud 只代表允許雲端花費，不代表花費上限。"
+            "--instagram-since 只是在本機依發佈時間篩選，不會限制供應商計費範圍。"
+        )
+    if isinstance(max_items, bool) or not isinstance(max_items, int) or max_items <= 0:
+        raise ValueError("--instagram-max-items 必須是正整數。")
     token = os.getenv("BRIGHTDATA_API_TOKEN", "").strip()
     if not token:
         raise RuntimeError("缺少 BRIGHTDATA_API_TOKEN；請在專案 .env 本機填入。")
@@ -5997,15 +6272,13 @@ def fetch_instagram_author(
         timeout_seconds = int(os.getenv("BRIGHTDATA_RUN_TIMEOUT_SECONDS", "1800"))
     except ValueError as exc:
         raise ValueError("BRIGHTDATA_RUN_TIMEOUT_SECONDS 必須是整數。") from exc
-    if timeout_seconds <= 0 or (max_items is not None and max_items <= 0):
-        raise ValueError("Bright Data timeout 與 --instagram-max-items 必須大於 0。")
+    if timeout_seconds <= 0:
+        raise ValueError("BRIGHTDATA_RUN_TIMEOUT_SECONDS 必須大於 0。")
 
     username = instagram_username(author)
     author_url = instagram_author_url(username)
     since_timestamp = parse_instagram_since(since)
-    discovery_input: dict[str, Any] = {"url": author_url}
-    if max_items is not None:
-        discovery_input["num_of_posts"] = max_items
+    discovery_input: dict[str, Any] = {"url": author_url, "num_of_posts": max_items}
     excluded = sorted({str(item).strip() for item in (exclude_ids or []) if str(item).strip()})
     if excluded:
         discovery_input["posts_to_not_include"] = excluded
@@ -6421,11 +6694,22 @@ def update_rss_subscription(
     tags: list[str] | None = None,
     latest_only: bool | None = None,
     enabled: bool | None = None,
+    instagram_max_items: int | None = None,
 ) -> dict[str, Any]:
     state = load_rss_state(root)
     subscription = next((item for item in state["subscriptions"] if item.get("id") == subscription_id), None)
     if subscription is None:
         raise RuntimeError(f"找不到 RSS 訂閱：{subscription_id}")
+    if instagram_max_items is not None:
+        if str(subscription.get("kind") or "rss") != "instagram-author":
+            raise ValueError("--instagram-max-items 只能用於 Instagram 作者訂閱。")
+        if (
+            isinstance(instagram_max_items, bool)
+            or not isinstance(instagram_max_items, int)
+            or instagram_max_items <= 0
+        ):
+            raise ValueError("--instagram-max-items 必須是正整數。")
+        subscription["instagram_max_items"] = instagram_max_items
     if name is not None:
         subscription["name"] = name.strip() or subscription.get("name") or subscription_id
     if keywords is not None:
@@ -6893,17 +7177,33 @@ def run_rss_command(args: argparse.Namespace) -> int:
         raise ValueError("--rss-add、--facebook-author 與 --instagram-author 一次只能使用一個。")
     if (args.facebook_since is not None or args.facebook_provider is not None or args.facebook_discover_only) and not args.facebook_author:
         raise ValueError("--facebook-since／--facebook-provider／--facebook-discover-only 必須搭配 --facebook-author。")
+    instagram_budget_update = (
+        args.rss_update
+        and args.instagram_max_items is not None
+        and args.instagram_since is None
+        and not args.instagram_discover_only
+    )
     if (
         args.instagram_since is not None
         or args.instagram_max_items is not None
         or args.instagram_discover_only
-    ) and not args.instagram_author:
+    ) and not args.instagram_author and not instagram_budget_update:
         raise ValueError("--instagram-since／--instagram-max-items／--instagram-discover-only 必須搭配 --instagram-author。")
-    if args.instagram_max_items is not None and args.instagram_max_items <= 0:
-        raise ValueError("--instagram-max-items 必須大於 0。")
-    edits = any(value is not None for value in (args.rss_name, args.rss_keywords, args.rss_tags, args.rss_latest_only))
+    if args.instagram_max_items is not None and (
+        isinstance(args.instagram_max_items, bool)
+        or not isinstance(args.instagram_max_items, int)
+        or args.instagram_max_items <= 0
+    ):
+        raise ValueError("--instagram-max-items 必須是正整數。")
+    if args.instagram_author and args.instagram_max_items is None:
+        raise ValueError(
+            "Instagram/Bright Data 付費盤點需要有限的結果預算：請用 --instagram-max-items "
+            "指定正整數（例如 20）；--allow-batch-cloud 只代表允許雲端花費，不代表花費上限。"
+            "--instagram-since 只是在本機依發佈時間篩選，不會限制供應商計費範圍。"
+        )
+    edits = any(value is not None for value in (args.rss_name, args.rss_keywords, args.rss_tags, args.rss_latest_only, args.instagram_max_items))
     if edits and not (args.rss_add or args.rss_update or args.facebook_author or args.instagram_author):
-        raise ValueError("名稱／關鍵字／標籤／latest-only 設定只可搭配新增或更新訂閱。")
+        raise ValueError("名稱／關鍵字／標籤／latest-only／Instagram 結果預算設定只可搭配新增或更新訂閱。")
     if args.rss_update and not edits:
         raise ValueError("--rss-update 至少要搭配一個要修改的設定。")
     if args.rss_list_items and not args.rss_list:
@@ -6979,6 +7279,11 @@ def run_rss_command(args: argparse.Namespace) -> int:
             )
     if args.instagram_author:
         since = args.instagram_since or "365d"
+        print(
+            "Instagram/Bright Data 本次供應商請求上限："
+            f"num_of_posts={args.instagram_max_items}；"
+            f"--instagram-since {since} 僅為本機時間篩選，不限制供應商計費範圍。"
+        )
         if args.instagram_discover_only:
             with rss_writer_lock(root):
                 username = instagram_username(args.instagram_author)
@@ -7029,6 +7334,7 @@ def run_rss_command(args: argparse.Namespace) -> int:
                 keywords=csv_values(args.rss_keywords) if args.rss_keywords is not None else None,
                 tags=csv_values(args.rss_tags) if args.rss_tags is not None else None,
                 latest_only=args.rss_latest_only,
+                instagram_max_items=args.instagram_max_items,
             )
         print(f"已更新 RSS：{subscription['name']}（ID {subscription['id']}）")
     for subscription_id, enabled in ((args.rss_enable, True), (args.rss_disable, False)):
@@ -7930,7 +8236,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     rss = parser.add_argument_group("RSS 訂閱")
     rss.add_argument("--rss-add", metavar="FEED_URL", help="加入 RSS/Atom Feed，並立即把新項目排入本機佇列")
     rss.add_argument("--rss-remove", metavar="ID", help="移除訂閱與佇列紀錄；不刪除既有 jobs")
-    rss.add_argument("--rss-update", metavar="ID", help="修改既有訂閱的名稱、關鍵字、標籤或 latest-only")
+    rss.add_argument("--rss-update", metavar="ID", help="修改既有訂閱的名稱、關鍵字、標籤、latest-only 或 Instagram 結果預算")
     rss.add_argument("--rss-enable", metavar="ID", help="啟用既有訂閱")
     rss.add_argument("--rss-disable", metavar="ID", help="暫停既有訂閱")
     rss.add_argument("--rss-requeue", metavar="ITEM_ID", help="將 failed/dead-letter 項目重排並清除嘗試次數")
@@ -7999,7 +8305,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--instagram-max-items",
         type=int,
         default=None,
-        help="手動限制本次發現的近期 Reels 數；預設不設上限",
+        help="本次發現的供應商結果預算（num_of_posts，正整數，必填）；--instagram-since 只是在本機依發佈時間篩選，不限制供應商計費範圍",
     )
     rss.add_argument(
         "--instagram-discover-only",
@@ -8249,6 +8555,24 @@ def run_batch(args: argparse.Namespace) -> Path:
     return output
 
 
+def bind_analysis_source(video_path: Path, previous: dict, *, reuse_cloud: bool,
+                         local_only: bool) -> str:
+    """Freeze source bytes; refuse unsafe cache reuse before any provider work."""
+    source_hash = file_sha256(video_path)
+    if reuse_cloud and not local_only and previous.get("source_sha256") != source_hash:
+        raise RuntimeError(
+            "STALE_SOURCE: cached analysis lacks this source byte revision; "
+            "use --refresh explicitly to regenerate analysis (normal cloud/cost controls still apply)."
+        )
+    return source_hash
+
+
+def assert_analysis_source(video_path: Path, expected_sha256: str) -> None:
+    """Never publish evidence as complete if source bytes drifted during analysis."""
+    if file_sha256(video_path) != expected_sha256:
+        raise RuntimeError("STALE_SOURCE: source bytes changed during analysis; rerun explicitly.")
+
+
 def run_pipeline(args: argparse.Namespace) -> Path:
     bind_cost_root(args.root.resolve())
     root = args.root.resolve()
@@ -8350,11 +8674,15 @@ def run_pipeline(args: argparse.Namespace) -> Path:
     for preserved in ("categories", "level"):
         if previous.get(preserved):
             manifest[preserved] = previous[preserved]
-    write_json(manifest_path, manifest)
-
+    # Preserve an existing completed manifest until its source byte binding
+    # passes. A refused retry must not erase the cache authority and thereby
+    # make the next retry silently regenerate paid evidence.
+    manifest_started = False
     try:
         captions_only: dict[str, Any] | None = None
         if args.no_video:
+            write_json(manifest_path, manifest)
+            manifest_started = True
             # 只抓字幕：不下載影片、不切音訊、不抽幀。標題與時長改由 info.json 提供。
             if not args.url:
                 raise ValueError("--no-video 只支援 --url。")
@@ -8386,6 +8714,14 @@ def run_pipeline(args: argparse.Namespace) -> Path:
         if not args.no_video:
             manifest["source"]["resolved_video"] = artifact_path(video_path, root)
             manifest["source"]["title"] = str(getattr(args, "rss_title", "") or source_title(job_dir, video_path))
+            # Persist the analyzed byte revision before producing evidence.
+            # A legacy/stale cache must not silently trigger replacement paid work.
+            manifest["source_sha256"] = bind_analysis_source(
+                video_path, previous, reuse_cloud=reuse_cloud,
+                local_only=args.dry_run or args.local_only,
+            )
+            write_json(manifest_path, manifest)
+            manifest_started = True
 
             probe = probe_video(video_path, job_dir / "source.probe.json")
             has_video = any(stream.get("codec_type") == "video" for stream in probe.get("streams", []))
@@ -8641,6 +8977,8 @@ def run_pipeline(args: argparse.Namespace) -> Path:
             },
         )
         manifest["artifacts"]["source"] = artifact_path(job_dir / "source.json", root)
+        if not args.no_video:
+            assert_analysis_source(video_path, manifest["source_sha256"])
         write_json(manifest_path, manifest)
         connection = index_connection(root)
         try:
@@ -8656,9 +8994,12 @@ def run_pipeline(args: argparse.Namespace) -> Path:
             pass
         return manifest_path
     except Exception as exc:
-        manifest["status"] = "failed"
-        manifest["error"] = str(exc)
-        write_json(manifest_path, manifest)
+        # A pre-binding refusal preserves the exact old manifest/artifacts on
+        # every retry. New jobs still retain diagnostic failure manifests.
+        if manifest_started or not manifest_path.exists():
+            manifest["status"] = "failed"
+            manifest["error"] = str(exc)
+            write_json(manifest_path, manifest)
         raise
 
 
@@ -8726,13 +9067,21 @@ def main() -> int:
     if getattr(args, "cost_report", None) is not None:
         from cost_tracker import get_cost_report
 
-        res = get_cost_report(args.root.resolve(), period_type=args.cost_report)
+        try:
+            res = get_cost_report(args.root.resolve(), period_type=args.cost_report)
+        except (RuntimeError, ValueError, OSError) as exc:
+            print(f"成本報告 ERROR: {exc}", file=sys.stderr)
+            return 1
         print(f"成本與用量報告：\n{json.dumps(res, ensure_ascii=False, indent=2)}")
         return 0
     if getattr(args, "budget_status", False):
         from cost_tracker import get_budget_status
 
-        res = get_budget_status(args.root.resolve())
+        try:
+            res = get_budget_status(args.root.resolve())
+        except (RuntimeError, ValueError, OSError) as exc:
+            print(f"預算狀態 ERROR: {exc}", file=sys.stderr)
+            return 1
         print(f"預算狀態：\n{json.dumps(res, ensure_ascii=False, indent=2)}")
         return 0
     if getattr(args, "provider_health", False):
@@ -8902,11 +9251,7 @@ def main() -> int:
                 for hit in hits:
                     label = hit["title"] or hit["job"]
                     score = f" {hit['score']:.3f}" if "score" in hit else ""
-                    stamp = (
-                        "—"
-                        if hit.get("timestamp_kind") == "source_level"
-                        else format_timestamp(hit["timestamp"])
-                    )
+                    stamp = format_hit_timestamp(hit)
                     print(f"-{score} [{stamp}] {label}（{hit['kind']}）{hit.get('occurrence_id') or ''}")
                     print(f"    {hit['snippet']}")
                     print(f"    {source_link(hit['source'], hit['timestamp'])}")
@@ -8957,11 +9302,7 @@ def main() -> int:
                     print("\n引用：")
                     for hit in result["citations"]:
                         label = hit["title"] or hit["job"]
-                        stamp = (
-                            "—"
-                            if hit.get("timestamp_kind") == "source_level"
-                            else format_timestamp(hit["timestamp"])
-                        )
+                        stamp = format_hit_timestamp(hit)
                         print(f"  [{hit['block_index']}] {label} {stamp}（{hit['kind']}）{hit.get('occurrence_id') or ''}")
                         print(f"      {hit.get('link') or source_link(hit['source'], hit['timestamp'])}")
                         # 附上原文：不點開影片就能判斷這個引用該不該信

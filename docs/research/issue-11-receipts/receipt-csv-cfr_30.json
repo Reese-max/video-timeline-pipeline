@@ -1,0 +1,69 @@
+{
+  "schema": "cut-receipt/1",
+  "specHash": "6a9e24fc70929016d30081026b5075f3a4296fff6cd42cfb1ef99b3a5acdcbf2",
+  "exportFormat": "csv",
+  "expectedContentHash": "e6284cc94ec4aae135b02662f7ee851d7a41d373e2fc111b2210cc87ba0d4602",
+  "observedContentHash": "e6284cc94ec4aae135b02662f7ee851d7a41d373e2fc111b2210cc87ba0d4602",
+  "toleranceSec": 0.05,
+  "nleImport": "NLE_IMPORT_UNVERIFIED",
+  "externalApiCalls": 0,
+  "localSubprocessCalls": 3,
+  "segments": [
+    {
+      "segmentId": "seg-0",
+      "intendedSourceRange": {
+        "startSec": 0.5,
+        "endSec": 1.5
+      },
+      "status": "ok",
+      "deltaImportSec": 0.0,
+      "deltaFFmpegSec": 0.0,
+      "importedSourceRange": {
+        "startSec": 0.5,
+        "endSec": 1.5
+      },
+      "ffprobe": {
+        "frames": 45,
+        "firstPtsSec": 0.0,
+        "lastPtsSec": 1.466667,
+        "medianFrameDurSec": 0.03333300000000006
+      },
+      "observedCoverageSec": {
+        "startSec": 0.0,
+        "endSec": 1.5
+      }
+    },
+    {
+      "segmentId": "seg-1",
+      "intendedSourceRange": {
+        "startSec": 2.0,
+        "endSec": 3.0
+      },
+      "status": "ok",
+      "deltaImportSec": 0.0,
+      "deltaFFmpegSec": 0.0,
+      "importedSourceRange": {
+        "startSec": 2.0,
+        "endSec": 3.0
+      },
+      "ffprobe": {
+        "frames": 90,
+        "firstPtsSec": 0.0,
+        "lastPtsSec": 2.966667,
+        "medianFrameDurSec": 0.03333300000000006
+      },
+      "observedCoverageSec": {
+        "startSec": 0.0,
+        "endSec": 3.0
+      }
+    }
+  ],
+  "mismatches": 0,
+  "stillNeedsHumanFix": false,
+  "status": "verified",
+  "parser": "cutspec-csv/1",
+  "specIssues": [],
+  "sourceFingerprint": "17568:1789664373865397428",
+  "adapterVersion": "cutspec-csv/1",
+  "receiptId": "1f717a5581efd4a8"
+}

@@ -223,12 +223,18 @@ BRIGHTDATA_RUN_TIMEOUT_SECONDS=1800
 python pipeline.py --instagram-author 'https://www.instagram.com/<USERNAME>/' --instagram-max-items 3 --instagram-discover-only --allow-batch-cloud
 ```
 
-確認後加入佇列。預設不設結果筆數上限；`--instagram-since 365d` 會在本機依供應商實際回傳的發佈時間保留近一年結果：
+確認後加入佇列。`--instagram-max-items` 是必填的供應商結果預算（`num_of_posts`，正整數），沒有它即使加了 `--allow-batch-cloud` 也會在送出前拒絕；`--instagram-since 365d` 只會在本機依供應商實際回傳的發佈時間保留近一年結果，不會限制供應商計費範圍：
 
 ```powershell
-python pipeline.py --instagram-author '<USERNAME>' --instagram-since 365d --rss-all-items --allow-batch-cloud
+python pipeline.py --instagram-author '<USERNAME>' --instagram-max-items 20 --instagram-since 365d --rss-all-items --allow-batch-cloud
 python pipeline.py --rss-refresh --allow-batch-cloud
 python pipeline.py --rss-process --rss-max-items 4 --allow-batch-cloud
+```
+
+舊訂閱若沒有結果預算（`instagram_max_items` 為空），刷新會直接失敗並保留原訂閱，不會送出計費請求；用以下命令補上有限預算即可繼續，不需刪除重建：
+
+```powershell
+python pipeline.py --rss-update '<SUBSCRIPTION_ID>' --instagram-max-items 20
 ```
 
 盤點快照保存在 Git 忽略且受 ACL 保護的 `rss\instagram-<雜湊>-latest.json`，包含原始 Bright Data 結果與 snapshot provenance。刷新時會把已見 Post ID 傳入 `posts_to_not_include`，本機佇列仍以穩定 ID 去重。Bright Data 的 Reel discovery 目前不支援伺服器端日期篩選；若某筆沒有 `date_posted`，工具會保留並在快照及盤點訊息標示「無法驗證回溯範圍」，不會假裝近一年盤點完整。私人／登入限定內容不處理，平台可見性與供應商回傳仍可能造成缺漏。請參考 [Instagram Scraper API](https://docs.brightdata.com/datasets/scrapers/instagram/introduction)、[Reel discovery](https://docs.brightdata.com/api-reference/scrapers/social-media-apis/instagram-reels-discover-by-url) 與 [非同步 snapshot 流程](https://docs.brightdata.com/api-reference/rest-api/scraper/asynchronous-requests)。
@@ -241,7 +247,7 @@ python pipeline.py --rss-process --rss-max-items 4 --allow-batch-cloud
 python pipeline.py --url 'https://www.instagram.com/reel/<SHORTCODE>/'
 ```
 
-此 CLI 作者盤點流程的 Bright Data 只負責內容發現；實際下載仍由 yt-dlp 完成，之後才是 Groq 時間戳轉錄與 MiniMax 摘要。免費額度與餘額續用行為依帳戶主控台為準，程式無法保證不扣款，因此所有 Bright Data 盤點都要求明確加上 `--allow-batch-cloud`。
+此 CLI 作者盤點流程的 Bright Data 只負責內容發現；實際下載仍由 yt-dlp 完成，之後才是 Groq 時間戳轉錄與 MiniMax 摘要。免費額度與餘額續用行為依帳戶主控台為準，程式無法保證不扣款，因此所有 Bright Data 盤點都要求明確加上 `--allow-batch-cloud`，且作者盤點另須以 `--instagram-max-items` 給出有限的供應商結果預算。
 
 ### MCP 公開 IG／Threads／Facebook 單篇貼文
 
@@ -448,6 +454,23 @@ MiniMax 官方目前標示 MiniMax-M3 為 1,000,000 token context、M2.x 為 204
 
 PaddleOCR 與 PySceneDetect 暫不列為必要依賴：`native` 模式提供本地 fallback；`steipete` 模式提供場景偵測與 Tesseract OCR。兩者都只把候選畫面交給後續 MiniMax 視覺階段。
 
+### CutSpec / NLE handoff（research spike，issue #11）
+
+`cutspec.py` 把有證據的片段變成可交給 Premiere/Resolve 等 NLE 的 rough-cut
+規格：版本化 `CutSpec`（deterministic `specHash`）、唯讀 preview、
+CSV + OTIO 匯出、`verify` 產生 `CutReceipt`（OTIO parser round-trip +
+ffprobe source-range coverage）。全程 0 外部 API call、不修改來源影音、
+source revision 漂移即 `STALE_SOURCE` 不自動重綁；匯出預設只留
+basename（`--full-paths` 才保留完整路徑）。設計與實測 receipt 見
+`docs/research/issue-11-paper-cut.md` 與 `docs/research/issue-11-receipts/`。
+
+```powershell
+python cutspec.py build --video source.mp4 --segments segs.json --out spec.json
+python cutspec.py preview --spec spec.json --video source.mp4
+python cutspec.py export --spec spec.json --format otio --out cut.otio
+python cutspec.py verify --spec spec.json --video source.mp4 --export-file cut.otio --format otio --receipt receipt.json
+```
+
 ## 本地搜尋索引（本專案的資料庫）
 
 跑過的影片會自動寫進專案根目錄的 `library.db`（SQLite FTS5，標準函式庫，無額外安裝，不需要任何服務或 port）。這一個檔就是整個知識庫，複製走即完整搬移。要重掃既有的 `jobs\`：
@@ -480,7 +503,7 @@ python pipeline.py --digest
 
 `--ask` 先讓模型把問句拆成檢索詞（整句丟進 FTS5 是 phrase 比對，長問句必定 0 筆），再讓模型選擇要呈現的完整來源片段。程式核對原文與引用編號後，以 `[1]`、`[2]` 對應到影片標題與時間戳；模型自行改寫的答案不會直接發布。
 
-每個片段都有穩定的 `occurrence_id`（由 job、類型、起點與內容雜湊決定），重建索引不會改變它——引用不會因 `--index` 重跑而指到別的片段。Ask 的模型回應須為 `{"claims":[{"support_kind":"source_quote","block_index":1,"quote":"完整原始片段文字"}]}`。原文須完整一致，不接受截去日期或否定詞的摘錄，也不接受跨越合併片段邊界的引文；非法編號、改寫、額外文字或模型提供的來源 URL 會使整份回答拒絕。無法核對時回傳 `insufficient_evidence=true`、空 `claims`，並保留檢索 evidence；合法的舊格式引用可保留供查閱，但舊格式主張不會發布。
+每個片段都有完整 SHA-256 的 `occurrence_id`，綁定 `library_id`、job、`analysis_revision`、類型、真實起訖（未知保持 NULL）、時間種類、文字雜湊、chunker 版本與有證據的原始 segment IDs。同一份來源及分析重建索引時 ID 不變；來源 URL／位元組版本、實際模型與分析參數、原始 timeline／summary 或明示 analysis revision 改變時，引用屬於新版本。`library-id.json` 是持久資料，搬移、備份與衍生資料庫重建時須保留；連同此檔複製的資料庫仍代表同一邏輯 library，獨立建立的 library 則有不同身分。搜尋與引用輸出保留上述來源欄位；沒有原始 segment ID 時輸出空陣列，不捏造。Ask 的模型回應須為 `{"claims":[{"support_kind":"source_quote","block_index":1,"quote":"完整原始片段文字"}]}`。原文須完整一致，不接受截去日期或否定詞的摘錄，也不接受跨越合併片段邊界的引文；非法編號、改寫、額外文字或模型提供的來源 URL 會使整份回答拒絕。無法核對時回傳 `insufficient_evidence=true`、空 `claims`，並保留檢索 evidence；合法的舊格式引用可保留供查閱，但舊格式主張不會發布。
 
 成功的 `claims` 由程式綁定原始 occurrence IDs，標記 `quote_verified=true`；`support_validation=exact_source_quote` 僅代表引文與已提供原文一致。逐字稿、視覺模型觀察與衍生摘要會分別標示來源類型。`semantic_support_verified` 一律仍是 `false`：尚未驗證片段是否回答問題、影片說法是否正確或舊價格是否適用於現在。跨片綜合、模型推論與當前外部事實仍拒絕生成；issue #5 的人工 golden evaluation 與完整語意支持驗證尚未完成。片段指令仍為不可信資料，核對失敗不會自動增加修復或驗證模型呼叫。
 
@@ -519,6 +542,8 @@ OpenRouter 有官方的 [embeddings](https://openrouter.ai/docs/api/reference/em
 本機後端首次使用要下載約 2.2 GB 模型。CPU 實測約 94 筆/秒；裝的若是 `torch+cpu` 就吃不到 GPU，要 GPU 得另外裝 CUDA 版。
 
 `--embed` 只補算「這個 embedding 契約還沒算過」的片段：重跑不重複付費，換契約才重算。契約是 `backend::model`（例如 `openrouter::nvidia/nemotron-3-embed-1b:free`）；舊版以裸模型名存的向量仍可沿用，會在無歧義時自動改名，不覆寫已存在的新契約向量，也不為換名字重算付費向量。所有後端均驗證筆數、維度與有限值；查詢與文件維度或快取內容不符時拒絕比較。`--embed-plan` 列出補算的「可重用／待計費」筆數；`--rebuild-embeddings` 會先列出全部重算量，所有批次成功才在同一交易替換該契約，失敗保留舊向量（雲端後端須加 `--allow-batch-cloud` 授權）。
+
+文字快取使用完整 SHA-256，與每段 occurrence 的 library／analysis revision 分開：不同影片相同原文仍共用一份向量。`--index` 僅用本機原始文字，把可唯一對應的舊 16-hex 快取鍵遷移到完整鍵，保存原向量位元組與實際文字，不呼叫模型；碰撞或找不到原文的舊列保留隔離，不當作可重用。`--embed-plan` 可先檢查待算數量，再依原本費用授權明確執行 `--embed`。快取原文不一致或雜湊契約錯誤會拒絕生成／重用，正常唯讀查詢不執行遷移；舊索引必須明確 `--index`。
 
 ### 為什麼不直接嵌入截圖
 
@@ -610,7 +635,7 @@ OPEN_NOTEBOOK_PASSWORD=不要提交到版本控制
 
 ## 成本守衛（#4）
 
-所有已啟用的對外傳輸都經過同一道守衛：送出前先在 `operations.db` 原子預留金額，送出後入帳並結清預留。CLI、背景排程、MCP 工具與內建重試都走同一條路徑，不存在只寫在文件、實際沒接上的開關。
+下列已啟用的傳輸入口經過同一道守衛：送出前先在 `operations.db` 原子預留金額，送出後入帳；結果不明時保留預留。CLI、背景排程與 MCP 綁定同一個成本帳本。部分 HTTP helper 的內建重試目前仍合併記在一次邏輯呼叫內，尚未逐次入帳；這些缺乏可驗證費用上限的操作在 strict 模式會拒絕送出。
 
 已接入的傳輸：
 
@@ -620,7 +645,7 @@ OPEN_NOTEBOOK_PASSWORD=不要提交到版本控制
 | MiniMax | `vision.analyze_images`、`summarize.*`、`query.keywords`、`query.answer`、`digest.report`、`library.classify` | 每次送出前，同一則 `finish_reason` 重試會各自入帳 |
 | OpenRouter | `embeddings`、`rerank` | 每個 embedding batch、query embedding 或 rerank 送出前（向量已存在時不送出、不預留） |
 | Meta Graph | `graph.query` | 每次分頁請求 |
-| Apify | `actor.run.start` | 一次 Actor 工作只預留一次，金額以供應商端 `APIFY_MAX_TOTAL_CHARGE_USD` 封頂；後續 poll／dataset 讀取屬同一筆遠端工作，不重複計完整 Actor 費用 |
+| Apify | `actor.run.start` | 只送出一次啟動 POST，不自動重試；金額以供應商端 `APIFY_MAX_TOTAL_CHARGE_USD` 封頂。timeout／5xx 保留未確認預留；後續 poll／dataset 讀取屬同一筆遠端工作，不重複計完整 Actor 費用 |
 | Bright Data | `datasets.trigger` | 寫入 `.submitted` 回執前；被拒絕時不會留下「送出狀態不明」的標記 |
 | Open Notebook | `sources.sync` | 建立 source 前 |
 | RSS 通知 Webhook | `notify` | 每次通知前 |
@@ -638,6 +663,10 @@ COST_TIMEZONE=Asia/Taipei
 * `BUDGET_HARD_STOP=true` **且** `DAILY_BUDGET_USD>0`：嚴格模式。`已花費 + 未結清預留 + 本次上限` 超過每日上限時，傳輸在開連線前就被拒絕（`Budget blocked:`），並記一筆 `blocked_budget`。
 * 嚴格模式下成本帳本不可寫（唯讀、損壞、磁碟滿）一律 fail-closed，不會因為記帳失敗就放行付費請求。
 * 超時、連線中斷或結果不明的 attempt 記為 `unknown` 且**不結清**預留，避免遠端仍在跑的工作看起來免費；之後要用 `provider_operation_id`（Apify run、Bright Data snapshot）對帳。
+* 預算檢查在 SQLite writer transaction 內讀取已花費與未結清預留，commit 後才送網路；併發 worker 不會使用同一份舊餘額重複批准。
+* 受守衛控制的 `request_json` 每次實際 HTTP attempt（包括重試）都有獨立預留與 usage row，以 `logical_operation_id`／`attempt_no` 連結；先前 timeout 的風險不會被後來成功的重試消除。同一筆 unknown usage 與其未結清預留只計一次風險。
+* 本機快取重用記為 `cache_hit`／`zero_local`，不建立新的預留、不送出供應商請求，也不抵扣先前成本。舊帳本只增加新欄位，不重估或改寫歷史金額；缺少舊 reservation link 的紀錄保留原有保守計算與人工對帳邊界。
+* `--budget-status` 顯示已結算、未結清預留與 projected 風險；`remaining_usd` 是扣除全部風險後可用的預算。整數微美元欄位保留精確值；正數但不足一微美元的上限不會變成無上限。quota／permission 業務碼在回應遮罩後分類，不當成暫時限流重試。
 * 沒有開嚴格模式時，守衛是諮詢性的：帳本寫不進去（唯讀、磁碟滿、被鎖住）只會印一行 `!` 警告並照常送出，但該 attempt 的預留會留在 `reserved`，不會因為沒記到帳就當成沒花錢。要「記不到就不准花」，請開 `BUDGET_HARD_STOP=true` 並設定 `DAILY_BUDGET_USD`。
 * 目前沒有自動釋出／對帳 `reserved` 預留的工具；unknown attempt 的遠端工作要人工用 `provider_operation_id` 對帳（規劃中的統一對帳屬 #7 範圍）。
 

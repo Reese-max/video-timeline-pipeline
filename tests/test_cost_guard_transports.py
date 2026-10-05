@@ -257,10 +257,10 @@ class GuardAccountingTests(unittest.TestCase):
                 pipeline.minimax_chat([{"role": "user", "content": "hi"}], "mm-key", "MiniMax-M3")
 
         usage = rows(self.root, "usage_costs")
-        self.assertEqual(len(usage), 1)
-        self.assertEqual(usage[0]["status"], "unknown")
+        self.assertEqual(len(usage), 4)
+        self.assertEqual([row["status"] for row in usage], ["unknown"] * 4)
         # An unproven attempt keeps its risk: the reservation must stay outstanding.
-        self.assertEqual(rows(self.root, "budget_reservations")[0]["status"], "reserved")
+        self.assertEqual([row["status"] for row in rows(self.root, "budget_reservations")], ["reserved"] * 4)
 
     def test_remote_operation_id_is_kept_for_reconciliation(self) -> None:
         snapshot = "s_abc123"
@@ -458,6 +458,64 @@ class GuardModeTests(unittest.TestCase):
         self.assertEqual(len(usage), 1)
         self.assertEqual(usage[0]["status"], "blocked_budget")
         self.assertEqual(int(usage[0]["estimated_micro_usd"]), 100_001)
+
+    def test_apify_start_never_retries_an_uncertain_billable_submission(self) -> None:
+        env = {"BUDGET_HARD_STOP": "true", "DAILY_BUDGET_USD": "1",
+               "APIFY_API_TOKEN": "apify-token", "APIFY_MAX_TOTAL_CHARGE_USD": "1"}
+        for failure in ("timeout", "http503", "missing_run_id"):
+            def reject(_request, **_kwargs):
+                if failure == "missing_run_id":
+                    return FakeResponse({"data": {"status": "RUNNING"}})
+                if failure == "timeout":
+                    raise TimeoutError("read timed out")
+                raise urllib.error.HTTPError("https://api.apify.com/v2/actors/x/runs", 503,
+                                             "Unavailable", {}, io.BytesIO(b'{"error":"unavailable"}'))
+            with self.subTest(failure=failure), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                with patch.dict(os.environ, env), cost_tracker.cost_root_scope(root), \
+                        patch.object(pipeline.time, "sleep", lambda *_: None), \
+                        patch.object(urllib.request, "urlopen", side_effect=reject) as transport:
+                    with self.assertRaises(RuntimeError):
+                        pipeline.fetch_facebook_author_apify("https://www.facebook.com/somepage", "365d")
+                self.assertEqual(transport.call_count, 1, "a retry could create another charged Actor run")
+                usage = rows(root, "usage_costs")
+                self.assertEqual(len(usage), 1)
+                self.assertEqual(usage[0]["status"], "unknown")
+                self.assertEqual(rows(root, "budget_reservations")[0]["status"], "reserved")
+
+    def test_apify_authoritative_auth_failure_still_settles_without_retry(self) -> None:
+        env = {"BUDGET_HARD_STOP": "true", "DAILY_BUDGET_USD": "1",
+               "APIFY_API_TOKEN": "apify-token", "APIFY_MAX_TOTAL_CHARGE_USD": "1"}
+        failure = urllib.error.HTTPError("https://api.apify.com/v2/actors/x/runs", 401,
+                                         "Unauthorized", {}, io.BytesIO(b'{"error":"invalid api key"}'))
+        with patch.dict(os.environ, env), cost_tracker.cost_root_scope(self.root), \
+                patch.object(urllib.request, "urlopen", side_effect=failure) as transport:
+            with self.assertRaises(RuntimeError):
+                pipeline.fetch_facebook_author_apify("https://www.facebook.com/somepage", "365d")
+        self.assertEqual(transport.call_count, 1)
+        usage = rows(self.root, "usage_costs")
+        self.assertEqual(usage[0]["status"], "failed")
+        self.assertEqual(usage[0]["safe_error"], "auth")
+        self.assertEqual(rows(self.root, "budget_reservations")[0]["status"], "settled")
+
+    def test_successful_apify_start_keeps_one_cap_and_remote_id_through_dataset_read(self) -> None:
+        env = {"BUDGET_HARD_STOP": "true", "DAILY_BUDGET_USD": "1",
+               "APIFY_API_TOKEN": "apify-token", "APIFY_MAX_TOTAL_CHARGE_USD": "1"}
+        responses = [FakeResponse({"data": {"id": "run-1", "status": "SUCCEEDED", "defaultDatasetId": "ds-1"}}),
+                     FakeResponse([])]
+        with patch.dict(os.environ, env), cost_tracker.cost_root_scope(self.root), \
+                patch.object(urllib.request, "urlopen", side_effect=responses) as transport:
+            result = pipeline.fetch_facebook_author_apify("https://www.facebook.com/somepage", "365d")
+        self.assertEqual(result["items"], [])
+        self.assertEqual([call.args[0].get_method() for call in transport.call_args_list], ["POST", "GET"])
+        usage = rows(self.root, "usage_costs")
+        self.assertEqual(len(usage), 1)
+        self.assertEqual(usage[0]["provider_request_id"], "run-1")
+        self.assertEqual(usage[0]["status"], "succeeded")
+        reservations = rows(self.root, "budget_reservations")
+        self.assertEqual(len(reservations), 1)
+        self.assertEqual(reservations[0]["max_micro_usd"], 1_000_000)
+        self.assertEqual(reservations[0]["status"], "settled")
 
     def test_strict_mode_refuses_operations_without_a_verified_bound(self) -> None:
         with patch.dict(os.environ, BLOCKED_ENV), cost_tracker.cost_root_scope(self.root):

@@ -18,6 +18,7 @@ batches/
 rss/
 canary/
 library.db
+library-id.json
 operations.db
 operations.db-*
 digest_preview_*.md

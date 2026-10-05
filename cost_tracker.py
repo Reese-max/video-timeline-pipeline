@@ -19,7 +19,9 @@ import sqlite3
 from decimal import Decimal, InvalidOperation
 import time
 import uuid
+import zoneinfo
 from contextlib import closing, contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterator, Literal
@@ -124,6 +126,7 @@ def _init_cost_schema(conn: sqlite3.Connection) -> None:
                 estimated_micro_usd INTEGER DEFAULT 0,
                 actual_micro_usd INTEGER,
                 cost_status TEXT NOT NULL,
+                reservation_id TEXT,
                 created_at TEXT NOT NULL
             );
 
@@ -143,21 +146,71 @@ def _init_cost_schema(conn: sqlite3.Connection) -> None:
 
             CREATE INDEX IF NOT EXISTS ix_costs_job ON usage_costs(job, provider);
             CREATE INDEX IF NOT EXISTS ix_costs_period ON usage_costs(created_at, provider);
-            CREATE INDEX IF NOT EXISTS ix_budget_period ON budget_reservations(period_id, status);
+            -- Outstanding reservations are selected by the configured period
+            -- window, so they are indexed by the same columns the filter uses.
+            -- period_id is kept as a stored audit label (reporting, dedup key)
+            -- but is no longer a predicate, so ix_budget_period is not created.
+            CREATE INDEX IF NOT EXISTS ix_budget_reserved_window
+                ON budget_reservations(account_scope, created_at, status);
             """
         )
+        # Older operations.db files predate the attempt/reservation link. Keep
+        # their rows intact; only new records receive an explicit link.
+        conn.execute("BEGIN IMMEDIATE")
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(usage_costs)")}
+        if "reservation_id" not in columns:
+            conn.execute("ALTER TABLE usage_costs ADD COLUMN reservation_id TEXT")
 
 
 def _utc_now_iso() -> str:
     return datetime.datetime.now(datetime.timezone.utc).isoformat()
 
 
-def _current_period_id(period_type: str = "daily") -> str:
-    tz_name = os.getenv("COST_TIMEZONE", "Asia/Taipei")
-    now = datetime.datetime.now(datetime.timezone.utc)
+def _cost_timezone() -> zoneinfo.ZoneInfo:
+    """Resolve COST_TIMEZONE to an IANA timezone; invalid values fail explicitly."""
+    tz_name = (os.getenv("COST_TIMEZONE", "Asia/Taipei") or "").strip()
+    try:
+        return zoneinfo.ZoneInfo(tz_name)
+    except (zoneinfo.ZoneInfoNotFoundError, ValueError) as exc:
+        # A missing system tz database and a misspelled key raise the same
+        # exception; name the remedy so an operator does not keep editing a
+        # valid setting on a host that simply has no IANA data installed.
+        raise ValueError(
+            f"Invalid COST_TIMEZONE {tz_name!r}: {exc}. "
+            "Use an IANA zone name (e.g. Asia/Taipei, UTC); if the name is "
+            "correct, install the IANA database (pip install tzdata)."
+        ) from exc
+
+
+def _current_period(period_type: str = "daily") -> tuple[str, str, str, str]:
+    """Return (period_id, window_start_utc_iso, window_end_utc_iso, tz_key).
+
+    The period is the current local day/month in the configured COST_TIMEZONE;
+    the bounds are the UTC instants of that local window so created_at filters
+    attribute spend to the configured accounting period, not the UTC date.
+    """
+    tz = _cost_timezone()
+    local_today = datetime.datetime.now(datetime.timezone.utc).astimezone(tz).date()
     if period_type == "monthly":
-        return now.strftime("%Y-%m")
-    return now.strftime("%Y-%m-%d")
+        start_date = local_today.replace(day=1)
+        if start_date.month == 12:
+            end_date = start_date.replace(year=start_date.year + 1, month=1)
+        else:
+            end_date = start_date.replace(month=start_date.month + 1)
+        period_id = start_date.strftime("%Y-%m")
+    else:
+        start_date = local_today
+        end_date = local_today + datetime.timedelta(days=1)
+        period_id = local_today.strftime("%Y-%m-%d")
+    start_utc = datetime.datetime.combine(start_date, datetime.time.min, tzinfo=tz).astimezone(datetime.timezone.utc)
+    end_utc = datetime.datetime.combine(end_date, datetime.time.min, tzinfo=tz).astimezone(datetime.timezone.utc)
+    # timespec="seconds" pins the bound format; stored created_at values compare
+    # correctly whether or not they carry a fractional-second component.
+    return period_id, start_utc.isoformat(timespec="seconds"), end_utc.isoformat(timespec="seconds"), tz.key
+
+
+def _current_period_id(period_type: str = "daily") -> str:
+    return _current_period(period_type)[0]
 
 
 def estimate_operation_cost_micro_usd(provider: str, model: str | None, prompt_tokens: int, completion_tokens: int) -> int:
@@ -196,6 +249,37 @@ def _daily_budget_usd() -> Decimal:
     return budget
 
 
+def _hard_stop_enabled() -> bool:
+    return os.getenv("BUDGET_HARD_STOP", "false").strip().lower() in ("true", "1", "yes")
+
+
+def _budget_balances(conn: sqlite3.Connection, start: str, end: str,
+                     account_scope: str | None = None) -> tuple[int, int]:
+    """Read settled spend and outstanding risk from one caller-owned snapshot."""
+    settled = conn.execute(
+        """
+        SELECT COALESCE(SUM(u.estimated_micro_usd), 0)
+        FROM usage_costs u
+        WHERE (? IS NULL OR u.account_scope = ?) AND u.created_at >= ? AND u.created_at < ?
+          AND u.status != 'blocked_budget'
+          AND NOT EXISTS (
+            SELECT 1 FROM budget_reservations b
+            WHERE b.reservation_id = u.reservation_id AND b.status = 'reserved'
+          )
+        """, (account_scope, account_scope, start, end),
+    ).fetchone()[0]
+    # Use the configured period's UTC window for both halves, including when
+    # COST_TIMEZONE has changed since the original reservation was created.
+    outstanding = conn.execute(
+        """
+        SELECT COALESCE(SUM(max_micro_usd), 0) FROM budget_reservations
+        WHERE (? IS NULL OR account_scope = ?) AND created_at >= ? AND created_at < ?
+          AND status = 'reserved'
+        """, (account_scope, account_scope, start, end),
+    ).fetchone()[0]
+    return int(settled), int(outstanding)
+
+
 def check_and_reserve_budget(
     root: Path,
     operation_name: str,
@@ -206,42 +290,29 @@ def check_and_reserve_budget(
 
     Returns: (allowed, reservation_id, reason)
     """
-    hard_stop = os.getenv("BUDGET_HARD_STOP", "false").lower() in ("true", "1", "yes")
+    hard_stop = _hard_stop_enabled()
     daily_budget_usd = _daily_budget_usd()
     daily_budget_micro = int(daily_budget_usd * 1_000_000)
+
+    # Resolve the accounting period first: an invalid COST_TIMEZONE must fail
+    # before get_operations_db creates/migrates operations.db.
+    period_id, period_start_utc, period_end_utc, tz_key = _current_period("daily")
 
     with closing(get_operations_db(root)) as conn:
         _init_cost_schema(conn)
 
-        period_id = _current_period_id("daily")
-
         with conn:
-            cur = conn.cursor()
-            # Sum settled actual/estimated costs for today
-            cur.execute(
-                """
-                SELECT COALESCE(SUM(estimated_micro_usd), 0)
-                FROM usage_costs
-                WHERE account_scope = ? AND created_at LIKE ? AND status != 'blocked_budget'
-                """,
-                (account_scope, f"{period_id}%"),
+            # SELECT does not begin SQLite's implicit write transaction. Take
+            # the writer lease before reading either balance so another worker
+            # cannot approve against the same pre-reservation balance.
+            conn.execute("BEGIN IMMEDIATE")
+            settled_micro, outstanding_micro = _budget_balances(
+                conn, period_start_utc, period_end_utc, account_scope,
             )
-            settled_micro = int(cur.fetchone()[0])
-
-            # Sum outstanding reservations
-            cur.execute(
-                """
-                SELECT COALESCE(SUM(max_micro_usd), 0)
-                FROM budget_reservations
-                WHERE account_scope = ? AND period_id = ? AND status = 'reserved'
-                """,
-                (account_scope, period_id),
-            )
-            outstanding_micro = int(cur.fetchone()[0])
 
             total_projected = settled_micro + outstanding_micro + estimated_micro_usd
 
-            if hard_stop and daily_budget_micro > 0 and total_projected > daily_budget_micro:
+            if hard_stop and daily_budget_usd > 0 and total_projected > daily_budget_micro:
                 reason = (
                     f"Budget blocked: projected ({total_projected / 1_000_000:.3f} USD) "
                     f"exceeds daily limit ({daily_budget_usd:.2f} USD)"
@@ -265,7 +336,7 @@ def check_and_reserve_budget(
                         library_id=None,
                         job=None,
                         analysis_revision=None,
-                        payload={"reason": reason, "period_id": period_id, "account_scope": account_scope},
+                        payload={"reason": reason, "period_id": period_id, "account_scope": account_scope, "accounting_timezone": tz_key},
                         dedup_key=f"budget_blocked_{period_id}_{account_scope}",
                     )
                 except Exception:
@@ -331,7 +402,7 @@ def guard_is_strict() -> bool:
     Outside strict mode the guard stays advisory, so the default local pipeline
     keeps working without a configured budget.
     """
-    if os.getenv("BUDGET_HARD_STOP", "false").strip().lower() not in ("true", "1", "yes"):
+    if not _hard_stop_enabled():
         return False
     try:
         return _daily_budget_usd() > 0
@@ -355,6 +426,101 @@ class GuardOutcome:
     provider_operation_id: str | None = None
 
 
+@dataclass
+class _ActiveAttempt:
+    root: Path
+    outcome: GuardOutcome
+    model: str | None
+    request_units: int
+    response_units: int
+    account_scope: str
+    job: str | None
+    library_id: str | None
+    logical_operation_id: str
+    started: float
+    attempt_no: int = 1
+    transport_used: bool = False
+    recorded: bool = False
+
+
+_ACTIVE_ATTEMPT: ContextVar[_ActiveAttempt | None] = ContextVar("provider_cost_attempt", default=None)
+
+
+def _finish_attempt(state: _ActiveAttempt, error: BaseException | None = None) -> None:
+    if state.recorded:
+        return
+    category = None
+    unresolved = False
+    if error is not None:
+        status_code = getattr(error, "status_code", getattr(error, "code", None))
+        category = classify_error(error, status_code if isinstance(status_code, int) else None,
+                                  getattr(error, "response_body", None))
+        # A failed trigger response does not prove that a remote job was never
+        # accepted. Keep the same risk as an uncertain POST timeout.
+        remote_trigger = (state.outcome.provider, state.outcome.operation) in {
+            ("apify", "actor.run.start"), ("brightdata", "datasets.trigger")
+        }
+        unresolved = (category in ("timeout", "network", "unknown")
+                      or getattr(error, "provider_outcome_unknown", False)
+                      or (remote_trigger and isinstance(status_code, int)
+                          and (status_code == 408 or status_code >= 500)))
+    _record_guard_attempt(
+        state.root, state.outcome, model=state.model,
+        status=("unknown" if unresolved else "failed") if error is not None else "succeeded",
+        safe_error=category, request_units=state.request_units, response_units=state.response_units,
+        latency_ms=(time.monotonic() - state.started) * 1000.0,
+        account_scope=state.account_scope, job=state.job, library_id=state.library_id,
+        settle_reservation=not unresolved, logical_operation_id=state.logical_operation_id,
+        attempt_no=state.attempt_no,
+    )
+    state.recorded = True
+
+
+@contextmanager
+def provider_transport_attempt() -> Iterator[None]:
+    """Own one actual request inside an existing provider guard.
+
+    Reuse its first reservation. Each retry gets a new reservation before I/O;
+    failures are recorded before the caller decides whether to retry. The last
+    successful attempt is recorded when the outer guard has captured remote IDs.
+    Unrelated HTTP helpers remain outside this provider-specific context.
+    """
+    state = _ACTIVE_ATTEMPT.get()
+    if state is None:
+        yield
+        return
+    if state.transport_used:
+        # A guard can enclose several requests (e.g. replace + upload). Finish
+        # the previous successful request before reserving the next one.
+        _finish_attempt(state)
+        try:
+            allowed, reservation_id, reason = check_and_reserve_budget(
+                state.root, f"{state.outcome.provider}/{state.outcome.operation}",
+                state.outcome.estimated_micro_usd, state.account_scope,
+            )
+        except Exception as exc:
+            if guard_is_strict():
+                raise BudgetBlockedError(
+                    f"Budget blocked: 重試預算帳本不可用（{type(exc).__name__}），strict 模式 fail-closed。",
+                    provider=state.outcome.provider, operation=state.outcome.operation,
+                ) from exc
+            print(f"! 成本預留失敗（{type(exc).__name__}），非嚴格模式重試未追蹤。")
+            allowed, reservation_id, reason = True, None, "advisory ledger unavailable"
+        if not allowed:
+            raise BudgetBlockedError(reason, provider=state.outcome.provider, operation=state.outcome.operation)
+        state.outcome.reservation_id = reservation_id
+        state.outcome.provider_operation_id = None
+        state.attempt_no += 1
+        state.started = time.monotonic()
+        state.recorded = False
+    state.transport_used = True
+    try:
+        yield
+    except BaseException as exc:
+        _finish_attempt(state, exc)
+        raise
+
+
 def _record_guard_attempt(
     root: Path,
     outcome: GuardOutcome,
@@ -369,6 +535,8 @@ def _record_guard_attempt(
     job: str | None,
     library_id: str | None,
     settle_reservation: bool,
+    logical_operation_id: str | None = None,
+    attempt_no: int = 1,
 ) -> None:
     try:
         record_usage(
@@ -388,6 +556,8 @@ def _record_guard_attempt(
             estimated_micro_usd=outcome.estimated_micro_usd,
             account_scope=account_scope,
             settle_reservation=settle_reservation,
+            logical_operation_id=logical_operation_id,
+            attempt_no=attempt_no,
         )
     except Exception as exc:  # telemetry must never break a paid attempt
         print(f"! 成本帳本寫入失敗（{outcome.provider}/{outcome.operation}）：{type(exc).__name__}")
@@ -482,48 +652,18 @@ def provider_cost_guard(
         enforced=True,
         estimated_micro_usd=bound,
     )
-    started = time.monotonic()
+    state = _ActiveAttempt(target, outcome, model, request_units, response_units, account_scope,
+                           job, library_id, str(uuid.uuid4()), time.monotonic())
+    token = _ACTIVE_ATTEMPT.set(state)
     try:
         yield outcome
     except BaseException as exc:
-        status_code = getattr(exc, "status_code", None)
-        category = classify_error(
-            exc,
-            status_code if isinstance(status_code, int) else None,
-            getattr(exc, "response_body", None),
-        )
-        # An unproven outcome (timeout, dropped connection, unknown) keeps its
-        # reserved risk: settling it would let an unreconciled remote job look free.
-        unresolved = category in ("timeout", "network", "unknown")
-        _record_guard_attempt(
-            target,
-            outcome,
-            model=model,
-            status="unknown" if unresolved else "failed",
-            safe_error=category,
-            request_units=request_units,
-            response_units=response_units,
-            latency_ms=(time.monotonic() - started) * 1000.0,
-            account_scope=account_scope,
-            job=job,
-            library_id=library_id,
-            settle_reservation=not unresolved,
-        )
+        _finish_attempt(state, exc)
         raise
-    _record_guard_attempt(
-        target,
-        outcome,
-        model=model,
-        status="succeeded",
-        safe_error=None,
-        request_units=request_units,
-        response_units=response_units,
-        latency_ms=(time.monotonic() - started) * 1000.0,
-        account_scope=account_scope,
-        job=job,
-        library_id=library_id,
-        settle_reservation=True,
-    )
+    else:
+        _finish_attempt(state)
+    finally:
+        _ACTIVE_ATTEMPT.reset(token)
 
 
 def record_usage(
@@ -546,6 +686,8 @@ def record_usage(
     estimated_micro_usd: int | None = None,
     account_scope: str = "default",
     settle_reservation: bool = True,
+    logical_operation_id: str | None = None,
+    attempt_no: int = 1,
 ) -> str:
     """Record a completed or failed operation attempt and settle reservation."""
     with closing(get_operations_db(root)) as conn:
@@ -576,8 +718,9 @@ def record_usage(
                     cost_id, library_id, job, analysis_revision, provider, model, operation,
                     request_units, response_units, started_at, finished_at, latency_ms,
                     cache_hit, status, safe_error, provider_request_id,
-                    estimated_micro_usd, actual_micro_usd, cost_status, account_scope, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    estimated_micro_usd, actual_micro_usd, cost_status, account_scope, created_at,
+                    reservation_id, logical_operation_id, attempt_no
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     cost_id,
@@ -601,6 +744,9 @@ def record_usage(
                     cost_status,
                     account_scope,
                     now_iso,
+                    reservation_id,
+                    logical_operation_id,
+                    attempt_no,
                 ),
             )
 
@@ -618,12 +764,26 @@ def record_usage(
         return cost_id
 
 
+def record_provider_cache_hit(provider: str, operation: str, *, model: str | None = None,
+                              job: str | None = None, root: Path | None = None) -> None:
+    """Record reuse without reserving funds, sending I/O, or undoing past spend."""
+    target = root if root is not None else get_cost_root()
+    if target is None:
+        return
+    try:
+        record_usage(target, provider=provider, operation=operation, model=model,
+                     job=job, cache_hit=True, status="cache_hit")
+    except Exception as exc:
+        # An unavailable ledger must not prevent a proven local cache read.
+        print(f"! 快取成本紀錄失敗（{type(exc).__name__}）：{provider}/{operation}")
+
+
 def get_cost_report(root: Path, period_type: str = "daily") -> dict[str, Any]:
     """Compile read-only financial and token usage report."""
+    period_id, period_start_utc, period_end_utc, tz_key = _current_period(period_type)
+
     with closing(get_operations_db(root)) as conn:
         _init_cost_schema(conn)
-
-        period_id = _current_period_id(period_type)
 
         cur = conn.cursor()
         cur.execute(
@@ -636,10 +796,10 @@ def get_cost_report(root: Path, period_type: str = "daily") -> dict[str, Any]:
                    SUM(estimated_micro_usd) as total_estimated_uUSD,
                    SUM(COALESCE(actual_micro_usd, 0)) as total_actual_uUSD
             FROM usage_costs
-            WHERE created_at LIKE ?
+            WHERE created_at >= ? AND created_at < ? AND status != 'blocked_budget'
             GROUP BY provider
             """,
-            (f"{period_id}%",),
+            (period_start_utc, period_end_utc),
         )
         rows = cur.fetchall()
 
@@ -663,49 +823,50 @@ def get_cost_report(root: Path, period_type: str = "daily") -> dict[str, Any]:
         return {
             "period": period_id,
             "period_type": period_type,
+            "accounting_timezone": tz_key,
             "grand_total_estimated_usd": round(grand_total_uUSD / 1_000_000.0, 4),
             "providers": provider_breakdown,
         }
 
 
 def get_budget_status(root: Path) -> dict[str, Any]:
-    """Return current budget usage vs limits."""
+    """Return the root ledger's settled spend, outstanding risk and availability."""
+    period_id, period_start_utc, period_end_utc, tz_key = _current_period("daily")
+    daily_budget = _daily_budget_usd()
+    daily_budget_usd = float(daily_budget)
+    daily_budget_micro = int(daily_budget * 1_000_000)
+    hard_stop = _hard_stop_enabled()
+
     with closing(get_operations_db(root)) as conn:
         _init_cost_schema(conn)
 
-        period_id = _current_period_id("daily")
-        daily_budget_usd = float(os.getenv("DAILY_BUDGET_USD", "0"))
-        hard_stop = os.getenv("BUDGET_HARD_STOP", "false").lower() in ("true", "1", "yes")
-
-        cur = conn.cursor()
-        cur.execute(
-            """
-            SELECT COALESCE(SUM(estimated_micro_usd), 0)
-            FROM usage_costs
-            WHERE created_at LIKE ? AND status != 'blocked_budget'
-            """,
-            (f"{period_id}%",),
-        )
-        spent_micro = int(cur.fetchone()[0])
-        spent_usd = round(spent_micro / 1_000_000.0, 4)
-
-        cur.execute(
-            """
-            SELECT COUNT(*)
-            FROM usage_costs
-            WHERE status = 'blocked_budget' AND created_at LIKE ?
-            """,
-            (f"{period_id}%",),
-        )
-        blocked_count = int(cur.fetchone()[0])
-
-        remaining_usd = max(0.0, round(daily_budget_usd - spent_usd, 4)) if daily_budget_usd > 0 else None
+        with conn:
+            # Both balance reads share one snapshot, including a concurrent
+            # worker's atomic usage insert + reservation settlement.
+            conn.execute("BEGIN")
+            spent_micro, outstanding_micro = _budget_balances(conn, period_start_utc, period_end_utc)
+            blocked_count = int(conn.execute(
+                """SELECT COUNT(*) FROM usage_costs
+                   WHERE status = 'blocked_budget' AND created_at >= ? AND created_at < ?""",
+                (period_start_utc, period_end_utc),
+            ).fetchone()[0])
+        projected_micro = spent_micro + outstanding_micro
+        available_micro = max(0, daily_budget_micro - projected_micro) if daily_budget > 0 else None
+        remaining_usd = available_micro / 1_000_000.0 if available_micro is not None else None
 
         return {
             "period": period_id,
+            "accounting_timezone": tz_key,
             "daily_budget_limit_usd": daily_budget_usd if daily_budget_usd > 0 else "unlimited",
-            "spent_usd": spent_usd,
+            "account_scope": "all_root_ledger_scopes",
+            "spent_usd": round(spent_micro / 1_000_000.0, 4),
+            "outstanding_usd": outstanding_micro / 1_000_000.0,
+            "projected_usd": projected_micro / 1_000_000.0,
             "remaining_usd": remaining_usd,
+            "spent_micro_usd": spent_micro,
+            "outstanding_micro_usd": outstanding_micro,
+            "projected_micro_usd": projected_micro,
+            "available_micro_usd": available_micro,
             "hard_stop_enabled": hard_stop,
             "blocked_operations_today": blocked_count,
         }
