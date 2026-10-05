@@ -15,6 +15,7 @@ import hashlib
 import heapq
 import http.cookiejar
 import importlib.util
+import importlib.metadata
 import io
 import json
 import math
@@ -3174,6 +3175,10 @@ def index_connection(root: Path) -> sqlite3.Connection:
             content_hash TEXT PRIMARY KEY,
             text TEXT NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS vector_contracts (
+            namespace TEXT PRIMARY KEY,
+            descriptor TEXT NOT NULL
+        );
         CREATE TABLE IF NOT EXISTS library_identity (
             singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
             library_id TEXT NOT NULL
@@ -3313,56 +3318,215 @@ def read_connection(root: Path) -> sqlite3.Connection:
     return connection
 
 
-def vector_namespace(backend: str, model: str) -> str:
-    """embedding 契約字串：provider/backend 與模型一起決定向量空間，不可混用。"""
-    return f"{backend}::{model}"
+def embedding_contract(backend: str, model: str) -> dict[str, Any]:
+    """Observe an already-loaded encoder; never load/download or infer a revision.
+
+    OpenRouter's current embedding response supplies no immutable revision. A
+    requested model name, analysis revision, or observed vector length cannot
+    substitute for that evidence. Local support is deliberately restricted to
+    a pinned Transformer plus configuration-only Pooling/Normalize modules.
+    """
+    unknown = {"status": "UNKNOWN", "descriptor": None, "reason": "unresolved_model_revision"}
+    if backend != "local":
+        return unknown
+    encoder = _LOCAL_EMBEDDERS.get(model)
+    if encoder is None:
+        return {**unknown, "reason": "local_model_not_loaded"}
+    try:
+        modules = list(encoder._modules.values())
+        if not modules or type(modules[0]).__module__ != "sentence_transformers.models.Transformer":
+            return {**unknown, "reason": "unsupported_local_modules"}
+        transformer = modules[0]
+        if getattr(transformer, "backend", None) != "torch":
+            return {**unknown, "reason": "unsupported_local_backend"}
+        auto_model = transformer.auto_model
+        active = [getattr(auto_model, name, None) for name in ("active_adapter", "active_adapters")]
+        if (getattr(auto_model, "peft_config", None) is not None
+                or getattr(auto_model, "_hf_peft_config_loaded", False)
+                or any(value for value in active if not callable(value))):
+            # A base commit does not identify separately weighted adapters.
+            return {**unknown, "reason": "unresolved_adapter_revision"}
+        revision = transformer.auto_model.config._commit_hash
+        tokenizer_revision = transformer.tokenizer.init_kwargs.get("_commit_hash")
+        if not isinstance(revision, str) or not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", revision):
+            return unknown
+        if tokenizer_revision != revision:
+            return {**unknown, "reason": "unresolved_tokenizer_revision"}
+        tokenizer = transformer.tokenizer
+        if (getattr(tokenizer, "is_fast", None) is not True
+                or tokenizer.truncation_side not in {"left", "right"}
+                or tokenizer.padding_side not in {"left", "right"}
+                or type(tokenizer.split_special_tokens) is not bool
+                or not isinstance(tokenizer.model_input_names, list)
+                or not tokenizer.model_input_names
+                or any(not isinstance(name, str) or not name for name in tokenizer.model_input_names)
+                or not isinstance(tokenizer.special_tokens_map, dict)):
+            return {**unknown, "reason": "unresolved_tokenizer_preprocessing"}
+        serialized = tokenizer.backend_tokenizer.to_str()
+        if not isinstance(serialized, str) or len(serialized.encode("utf-8")) > 32_000_000:
+            return {**unknown, "reason": "unresolved_tokenizer_preprocessing"}
+        tokenizer_state = json.loads(serialized)
+        if (not isinstance(tokenizer_state, dict)
+                or not isinstance(tokenizer_state.get("model"), dict)
+                or not isinstance(tokenizer_state["model"].get("type"), str)
+                or not isinstance(tokenizer_state.get("added_tokens"), list)):
+            return {**unknown, "reason": "unresolved_tokenizer_preprocessing"}
+        # Transformer.tokenize supplies padding=True, longest_first truncation
+        # and its explicit max_seq_length on every call. These two backend
+        # fields are transient call state; all vocabulary/normalizer/decoder/
+        # postprocessor/added-token state remains in the observed fingerprint.
+        tokenizer_state.pop("padding", None)
+        tokenizer_state.pop("truncation", None)
+        tokenizer_fingerprint = hashlib.sha256(json.dumps(
+            tokenizer_state, sort_keys=True, separators=(",", ":"),
+            ensure_ascii=False, allow_nan=False).encode("utf-8")).hexdigest()
+        configs = []
+        for index, module in enumerate(modules):
+            module_type = type(module).__module__
+            allowed = {"sentence_transformers.models.Pooling", "sentence_transformers.models.Normalize"}
+            if index and module_type not in allowed:
+                return {**unknown, "reason": "unsupported_local_modules"}
+            # Normalize's published SDK module is parameterless and has no
+            # get_config_dict; the runtime version + recipe binds its behavior.
+            config = {} if module_type == "sentence_transformers.models.Normalize" else module.get_config_dict()
+            if not isinstance(config, dict):
+                return {**unknown, "reason": "incomplete_local_metadata"}
+            configs.append({"type": module_type, "config": config})
+        if (type(encoder.max_seq_length) is not int or encoder.max_seq_length <= 0
+                or not isinstance(encoder.prompts, dict)
+                or any(not isinstance(k, str) or not isinstance(v, str) for k, v in encoder.prompts.items())
+                or (encoder.default_prompt_name is not None and encoder.default_prompt_name not in encoder.prompts)
+                or (encoder.truncate_dim is not None and (type(encoder.truncate_dim) is not int or encoder.truncate_dim <= 0))
+                or transformer.auto_model.dtype is None or encoder.device is None):
+            return {**unknown, "reason": "incomplete_local_preprocessing"}
+        descriptor = {
+            "schema": "embedding-contract/v1", "backend": backend,
+            "provider": "local://sentence-transformers", "model": model,
+            "resolved_revision": revision, "dimension": encoder.get_sentence_embedding_dimension(),
+            "preprocessing": {
+                "recipe": "sentence-transformers.encode/v1",
+                "transformer_backend": transformer.backend,
+                "tokenizer": {"state_sha256": tokenizer_fingerprint,
+                              "truncation_side": tokenizer.truncation_side,
+                              "padding_side": tokenizer.padding_side,
+                              "split_special_tokens": tokenizer.split_special_tokens,
+                              "model_input_names": tokenizer.model_input_names,
+                              "special_tokens_map": tokenizer.special_tokens_map},
+                "normalize_embeddings": False, "precision": "float32",
+                "max_seq_length": encoder.max_seq_length, "prompts": encoder.prompts,
+                "default_prompt_name": encoder.default_prompt_name,
+                "truncate_dim": encoder.truncate_dim, "modules": configs,
+                "model_dtype": str(transformer.auto_model.dtype), "device": str(encoder.device),
+                "runtime": {name: importlib.metadata.version(name)
+                            for name in ("sentence-transformers", "transformers", "tokenizers", "torch")},
+            },
+        }
+        contract = {"status": "KNOWN", "descriptor": descriptor, "reason": None}
+        _contract_json(contract, backend, model)
+        return contract
+    except (AttributeError, TypeError, ValueError, RuntimeError, importlib.metadata.PackageNotFoundError):
+        return {**unknown, "reason": "incomplete_local_metadata"}
+
+
+def _contract_json(contract: Any, backend: str, model: str) -> str:
+    """Closed, finite, bounded descriptor; KNOWN is metadata, not attestation."""
+    descriptor = contract.get("descriptor") if isinstance(contract, dict) else None
+    fields = {"schema", "backend", "provider", "model", "resolved_revision", "dimension", "preprocessing"}
+    if (not isinstance(contract, dict) or set(contract) != {"status", "descriptor", "reason"}
+            or contract.get("status") != "KNOWN" or contract.get("reason") is not None
+            or not isinstance(descriptor, dict) or set(descriptor) != fields
+            or descriptor.get("schema") != "embedding-contract/v1"
+            or descriptor.get("backend") != backend or descriptor.get("model") != model
+            or not isinstance(backend, str) or backend not in {"local", "openrouter"}
+            or not isinstance(model, str) or not model or len(model) > 512
+            or not isinstance(descriptor.get("provider"), str) or not descriptor["provider"]
+            or len(descriptor["provider"]) > 2048
+            or not isinstance(descriptor.get("resolved_revision"), str)
+            or not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", descriptor["resolved_revision"])
+            or type(descriptor.get("dimension")) is not int or not 1 <= descriptor["dimension"] <= 65536
+            or not isinstance(descriptor.get("preprocessing"), dict)
+            or not isinstance(descriptor["preprocessing"].get("recipe"), str)
+            or not descriptor["preprocessing"]["recipe"]):
+        raise RuntimeError("embedding contract UNKNOWN：缺少已解析 revision/dimension/preprocessing；拒絕重用或呼叫。")
+    def json_value(value: Any, depth: int = 0) -> bool:
+        if depth > 12:
+            return False
+        if value is None or type(value) in (bool, int):
+            return True
+        if type(value) is float:
+            return math.isfinite(value)
+        if isinstance(value, str):
+            return len(value) <= 8192
+        if isinstance(value, list):
+            return len(value) <= 4096 and all(json_value(item, depth + 1) for item in value)
+        if isinstance(value, dict):
+            return len(value) <= 4096 and all(isinstance(key, str) and len(key) <= 512 and json_value(item, depth + 1) for key, item in value.items())
+        return False
+    if not json_value(descriptor):
+        raise RuntimeError("embedding contract 含不合法或過深的 preprocessing metadata。")
+    try:
+        canonical = json.dumps(descriptor, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False)
+    except (TypeError, ValueError, RecursionError) as exc:
+        raise RuntimeError("embedding contract 含不合法 preprocessing metadata。") from exc
+    if len(canonical.encode("utf-8")) > 65536:
+        raise RuntimeError("embedding contract metadata 過大。")
+    return canonical
+
+
+def vector_namespace(backend: str, model: str, contract: dict[str, Any] | None = None) -> str:
+    canonical = _contract_json(contract if contract is not None else embedding_contract(backend, model), backend, model)
+    return "embed_v1:" + hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _check_vector_contract(connection: sqlite3.Connection, namespace: str, contract: dict[str, Any]) -> bool:
+    descriptor = contract.get("descriptor") or {}
+    canonical = _contract_json(contract, descriptor.get("backend"), descriptor.get("model"))
+    if namespace != vector_namespace(descriptor["backend"], descriptor["model"], contract):
+        raise RuntimeError("query/document embedding contract mismatch。")
+    table = connection.execute("SELECT 1 FROM sqlite_master WHERE name='vector_contracts' AND type='table'").fetchone()
+    row = connection.execute("SELECT descriptor FROM vector_contracts WHERE namespace=?", (namespace,)).fetchone() if table else None
+    if row and row[0] != canonical:
+        raise RuntimeError("快取 embedding contract metadata 不符；拒絕沿用。")
+    return row is not None
+
+
+def _register_vector_contract(connection: sqlite3.Connection, namespace: str, contract: dict[str, Any]) -> None:
+    if _check_vector_contract(connection, namespace, contract):
+        return
+    if connection.execute("SELECT 1 FROM vectors WHERE model=? LIMIT 1", (namespace,)).fetchone():
+        raise RuntimeError("已有向量但 embedding contract metadata UNKNOWN；保留原樣，拒絕補造。")
+    descriptor = contract["descriptor"]
+    connection.execute("INSERT INTO vector_contracts VALUES (?, ?)",
+                       (namespace, _contract_json(contract, descriptor["backend"], descriptor["model"])))
 
 
 def remap_legacy_vectors(connection: sqlite3.Connection) -> None:
-    """把舊版裸模型名的向量無歧義地改名為 `backend::model`。
+    """Legacy names prove neither immutable revision nor preprocessing: quarantine.
 
-    只有剛好是某個 backend 預設模型的裸名才能確定歸屬；其他裸名保留原樣，
-    但不會被任何後端重用，避免把不同向量空間混在一起。
+    Retain original rows/bytes. The separate text-hash migration still proves
+    local text identity, and can reuse only a namespace with a stored complete
+    matching contract; a current default model never certifies historical data.
     """
-    try:
-        models = {row[0] for row in connection.execute("SELECT DISTINCT model FROM vectors")}
-    except sqlite3.Error:
-        return
-    for legacy in models:
-        if "::" in legacy:
-            continue
-        backends = [name for name, default in DEFAULT_EMBED_MODEL.items() if default == legacy]
-        if len(backends) != 1:
-            continue
-        namespaced = vector_namespace(backends[0], legacy)
-        connection.execute(
-            "INSERT OR IGNORE INTO vectors (text_hash, model, dim, vector) "
-            "SELECT text_hash, ?, dim, vector FROM vectors WHERE model = ?",
-            (namespaced, legacy),
-        )
-        connection.execute("DELETE FROM vectors WHERE model = ?", (legacy,))
-        connection.commit()
+    return
 
 
-def resolve_vector_key(connection: sqlite3.Connection, backend: str, model: str) -> str | None:
-    """只沿用新契約鍵，或 backend 歸屬唯一可證明的舊預設模型鍵。"""
-    namespaced = vector_namespace(backend, model)
-    found = {
-        row[0]
-        for row in connection.execute(
-            "SELECT DISTINCT model FROM vectors WHERE model IN (?, ?)", (namespaced, model)
-        )
-    }
-    if namespaced in found:
-        return namespaced
-    if model in found:
-        legacy_backends = [
-            name for name, default_model in DEFAULT_EMBED_MODEL.items()
-            if default_model == model
-        ]
-        if legacy_backends == [backend]:
-            return model
-    return None
+def resolve_vector_key(connection: sqlite3.Connection, backend: str, model: str,
+                       contract: dict[str, Any] | None = None) -> str | None:
+    contract = contract if contract is not None else embedding_contract(backend, model)
+    if contract.get("status") != "KNOWN":
+        return None
+    namespaced = vector_namespace(backend, model, contract)
+    if not _check_vector_contract(connection, namespaced, contract):
+        return None
+    dimensions = {row[0] for row in connection.execute("SELECT DISTINCT dim FROM vectors WHERE model=?", (namespaced,))}
+    if dimensions and dimensions != {contract["descriptor"]["dimension"]}:
+        raise RuntimeError("cached embedding contract dimension mismatch。")
+    return namespaced if connection.execute("SELECT 1 FROM vectors WHERE model=? LIMIT 1", (namespaced,)).fetchone() else None
+
+
+def _quarantined_legacy_vectors(connection: sqlite3.Connection, backend: str, model: str) -> int:
+    return connection.execute("SELECT count(*) FROM vectors WHERE model IN (?, ?)",
+                              (model, f"{backend}::{model}")).fetchone()[0]
 
 
 def text_hash(text: str) -> str:
@@ -3422,7 +3586,7 @@ def _text_catalog(connection: sqlite3.Connection) -> dict[str, str]:
 
 
 def _verified_vector_hashes(connection: sqlite3.Connection, model_key: str,
-                            texts: dict[str, str]) -> set[str]:
+                            texts: dict[str, str], dim: int | None = None) -> set[str]:
     # Full hashes without a historical proof can be bound only to unambiguous
     # local originals. Generated vectors always keep the actual input text.
     tables = {row[0] for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")}
@@ -3430,7 +3594,14 @@ def _verified_vector_hashes(connection: sqlite3.Connection, model_key: str,
     if any(digest in proofs and proofs[digest] != text for digest, text in texts.items()):
         raise RuntimeError("content hash collision：快取原文與目前原文不同。")
     reusable: set[str] = set()
-    for (digest,) in connection.execute("SELECT text_hash FROM vectors WHERE model=?", (model_key,)):
+    for digest, stored_dim, blob in connection.execute("SELECT text_hash, dim, vector FROM vectors WHERE model=?", (model_key,)):
+        if dim is not None:
+            if stored_dim != dim:
+                raise RuntimeError("cached embedding contract dimension mismatch。")
+            try:
+                validate_embedding_vectors([unpack_vector(blob)], 1, dim)
+            except (TypeError, ValueError) as exc:
+                raise RuntimeError("快取向量格式損壞，拒絕沿用。") from exc
         if digest not in texts:
             continue
         if digest in proofs and proofs[digest] != texts[digest]:
@@ -4107,9 +4278,11 @@ def build_embeddings(
     root: Path, api_key: str, model: str, backend: str = "openrouter", batch_size: int = EMBED_BATCH_SIZE
 ) -> tuple[int, int]:
     """只補算這個 embedding 契約還沒算過的片段：重跑不重複付費，換契約才重算。"""
+    contract = embedding_contract(backend, model)
+    _contract_json(contract, backend, model)  # Fail before DDL, billing, or model loading.
     connection = index_connection(root)
     try:
-        return _build_embeddings(connection, api_key, model, backend, batch_size)
+        return _build_embeddings(connection, api_key, model, backend, batch_size, contract=contract)
     finally:
         connection.close()
 
@@ -4117,27 +4290,32 @@ def build_embeddings(
 def _build_embeddings(
     connection: sqlite3.Connection, api_key: str, model: str, backend: str,
     batch_size: int = EMBED_BATCH_SIZE, *, commit_batches: bool = True,
+    contract: dict[str, Any] | None = None,
+    allow_quarantined: bool = False,
 ) -> tuple[int, int]:
-    model_key = resolve_vector_key(connection, backend, model) or vector_namespace(backend, model)
+    contract = contract if contract is not None else embedding_contract(backend, model)
+    canonical = _contract_json(contract, backend, model)
+    model_key = vector_namespace(backend, model, contract)
     texts = _text_catalog(connection)
-    have = _verified_vector_hashes(connection, model_key, texts)
+    _register_vector_contract(connection, model_key, contract)
+    dim = contract["descriptor"]["dimension"]
+    have = _verified_vector_hashes(connection, model_key, texts, dim)
     connection.execute("CREATE TABLE IF NOT EXISTS vector_texts (content_hash TEXT PRIMARY KEY, text TEXT NOT NULL)")
-    dimensions = {row[0] for row in connection.execute("SELECT DISTINCT dim FROM vectors WHERE model = ?", (model_key,))}
-    if len(dimensions) > 1:
-        raise RuntimeError("既有 embedding 契約含有不一致的維度，請先修復或重建。")
-    dim = next(iter(dimensions), None)
     pending: dict[str, str] = {}
     for digest, text in texts.items():
         if digest not in have:
             pending[digest] = text
     items = list(pending.items())
+    if items and not allow_quarantined and _quarantined_legacy_vectors(connection, backend, model):
+        raise RuntimeError("legacy embedding contract UNKNOWN：保留舊向量；先檢查 --embed-plan，明確 --rebuild-embeddings 才能另建，勿靜默重算。")
     done = 0
     for start in range(0, len(items), batch_size):
         batch = items[start : start + batch_size]
         vectors = validate_embedding_vectors(
             embed_texts([text for _, text in batch], api_key, model, backend), len(batch), dim
         )
-        dim = len(vectors[0])
+        if _contract_json(embedding_contract(backend, model), backend, model) != canonical:
+            raise RuntimeError("embedding contract changed during generation；拒絕保存。")
         connection.executemany(
             "INSERT OR REPLACE INTO vectors VALUES (?, ?, ?, ?)",
             [(digest, model_key, dim, pack_vector(vector)) for (digest, _), vector in zip(batch, vectors)],
@@ -4148,6 +4326,8 @@ def _build_embeddings(
         done += len(batch)
         print(f"  已嵌入 {done}/{len(items)}")
     total = connection.execute("SELECT count(*) FROM vectors WHERE model = ?", (model_key,)).fetchone()[0]
+    if commit_batches:
+        connection.commit()
     return done, total
 
 
@@ -4155,19 +4335,30 @@ def plan_embeddings(root: Path, backend: str, model: str, *, rebuild: bool = Fal
     """embedding 重建／補算的事前計畫：可重用量與待計費量先亮出來再說。"""
     connection = read_connection(root)
     try:
-        model_key = resolve_vector_key(connection, backend, model) or vector_namespace(
-            backend, model
-        )
         catalog = _text_catalog(connection)
         texts = set(catalog)
-        have = _verified_vector_hashes(connection, model_key, catalog)
+        contract = embedding_contract(backend, model)
+        quarantined = _quarantined_legacy_vectors(connection, backend, model)
+        if contract.get("status") != "KNOWN":
+            return {"model": None, "contract": contract, "total_texts": len(texts),
+                    "reusable": 0, "pending": len(texts), "est_calls": None,
+                    "blocked_reason": "embedding_contract_unknown", "quarantined_vectors": quarantined}
+        model_key = vector_namespace(backend, model, contract)
+        registered = _check_vector_contract(connection, model_key, contract)
+        if not registered and connection.execute("SELECT 1 FROM vectors WHERE model=? LIMIT 1", (model_key,)).fetchone():
+            raise RuntimeError("embedding contract metadata UNKNOWN；拒絕沿用。")
+        have = _verified_vector_hashes(connection, model_key, catalog, contract["descriptor"]["dimension"]) if registered else set()
         pending = texts if rebuild else texts - have
+        blocked = bool(quarantined and pending and not rebuild)
         return {
             "model": model_key,
+            "contract": contract,
+            "blocked_reason": "legacy_embedding_contract_unknown" if blocked else None,
+            "quarantined_vectors": quarantined,
             "total_texts": len(texts),
             "reusable": 0 if rebuild else len(texts & have),
             "pending": len(pending),
-            "est_calls": math.ceil(len(pending) / EMBED_BATCH_SIZE) if pending else 0,
+            "est_calls": None if blocked else math.ceil(len(pending) / EMBED_BATCH_SIZE) if pending else 0,
         }
     finally:
         connection.close()
@@ -4176,16 +4367,17 @@ def plan_embeddings(root: Path, backend: str, model: str, *, rebuild: bool = Fal
 def rebuild_embeddings(root: Path, api_key: str, model: str, backend: str = "openrouter") -> dict[str, Any]:
     """所有批次成功才原子替換指定契約；失敗保留原向量。雲端在 CLI 層要求 opt-in。"""
     plan = plan_embeddings(root, backend, model, rebuild=True)
+    contract = plan["contract"]
+    _contract_json(contract, backend, model)
     connection = index_connection(root)
     try:
-        model_key = resolve_vector_key(connection, backend, model) or vector_namespace(
-            backend, model
-        )
+        model_key = vector_namespace(backend, model, contract)
+        _register_vector_contract(connection, model_key, contract)
         deleted = connection.execute(
             "DELETE FROM vectors WHERE model = ?", (model_key,)
         ).rowcount
         # ponytail: 重建期間持有一個 SQLite 寫入交易；有寫入競爭時再改獨立 staging DB。
-        added, total = _build_embeddings(connection, api_key, model, backend, commit_batches=False)
+        added, total = _build_embeddings(connection, api_key, model, backend, commit_batches=False, contract=contract, allow_quarantined=True)
         connection.commit()
     finally:
         connection.close()
@@ -4207,6 +4399,7 @@ def _vector_candidates(
     model_key: str,
     filters: SearchFilter,
     limit: int,
+    *, contract: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
     """eligible-set 內的向量候選：篩選先於計分，peak RAM 以候選數為界（有界 Top-K heap）。
 
@@ -4214,6 +4407,10 @@ def _vector_candidates(
     同一 hash 的向量 blob 只搬一次：先對符合篩選的不重複 hash 計分取 Top-K，
     再把勝出 hash 對回各自的 occurrence 列——同文多來源不必逐列搬向量。
     """
+    if contract is None or not _check_vector_contract(connection, model_key, contract):
+        raise RuntimeError("query/document embedding contract UNKNOWN；拒絕比較。")
+    contract_dim = contract["descriptor"]["dimension"]
+    validate_embedding_vectors([query_vector], 1, contract_dim)
     clauses, params = _event_filter_sql(filters, "occurrences", "videos")
     where = (" AND " + " AND ".join(clauses)) if clauses else ""
     validate_embedding_vectors([query_vector], 1)
@@ -4312,15 +4509,21 @@ def semantic_search(
 ) -> list[dict[str, Any]]:
     connection = read_connection(root)
     try:
-        model_key = resolve_vector_key(connection, backend, model)
+        contract = embedding_contract(backend, model)
+        canonical = _contract_json(contract, backend, model)
+        model_key = resolve_vector_key(connection, backend, model, contract)
         if not model_key:
             raise RuntimeError(f"索引裡沒有 {model} 的向量；先執行 `--embed`。")
+        query_vector = validate_embedding_vectors(embed_texts([query], api_key, model, backend), 1, contract["descriptor"]["dimension"])[0]
+        if _contract_json(embedding_contract(backend, model), backend, model) != canonical:
+            raise RuntimeError("query embedding contract changed；拒絕比較。")
         candidates = _vector_candidates(
             connection,
-            embed_texts([query], api_key, model, backend)[0],
+            query_vector,
             model_key,
             filters or SearchFilter(),
             max(limit * 4, 50),
+            contract=contract,
         )
     finally:
         connection.close()
@@ -4455,8 +4658,22 @@ def hybrid_search(
         fts_hits = _search_events(connection, query, candidate_k, filters)
         vector_hits: list[dict[str, Any]] = []
         degraded: str | None = None
-        model_key = resolve_vector_key(connection, embed_backend, embed_model) if embed_backend else None
-        if embed_backend and not model_key:
+        contract = embedding_contract(embed_backend, embed_model) if embed_backend else None
+        invalid_contract = False
+        try:
+            model_key = resolve_vector_key(connection, embed_backend, embed_model, contract) if contract and contract.get("status") == "KNOWN" else None
+        except RuntimeError:
+            if strict:
+                raise
+            model_key = None
+            invalid_contract = True
+        if embed_backend and contract.get("status") != "KNOWN":
+            if strict:
+                _contract_json(contract, embed_backend, embed_model)
+            degraded = "embedding_contract_unknown"
+        elif invalid_contract:
+            degraded = "embedding_contract_invalid"
+        elif embed_backend and not model_key:
             if strict:
                 raise RuntimeError(
                     f"索引裡沒有 {embed_model} 的向量；先執行 `--embed`（strict 模式不降級）。"
@@ -4469,9 +4686,12 @@ def hybrid_search(
             degraded = "no_api_key"
         elif embed_backend:
             try:
-                query_vector = embed_texts([query], embed_key, embed_model, embed_backend)[0]
+                canonical = _contract_json(contract, embed_backend, embed_model)
+                query_vector = validate_embedding_vectors(embed_texts([query], embed_key, embed_model, embed_backend), 1, contract["descriptor"]["dimension"])[0]
+                if _contract_json(embedding_contract(embed_backend, embed_model), embed_backend, embed_model) != canonical:
+                    raise RuntimeError("query embedding contract changed；拒絕比較。")
                 vector_hits = _vector_candidates(
-                    connection, query_vector, model_key, filters, candidate_k
+                    connection, query_vector, model_key, filters, candidate_k, contract=contract
                 )
             except budget_blocked_error():
                 # A refused paid request is a policy boundary, not a retrieval
@@ -5392,14 +5612,18 @@ def audit_library(root: Path) -> list[str]:
         distinct_texts = connection.execute(
             "SELECT count(DISTINCT content_hash) FROM occurrences"
         ).fetchone()[0]
-        vector_coverage = {
-            model: connection.execute(
-                "SELECT count(*) FROM vectors WHERE model = ? AND text_hash IN "
-                "(SELECT DISTINCT content_hash FROM occurrences)",
-                (model,),
-            ).fetchone()[0]
-            for model in vectors
-        }
+        vector_coverage: dict[str, int | None] = {}
+        contract_table = connection.execute("SELECT 1 FROM sqlite_master WHERE name='vector_contracts' AND type='table'").fetchone()
+        catalog = _text_catalog(connection)
+        for namespace in vectors:
+            row = connection.execute("SELECT descriptor FROM vector_contracts WHERE namespace=?", (namespace,)).fetchone() if contract_table else None
+            try:
+                stored = json.loads(row[0]) if row else None
+                contract = embedding_contract(stored["backend"], stored["model"]) if isinstance(stored, dict) else None
+                valid = contract and _check_vector_contract(connection, namespace, contract)
+                vector_coverage[namespace] = len(_verified_vector_hashes(connection, namespace, catalog, contract["descriptor"]["dimension"])) if valid else None
+            except (KeyError, TypeError, ValueError, RuntimeError):
+                vector_coverage[namespace] = None
         unknown_published = connection.execute(
             "SELECT count(*) FROM videos WHERE published_at IS NULL"
         ).fetchone()[0]
@@ -5435,6 +5659,10 @@ def audit_library(root: Path) -> list[str]:
     if vectors:
         for model, count in vectors.items():
             covered = vector_coverage[model]
+            if covered is None:
+                print(f"  向量：{count} 筆保留／隔離（{model}；embedding contract UNKNOWN 或不符）")
+                issues.append(f"{model} 的向量契約 UNKNOWN 或不符，不能宣稱語意檢索 ready；FTS 仍可用。")
+                continue
             print(f"  向量：{covered} / {distinct_texts} 種文字覆蓋（{model}，庫內共 {count} 筆）")
             if covered < distinct_texts:
                 issues.append(

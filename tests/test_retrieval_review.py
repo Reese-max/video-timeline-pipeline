@@ -11,10 +11,11 @@ from pathlib import Path
 from unittest import mock
 
 import pipeline
+from embedding_contract_fixture import FictionalContractsCase, fictional_embedding_contract, seed_contract
 from test_retrieval import fake_embed, fake_embed_batch, seed_library, seed_vectors, seed_video
 
 
-class ReviewRegressions(unittest.TestCase):
+class ReviewRegressions(FictionalContractsCase):
     def test_fts_snippet_uses_text_after_occurrence_column_added(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -35,6 +36,7 @@ class ReviewRegressions(unittest.TestCase):
             pipeline.build_index(root)
             key = pipeline.vector_namespace("openrouter", "review-model")
             with contextlib.closing(pipeline.index_connection(root)) as db:
+                self.assertEqual(seed_contract(db, "openrouter", "review-model"), key)
                 texts = [row[0] for row in db.execute("SELECT text FROM events")]
                 db.executemany("INSERT INTO vectors VALUES (?, ?, 2, ?)", [
                     (pipeline.text_hash(text), key, pipeline.pack_vector([1., 0.]))
@@ -123,6 +125,7 @@ class ReviewRegressions(unittest.TestCase):
             key = pipeline.vector_namespace("openrouter", "review-model")
             for vector in ([1.], [float("nan"), 0.]):
                 with contextlib.closing(pipeline.index_connection(root)) as db:
+                    self.assertEqual(seed_contract(db, "openrouter", "review-model"), key)
                     db.execute("INSERT OR REPLACE INTO vectors VALUES (?, ?, 2, ?)",
                                (pipeline.text_hash("topic"), key, pipeline.pack_vector(vector)))
                     db.commit()
@@ -138,14 +141,16 @@ class ReviewRegressions(unittest.TestCase):
             root = Path(temporary)
             with contextlib.closing(pipeline.index_connection(root)) as db:
                 db.execute("INSERT INTO videos (job) VALUES ('one')")
+                model_key = seed_contract(db, "openrouter", "memory-model")
                 text = "x" * 1000
                 digest = pipeline.text_hash(text)
                 db.executemany("INSERT INTO occurrences VALUES (?, 'one', ?, 'speech', ?, NULL, 'point', ?, ?, 'v1')",
                                ((f"occ_{i:05d}", i, i, text, digest) for i in range(6000)))
-                db.execute("INSERT INTO vectors VALUES (?, 'model', 2, ?)", (digest, pipeline.pack_vector([1., 0.])))
+                db.execute("INSERT INTO vectors VALUES (?, ?, 2, ?)", (digest, model_key, pipeline.pack_vector([1., 0.])))
                 tracemalloc.start()
                 try:
-                    hits = pipeline._vector_candidates(db, [1., 0.], "model", pipeline.SearchFilter(), 1)
+                    hits = pipeline._vector_candidates(db, [1., 0.], model_key, pipeline.SearchFilter(), 1,
+                                                       contract=fictional_embedding_contract("openrouter", "memory-model"))
                     peak = tracemalloc.get_traced_memory()[1]
                 finally:
                     tracemalloc.stop()
@@ -313,15 +318,15 @@ class ReviewRegressions(unittest.TestCase):
             seed_video(root, "one", timeline=same)
             seed_video(root, "two", timeline=same)  # 同文：兩個 occurrence 共用一個向量
             pipeline.build_index(root)
-            seed_vectors(root, pipeline.vector_namespace("openrouter", "m"))
+            seed_vectors(root, pipeline.vector_namespace("openrouter", "m"), model="m")
             with contextlib.redirect_stdout(io.StringIO()):
                 issues = pipeline.audit_library(root)
             self.assertFalse([i for i in issues if "向量" in i])
             # 一筆 stale 向量＋一種未嵌入的新文字：stale 不可掩蓋缺口
             with contextlib.closing(pipeline.index_connection(root)) as db:
                 db.execute(
-                    "INSERT INTO vectors VALUES ('stalehash', ?, 2, ?)",
-                    (pipeline.vector_namespace("openrouter", "m"), pipeline.pack_vector([1.0, 0.0])),
+                    "INSERT INTO vectors VALUES ('stalehash', ?, 1024, ?)",
+                    (pipeline.vector_namespace("openrouter", "m"), pipeline.pack_vector(fake_embed("stale text"))),
                 )
                 db.commit()
             seed_video(root, "three", timeline=[{"timestamp": 0.0, "type": "speech", "text": "全新的句子"}])
@@ -424,7 +429,8 @@ class ReviewRegressions(unittest.TestCase):
             seed_vectors(root, model_key)
             with contextlib.closing(pipeline.read_connection(root)) as db:
                 hits = pipeline._vector_candidates(
-                    db, fake_embed("同一段逐字稿"), model_key, pipeline.SearchFilter(), 10
+                    db, fake_embed("同一段逐字稿"), model_key, pipeline.SearchFilter(), 10,
+                    contract=fictional_embedding_contract("openrouter", "test-embed")
                 )
             speech_hits = [h for h in hits if h["text"] == "同一段逐字稿"]
             self.assertEqual(len(speech_hits), 2)

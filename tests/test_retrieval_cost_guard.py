@@ -8,6 +8,7 @@ from unittest import mock
 
 import cost_tracker
 import pipeline
+from embedding_contract_fixture import FictionalContractsCase
 from test_retrieval import seed_library, seed_vectors
 
 
@@ -15,7 +16,7 @@ STRICT = {"BUDGET_HARD_STOP": "true", "DAILY_BUDGET_USD": "1"}
 OPEN = {"BUDGET_HARD_STOP": "false", "DAILY_BUDGET_USD": "100"}
 
 
-class RetrievalCostGuardTests(unittest.TestCase):
+class RetrievalCostGuardTests(FictionalContractsCase):
     def test_rerank_guard_rejects_before_transport(self):
         with tempfile.TemporaryDirectory() as temporary, mock.patch.dict(os.environ, STRICT), cost_tracker.cost_root_scope(Path(temporary)):
             with mock.patch.object(pipeline, "post_json", return_value={"results": [{"index": 0}]}) as transport:

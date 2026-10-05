@@ -11,11 +11,15 @@ from pathlib import Path
 from unittest import mock
 
 import pipeline
+from embedding_contract_fixture import fictional_embedding_contract, seed_contract
 from test_retrieval import seed_video
 
 
 class EvidenceIdentityCacheTests(unittest.TestCase):
     def setUp(self):
+        contract = mock.patch.object(pipeline, "embedding_contract", side_effect=fictional_embedding_contract)
+        contract.start()
+        self.addCleanup(contract.stop)
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name) / "library"
@@ -133,6 +137,7 @@ class EvidenceIdentityCacheTests(unittest.TestCase):
         vector = pipeline.pack_vector([1., 0.])
         with contextlib.closing(sqlite3.connect(self.root / "library.db")) as db:
             db.execute("INSERT INTO vectors VALUES (?, ?, 2, ?)", (legacy, key, vector)); db.commit()
+            self.assertEqual(seed_contract(db, "local", "offline"), key); db.commit()
         with mock.patch.object(pipeline, "embed_texts") as embed:
             pipeline.build_index(self.root)
             self.assertEqual(pipeline.plan_embeddings(self.root, "local", "offline")["reusable"], 1)
@@ -158,6 +163,7 @@ class EvidenceIdentityCacheTests(unittest.TestCase):
         legacy = "0" * 16
         with contextlib.closing(sqlite3.connect(self.root / "library.db")) as db:
             db.execute("INSERT INTO vectors VALUES (?, ?, 2, ?)", (legacy, key, old_vector)); db.commit()
+            self.assertEqual(seed_contract(db, "local", "offline"), key); db.commit()
         with mock.patch.object(pipeline, "_legacy_text_hash", return_value=legacy), mock.patch.object(pipeline, "embed_texts") as embed:
             pipeline.build_index(self.root)
             self.assertEqual(pipeline.plan_embeddings(self.root, "local", "offline")["reusable"], 0)
@@ -196,6 +202,7 @@ class EvidenceIdentityCacheTests(unittest.TestCase):
         with contextlib.closing(sqlite3.connect(self.root / "library.db")) as db:
             db.executescript("CREATE TABLE events(job TEXT,timestamp REAL,kind TEXT,text TEXT);"
                              "CREATE TABLE vectors(text_hash TEXT,model TEXT,dim INTEGER,vector BLOB,PRIMARY KEY(text_hash,model));")
+            self.assertEqual(seed_contract(db, "local", "offline"), key)
             db.execute("INSERT INTO events VALUES ('same-job',9,'speech',?)", (text,))
             db.execute("INSERT INTO vectors VALUES (?,?,2,?)", (legacy,key,vector)); db.commit()
         with mock.patch.object(pipeline, "embed_texts") as embed:

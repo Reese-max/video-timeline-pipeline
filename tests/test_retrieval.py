@@ -16,6 +16,7 @@ from pathlib import Path
 from unittest import mock
 
 import pipeline
+from embedding_contract_fixture import FictionalContractsCase, seed_contract
 
 
 def fake_embed(text: str, dim: int = 1024) -> list[float]:
@@ -84,11 +85,12 @@ def seed_video(
     return job_dir
 
 
-def seed_vectors(root: Path, model_key: str) -> None:
+def seed_vectors(root: Path, model_key: str, *, model: str = "test-embed") -> None:
     """Embed every event text with the fake embedder, honouring the shared
     (text_hash, model) cache contract."""
     connection = pipeline.index_connection(root)
     try:
+        assert seed_contract(connection, "openrouter", model, dimension=1024) == model_key
         texts = [row[0] for row in connection.execute("SELECT text FROM events")]
         for text in set(texts):
             vector = fake_embed(text)
@@ -320,7 +322,7 @@ class FilterTests(unittest.TestCase):
             self.assertFalse((root / "library.db").exists())
 
 
-class HybridTests(unittest.TestCase):
+class HybridTests(FictionalContractsCase):
     def _hybrid(self, root: Path, query: str, **kwargs):
         with mock.patch.object(pipeline, "embed_texts", side_effect=fake_embed_batch):
             return pipeline.hybrid_search(
@@ -441,7 +443,7 @@ class HybridTests(unittest.TestCase):
             self.assertIn("error", broken["rerank"])
 
 
-class EmbeddingContractTests(unittest.TestCase):
+class EmbeddingContractTests(FictionalContractsCase):
     def test_openrouter_batch_validates_count_dim_and_finiteness(self) -> None:
         responses = [
             {"data": [{"index": 0, "embedding": [0.1, 0.2]}]},  # 數量不符
@@ -466,15 +468,14 @@ class EmbeddingContractTests(unittest.TestCase):
             vectors = pipeline.embed_texts_openrouter(["a", "b"], "key", "model")
         self.assertEqual(vectors, [[0.1, 0.2], [0.3, 0.4]])
 
-    def test_vector_namespace_and_legacy_remap(self) -> None:
-        self.assertEqual(
-            pipeline.vector_namespace("openrouter", "m"), "openrouter::m"
-        )
+    def test_vector_namespace_and_legacy_quarantine(self) -> None:
+        self.assertTrue(pipeline.vector_namespace("openrouter", "m").startswith("embed_v1:"))
+        self.assertNotEqual(pipeline.vector_namespace("openrouter", "m"), pipeline.vector_namespace("local", "m"))
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             connection = pipeline.index_connection(root)
             try:
-                # 舊表遺留的 bare model 向量：預設模型可無歧義映射沿用
+                # Bare default names do not prove revision/preprocessing.
                 connection.execute(
                     "INSERT INTO vectors VALUES ('h1', ?, 2, ?)",
                     (pipeline.DEFAULT_EMBED_MODEL["openrouter"], b"\x00" * 8),
@@ -490,20 +491,12 @@ class EmbeddingContractTests(unittest.TestCase):
                     for row in connection.execute("SELECT DISTINCT model FROM vectors")
                 }
                 default_model = pipeline.DEFAULT_EMBED_MODEL["openrouter"]
-                self.assertEqual(
-                    pipeline.resolve_vector_key(connection, "openrouter", default_model),
-                    pipeline.vector_namespace("openrouter", default_model),
-                )
+                self.assertIsNone(pipeline.resolve_vector_key(connection, "openrouter", default_model))
                 self.assertIsNone(pipeline.resolve_vector_key(connection, "openrouter", "mystery"))
                 self.assertIsNone(pipeline.resolve_vector_key(connection, "local", "mystery"))
             finally:
                 connection.close()
-            self.assertIn(
-                pipeline.vector_namespace(
-                    "openrouter", pipeline.DEFAULT_EMBED_MODEL["openrouter"]
-                ),
-                models,
-            )
+            self.assertIn(pipeline.DEFAULT_EMBED_MODEL["openrouter"], models)
             self.assertIn("mystery", models)  # 無法歸屬的保留原樣，不靜默改名
 
     def test_embed_plan_reports_reuse_and_pending(self) -> None:
@@ -596,7 +589,7 @@ class ContextPackingTests(unittest.TestCase):
         self.assertEqual(len(packed["blocks"]), 3)
 
 
-class GroundedAnswerTests(unittest.TestCase):
+class GroundedAnswerTests(FictionalContractsCase):
     def _ask(self, root: Path, answer: str, **kwargs):
         captured = {}
 
@@ -805,7 +798,7 @@ class CliOutputTests(unittest.TestCase):
         self.assertNotIn("[2] Gamma", rendered)
 
 
-class AuditTests(unittest.TestCase):
+class AuditTests(FictionalContractsCase):
     def test_audit_reports_occurrences_and_vector_contracts(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -815,7 +808,7 @@ class AuditTests(unittest.TestCase):
             self.assertIsInstance(issues, list)
 
 
-class EvalDatasetTests(unittest.TestCase):
+class EvalDatasetTests(FictionalContractsCase):
     def test_eval_dataset_replays_against_fixture(self) -> None:
         dataset_path = Path(__file__).resolve().parent.parent / "evals" / "ask_eval.json"
         cases = json.loads(dataset_path.read_text(encoding="utf-8"))["cases"]

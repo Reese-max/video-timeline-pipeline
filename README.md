@@ -541,7 +541,17 @@ OpenRouter 有官方的 [embeddings](https://openrouter.ai/docs/api/reference/em
 
 本機後端首次使用要下載約 2.2 GB 模型。CPU 實測約 94 筆/秒；裝的若是 `torch+cpu` 就吃不到 GPU，要 GPU 得另外裝 CUDA 版。
 
-`--embed` 只補算「這個 embedding 契約還沒算過」的片段：重跑不重複付費，換契約才重算。契約是 `backend::model`（例如 `openrouter::nvidia/nemotron-3-embed-1b:free`）；舊版以裸模型名存的向量仍可沿用，會在無歧義時自動改名，不覆寫已存在的新契約向量，也不為換名字重算付費向量。所有後端均驗證筆數、維度與有限值；查詢與文件維度或快取內容不符時拒絕比較。`--embed-plan` 列出補算的「可重用／待計費」筆數；`--rebuild-embeddings` 會先列出全部重算量，所有批次成功才在同一交易替換該契約，失敗保留舊向量（雲端後端須加 `--allow-batch-cloud` 授權）。
+向量快取現在使用完整 `embedding-contract/v1` descriptor 的 SHA-256 namespace，綁定 backend/provider、模型名、**已解析的模型 revision**、維度與 preprocessing recipe/config/runtime；descriptor 另存於衍生 `vector_contracts` 表。只有目前 encoder metadata 與已存 descriptor 完全相同，且原文 hash／向量維度／有限值通過驗證時才沿用。舊裸模型名、`backend::model`，或缺 descriptor 的向量保留原始 bytes、隔離不沿用；預設模型名與 analysis revision 都不能證明歷史 embedding revision。已有完整契約的 namespace 可在本機原文無歧義時遷移 16 位文字 hash，保留舊列且不重新呼叫 provider。
+
+目前 OpenRouter 回應未提供可驗證的 immutable revision，因此其持久快取／generation／semantic query 契約為 **UNKNOWN**；不為探測契約或修復快取送出呼叫。Local resolver 只觀察**已載入**的 pinned Transformer/tokenizer 同 revision、configuration-only Pooling/Normalize、實際維度與 encode config/runtime；缺任一 metadata、未載入或不支援的 module 都是 UNKNOWN，不自動下載／載入模型。這是有限的 metadata identity，並非 weights 的密碼學 attestation 或真實供應商驗收。UNKNOWN 時 `--embed-plan` 回報 reusable=0、est_calls=null 與 blocked_reason；寫入／重建／strict semantic 拒絕，hybrid 明示 `embedding_contract_unknown` 並使用 FTS。要恢復真實 semantic 使用，仍須取得完整且可信的 resolved encoder metadata，不能以 requested revision、觀察到的維度或設定宣告替代。
+
+完整且相符的契約下，`--embed` 只補算新文字，所有後端仍驗證筆數、維度與有限值；generation/query 期間契約漂移拒絕保存／比較。`--embed-plan` 列出可重用／待補算筆數；若同模型有未證明契約的 legacy 列且需要補算，回報 quarantined_vectors 與 `legacy_embedding_contract_unknown`，拒絕靜默重算。明確 `--rebuild-embeddings` 可為**已知的目前契約**另建向量，保留 unknown 舊列；所有批次成功才在同一交易替換該完整契約，失敗保留舊向量（雲端 opt-in 與成本防護仍保留，並不代表 UNKNOWN 契約可呼叫）。測試的 pinned descriptor 是明示 fictional offline mock encoder，不能授權真實 provider、權利或人工 golden acceptance；issue #5 的語意 claim support 與人工品質驗收仍未完成。
+
+Local contract 目前還要求實際 Transformer backend 為 `torch`，並記錄該 backend；缺 backend 或 ONNX/OpenVINO 都是 UNKNOWN。PEFT／active adapter／已載入 adapter flag 也拒絕：base model 的 commit 不能證明另加 adapter weights 的 revision，不能用同一 namespace 沿用其向量。
+
+已載入 fast tokenizer 還須提供實際序列化的 vocabulary／normalizer／pre-tokenizer／postprocessor／added-token 狀態、truncation/padding side 與 special-token mapping；其雜湊及有效設定納入 preprocessing 身分。缺少或不支援的 tokenizer metadata 是 UNKNOWN。僅排除 pinned Transformer 每次明確指定的 backend padding/truncation 暫態；不儲存詞彙表，也不讀取 request/auth options。
+
+Tokenizer 的實際 `split_special_tokens` boolean、`model_input_names` 與 `tokenizers` runtime version 也納入身分；special-token split flag 不在 backend JSON 中，不能以序列化雜湊代替它。缺少或型別不符的 flag／input-name metadata 同樣拒絕重用。
 
 文字快取使用完整 SHA-256，與每段 occurrence 的 library／analysis revision 分開：不同影片相同原文仍共用一份向量。`--index` 僅用本機原始文字，把可唯一對應的舊 16-hex 快取鍵遷移到完整鍵，保存原向量位元組與實際文字，不呼叫模型；碰撞或找不到原文的舊列保留隔離，不當作可重用。`--embed-plan` 可先檢查待算數量，再依原本費用授權明確執行 `--embed`。快取原文不一致或雜湊契約錯誤會拒絕生成／重用，正常唯讀查詢不執行遷移；舊索引必須明確 `--index`。
 
