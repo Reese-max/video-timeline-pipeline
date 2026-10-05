@@ -1580,10 +1580,12 @@ class ApiRequestError(RuntimeError):
     RuntimeError 完全相同，既有呼叫端與測試不受影響。
     """
 
-    def __init__(self, message: str, *, status_code: int | None = None, response_body: str = "") -> None:
+    def __init__(self, message: str, *, status_code: int | None = None, response_body: str = "",
+                 provider_outcome_unknown: bool = False) -> None:
         super().__init__(message)
         self.status_code = status_code
         self.response_body = response_body
+        self.provider_outcome_unknown = provider_outcome_unknown
 
 
 def request_json(
@@ -4357,7 +4359,16 @@ def fetch_facebook_author_apify(author: str, since: str) -> dict[str, Any]:
             estimated_micro_usd=max_charge_micro,
             provider_enforced_upper_bound_micro_usd=max_charge_micro,
         ) as guard_outcome:
-            payload = post_json(run_url, headers, json.dumps(actor_input).encode("utf-8"), timeout=70)
+            # Actor starts are not idempotent: a timeout/5xx may still have
+            # created a charged run. Send once and retain its risk for manual
+            # reconciliation instead of multiplying runs under one reservation.
+            try:
+                payload = request_json(run_url, headers, method="POST",
+                                       body=json.dumps(actor_input).encode("utf-8"), timeout=70, attempts=1)
+            except ApiRequestError as exc:
+                uncertain = exc.status_code is None or exc.status_code == 408 or exc.status_code >= 500
+                raise ApiRequestError(str(exc), status_code=exc.status_code, response_body=exc.response_body,
+                                      provider_outcome_unknown=uncertain) from exc
             run = payload.get("data") if isinstance(payload, dict) else None
             if not isinstance(run, dict) or not run.get("id"):
                 raise RuntimeError("Apify 啟動回應缺少 run ID。")

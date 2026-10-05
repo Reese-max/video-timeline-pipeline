@@ -545,7 +545,7 @@ def provider_cost_guard(
         )
         # An unproven outcome (timeout, dropped connection, unknown) keeps its
         # reserved risk: settling it would let an unreconciled remote job look free.
-        unresolved = category in ("timeout", "network", "unknown")
+        unresolved = category in ("timeout", "network", "unknown") or getattr(exc, "provider_outcome_unknown", False)
         _record_guard_attempt(
             target,
             outcome,

@@ -595,7 +595,7 @@ OPEN_NOTEBOOK_PASSWORD=不要提交到版本控制
 
 ## 成本守衛（#4）
 
-所有已啟用的對外傳輸都經過同一道守衛：送出前先在 `operations.db` 原子預留金額，送出後入帳並結清預留。CLI、背景排程、MCP 工具與內建重試都走同一條路徑，不存在只寫在文件、實際沒接上的開關。
+下列已啟用的傳輸入口經過同一道守衛：送出前先在 `operations.db` 原子預留金額，送出後入帳；結果不明時保留預留。CLI、背景排程與 MCP 綁定同一個成本帳本。部分 HTTP helper 的內建重試目前仍合併記在一次邏輯呼叫內，尚未逐次入帳；這些缺乏可驗證費用上限的操作在 strict 模式會拒絕送出。
 
 已接入的傳輸：
 
@@ -605,7 +605,7 @@ OPEN_NOTEBOOK_PASSWORD=不要提交到版本控制
 | MiniMax | `vision.analyze_images`、`summarize.*`、`query.keywords`、`query.answer`、`digest.report`、`library.classify` | 每次送出前，同一則 `finish_reason` 重試會各自入帳 |
 | OpenRouter | `embeddings` | 每個 batch 送出前（向量已存在時不送出、不預留） |
 | Meta Graph | `graph.query` | 每次分頁請求 |
-| Apify | `actor.run.start` | 一次 Actor 工作只預留一次，金額以供應商端 `APIFY_MAX_TOTAL_CHARGE_USD` 封頂；後續 poll／dataset 讀取屬同一筆遠端工作，不重複計完整 Actor 費用 |
+| Apify | `actor.run.start` | 只送出一次啟動 POST，不自動重試；金額以供應商端 `APIFY_MAX_TOTAL_CHARGE_USD` 封頂。timeout／5xx 保留未確認預留；後續 poll／dataset 讀取屬同一筆遠端工作，不重複計完整 Actor 費用 |
 | Bright Data | `datasets.trigger` | 寫入 `.submitted` 回執前；被拒絕時不會留下「送出狀態不明」的標記 |
 | Open Notebook | `sources.sync` | 建立 source 前 |
 | RSS 通知 Webhook | `notify` | 每次通知前 |
