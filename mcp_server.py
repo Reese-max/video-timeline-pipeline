@@ -412,11 +412,13 @@ def safe_media_path(job_id: str, relative_name: str) -> Path | None:
     return candidate if candidate.is_file() else None
 
 
-def read_manifest(job_dir: Path) -> dict | None:
+def read_manifest(job_dir: Path, *, strict: bool = False) -> dict | None:
     path = job_dir / "manifest.json"
     try:
         value = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
+        if strict:
+            raise
         return None
     return value if isinstance(value, dict) and value.get("status") == "ready" else None
 
@@ -1250,14 +1252,13 @@ def operation_tool_result(payload: dict) -> types.CallToolResult:
 def refreshed_operation(operation_id: str) -> dict:
     payload = get_queue().get(operation_id)
     if payload.get("status") == "completed" and payload.get("result_kind") == "prepared":
-        try:
-            job_dir = prepared_job_dir(payload["result"]["job_id"])
-            manifest = read_manifest(job_dir)
-            if not manifest or prepared_media_path(job_dir, manifest) is None:
-                raise ValueError("missing manifest or retained media")
-            payload["result"] = tool_payload(manifest)
-        except (RuntimeError, ValueError, OSError):
-            payload = {**payload, "status": "expired", "error_code": "MEDIA_EXPIRED", "error": "影片已過保留期限，請重新準備。", "result": None}
+        job_dir = prepared_job_dir(payload["result"]["job_id"])
+        manifest = read_manifest(job_dir, strict=True)
+        if not manifest:
+            raise ValueError("missing or invalid manifest")
+        if prepared_media_path(job_dir, manifest) is None:
+            return {**payload, "status": "expired", "error_code": "MEDIA_EXPIRED", "error": "影片已過保留期限，請重新準備。", "result": None}
+        payload["result"] = tool_payload(manifest)
     return payload
 
 

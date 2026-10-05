@@ -129,6 +129,35 @@ async function test(name, run) { await run(); count++; console.log('ok ' + count
   await test('media retention expiry requires new preparation', async () => {
     const h = harness({ snapshot: { prepared: job('first'), analysis: null, latest_operation: { ...pending(), status: 'expired', error_code: 'MEDIA_EXPIRED', error: 'fixture retention expiry' } } }); await h.flush(); assert.equal(h.elements.get('resume').hidden, true); assert.match(h.elements.get('status').textContent, /保留期限/); assert.equal(h.calls.length, 1);
   });
+  for (const reprepare of [false, true]) await test('expiry clears existing evidence and Drive before same-job reprepare=' + reprepare, async () => {
+    let expired = false;
+    const h = harness({ respond(name) {
+      if (name === 'get_prepared_video') return expired
+        ? { status: 'expired', error_code: 'MEDIA_EXPIRED', job_id: 'first', prepared: null, analysis: null, active_operation: reprepare ? pending('re-after-expiry', 'prepare') : null }
+        : { prepared: job('first'), analysis: analysis('first'), drive: drive('first'), active_operation: null, latest_operation: null };
+      if (name === 'get_video_job') return completed(job('first'), 'prepared', 're-after-expiry');
+      throw new Error('Unexpected ' + name);
+    } });
+    await h.flush();
+    assert.equal(h.elements.get('findings').hidden, false);
+    assert.equal(h.elements.get('drive-handoff').hidden, false);
+    expired = true;
+    await h.click('refresh');
+    assert.equal(h.elements.get('findings').hidden, true);
+    assert.equal(h.elements.get('evidence').children.length, 0);
+    assert.equal(h.elements.get('drive-handoff').hidden, true);
+    assert.equal(h.elements.get('drive-prompt').value, '');
+    assert.equal(h.elements.get('ask').disabled, true);
+    assert.equal(h.elements.get('player').getAttribute('src'), null);
+    assert.equal(h.openai.widgetState.privateContent.jobId, 'first');
+    if (reprepare) {
+      await h.poll();
+      assert.equal(h.elements.get('findings').hidden, true);
+      assert.equal(h.elements.get('ask').disabled, true);
+      assert.equal(h.elements.get('analyze').disabled, false);
+    }
+    assert.equal(h.prompts.length, 0);
+  });
   await test('expired snapshot is not an unknown restore failure', async () => {
     const h = harness({ snapshot: { status: 'expired', error_code: 'MEDIA_EXPIRED', error: '影片已過保留期限，請重新準備。', job_id: 'first', prepared: null, analysis: null, active_operation: null, latest_operation: null } });
     await h.flush();

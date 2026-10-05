@@ -194,6 +194,41 @@ class IntegrationTests(unittest.TestCase):
             self.assertIsNone(refreshed['result'])
         queue.close()
 
+    def test_completed_prepare_refresh_propagates_manifest_read_errors(self):
+        queue = JobQueue(self.root / 'queue',autostart=False)
+        with patch.object(server,'get_queue',return_value=queue):
+            operation = queue.submit('prepare',{'url':'https://example.test/video'},self.job_id)
+            with queue.connect() as db:
+                db.execute("UPDATE jobs SET status='completed',result=? WHERE id=?",
+                           (json.dumps(server.tool_payload(self.manifest)),operation['operation_id']))
+            original_read_text = Path.read_text
+            def deny_manifest_read(path, *args, **kwargs):
+                if path == self.job / 'manifest.json':
+                    raise PermissionError('fixture permission denied')
+                return original_read_text(path, *args, **kwargs)
+            with patch.object(Path,'read_text',autospec=True,side_effect=deny_manifest_read):
+                with self.assertRaises(PermissionError):
+                    server.refreshed_operation(operation['operation_id'])
+            (self.job / 'manifest.json').unlink()
+            with self.assertRaises(FileNotFoundError):
+                server.refreshed_operation(operation['operation_id'])
+            (self.job / 'manifest.json').write_text('{',encoding='utf-8')
+            with self.assertRaises(json.JSONDecodeError):
+                server.refreshed_operation(operation['operation_id'])
+        queue.close()
+
+    def test_completed_prepare_refresh_propagates_media_permission_errors(self):
+        queue = JobQueue(self.root / 'queue',autostart=False)
+        with patch.object(server,'get_queue',return_value=queue):
+            operation = queue.submit('prepare',{'url':'https://example.test/video'},self.job_id)
+            with queue.connect() as db:
+                db.execute("UPDATE jobs SET status='completed',result=? WHERE id=?",
+                           (json.dumps(server.tool_payload(self.manifest)),operation['operation_id']))
+            with patch.object(server,'prepared_media_path',side_effect=PermissionError('fixture permission denied')):
+                with self.assertRaises(PermissionError):
+                    server.refreshed_operation(operation['operation_id'])
+        queue.close()
+
     def test_background_tools_queue_once_and_restore_active_operation(self):
         queue = JobQueue(self.root / 'queue',autostart=False)
         with patch.object(server,'get_queue',return_value=queue):
