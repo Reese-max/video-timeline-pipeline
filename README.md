@@ -223,12 +223,18 @@ BRIGHTDATA_RUN_TIMEOUT_SECONDS=1800
 python pipeline.py --instagram-author 'https://www.instagram.com/<USERNAME>/' --instagram-max-items 3 --instagram-discover-only --allow-batch-cloud
 ```
 
-確認後加入佇列。預設不設結果筆數上限；`--instagram-since 365d` 會在本機依供應商實際回傳的發佈時間保留近一年結果：
+確認後加入佇列。`--instagram-max-items` 是必填的供應商結果預算（`num_of_posts`，正整數），沒有它即使加了 `--allow-batch-cloud` 也會在送出前拒絕；`--instagram-since 365d` 只會在本機依供應商實際回傳的發佈時間保留近一年結果，不會限制供應商計費範圍：
 
 ```powershell
-python pipeline.py --instagram-author '<USERNAME>' --instagram-since 365d --rss-all-items --allow-batch-cloud
+python pipeline.py --instagram-author '<USERNAME>' --instagram-max-items 20 --instagram-since 365d --rss-all-items --allow-batch-cloud
 python pipeline.py --rss-refresh --allow-batch-cloud
 python pipeline.py --rss-process --rss-max-items 4 --allow-batch-cloud
+```
+
+舊訂閱若沒有結果預算（`instagram_max_items` 為空），刷新會直接失敗並保留原訂閱，不會送出計費請求；用以下命令補上有限預算即可繼續，不需刪除重建：
+
+```powershell
+python pipeline.py --rss-update '<SUBSCRIPTION_ID>' --instagram-max-items 20
 ```
 
 盤點快照保存在 Git 忽略且受 ACL 保護的 `rss\instagram-<雜湊>-latest.json`，包含原始 Bright Data 結果與 snapshot provenance。刷新時會把已見 Post ID 傳入 `posts_to_not_include`，本機佇列仍以穩定 ID 去重。Bright Data 的 Reel discovery 目前不支援伺服器端日期篩選；若某筆沒有 `date_posted`，工具會保留並在快照及盤點訊息標示「無法驗證回溯範圍」，不會假裝近一年盤點完整。私人／登入限定內容不處理，平台可見性與供應商回傳仍可能造成缺漏。請參考 [Instagram Scraper API](https://docs.brightdata.com/datasets/scrapers/instagram/introduction)、[Reel discovery](https://docs.brightdata.com/api-reference/scrapers/social-media-apis/instagram-reels-discover-by-url) 與 [非同步 snapshot 流程](https://docs.brightdata.com/api-reference/rest-api/scraper/asynchronous-requests)。
@@ -241,7 +247,7 @@ python pipeline.py --rss-process --rss-max-items 4 --allow-batch-cloud
 python pipeline.py --url 'https://www.instagram.com/reel/<SHORTCODE>/'
 ```
 
-此 CLI 作者盤點流程的 Bright Data 只負責內容發現；實際下載仍由 yt-dlp 完成，之後才是 Groq 時間戳轉錄與 MiniMax 摘要。免費額度與餘額續用行為依帳戶主控台為準，程式無法保證不扣款，因此所有 Bright Data 盤點都要求明確加上 `--allow-batch-cloud`。
+此 CLI 作者盤點流程的 Bright Data 只負責內容發現；實際下載仍由 yt-dlp 完成，之後才是 Groq 時間戳轉錄與 MiniMax 摘要。免費額度與餘額續用行為依帳戶主控台為準，程式無法保證不扣款，因此所有 Bright Data 盤點都要求明確加上 `--allow-batch-cloud`，且作者盤點另須以 `--instagram-max-items` 給出有限的供應商結果預算。
 
 ### MCP 公開 IG／Threads／Facebook 單篇貼文
 

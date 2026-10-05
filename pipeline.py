@@ -4644,6 +4644,14 @@ def fetch_instagram_author(
 ) -> dict[str, Any]:
     if not allow_paid:
         raise RuntimeError("Bright Data 可能計費；確認帳戶額度後加上 --allow-batch-cloud。")
+    if max_items is None:
+        raise ValueError(
+            "Instagram/Bright Data 付費盤點需要有限的結果預算：請用 --instagram-max-items "
+            "指定正整數（例如 20）；--allow-batch-cloud 只代表允許雲端花費，不代表花費上限。"
+            "--instagram-since 只是在本機依發佈時間篩選，不會限制供應商計費範圍。"
+        )
+    if isinstance(max_items, bool) or not isinstance(max_items, int) or max_items <= 0:
+        raise ValueError("--instagram-max-items 必須是正整數。")
     token = os.getenv("BRIGHTDATA_API_TOKEN", "").strip()
     if not token:
         raise RuntimeError("缺少 BRIGHTDATA_API_TOKEN；請在專案 .env 本機填入。")
@@ -4651,15 +4659,13 @@ def fetch_instagram_author(
         timeout_seconds = int(os.getenv("BRIGHTDATA_RUN_TIMEOUT_SECONDS", "1800"))
     except ValueError as exc:
         raise ValueError("BRIGHTDATA_RUN_TIMEOUT_SECONDS 必須是整數。") from exc
-    if timeout_seconds <= 0 or (max_items is not None and max_items <= 0):
-        raise ValueError("Bright Data timeout 與 --instagram-max-items 必須大於 0。")
+    if timeout_seconds <= 0:
+        raise ValueError("BRIGHTDATA_RUN_TIMEOUT_SECONDS 必須大於 0。")
 
     username = instagram_username(author)
     author_url = instagram_author_url(username)
     since_timestamp = parse_instagram_since(since)
-    discovery_input: dict[str, Any] = {"url": author_url}
-    if max_items is not None:
-        discovery_input["num_of_posts"] = max_items
+    discovery_input: dict[str, Any] = {"url": author_url, "num_of_posts": max_items}
     excluded = sorted({str(item).strip() for item in (exclude_ids or []) if str(item).strip()})
     if excluded:
         discovery_input["posts_to_not_include"] = excluded
@@ -5073,11 +5079,22 @@ def update_rss_subscription(
     tags: list[str] | None = None,
     latest_only: bool | None = None,
     enabled: bool | None = None,
+    instagram_max_items: int | None = None,
 ) -> dict[str, Any]:
     state = load_rss_state(root)
     subscription = next((item for item in state["subscriptions"] if item.get("id") == subscription_id), None)
     if subscription is None:
         raise RuntimeError(f"找不到 RSS 訂閱：{subscription_id}")
+    if instagram_max_items is not None:
+        if str(subscription.get("kind") or "rss") != "instagram-author":
+            raise ValueError("--instagram-max-items 只能用於 Instagram 作者訂閱。")
+        if (
+            isinstance(instagram_max_items, bool)
+            or not isinstance(instagram_max_items, int)
+            or instagram_max_items <= 0
+        ):
+            raise ValueError("--instagram-max-items 必須是正整數。")
+        subscription["instagram_max_items"] = instagram_max_items
     if name is not None:
         subscription["name"] = name.strip() or subscription.get("name") or subscription_id
     if keywords is not None:
@@ -5541,17 +5558,33 @@ def run_rss_command(args: argparse.Namespace) -> int:
         raise ValueError("--rss-add、--facebook-author 與 --instagram-author 一次只能使用一個。")
     if (args.facebook_since is not None or args.facebook_provider is not None or args.facebook_discover_only) and not args.facebook_author:
         raise ValueError("--facebook-since／--facebook-provider／--facebook-discover-only 必須搭配 --facebook-author。")
+    instagram_budget_update = (
+        args.rss_update
+        and args.instagram_max_items is not None
+        and args.instagram_since is None
+        and not args.instagram_discover_only
+    )
     if (
         args.instagram_since is not None
         or args.instagram_max_items is not None
         or args.instagram_discover_only
-    ) and not args.instagram_author:
+    ) and not args.instagram_author and not instagram_budget_update:
         raise ValueError("--instagram-since／--instagram-max-items／--instagram-discover-only 必須搭配 --instagram-author。")
-    if args.instagram_max_items is not None and args.instagram_max_items <= 0:
-        raise ValueError("--instagram-max-items 必須大於 0。")
-    edits = any(value is not None for value in (args.rss_name, args.rss_keywords, args.rss_tags, args.rss_latest_only))
+    if args.instagram_max_items is not None and (
+        isinstance(args.instagram_max_items, bool)
+        or not isinstance(args.instagram_max_items, int)
+        or args.instagram_max_items <= 0
+    ):
+        raise ValueError("--instagram-max-items 必須是正整數。")
+    if args.instagram_author and args.instagram_max_items is None:
+        raise ValueError(
+            "Instagram/Bright Data 付費盤點需要有限的結果預算：請用 --instagram-max-items "
+            "指定正整數（例如 20）；--allow-batch-cloud 只代表允許雲端花費，不代表花費上限。"
+            "--instagram-since 只是在本機依發佈時間篩選，不會限制供應商計費範圍。"
+        )
+    edits = any(value is not None for value in (args.rss_name, args.rss_keywords, args.rss_tags, args.rss_latest_only, args.instagram_max_items))
     if edits and not (args.rss_add or args.rss_update or args.facebook_author or args.instagram_author):
-        raise ValueError("名稱／關鍵字／標籤／latest-only 設定只可搭配新增或更新訂閱。")
+        raise ValueError("名稱／關鍵字／標籤／latest-only／Instagram 結果預算設定只可搭配新增或更新訂閱。")
     if args.rss_update and not edits:
         raise ValueError("--rss-update 至少要搭配一個要修改的設定。")
     if args.rss_list_items and not args.rss_list:
@@ -5627,6 +5660,11 @@ def run_rss_command(args: argparse.Namespace) -> int:
             )
     if args.instagram_author:
         since = args.instagram_since or "365d"
+        print(
+            "Instagram/Bright Data 本次供應商請求上限："
+            f"num_of_posts={args.instagram_max_items}；"
+            f"--instagram-since {since} 僅為本機時間篩選，不限制供應商計費範圍。"
+        )
         if args.instagram_discover_only:
             with rss_writer_lock(root):
                 username = instagram_username(args.instagram_author)
@@ -5677,6 +5715,7 @@ def run_rss_command(args: argparse.Namespace) -> int:
                 keywords=csv_values(args.rss_keywords) if args.rss_keywords is not None else None,
                 tags=csv_values(args.rss_tags) if args.rss_tags is not None else None,
                 latest_only=args.rss_latest_only,
+                instagram_max_items=args.instagram_max_items,
             )
         print(f"已更新 RSS：{subscription['name']}（ID {subscription['id']}）")
     for subscription_id, enabled in ((args.rss_enable, True), (args.rss_disable, False)):
@@ -6570,7 +6609,7 @@ def parse_args() -> argparse.Namespace:
     rss = parser.add_argument_group("RSS 訂閱")
     rss.add_argument("--rss-add", metavar="FEED_URL", help="加入 RSS/Atom Feed，並立即把新項目排入本機佇列")
     rss.add_argument("--rss-remove", metavar="ID", help="移除訂閱與佇列紀錄；不刪除既有 jobs")
-    rss.add_argument("--rss-update", metavar="ID", help="修改既有訂閱的名稱、關鍵字、標籤或 latest-only")
+    rss.add_argument("--rss-update", metavar="ID", help="修改既有訂閱的名稱、關鍵字、標籤、latest-only 或 Instagram 結果預算")
     rss.add_argument("--rss-enable", metavar="ID", help="啟用既有訂閱")
     rss.add_argument("--rss-disable", metavar="ID", help="暫停既有訂閱")
     rss.add_argument("--rss-requeue", metavar="ITEM_ID", help="將 failed/dead-letter 項目重排並清除嘗試次數")
@@ -6639,7 +6678,7 @@ def parse_args() -> argparse.Namespace:
         "--instagram-max-items",
         type=int,
         default=None,
-        help="手動限制本次發現的近期 Reels 數；預設不設上限",
+        help="本次發現的供應商結果預算（num_of_posts，正整數，必填）；--instagram-since 只是在本機依發佈時間篩選，不限制供應商計費範圍",
     )
     rss.add_argument(
         "--instagram-discover-only",
