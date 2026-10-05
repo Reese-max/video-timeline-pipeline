@@ -7299,13 +7299,21 @@ def main() -> int:
     if getattr(args, "cost_report", None) is not None:
         from cost_tracker import get_cost_report
 
-        res = get_cost_report(args.root.resolve(), period_type=args.cost_report)
+        try:
+            res = get_cost_report(args.root.resolve(), period_type=args.cost_report)
+        except (RuntimeError, ValueError, OSError) as exc:
+            print(f"成本報告 ERROR: {exc}", file=sys.stderr)
+            return 1
         print(f"成本與用量報告：\n{json.dumps(res, ensure_ascii=False, indent=2)}")
         return 0
     if getattr(args, "budget_status", False):
         from cost_tracker import get_budget_status
 
-        res = get_budget_status(args.root.resolve())
+        try:
+            res = get_budget_status(args.root.resolve())
+        except (RuntimeError, ValueError, OSError) as exc:
+            print(f"預算狀態 ERROR: {exc}", file=sys.stderr)
+            return 1
         print(f"預算狀態：\n{json.dumps(res, ensure_ascii=False, indent=2)}")
         return 0
     if getattr(args, "provider_health", False):
