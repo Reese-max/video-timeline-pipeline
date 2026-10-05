@@ -24,6 +24,16 @@ from email_providers import BaseProvider, DeliveryResult, get_configured_provide
 from email_templates import render_digest_email, render_event_email
 
 
+def bind_cost_root(root: Path) -> None:
+    """Bind the cost ledger root for this run so email transports inherit the guard (#4).
+
+    cost_tracker imports this module, so the import stays lazy.
+    """
+    from cost_tracker import set_cost_root
+
+    set_cost_root(root)
+
+
 def get_operations_db(root: Path) -> sqlite3.Connection:
     """Connect to operations.db and ensure schema migrations are applied."""
     db_path = root / "operations.db"
@@ -372,6 +382,7 @@ def run_digest_send(
     provider: BaseProvider | None = None,
 ) -> dict[str, Any]:
     """Execute digest compilation and dispatch with safety checks."""
+    bind_cost_root(root)
     if dry_run or local_only:
         # Failsafe: sending is forbidden in dry-run or local-only mode
         preview_path = run_digest_preview(root, digest_type, date_str)
@@ -502,6 +513,7 @@ def run_digest_send(
 
 def run_notify_test(root: Path, provider: BaseProvider | None = None) -> dict[str, Any]:
     """Dispatch an end-to-end connectivity test email / webhook."""
+    bind_cost_root(root)
     active_provider = provider or get_configured_provider()
     recipient = os.getenv("EMAIL_TO", "").strip() or os.getenv("NOTIFY_WEBHOOK_URL", "").strip() or "test@example.com"
     subject = "【系統測試】Video Timeline Pipeline 通知測試信"
@@ -567,6 +579,7 @@ def run_notify_test(root: Path, provider: BaseProvider | None = None) -> dict[st
 
 def run_notification_retry(root: Path, provider: BaseProvider | None = None) -> dict[str, int]:
     """Retry deliveries that are in retry_wait status."""
+    bind_cost_root(root)
     with closing(get_operations_db(root)) as conn:
         active_provider = provider or get_configured_provider()
         worker_id = f"retry_worker_{os.getpid()}"

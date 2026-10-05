@@ -6,6 +6,8 @@ Guarantees:
 - Atomic budget reservations with settled + outstanding + proposed upper bounds.
 - Status separation: HTTP outcome vs billing status (actual | estimated | confirmed_included | unknown).
 - Pure local read-only cost reporting without triggering external paid network requests.
+- `provider_cost_guard` wraps every enabled provider transport: reserve before the
+  send, refuse the send when the budget is exhausted, settle afterwards.
 """
 
 from __future__ import annotations
@@ -14,10 +16,13 @@ import datetime
 import json
 import os
 import sqlite3
+from decimal import Decimal, InvalidOperation
+import time
 import uuid
-from contextlib import closing
+from contextlib import closing, contextmanager
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Iterator, Literal
 
 from notifications import get_operations_db
 
@@ -177,6 +182,20 @@ def estimate_operation_cost_micro_usd(provider: str, model: str | None, prompt_t
     return 0
 
 
+def _daily_budget_usd() -> Decimal:
+    """Parse the configured budget exactly and reject invalid or negative values."""
+    raw = os.getenv("DAILY_BUDGET_USD", "0").strip()
+    if not raw:
+        raw = "0"
+    try:
+        budget = Decimal(raw)
+    except InvalidOperation as exc:
+        raise ValueError("DAILY_BUDGET_USD must be a finite, non-negative decimal.") from exc
+    if not budget.is_finite() or budget < 0:
+        raise ValueError("DAILY_BUDGET_USD must be a finite, non-negative decimal.")
+    return budget
+
+
 def check_and_reserve_budget(
     root: Path,
     operation_name: str,
@@ -188,7 +207,7 @@ def check_and_reserve_budget(
     Returns: (allowed, reservation_id, reason)
     """
     hard_stop = os.getenv("BUDGET_HARD_STOP", "false").lower() in ("true", "1", "yes")
-    daily_budget_usd = float(os.getenv("DAILY_BUDGET_USD", "0"))
+    daily_budget_usd = _daily_budget_usd()
     daily_budget_micro = int(daily_budget_usd * 1_000_000)
 
     with closing(get_operations_db(root)) as conn:
@@ -267,6 +286,246 @@ def check_and_reserve_budget(
         return True, reservation_id, "Approved"
 
 
+class BudgetBlockedError(RuntimeError):
+    """Raised before a paid transport is dispatched when the guard refuses it.
+
+    A blocked call must never reach the provider: the transport raises this
+    instead of opening the socket, so the reserved-but-unspent amount stays
+    available for the operator's other work.
+    """
+
+    def __init__(self, reason: str, *, provider: str | None = None, operation: str | None = None) -> None:
+        self.reason = reason
+        self.provider = provider
+        self.operation = operation
+        super().__init__(reason)
+
+
+_COST_ROOT: Path | None = None
+
+
+def set_cost_root(root: Path | None) -> None:
+    """Establish the project root whose operations.db backs the cost ledger."""
+    global _COST_ROOT
+    _COST_ROOT = Path(root) if root is not None else None
+
+
+def get_cost_root() -> Path | None:
+    return _COST_ROOT
+
+
+@contextmanager
+def cost_root_scope(root: Path | None) -> Iterator[Path | None]:
+    """Bind the cost ledger root for the duration of one run or test."""
+    previous = get_cost_root()
+    set_cost_root(root)
+    try:
+        yield get_cost_root()
+    finally:
+        set_cost_root(previous)
+
+
+def guard_is_strict() -> bool:
+    """Strict mode: an operator asked for a hard stop with a positive daily cap.
+
+    Outside strict mode the guard stays advisory, so the default local pipeline
+    keeps working without a configured budget.
+    """
+    if os.getenv("BUDGET_HARD_STOP", "false").strip().lower() not in ("true", "1", "yes"):
+        return False
+    try:
+        return _daily_budget_usd() > 0
+    except ValueError as exc:
+        raise BudgetBlockedError(
+            "Budget blocked: DAILY_BUDGET_USD 設定無效，strict 模式 fail-closed。",
+            provider="budget",
+            operation="configuration",
+        ) from exc
+
+
+@dataclass
+class GuardOutcome:
+    """What the guard decided for one dispatched attempt."""
+
+    provider: str
+    operation: str
+    reservation_id: str | None = None
+    enforced: bool = False
+    estimated_micro_usd: int = 0
+    provider_operation_id: str | None = None
+
+
+def _record_guard_attempt(
+    root: Path,
+    outcome: GuardOutcome,
+    *,
+    model: str | None,
+    status: UsageStatus,
+    safe_error: str | None,
+    request_units: int,
+    response_units: int,
+    latency_ms: float,
+    account_scope: str,
+    job: str | None,
+    library_id: str | None,
+    settle_reservation: bool,
+) -> None:
+    try:
+        record_usage(
+            root,
+            provider=outcome.provider,
+            operation=outcome.operation,
+            job=job,
+            library_id=library_id,
+            model=model,
+            request_units=request_units,
+            response_units=response_units,
+            latency_ms=latency_ms,
+            status=status,
+            safe_error=safe_error,
+            provider_request_id=outcome.provider_operation_id,
+            reservation_id=outcome.reservation_id,
+            estimated_micro_usd=outcome.estimated_micro_usd,
+            account_scope=account_scope,
+            settle_reservation=settle_reservation,
+        )
+    except Exception as exc:  # telemetry must never break a paid attempt
+        print(f"! 成本帳本寫入失敗（{outcome.provider}/{outcome.operation}）：{type(exc).__name__}")
+
+
+@contextmanager
+def provider_cost_guard(
+    provider: str,
+    operation: str,
+    *,
+    root: Path | None = None,
+    model: str | None = None,
+    request_units: int = 0,
+    response_units: int = 0,
+    estimated_micro_usd: int | None = None,
+    account_scope: str = "default",
+    job: str | None = None,
+    library_id: str | None = None,
+    provider_enforced_upper_bound_micro_usd: int | None = None,
+) -> Iterator[GuardOutcome]:
+    """Reserve budget before a paid transport send and settle the attempt after.
+
+    Strict mode requires a provider-enforced upper bound, a ledger root, and
+    available budget. A modelled estimate alone is not a hard bound and cannot
+    authorize a paid transport in strict mode.
+    """
+    target = Path(root) if root is not None else get_cost_root()
+    strict = guard_is_strict()
+
+    if target is None:
+        if strict:
+            raise BudgetBlockedError(
+                f"Budget blocked: 成本守衛尚未綁定專案根目錄（{provider}/{operation}）。",
+                provider=provider,
+                operation=operation,
+            )
+        yield GuardOutcome(provider=provider, operation=operation)
+        return
+
+    estimated_bound = (
+        int(estimated_micro_usd)
+        if estimated_micro_usd is not None
+        else estimate_operation_cost_micro_usd(provider, model, request_units, response_units)
+    )
+    if estimated_bound < 0:
+        raise ValueError("estimated_micro_usd must be non-negative.")
+
+    if strict:
+        if provider_enforced_upper_bound_micro_usd is None:
+            raise BudgetBlockedError(
+                f"Budget blocked: {provider}/{operation} 僅有估算、沒有供應商端可執行的費用上限，strict 模式拒絕送出。",
+                provider=provider,
+                operation=operation,
+            )
+        bound = int(provider_enforced_upper_bound_micro_usd)
+        if bound <= 0:
+            raise BudgetBlockedError(
+                f"Budget blocked: {provider}/{operation} 的供應商費用上限無效，strict 模式拒絕送出。",
+                provider=provider,
+                operation=operation,
+            )
+    else:
+        bound = estimated_bound
+
+    try:
+        allowed, reservation_id, reason = check_and_reserve_budget(
+            target, operation_name=f"{provider}/{operation}", estimated_micro_usd=bound, account_scope=account_scope
+        )
+    except Exception as exc:
+        # C3: a broken ledger must stop new paid I/O in hard mode instead of
+        # silently letting the request through untracked.
+        if strict:
+            raise BudgetBlockedError(
+                f"Budget blocked: 預算帳本不可用（{type(exc).__name__}），strict 模式 fail-closed。",
+                provider=provider,
+                operation=operation,
+            ) from exc
+        # 非嚴格模式是諮詢性的，但一定要讓操作者知道這次送出沒有被記帳。
+        print(
+            f"! 成本預留失敗（{type(exc).__name__}），非嚴格模式照常送出但不追蹤：{provider}/{operation}"
+        )
+        yield GuardOutcome(provider=provider, operation=operation, estimated_micro_usd=bound)
+        return
+
+    if not allowed:
+        raise BudgetBlockedError(reason, provider=provider, operation=operation)
+
+    outcome = GuardOutcome(
+        provider=provider,
+        operation=operation,
+        reservation_id=reservation_id,
+        enforced=True,
+        estimated_micro_usd=bound,
+    )
+    started = time.monotonic()
+    try:
+        yield outcome
+    except BaseException as exc:
+        status_code = getattr(exc, "status_code", None)
+        category = classify_error(
+            exc,
+            status_code if isinstance(status_code, int) else None,
+            getattr(exc, "response_body", None),
+        )
+        # An unproven outcome (timeout, dropped connection, unknown) keeps its
+        # reserved risk: settling it would let an unreconciled remote job look free.
+        unresolved = category in ("timeout", "network", "unknown")
+        _record_guard_attempt(
+            target,
+            outcome,
+            model=model,
+            status="unknown" if unresolved else "failed",
+            safe_error=category,
+            request_units=request_units,
+            response_units=response_units,
+            latency_ms=(time.monotonic() - started) * 1000.0,
+            account_scope=account_scope,
+            job=job,
+            library_id=library_id,
+            settle_reservation=not unresolved,
+        )
+        raise
+    _record_guard_attempt(
+        target,
+        outcome,
+        model=model,
+        status="succeeded",
+        safe_error=None,
+        request_units=request_units,
+        response_units=response_units,
+        latency_ms=(time.monotonic() - started) * 1000.0,
+        account_scope=account_scope,
+        job=job,
+        library_id=library_id,
+        settle_reservation=True,
+    )
+
+
 def record_usage(
     root: Path,
     provider: str,
@@ -284,6 +543,9 @@ def record_usage(
     provider_request_id: str | None = None,
     reservation_id: str | None = None,
     actual_micro_usd: int | None = None,
+    estimated_micro_usd: int | None = None,
+    account_scope: str = "default",
+    settle_reservation: bool = True,
 ) -> str:
     """Record a completed or failed operation attempt and settle reservation."""
     with closing(get_operations_db(root)) as conn:
@@ -293,11 +555,19 @@ def record_usage(
         now_iso = _utc_now_iso()
 
         if cache_hit:
+            # 快取命中沒有新的雲端請求：任何傳入的估計都不適用（也不得回頭抵扣已花費用）。
             estimated_micro = 0
             cost_status: CostStatus = "zero_local"
+        elif actual_micro_usd is not None:
+            estimated_micro = int(actual_micro_usd)
+            cost_status = "actual"
+        elif estimated_micro_usd is not None:
+            estimated_micro = int(estimated_micro_usd)
+            # C2: an operation without a verified price is unknown cost, never free.
+            cost_status = "estimated" if estimated_micro > 0 else "unknown"
         else:
             estimated_micro = estimate_operation_cost_micro_usd(provider, model, request_units, response_units)
-            cost_status = "actual" if actual_micro_usd is not None else "estimated"
+            cost_status = "estimated" if estimated_micro > 0 else "unknown"
 
         with conn:
             conn.execute(
@@ -306,8 +576,8 @@ def record_usage(
                     cost_id, library_id, job, analysis_revision, provider, model, operation,
                     request_units, response_units, started_at, finished_at, latency_ms,
                     cache_hit, status, safe_error, provider_request_id,
-                    estimated_micro_usd, actual_micro_usd, cost_status, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    estimated_micro_usd, actual_micro_usd, cost_status, account_scope, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     cost_id,
@@ -329,12 +599,13 @@ def record_usage(
                     estimated_micro,
                     actual_micro_usd,
                     cost_status,
+                    account_scope,
                     now_iso,
                 ),
             )
 
             # Settle budget reservation if one exists
-            if reservation_id:
+            if reservation_id and settle_reservation:
                 conn.execute(
                     """
                     UPDATE budget_reservations

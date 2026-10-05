@@ -70,7 +70,29 @@ python pipeline.py --video 'D:\path\to\video.mp4' --dry-run --slide-extractor st
 
 ## ChatGPT 網頁 MCP 影片摘要
 
-`mcp_server.py` 是最小的 ChatGPT Apps/MCP 入口：公開影片 URL → 既有下載器 → FFmpeg 分段 → Groq 語音辨識／MiniMax 抽樣畫面分析 → ChatGPT 根據工具證據整理時間軸。widget 自動呼叫 `analyze_prepared_video`；主流程不再依賴原生 MP4 附件或 Drive。CLI 的 MiniMax 摘要流程不變；MCP 不另呼叫 MiniMax 產生摘要，避免重複成本與失敗環節。影片分段與代表影格放在 Git 忽略的 `mcp_jobs\`。
+`mcp_server.py` 是 ChatGPT Apps/MCP 入口：公開影片 URL → 既有下載器 → FFmpeg 分段 → Groq 語音辨識／MiniMax 抽樣畫面分析 → ChatGPT 根據工具證據整理時間軸。v12 widget 透過「開始分析」建立持久背景工作，再由「交給 ChatGPT 整理」送出整理要求；重新開啟不會自動重跑或重送。CLI 的 MiniMax 摘要流程不變；MCP 不另呼叫 MiniMax 產生摘要。影片放在 Git 忽略的 `mcp_jobs\`，工作佇列及簽章金鑰在私有 `.video-state/`。
+
+### v12：背景工作、可核對證據與儲存管理
+
+準備／分析／Drive 工具支援 `background=true`；可用 `get_video_job` 查進度，`cancel_video_job` 取消，`resume_video_job` 續跑，`get_prepared_video` 恢復結果及更新下載網址。新介面使用背景模式，舊客戶端的同步預設仍相容。Drive 僅在明確點選時上傳，不因證據不足而自動執行。
+
+長片最多使用 240 個低解析度探針、40 張入選影格；時間窗與場景變化兼顧全片範圍。快取比對來源 SHA-256、模型、語言、後端、取樣設定及程式版本。介面可切換逐字稿／畫面觀察、點時間碼核對原片，並顯示抽樣與缺漏限制。
+
+簽名下載網址預設 24 小時有效；受管媒體預設保留七天，總量 20 GiB、單工作 4 GiB、保留至少 1 GiB 空間。清理需 `MCP_STORAGE_CLEANUP_ENABLED=1`，只處理已明確納管且到期的工作，保護執行中工作及有效分享。舊工作不會在部署時被批次納管。設定、相容性及驗證界線詳見 [操作說明](docs/video-mcp-operations.md)。
+
+UI URI 已升為 `ui://video-timeline-pipeline/v12-<媒體網址 hash>.html`。更新服務後需重新整理外掛動作並產生新 widget；歷史 widget 不會自動更新。以下 v8–v11 段落保留歷史修復紀錄，操作以 v12 說明為準。
+
+### MCP 影音暫存保留 7 天
+
+`media_retention.py` 預設只預覽；加 `--apply` 才刪除。只處理準備及分析皆完成、來源指紋一致、品質為 `evidence_available`，且工作內最後檔案寫入已**超過 7 天**的工作。這是保守的完成時間判定，後續寫入會重新延長保留期。失敗、未完成、需要覆核、有 Drive 交接紀錄、`.keep-media`、下載暫存或連結的工作全部保留。
+
+```bash
+cd /home/box/video-timeline-pipeline
+.venv/bin/python media_retention.py --jobs-root /home/box/video-timeline-pipeline/mcp_jobs
+.venv/bin/python media_retention.py --jobs-root /home/box/video-timeline-pipeline/mcp_jobs --apply
+```
+
+只刪除明確命名的來源影片、MP4 分段、音訊與影格檔案；不刪工作目錄、摘要、逐字稿、JSON 紀錄、付費回執或 Google Drive 檔案。刪除紀錄留在各工作的 `media-retention.json`；刪除無法復原，原有媒體網址會失效，可重新下載來源影片。清理與 MCP 共用跨程序工作鎖，忙碌時跳過、不排隊。**啟用排程前必須先部署並重啟新版 MCP**，不可讓不認識共享鎖的舊程序與清理同時執行。可排每日台灣時間 03:00 先預覽再執行；程式本身不會安裝排程。安全回歸：`python -m unittest discover -s tests -p test_media_retention.py -v`。
 
 先在隔離環境安裝依賴（FFmpeg／ffprobe 仍需在 PATH）：
 
@@ -97,6 +119,8 @@ v11 的 `quality` 是保守證據檢查，不是準確率評分：分析階段�
 v9 修正 developer MCP 與官方 Drive 的交接邊界：不在原對話送出 Drive 讀取／摘要 follow-up；先開啟未啟用 developer MCP 的一般 ChatGPT 對話，選擇官方 Google Drive，再貼上 widget 的交接內容（job ID、全部檔案 ID／網址／大小與原片分段時間）。新對話須實際取得 bytes、記錄大小／SHA-256 並解碼，不能把 `drive_ready` 當成讀取成功。一般對話連結不會自動改變帳號的 developer mode 或連線設定，使用者需確認對話類型。登入、OAuth、Drive 檔案權限均未變更。UI URI 含媒體網址 SHA-256 前 12 碼，避免換網址後仍使用舊 CSP 快取。
 
 分析與 Drive 未取得單程序工作鎖時回傳 `status=busy`、`error_code=MCP_BUSY`、`retry_after_seconds=5`，不是成功，也不加入背景佇列。widget 僅對此忙碌狀態（或舊 host 包裝後的同一忙碌訊息）等待 5、10、20 秒，各重試一次；最多四次呼叫。仍忙碌就停止並保留手動重試入口。Drive 或 ChatGPT follow-up 失敗時沿用同一 widget 的分析結果，不重跑付費分析。其他錯誤不在 widget 自動重試；Drive 儲存層原有的續傳重試仍保留。切換 job 後不再重試舊工作，也不讓資料型通知覆寫目前分段。這不是持久化佇列，也沒有解除 ChatGPT 原生 `Unsupported file type` 限制。依 [官方 UI 快取規則](https://developers.openai.com/plugins/build/chatgpt-ui#embed-the-component-in-the-server-response)，UI URI 升為 `ui://video-timeline-pipeline/v11-<媒體網址 SHA-256 前 12 碼>.html`；部署後必須重新整理外掛動作並產生新 widget，歷史 widget 不會自動更新。`node tests/test_widget_handoff.cjs` 驗證流程與競態；不代表真實模型品質或網頁端驗收通過。
+
+監督啟動器預設讓媒體網址沿用固定的 `MCP_PUBLIC_BASE_URL`，避免 Cloudflare Quick Tunnel 換名後，長時間運作的 MCP 仍回傳已失效的影片網址。既有 `MCP_MEDIA_BASE_URL` 明確設定仍優先；需要 Quick Tunnel 時可明確設 `MCP_USE_QUICK_TUNNEL=1`，此模式仍需要在網址變更後受控重載 MCP 並建立新 widget。歷史 widget 的舊網址不會自動更新。
 
 新 tunnel 啟動會給遠端 DNS 負快取傳播時間：`MCP_MEDIA_STARTUP_ATTEMPTS` 預設 300 次（允許 1–900），每次失敗間隔 1 秒、單次連線最多 10 秒。不再僅因啟動頭一分鐘尚未解析就換掉已註冊的 tunnel。這是啟動等待，不會放寬 TLS 驗證，也不會改寫系統 DNS。
 
@@ -191,6 +215,7 @@ Apify Token 一律放在 `Authorization` header，不放 URL、輸出或 Git。A
 ```dotenv
 BRIGHTDATA_API_TOKEN=
 BRIGHTDATA_RUN_TIMEOUT_SECONDS=1800
+BRIGHTDATA_INSTAGRAM_MAX_ITEMS=3
 ```
 
 先用少量結果盤點；這只取得公開 Reel metadata，不下載影片，也不呼叫 Groq／MiniMax：
@@ -201,6 +226,8 @@ python pipeline.py --instagram-author 'https://www.instagram.com/<USERNAME>/' --
 
 確認後加入佇列。未提供 `--instagram-max-items` 時需設定 `BRIGHTDATA_INSTAGRAM_MAX_ITEMS`；`--instagram-since 365d` 會在本機依供應商實際回傳的發佈時間保留近一年結果，與供應商側結果上限不同：
 
+有效上限必須是正整數，逾時秒數也必須大於 0；專案與所選 `--root` 的 `.env` 會先載入，再驗證上限。送出前 stderr 顯示本次傳給供應商的 `num_of_posts`，不印 Token。結果筆數上限不是美元硬上限，也未代替供應商實際計費／上限執行驗證；啟用嚴格美元成本守衛時，Bright Data 仍因缺少可驗證的供應商費用上限而拒絕送出。
+
 ```powershell
 python pipeline.py --instagram-author '<USERNAME>' --instagram-since 365d --instagram-max-items 1000 --rss-all-items --allow-batch-cloud
 python pipeline.py --rss-refresh --allow-batch-cloud
@@ -210,6 +237,8 @@ python pipeline.py --rss-process --rss-max-items 4 --allow-batch-cloud
 盤點快照保存在 Git 忽略且受 ACL 保護的 `rss\instagram-<雜湊>-latest.json`，包含原始 Bright Data 結果與 snapshot provenance。刷新時會把已見 Post ID 傳入 `posts_to_not_include`，本機佇列仍以穩定 ID 去重。Bright Data 的 Reel discovery 目前不支援伺服器端日期篩選；若某筆沒有 `date_posted`，工具會保留並在快照及盤點訊息標示「無法驗證回溯範圍」，不會假裝近一年盤點完整。私人／登入限定內容不處理，平台可見性與供應商回傳仍可能造成缺漏。請參考 [Instagram Scraper API](https://docs.brightdata.com/datasets/scrapers/instagram/introduction)、[Reel discovery](https://docs.brightdata.com/api-reference/scrapers/social-media-apis/instagram-reels-discover-by-url) 與 [非同步 snapshot 流程](https://docs.brightdata.com/api-reference/rest-api/scraper/asynchronous-requests)。
 
 每輪作者採集的 POST 僅送一次，回執保存在所選 `--root` 的 `rss/brightdata/<雜湊>/`。相同輸入在輪詢、下載或本機儲存失敗後重試，沿用原 snapshot；只有訂閱狀態（或 `--instagram-discover-only` 的快照）成功儲存，後續明確允許的刷新才會開始新一輪採集，空結果亦同。回應不明時停止，不以重送嘗試恢復；改輸入／root 屬於另一個請求，不應用來繞過此保護。
+
+離線回歸：`python -m unittest discover -s tests -p test_instagram_budget_recovery.py -q`。測試使用模擬 HTTP 傳輸、暫存回執與 SQLite 帳本，驗證拒絕前零呼叫及中斷恢復；不代表真實 Bright Data 帳單或供應商端上限已驗收。
 
 單篇公開 Reel／影片貼文不需要先建立作者訂閱，可直接走既有入口：
 
@@ -244,6 +273,10 @@ FB 回應的 `content` 是貼文文字；`attachments` 的照片與影片分開�
 Instagram 先以無登入方式下載；可用時採用 `curl_cffi` 的 Chrome impersonation，忽略外部 yt-dlp 設定與外掛，避免暗中帶入 cookies。公開下載失敗後，僅在 `YTDLP_INSTAGRAM_COOKIE_FILE` 明確設定時嘗試一次 authenticated fallback。此變數須指向使用者自行提供、位於 repo 外的 Netscape cookies 絕對路徑（建議 Unix 權限 `600`）；只複製 Instagram 網域且未過期的 cookies 到私人暫存檔，結束即清理，不覆寫原檔、不讀取瀏覽器、不傳送憑證給 ChatGPT。需要時可設定 `YTDLP_INSTAGRAM_USER_AGENT`，通常留白交給 impersonation 管理。
 
 每次實際下載在工作目錄保存 `instagram-download.json`：包含實際 yt-dlp 版本、request handlers、`curl_cffi` 版本、impersonation 能力、User-Agent 設定模式、Python／作業系統／容器標記、是否使用 cookies，以及每次嘗試的結果。失敗也會在 MCP 的錯誤文字回傳相同診斷，保留第一次失敗原因；不輸出 Cookie／Authorization 值或憑證路徑。錯誤不等於影片已刪除；cookies 也不保證能修正上游 extractor／帳戶／網路限制。Regression：`python -m unittest discover -s tests -p test_instagram_download.py -v`。
+
+### Facebook 下載與 cookies
+
+Facebook 單支影片／Reels 同樣走 yt-dlp；可用時採用 `curl_cffi` Chrome impersonation。公開下載失敗（例如部分 Reel 出現 `Cannot parse data`）後，僅在 `YTDLP_FACEBOOK_COOKIE_FILE` 明確設定時嘗試一次 authenticated fallback。變數須指向使用者自行提供的 Netscape cookies 絕對路徑（建議 `/home/box/video-timeline-pipeline/secrets/facebook_cookies.txt`，Unix 權限 `600`）；只複製 Facebook／fb.com 網域 cookies 到私人暫存檔，結束即清理，不覆寫原檔、不讀取瀏覽器。工作目錄會寫入 `facebook-download.json` 診斷（不含 cookie 值）。Regression：`python -m unittest discover -s tests -p test_facebook_download.py -v`。
 
 ### Threads 單篇影片與 carousel
 
@@ -558,3 +591,46 @@ OPEN_NOTEBOOK_PASSWORD=不要提交到版本控制
 重跑同一支影片是**替換**而非新增：`manifest.json` 的 `open_notebook.source_id` 記著上次建立的條目，下次同步會先刪掉它再上傳，`replaced` 旗標會標示有沒有真的替換掉。少了這層，每次重跑都會在 notebook 疊一份同名 source。
 
 兩個前提：`manifest.json` 不能刪（那是唯一的對應記錄），以及若你在 Open Notebook 介面手動刪過該條目，這次同步會刪不到（404 會被忽略）而新增一份。手動刪掉的孤兒條目只能自己在介面清。
+
+## 成本守衛（#4）
+
+所有已啟用的對外傳輸都經過同一道守衛：送出前先在 `operations.db` 原子預留金額，送出後入帳並結清預留。CLI、背景排程、MCP 工具與內建重試都走同一條路徑，不存在只寫在文件、實際沒接上的開關。
+
+已接入的傳輸：
+
+| 供應商 | 操作 | 預留時機 |
+|---|---|---|
+| Groq | `audio.transcriptions` | 每個音訊片段送出前（命中本機快取時不預留、不產生新費用） |
+| MiniMax | `vision.analyze_images`、`summarize.*`、`query.keywords`、`query.answer`、`digest.report`、`library.classify` | 每次送出前，同一則 `finish_reason` 重試會各自入帳 |
+| OpenRouter | `embeddings` | 每個 batch 送出前（向量已存在時不送出、不預留） |
+| Meta Graph | `graph.query` | 每次分頁請求 |
+| Apify | `actor.run.start` | 一次 Actor 工作只預留一次，金額以供應商端 `APIFY_MAX_TOTAL_CHARGE_USD` 封頂；後續 poll／dataset 讀取屬同一筆遠端工作，不重複計完整 Actor 費用 |
+| Bright Data | `datasets.trigger` | 寫入 `.submitted` 回執前；被拒絕時不會留下「送出狀態不明」的標記 |
+| Open Notebook | `sources.sync` | 建立 source 前 |
+| RSS 通知 Webhook | `notify` | 每次通知前 |
+| Email（Resend／SMTP／Webhook） | `email.send`、`webhook.post` | 每次寄送前，被拒絕時回 `permanent_failure`（不重試、不遞迴告警） |
+
+**嚴格模式只放行帶有供應商端可執行上限的操作。** 目前只有 Apify Actor 啟動傳入 `maxTotalChargeUsd`（[Apify Run Actor API](https://docs.apify.com/api/v2/actors-runs-post) 說明該值限制單次 run 的總費用）。Groq、MiniMax、OpenRouter 等路徑目前只有估算，沒有可驗證的供應商端費用上限，因此即使估算值為正，hard-stop 開啟時仍會拒絕；soft mode 的估算只供記錄，不保證實際費用不超出本地預算。
+
+```text
+DAILY_BUDGET_USD=5.00
+BUDGET_HARD_STOP=true
+COST_TIMEZONE=Asia/Taipei
+```
+
+* `DAILY_BUDGET_USD` 留空或 `0`：不設上限，守衛只記帳。
+* `BUDGET_HARD_STOP=true` **且** `DAILY_BUDGET_USD>0`：嚴格模式。`已花費 + 未結清預留 + 本次上限` 超過每日上限時，傳輸在開連線前就被拒絕（`Budget blocked:`），並記一筆 `blocked_budget`。
+* 嚴格模式下成本帳本不可寫（唯讀、損壞、磁碟滿）一律 fail-closed，不會因為記帳失敗就放行付費請求。
+* 超時、連線中斷或結果不明的 attempt 記為 `unknown` 且**不結清**預留，避免遠端仍在跑的工作看起來免費；之後要用 `provider_operation_id`（Apify run、Bright Data snapshot）對帳。
+* 沒有開嚴格模式時，守衛是諮詢性的：帳本寫不進去（唯讀、磁碟滿、被鎖住）只會印一行 `!` 警告並照常送出，但該 attempt 的預留會留在 `reserved`，不會因為沒記到帳就當成沒花錢。要「記不到就不准花」，請開 `BUDGET_HARD_STOP=true` 並設定 `DAILY_BUDGET_USD`。
+* 目前沒有自動釋出／對帳 `reserved` 預留的工具；unknown attempt 的遠端工作要人工用 `provider_operation_id` 對帳（規劃中的統一對帳屬 #7 範圍）。
+
+```powershell
+python pipeline.py --cost-report daily
+python pipeline.py --budget-status
+python pipeline.py --provider-health
+```
+
+報表只讀本機 `operations.db`，不會為了查成本再發任何付費請求；「本程式、指定帳戶範圍、截至 as_of」不等於供應商帳單。`unknown` 不會被當成 0。
+
+**邊界**：本地守衛只能攔截「這個程式送出去的新請求」。供應商晚計費、同一帳戶被其他工具共用、無法取消的遠端工作，與沒有可驗證價格的操作，都不在這個保證裡；要真正的零超支，仍需要供應商端的額度控制。
