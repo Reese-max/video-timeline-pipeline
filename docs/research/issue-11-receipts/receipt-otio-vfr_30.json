@@ -1,0 +1,80 @@
+{
+  "schema": "cut-receipt/1",
+  "specHash": "8dbb9ec1ed685828427d21bf21ac4c248d255701f6875b2ff7252e7257cc4b46",
+  "exportFormat": "otio",
+  "expectedContentHash": "a1ef0a42f32f00d5ccf132838625e2bf6a7b428b6edba71ab271230f2c5e02f5",
+  "observedContentHash": "a1ef0a42f32f00d5ccf132838625e2bf6a7b428b6edba71ab271230f2c5e02f5",
+  "toleranceSec": 0.15,
+  "nleImport": "NLE_IMPORT_UNVERIFIED",
+  "externalApiCalls": 0,
+  "localSubprocessCalls": 3,
+  "segments": [
+    {
+      "segmentId": "seg-0",
+      "intendedSourceRange": {
+        "startSec": 0.5,
+        "endSec": 1.5
+      },
+      "status": "ok",
+      "deltaImportSec": 0.012499999999999956,
+      "deltaFFmpegSec": 0.0,
+      "importedSourceRange": {
+        "startSec": 0.49583333333333335,
+        "endSec": 1.4875
+      },
+      "ffprobe": {
+        "frames": 36,
+        "firstPtsSec": 0.033008,
+        "lastPtsSec": 1.466341,
+        "medianFrameDurSec": 0.03333300000000006
+      },
+      "observedCoverageSec": {
+        "startSec": 0.033008,
+        "endSec": 1.499674
+      }
+    },
+    {
+      "segmentId": "seg-1",
+      "intendedSourceRange": {
+        "startSec": 2.0,
+        "endSec": 3.0
+      },
+      "status": "ok",
+      "deltaImportSec": 0.02499999999999991,
+      "deltaFFmpegSec": 0.0,
+      "importedSourceRange": {
+        "startSec": 1.9833333333333334,
+        "endSec": 2.975
+      },
+      "ffprobe": {
+        "frames": 72,
+        "firstPtsSec": 0.033008,
+        "lastPtsSec": 2.966341,
+        "medianFrameDurSec": 0.03333300000000028
+      },
+      "observedCoverageSec": {
+        "startSec": 0.033008,
+        "endSec": 2.999674
+      }
+    }
+  ],
+  "mismatches": 0,
+  "stillNeedsHumanFix": false,
+  "status": "verified",
+  "parser": "opentimelineio-0.18.1",
+  "specIssues": [
+    {
+      "code": "UNTESTED_TIMEBASE",
+      "severity": "degraded",
+      "segmentId": null
+    },
+    {
+      "code": "VFR_SOURCE",
+      "severity": "degraded",
+      "segmentId": null
+    }
+  ],
+  "sourceFingerprint": "16609:1789664394293422422",
+  "adapterVersion": "opentimelineio-0.18.1",
+  "receiptId": "87f4fd5ee1b55595"
+}

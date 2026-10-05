@@ -7026,6 +7026,24 @@ def run_batch(args: argparse.Namespace) -> Path:
     return output
 
 
+def bind_analysis_source(video_path: Path, previous: dict, *, reuse_cloud: bool,
+                         local_only: bool) -> str:
+    """Freeze source bytes; refuse unsafe cache reuse before any provider work."""
+    source_hash = file_sha256(video_path)
+    if reuse_cloud and not local_only and previous.get("source_sha256") != source_hash:
+        raise RuntimeError(
+            "STALE_SOURCE: cached analysis lacks this source byte revision; "
+            "use --refresh explicitly to regenerate analysis (normal cloud/cost controls still apply)."
+        )
+    return source_hash
+
+
+def assert_analysis_source(video_path: Path, expected_sha256: str) -> None:
+    """Never publish evidence as complete if source bytes drifted during analysis."""
+    if file_sha256(video_path) != expected_sha256:
+        raise RuntimeError("STALE_SOURCE: source bytes changed during analysis; rerun explicitly.")
+
+
 def run_pipeline(args: argparse.Namespace) -> Path:
     bind_cost_root(args.root.resolve())
     root = args.root.resolve()
@@ -7127,11 +7145,15 @@ def run_pipeline(args: argparse.Namespace) -> Path:
     for preserved in ("categories", "level"):
         if previous.get(preserved):
             manifest[preserved] = previous[preserved]
-    write_json(manifest_path, manifest)
-
+    # Preserve an existing completed manifest until its source byte binding
+    # passes. A refused retry must not erase the cache authority and thereby
+    # make the next retry silently regenerate paid evidence.
+    manifest_started = False
     try:
         captions_only: dict[str, Any] | None = None
         if args.no_video:
+            write_json(manifest_path, manifest)
+            manifest_started = True
             # 只抓字幕：不下載影片、不切音訊、不抽幀。標題與時長改由 info.json 提供。
             if not args.url:
                 raise ValueError("--no-video 只支援 --url。")
@@ -7163,6 +7185,14 @@ def run_pipeline(args: argparse.Namespace) -> Path:
         if not args.no_video:
             manifest["source"]["resolved_video"] = artifact_path(video_path, root)
             manifest["source"]["title"] = str(getattr(args, "rss_title", "") or source_title(job_dir, video_path))
+            # Persist the analyzed byte revision before producing evidence.
+            # A legacy/stale cache must not silently trigger replacement paid work.
+            manifest["source_sha256"] = bind_analysis_source(
+                video_path, previous, reuse_cloud=reuse_cloud,
+                local_only=args.dry_run or args.local_only,
+            )
+            write_json(manifest_path, manifest)
+            manifest_started = True
 
             probe = probe_video(video_path, job_dir / "source.probe.json")
             has_video = any(stream.get("codec_type") == "video" for stream in probe.get("streams", []))
@@ -7418,6 +7448,8 @@ def run_pipeline(args: argparse.Namespace) -> Path:
             },
         )
         manifest["artifacts"]["source"] = artifact_path(job_dir / "source.json", root)
+        if not args.no_video:
+            assert_analysis_source(video_path, manifest["source_sha256"])
         write_json(manifest_path, manifest)
         connection = index_connection(root)
         try:
@@ -7433,9 +7465,12 @@ def run_pipeline(args: argparse.Namespace) -> Path:
             pass
         return manifest_path
     except Exception as exc:
-        manifest["status"] = "failed"
-        manifest["error"] = str(exc)
-        write_json(manifest_path, manifest)
+        # A pre-binding refusal preserves the exact old manifest/artifacts on
+        # every retry. New jobs still retain diagnostic failure manifests.
+        if manifest_started or not manifest_path.exists():
+            manifest["status"] = "failed"
+            manifest["error"] = str(exc)
+            write_json(manifest_path, manifest)
         raise
 
 
