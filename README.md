@@ -609,3 +609,46 @@ OPEN_NOTEBOOK_PASSWORD=不要提交到版本控制
 重跑同一支影片是**替換**而非新增：`manifest.json` 的 `open_notebook.source_id` 記著上次建立的條目，下次同步會先刪掉它再上傳，`replaced` 旗標會標示有沒有真的替換掉。少了這層，每次重跑都會在 notebook 疊一份同名 source。
 
 兩個前提：`manifest.json` 不能刪（那是唯一的對應記錄），以及若你在 Open Notebook 介面手動刪過該條目，這次同步會刪不到（404 會被忽略）而新增一份。手動刪掉的孤兒條目只能自己在介面清。
+
+## 成本守衛（#4）
+
+下列已啟用的傳輸入口經過同一道守衛：送出前先在 `operations.db` 原子預留金額，送出後入帳；結果不明時保留預留。CLI、背景排程與 MCP 綁定同一個成本帳本。部分 HTTP helper 的內建重試目前仍合併記在一次邏輯呼叫內，尚未逐次入帳；這些缺乏可驗證費用上限的操作在 strict 模式會拒絕送出。
+
+已接入的傳輸：
+
+| 供應商 | 操作 | 預留時機 |
+|---|---|---|
+| Groq | `audio.transcriptions` | 每個音訊片段送出前（命中本機快取時不預留、不產生新費用） |
+| MiniMax | `vision.analyze_images`、`summarize.*`、`query.keywords`、`query.answer`、`digest.report`、`library.classify` | 每次送出前，同一則 `finish_reason` 重試會各自入帳 |
+| OpenRouter | `embeddings` | 每個 batch 送出前（向量已存在時不送出、不預留） |
+| Meta Graph | `graph.query` | 每次分頁請求 |
+| Apify | `actor.run.start` | 只送出一次啟動 POST，不自動重試；金額以供應商端 `APIFY_MAX_TOTAL_CHARGE_USD` 封頂。timeout／5xx 保留未確認預留；後續 poll／dataset 讀取屬同一筆遠端工作，不重複計完整 Actor 費用 |
+| Bright Data | `datasets.trigger` | 寫入 `.submitted` 回執前；被拒絕時不會留下「送出狀態不明」的標記 |
+| Open Notebook | `sources.sync` | 建立 source 前 |
+| RSS 通知 Webhook | `notify` | 每次通知前 |
+| Email（Resend／SMTP／Webhook） | `email.send`、`webhook.post` | 每次寄送前，被拒絕時回 `permanent_failure`（不重試、不遞迴告警） |
+
+**嚴格模式只放行帶有供應商端可執行上限的操作。** 目前只有 Apify Actor 啟動傳入 `maxTotalChargeUsd`（[Apify Run Actor API](https://docs.apify.com/api/v2/actors-runs-post) 說明該值限制單次 run 的總費用）。Groq、MiniMax、OpenRouter 等路徑目前只有估算，沒有可驗證的供應商端費用上限，因此即使估算值為正，hard-stop 開啟時仍會拒絕；soft mode 的估算只供記錄，不保證實際費用不超出本地預算。
+
+```text
+DAILY_BUDGET_USD=5.00
+BUDGET_HARD_STOP=true
+COST_TIMEZONE=Asia/Taipei
+```
+
+* `DAILY_BUDGET_USD` 留空或 `0`：不設上限，守衛只記帳。
+* `BUDGET_HARD_STOP=true` **且** `DAILY_BUDGET_USD>0`：嚴格模式。`已花費 + 未結清預留 + 本次上限` 超過每日上限時，傳輸在開連線前就被拒絕（`Budget blocked:`），並記一筆 `blocked_budget`。
+* 嚴格模式下成本帳本不可寫（唯讀、損壞、磁碟滿）一律 fail-closed，不會因為記帳失敗就放行付費請求。
+* 超時、連線中斷或結果不明的 attempt 記為 `unknown` 且**不結清**預留，避免遠端仍在跑的工作看起來免費；之後要用 `provider_operation_id`（Apify run、Bright Data snapshot）對帳。
+* 沒有開嚴格模式時，守衛是諮詢性的：帳本寫不進去（唯讀、磁碟滿、被鎖住）只會印一行 `!` 警告並照常送出，但該 attempt 的預留會留在 `reserved`，不會因為沒記到帳就當成沒花錢。要「記不到就不准花」，請開 `BUDGET_HARD_STOP=true` 並設定 `DAILY_BUDGET_USD`。
+* 目前沒有自動釋出／對帳 `reserved` 預留的工具；unknown attempt 的遠端工作要人工用 `provider_operation_id` 對帳（規劃中的統一對帳屬 #7 範圍）。
+
+```powershell
+python pipeline.py --cost-report daily
+python pipeline.py --budget-status
+python pipeline.py --provider-health
+```
+
+報表只讀本機 `operations.db`，不會為了查成本再發任何付費請求；「本程式、指定帳戶範圍、截至 as_of」不等於供應商帳單。`unknown` 不會被當成 0。
+
+**邊界**：本地守衛只能攔截「這個程式送出去的新請求」。供應商晚計費、同一帳戶被其他工具共用、無法取消的遠端工作，與沒有可驗證價格的操作，都不在這個保證裡；要真正的零超支，仍需要供應商端的額度控制。

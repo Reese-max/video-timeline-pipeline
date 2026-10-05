@@ -452,10 +452,15 @@ def is_exportable(issues: List[ValidationIssue]) -> bool:
 
 
 def preview_cutspec(
-    spec: CutSpec, current_source: Optional[SourceInfo] = None
+    spec: CutSpec, current_source: Optional[SourceInfo] = None,
+    *, evidence_manifest: Optional[dict] = None, job_dir: Optional[Path | str] = None,
 ) -> Dict[str, Any]:
     """Read-only preview: clips, totals, gaps, flags. No subprocess, no network."""
     issues = validate_cutspec(spec, current_source=current_source)
+    evidence = _evidence_status(spec, evidence_manifest, job_dir,
+                                current_source.videoPath if current_source else None)
+    if evidence["status"] == "failed":
+        issues.append(ValidationIssue(evidence["code"], REJECT, None, evidence["failure"]))
     per_segment: Dict[str, List[ValidationIssue]] = {}
     for issue in issues:
         if issue.segmentId:
@@ -505,6 +510,7 @@ def preview_cutspec(
     )
     return {
         "specHash": spec.specHash,
+        "evidence": evidence,
         "cutSpecVersion": spec.cutSpecVersion,
         "source": {
             "videoPath": spec.source.videoPath,
@@ -564,8 +570,34 @@ def _export_path(video_path: str, redact_paths: bool) -> str:
     return name or "redacted"
 
 
-def cutspec_to_csv(spec: CutSpec, redact_paths: bool = False) -> str:
+def _evidence_status(spec: CutSpec, evidence_manifest: Optional[dict] = None,
+                     job_dir: Optional[Path | str] = None,
+                     video_path: Optional[Path | str] = None) -> dict:
+    import cut_provenance
+
+    if evidence_manifest is None and job_dir is None and not cut_provenance.requires_evidence(spec):
+        return {"status": "UNRESOLVED_EVIDENCE", "provenanceCoverage": 0.0}
+    try:
+        if evidence_manifest is None or job_dir is None:
+            raise cut_provenance.EvidenceError("MISSING_EVIDENCE_MANIFEST", "strict evidence requires its companion and source job")
+        return cut_provenance.validate_evidence(spec, evidence_manifest, job_dir, video_path)
+    except (cut_provenance.EvidenceError, TypeError, KeyError, AttributeError, OverflowError) as exc:
+        return {"status": "failed", "code": getattr(exc, "code", "INVALID_EVIDENCE_MANIFEST"),
+                "failure": str(exc), "provenanceCoverage": 0.0}
+
+
+def _require_export_evidence(spec: CutSpec, evidence_manifest: Optional[dict],
+                             job_dir: Optional[Path | str]) -> None:
+    evidence = _evidence_status(spec, evidence_manifest, job_dir)
+    if evidence["status"] == "failed":
+        raise ValueError(f"{evidence['code']}: {evidence['failure']}")
+
+
+def cutspec_to_csv(spec: CutSpec, redact_paths: bool = False, *,
+                   evidence_manifest: Optional[dict] = None,
+                   job_dir: Optional[Path | str] = None) -> str:
     """Deterministic CSV interchange: one source row + one row per segment."""
+    _require_export_evidence(spec, evidence_manifest, job_dir)
     buffer = io.StringIO()
     writer = csv.writer(buffer, lineterminator="\n")
     writer.writerow(CSV_COLUMNS)
@@ -747,8 +779,11 @@ def _otio_dict(spec: CutSpec, redact_paths: bool = False) -> Dict[str, Any]:
     }
 
 
-def cutspec_to_otio_json(spec: CutSpec, redact_paths: bool = False) -> str:
+def cutspec_to_otio_json(spec: CutSpec, redact_paths: bool = False, *,
+                         evidence_manifest: Optional[dict] = None,
+                         job_dir: Optional[Path | str] = None) -> str:
     """Emit an OTIO timeline deterministically (sorted keys, compact)."""
+    _require_export_evidence(spec, evidence_manifest, job_dir)
     return json.dumps(
         _otio_dict(spec, redact_paths=redact_paths),
         ensure_ascii=True,
@@ -923,6 +958,7 @@ def verify_export(
     export_text: str,
     export_format: str,
     tolerance_sec: Optional[float] = None,
+    *, evidence_manifest: Optional[dict] = None, job_dir: Optional[Path | str] = None,
 ) -> Dict[str, Any]:
     """Verify an export against the real source; emit a CutReceipt.
 
@@ -937,6 +973,7 @@ def verify_export(
     receipt: Dict[str, Any] = {
         "schema": CUTRECEIPT_SCHEMA,
         "specHash": spec.specHash,
+        "exportHash": hashlib.sha256(export_text.encode("utf-8")).hexdigest(),
         "exportFormat": export_format,
         "expectedContentHash": spec.source.contentHash,
         "observedContentHash": "",
@@ -974,6 +1011,11 @@ def verify_export(
             json.dumps(receipt, sort_keys=True).encode("utf-8")
         ).hexdigest()[:16]
         return receipt
+
+    evidence = _evidence_status(spec, evidence_manifest, job_dir, path)
+    receipt["evidence"] = evidence
+    if evidence["status"] == "failed":
+        return refuse(evidence["code"], evidence["failure"])
 
     if not path.is_file():
         receipt["status"] = "MISSING_SOURCE"
@@ -1140,7 +1182,7 @@ def _write_atomic(path: Path, text: str) -> None:
     tmp.replace(path)
 
 
-def main(argv: Optional[List[str]] = None) -> int:
+def _main(argv: Optional[List[str]] = None) -> int:
     parser = argparse.ArgumentParser(
         description="Evidence-backed paper-cut / NLE handoff (issue #11 spike)"
     )
@@ -1158,6 +1200,14 @@ def main(argv: Optional[List[str]] = None) -> int:
         "selection, reason, confidence, note, segmentId?}",
     )
     p_build.add_argument("--out")
+
+    p_evidence = sub.add_parser("build-evidence", help="resolve exact spans from an existing canonical source job")
+    p_evidence.add_argument("--video", required=True)
+    p_evidence.add_argument("--job-dir", required=True)
+    p_evidence.add_argument("--selections", required=True,
+                            help="JSON list of {artifact:transcript|timeline,index,selection?,reason?,note?}; ranges are derived")
+    p_evidence.add_argument("--out", required=True)
+    p_evidence.add_argument("--evidence-manifest", required=True)
 
     p_preview = sub.add_parser("preview", help="read-only cut preview")
     p_preview.add_argument("--spec", required=True)
@@ -1180,11 +1230,28 @@ def main(argv: Optional[List[str]] = None) -> int:
     p_verify.add_argument("--format", choices=["csv", "otio"], required=True)
     p_verify.add_argument("--receipt")
 
+    for command in (p_preview, p_export, p_verify):
+        command.add_argument("--job-dir", help="existing canonical source job for strict evidence resolution")
+        command.add_argument("--evidence-manifest", help="versioned cut-evidence/1 companion")
+
     args = parser.parse_args(argv)
 
     if args.command == "probe":
         source = source_from_video(Path(args.video))
         print(json.dumps(source.__dict__, ensure_ascii=False, indent=2))
+        return 0
+
+    if args.command == "build-evidence":
+        import cut_provenance
+
+        selections = json.loads(Path(args.selections).read_text(encoding="utf-8"))
+        spec, companion = cut_provenance.build_evidence_cutspec(args.job_dir, args.video, selections)
+        outputs = [Path(args.out).resolve(), Path(args.evidence_manifest).resolve()]
+        _check_evidence_outputs(outputs, args.job_dir, args.video)
+        if outputs[0] == outputs[1]:
+            raise ValueError("CutSpec and evidence companion require distinct output files")
+        _write_atomic(outputs[0], spec.to_json() + "\n")
+        _write_atomic(outputs[1], json.dumps(companion, ensure_ascii=False, sort_keys=True, indent=2) + "\n")
         return 0
 
     if args.command == "build":
@@ -1214,11 +1281,14 @@ def main(argv: Optional[List[str]] = None) -> int:
     if args.command == "preview":
         spec = CutSpec.from_json(Path(args.spec).read_text(encoding="utf-8"))
         current = source_from_video(Path(args.video)) if args.video else None
-        print(json.dumps(preview_cutspec(spec, current), ensure_ascii=False, indent=2))
-        return 0
+        evidence = _load_evidence_manifest(args.evidence_manifest)
+        preview = preview_cutspec(spec, current, evidence_manifest=evidence, job_dir=args.job_dir)
+        print(json.dumps(preview, ensure_ascii=False, indent=2))
+        return 2 if preview["status"] == "rejected" else 0
 
     if args.command == "export":
         spec = CutSpec.from_json(Path(args.spec).read_text(encoding="utf-8"))
+        evidence = _load_evidence_manifest(args.evidence_manifest)
         issues = validate_cutspec(spec)
         if not is_exportable(issues):
             for issue in issues:
@@ -1226,11 +1296,13 @@ def main(argv: Optional[List[str]] = None) -> int:
                     print(str(issue), file=sys.stderr)
             return 2
         text = (
-            cutspec_to_csv(spec, redact_paths=not args.full_paths)
+            cutspec_to_csv(spec, redact_paths=not args.full_paths, evidence_manifest=evidence, job_dir=args.job_dir)
             if args.format == "csv"
-            else cutspec_to_otio_json(spec, redact_paths=not args.full_paths)
+            else cutspec_to_otio_json(spec, redact_paths=not args.full_paths, evidence_manifest=evidence, job_dir=args.job_dir)
         )
         if args.out:
+            if args.job_dir:
+                _check_evidence_outputs([Path(args.out).resolve()], args.job_dir, spec.source.videoPath)
             _write_atomic(Path(args.out), text)
         else:
             print(text)
@@ -1239,15 +1311,50 @@ def main(argv: Optional[List[str]] = None) -> int:
     if args.command == "verify":
         spec = CutSpec.from_json(Path(args.spec).read_text(encoding="utf-8"))
         export_text = Path(args.export_file).read_text(encoding="utf-8")
-        receipt = verify_export(spec, Path(args.video), export_text, args.format)
+        evidence = _load_evidence_manifest(args.evidence_manifest)
+        receipt = verify_export(spec, Path(args.video), export_text, args.format,
+                                evidence_manifest=evidence, job_dir=args.job_dir)
         text = json.dumps(receipt, ensure_ascii=False, indent=2)
         if args.receipt:
+            if args.job_dir:
+                _check_evidence_outputs([Path(args.receipt).resolve()], args.job_dir, args.video)
             _write_atomic(Path(args.receipt), text + "\n")
         else:
             print(text)
-        return 0
+        return 0 if receipt["status"] == "verified" else 2
 
     return 1
+
+
+def _load_evidence_manifest(path: Optional[str]) -> Optional[dict]:
+    if not path:
+        return None
+    try:
+        return json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, ValueError, UnicodeError):
+        # Verification still emits a failed receipt for a missing/malformed
+        # companion; preview/export reject the same unsupported shape.
+        return {"schema": None}
+
+
+def _check_evidence_outputs(outputs: List[Path], job_dir: Path | str,
+                             video_path: Path | str) -> None:
+    job = Path(job_dir).resolve()
+    protected = {Path(video_path).resolve(), *(job / name for name in (
+        "manifest.json", "transcript.json", "timeline.json", "analysis/result.json"))}
+    if any(output in protected or output.is_relative_to(job) or output.name.endswith(".tmp") for output in outputs):
+        raise ValueError("evidence outputs must not replace canonical artifacts or source media")
+    if any(output.with_name(output.name + ".tmp").resolve() in protected
+           or output.with_name(output.name + ".tmp").resolve().is_relative_to(job) for output in outputs):
+        raise ValueError("temporary output would replace a canonical artifact")
+
+
+def main(argv: Optional[List[str]] = None) -> int:
+    try:
+        return _main(argv)
+    except (OSError, ValueError, TypeError, KeyError, AttributeError, OverflowError) as exc:
+        print(f"{getattr(exc, 'code', 'INVALID_INPUT')}: {exc}", file=sys.stderr)
+        return 2
 
 
 if __name__ == "__main__":
