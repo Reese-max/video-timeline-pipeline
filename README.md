@@ -623,6 +623,10 @@ COST_TIMEZONE=Asia/Taipei
 * `BUDGET_HARD_STOP=true` **且** `DAILY_BUDGET_USD>0`：嚴格模式。`已花費 + 未結清預留 + 本次上限` 超過每日上限時，傳輸在開連線前就被拒絕（`Budget blocked:`），並記一筆 `blocked_budget`。
 * 嚴格模式下成本帳本不可寫（唯讀、損壞、磁碟滿）一律 fail-closed，不會因為記帳失敗就放行付費請求。
 * 超時、連線中斷或結果不明的 attempt 記為 `unknown` 且**不結清**預留，避免遠端仍在跑的工作看起來免費；之後要用 `provider_operation_id`（Apify run、Bright Data snapshot）對帳。
+* 預算檢查在 SQLite writer transaction 內讀取已花費與未結清預留，commit 後才送網路；併發 worker 不會使用同一份舊餘額重複批准。
+* 受守衛控制的 `request_json` 每次實際 HTTP attempt（包括重試）都有獨立預留與 usage row，以 `logical_operation_id`／`attempt_no` 連結；先前 timeout 的風險不會被後來成功的重試消除。同一筆 unknown usage 與其未結清預留只計一次風險。
+* 本機快取重用記為 `cache_hit`／`zero_local`，不建立新的預留、不送出供應商請求，也不抵扣先前成本。舊帳本只增加新欄位，不重估或改寫歷史金額；缺少舊 reservation link 的紀錄保留原有保守計算與人工對帳邊界。
+* `--budget-status` 顯示已結算、未結清預留與 projected 風險；`remaining_usd` 是扣除全部風險後可用的預算。整數微美元欄位保留精確值；正數但不足一微美元的上限不會變成無上限。quota／permission 業務碼在回應遮罩後分類，不當成暫時限流重試。
 * 沒有開嚴格模式時，守衛是諮詢性的：帳本寫不進去（唯讀、磁碟滿、被鎖住）只會印一行 `!` 警告並照常送出，但該 attempt 的預留會留在 `reserved`，不會因為沒記到帳就當成沒花錢。要「記不到就不准花」，請開 `BUDGET_HARD_STOP=true` 並設定 `DAILY_BUDGET_USD`。
 * 目前沒有自動釋出／對帳 `reserved` 預留的工具；unknown attempt 的遠端工作要人工用 `provider_operation_id` 對帳（規劃中的統一對帳屬 #7 範圍）。
 
