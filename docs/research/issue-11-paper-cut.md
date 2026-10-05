@@ -173,7 +173,7 @@ redaction、篡改偵測）。
 
 ## 10. 已知誠實聲明 / 後續
 
-- `read_intervals` 從 seek point 解碼，observed coverage 會往前延伸到
+- Legacy seconds mode 的 `read_intervals` 從 seek point 解碼，observed coverage 會往前延伸到
   keyframe——receipt 記錄的是「範圍被真實內容覆蓋」，不是逐 frame 對齊。
 - VFR fixture 的 `avg_frame_rate`（2880/119）不在 TESTED_TIMEBASES，
   因此自動帶 `UNTESTED_TIMEBASE`；frame-accuracy 僅對測過的 CFR 宣稱。
@@ -278,8 +278,8 @@ new-job SHA capture、analysis 期間 source drift 與 legacy/stale cache
 provider-zero refusal 回歸。來源影音與既有 canonical artifacts 在
 preview/export/verify 的前後 bytes 不變。
 
-仍保持 `NLE_IMPORT_UNVERIFIED`；ffprobe 僅檢查解碼 coverage 包含 intended
-range，VFR 不宣稱逐 frame boundary accuracy。未量測人工 timecode →
+仍保持 `NLE_IMPORT_UNVERIFIED`；未提供 measured frame companion 時，ffprobe
+僅檢查解碼 coverage 包含 intended range，VFR 不宣稱逐 frame boundary accuracy。未量測人工 timecode →
 sequence 的完成時間基線，不宣稱省時百分比；historical `analyses/*`
 不同格式與任意第三方/摘要 layout 未包含在此 resolver acceptance。
 
@@ -310,3 +310,86 @@ record,cutSpecVersion,specHash,videoPath,contentHash,fingerprint,durationSec,fps
 frozen CFR/VFR 媒體上實際 round-trip；變動 evidence/source/selection/
 order/count/ranges 或壞 layout 會得到 failed receipt，不把 claimed hash
 當成成功依據。
+
+
+## 13. Measured decoded PTS / frame-boundary handoff
+
+原有 seconds interchange 保持相容，沒有 companion 時 receipt 明確回報
+`frameMapping.status=UNRESOLVED_FRAME_BOUNDARIES`。需要確定 decoded frames
+的離線 handoff 使用獨立 `cut-frame-map/1` companion。它不更改 CutSpec 的
+原始 evidence/sourceRange 或 canonical job，不用 nominal/average FPS 推算
+VFR frames，也不把 FFmpeg seek coverage 當精確 frame 邊界。
+
+`map-frames` 實際用 ffprobe 解碼 source 的第一個 video stream (`v:0`)，
+保存原始 presentation `pts` 整數、實際 stream `time_base`、stream index、
+所有 frame boundary indices 及 terminal boundary。每個 frame 必須有非負
+integer PTS 與量測到的正整數 duration；presentation PTS 必須嚴格遞增，
+每個 duration 必須接到下一個 PTS。最後 end boundary 是最後實際 PTS +
+最後量測 duration，不以 FPS/median duration 補猜。沒有 video、缺 PTS/
+duration、非單調／gap／overlap、負 PTS、超過 1,000,000 frames 或無法以
+OTIO double 精確保存的整數 ticks 都拒絕。stream time_base 必須是 1/N 的
+integer ticks-per-second clock；其他 clock 不猜測轉換。不宣稱支援所有 codec/container。
+
+時間座標是原始 presentation PTS × stream time_base，**不減掉 first PTS**。
+例如 frozen VFR source 的 first PTS 是 507、time_base 是 1/15360；因此
+0 秒不在它的 decoded domain 內，不能 silent clamp 到第一個 frame。
+所有 requested boundaries 須落在實際 first PTS 至 terminal boundary 內。
+
+Normalization contract：start 與 exclusive end 各自選**最近的實際 PTS
+boundary**；兩個 boundary 距離相同時選較晚者。計算用 decimal seconds
+轉 `Fraction`，不乘 nominal FPS、不 snap 到不存在的均勻 frame grid。
+結果須至少包含一個 decoded frame，否則 `EMPTY_NORMALIZED_FRAME_RANGE`。
+每個 entry 保存 requested range、normalized range、各邊界 frame index／PTS、
+`normalizationDeltaSec` 與依 normalized durations 累加的 output timeline。
+這是明確的可審查 frame snapping；有效範圍可能相對 requested evidence span
+往前或往後移動，原 evidence span/hash 保持不變，差異不隱藏。
+
+Companion hash 是 sorted compact ASCII JSON/UTF-8/SHA256，排除自身
+`manifestHash`。其 payload 包含 exact specHash、source content SHA256、
+normalization policy、完整 decoded PTS map 與所有 entries。preview/export/
+verify 會重讀實際 source bytes 並**重新解碼完整 map**，來源於解碼前後
+SHA 不同、companion 被更動或重算 hash 後偽造 PTS/entry 都 fail closed。
+這些操作只有 local subprocess，沒有網路、provider、secrets 或新分析。
+
+```sh
+python3 cutspec.py map-frames --spec spec.json --video SRC --out frames.json \
+  --job-dir ROOT/jobs/JOB --evidence-manifest evidence.json
+python3 cutspec.py preview --spec spec.json --frame-map frames.json \
+  --job-dir ROOT/jobs/JOB --evidence-manifest evidence.json
+python3 cutspec.py export --spec spec.json --format otio --out cut.otio \
+  --frame-map frames.json --job-dir ROOT/jobs/JOB --evidence-manifest evidence.json
+python3 cutspec.py verify --spec spec.json --video SRC --export-file cut.otio \
+  --format otio --receipt receipt.json --frame-map frames.json \
+  --job-dir ROOT/jobs/JOB --evidence-manifest evidence.json
+```
+
+CSV v1 仍保存原 requested seconds；**CSV + frame companion** 才是 frame
+handoff bundle。讀回時以同一 measured-boundary rule 解析 CSV seconds，驗證
+start/exclusive-end frame indices；沒有 companion 的 CSV receipt 不聲稱
+frame boundaries 已驗證。OTIO frame mode 使用 stream ticks (`rate=1/time_base`)
+與 normalized integer PTS ranges，內嵌 companion schema/hash/policy marker。
+OTIO 的原 CutSpec metadata 仍保存 requested ranges；actual clips 保存 normalized
+ranges，實際 official parser timeline 由 normalized durations 累加。
+
+Verifier 同時驗證實際 imported clip/frame indices、**exact OTIO tick values**、
+companion marker 與 cumulative timeline。即使使用者把一般 seconds tolerance
+放大，一個 tick 的 OTIO 改動也會拒絕；frame-mapped OTIO 缺 companion 會
+`MISSING_FRAME_MAP`。唯一的 parser float allowance 是 domain endpoints 的
+1/1,000,000 個 stream tick，以及 native timeline 累加的 1e-9 秒誤差；raw
+OTIO tick values 不適用此 allowance。Receipt hash 同時綁定 exact export bytes、
+frame companion identity、實際 selected frame indices 與 evidence companion。
+CLI 以 raw bytes 讀取 export 再嚴格 UTF-8 decode，不做 universal-newline
+translation；LF 與語意相同的 CRLF CSV 會有不同 exportHash/receiptId。所有
+atomic artifact writes 使用明確 UTF-8 bytes，不經 Windows text-mode newline
+translation。測試包含 Linux 上明確標示的 Windows newline 行為 model，
+不把 model 稱為已完成 Windows runtime 驗證。
+
+六支原有 CFR/VFR MP4 都跑實際 CLI、完整 ffprobe decoded-map、CSV + official
+OTIO 0.18.1 parser (12 rows)；來源／canonical artifacts 在前後 bytes 不變。
+VFR terminal 5-tick frame 有獨立實際 canary。Transcript/timeline inputs 仍是
+明確標示的 synthetic frozen span doubles，沒有真人／模型 performance claim。
+
+此 mode 驗證**此離線 handoff contract 選到的實際 decoded presentation frames**，
+未驗證 Premiere/Resolve 是否採用同一 stream clock/normalization。所有 receipts
+仍是 `NLE_IMPORT_UNVERIFIED`，人工 timecode→sequence baseline 仍 UNMEASURED；
+不宣稱已完成整個 issue #11 的人工流程／NLE acceptance。

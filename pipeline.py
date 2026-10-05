@@ -1573,6 +1573,12 @@ def bind_cost_root(root: Path) -> None:
     set_cost_root(root)
 
 
+def record_cost_cache_hit(provider: str, operation: str, **kwargs: Any) -> None:
+    from cost_tracker import record_provider_cache_hit
+
+    record_provider_cache_hit(provider, operation, **kwargs)
+
+
 class ApiRequestError(RuntimeError):
     """供應商 HTTP／傳輸失敗，帶著供應商自己的狀態碼與回應內容。
 
@@ -1581,11 +1587,12 @@ class ApiRequestError(RuntimeError):
     """
 
     def __init__(self, message: str, *, status_code: int | None = None, response_body: str = "",
-                 provider_outcome_unknown: bool = False) -> None:
+                 provider_outcome_unknown: bool = False, retry_after: float | None = None) -> None:
         super().__init__(message)
         self.status_code = status_code
         self.response_body = response_body
         self.provider_outcome_unknown = provider_outcome_unknown
+        self.retry_after = retry_after
 
 
 def request_json(
@@ -1605,36 +1612,44 @@ def request_json(
     for attempt in range(1, attempts + 1):
         request = urllib.request.Request(url, data=body, headers=headers, method=method)
         try:
-            with urllib.request.urlopen(request, timeout=budget.remaining(timeout)) as response:
-                raw = read_response(response, budget, read_timeout=timeout)
+            from cost_tracker import classify_error, is_retryable, provider_transport_attempt
+
+            with provider_transport_attempt():
+                try:
+                    with urllib.request.urlopen(request, timeout=budget.remaining(timeout)) as response:
+                        raw = read_response(response, budget, read_timeout=timeout)
+                except urllib.error.HTTPError as exc:
+                    try:
+                        detail = read_response(exc, budget, 4096, read_timeout=timeout).decode("utf-8", errors="replace")
+                    finally:
+                        exc.close()
+                    secrets = {value for key, value in headers.items() if key.lower() in {"authorization", "x-api-key", "api-key"}}
+                    secrets.update(value.split(" ", 1)[-1] for value in list(secrets))
+                    detail = redact_values(detail, secrets)
+                    # Classify only after reading and masking the provider's
+                    # business code, while this attempt still owns its reserve.
+                    raise ApiRequestError(
+                        f"API HTTP {exc.code}（{public_url(url)}）：{detail[:1200]}",
+                        status_code=exc.code, response_body=detail, retry_after=retry_delay(exc, delay),
+                    ) from exc
+                except (urllib.error.URLError, TimeoutError) as exc:
+                    reason = getattr(exc, "reason", None) or type(exc).__name__
+                    raise ApiRequestError(f"API 網路錯誤：{reason}", provider_outcome_unknown=True) from exc
             break
-        except urllib.error.HTTPError as exc:
-            try:
-                detail = read_response(exc, budget, 4096, read_timeout=timeout).decode("utf-8", errors="replace")
-            finally:
-                exc.close()
-            secrets = {value for key, value in headers.items() if key.lower() in {"authorization", "x-api-key", "api-key"}}
-            secrets.update(value.split(" ", 1)[-1] for value in list(secrets))
-            detail = redact_values(detail, secrets)
-            if exc.code in RETRY_STATUS and attempt < attempts:
-                wait = retry_delay(exc, delay)
-                print(f"! API HTTP {exc.code}，{wait:.0f} 秒後重試（{attempt}/{attempts - 1}）")
+        except ApiRequestError as exc:
+            category = classify_error(exc, exc.status_code, exc.response_body)
+            if exc.status_code in RETRY_STATUS and is_retryable(category) and attempt < attempts:
+                wait = exc.retry_after if exc.retry_after is not None else delay
+                print(f"! API HTTP {exc.status_code}，{wait:.0f} 秒後重試（{attempt}/{attempts - 1}）")
                 budget.sleep(wait)
                 delay *= 2
                 continue
-            # 帶上 URL：base_url 被環境變數改掉時，光看「404 page not found」查不出原因。
-            raise ApiRequestError(
-                f"API HTTP {exc.code}（{public_url(url)}）：{detail[:1200]}", status_code=exc.code, response_body=detail
-            ) from exc
-        # TimeoutError 不是 URLError 的子類，只接 URLError 會讓讀取逾時完全跳過重試
-        except (urllib.error.URLError, TimeoutError) as exc:
-            reason = getattr(exc, "reason", None) or type(exc).__name__
-            if attempt < attempts:
-                print(f"! API 網路錯誤（{reason}），{delay:.0f} 秒後重試（{attempt}/{attempts - 1}）")
+            if exc.status_code is None and exc.provider_outcome_unknown and attempt < attempts:
+                print(f"! API 網路錯誤，{delay:.0f} 秒後重試（{attempt}/{attempts - 1}）")
                 budget.sleep(delay)
                 delay *= 2
                 continue
-            raise ApiRequestError(f"API 網路錯誤：{reason}") from exc
+            raise
     try:
         result = json.loads(raw.decode("utf-8"))
         budget.check()
@@ -1960,6 +1975,7 @@ def transcribe_all(
         cache_path = cache_dir / f"{key}.json"
         cached = reuse_artifact(cache_path)
         if isinstance(cached, dict) and (cached.get("segments") or cached.get("text")):
+            record_cost_cache_hit("groq", "audio.transcriptions", model=model)
             return int(chunk["index"]), cached, key, True, 0.0
         started = time.monotonic()
         result = groq_transcribe(path, api_key, model, language, word_timestamps)
@@ -2431,6 +2447,7 @@ def analyze_images(
             cache_path = cache_dir / (hashlib.sha256(material.encode("utf-8")).hexdigest() + ".json")
             cached = reuse_artifact(cache_path)
             if reusable_visual_observation(cached, candidate):
+                record_cost_cache_hit("minimax", "vision.analyze_images", model=model)
                 cached = dict(cached)
                 cached["source_image"] = str(image_path)
                 return index, cached
@@ -2633,6 +2650,7 @@ def cached_minimax_summary(
     cache_path = cache_dir / (hashlib.sha256(material.encode("utf-8")).hexdigest() + ".json")
     cached = reuse_artifact(cache_path, "short_summary")
     if valid(cached):
+        record_cost_cache_hit("minimax", f"summarize.{kind}", model=model)
         return cached
     operation = f"summarize.{kind}"
     result = parse_json_object(minimax_chat(messages, api_key, model, thinking="disabled", operation=operation))
@@ -3022,29 +3040,22 @@ def open_notebook_sync(
     auth_headers = {"Authorization": f"Bearer {password}", "X-Password": password}
 
     replaced = False
-    if replace_source_id:
-        # 重跑同一支影片時先撤掉上次的條目，否則 notebook 會積出一排同名 source。
-        try:
-            request_json(
-                f"{base_url}/api/sources/{replace_source_id}",
-                auth_headers,
-                method="DELETE",
-                timeout=30,
-            )
-            replaced = True
-        except RuntimeError as exc:
-            # 使用者可能已經在 UI 手動刪掉了，那不是錯誤。
-            if "HTTP 404" not in str(exc):
-                raise
-
     fields = {"type": "upload", "notebook_id": notebook_id, "async_processing": "true"}
     if title:
         # 不傳的話 Open Notebook 拿檔名當標題，整個 notebook 會是一排 knowledge.md
         fields["title"] = title
     body, boundary = multipart_body(fields, "file", knowledge_path)
     headers = {**auth_headers, "Content-Type": f"multipart/form-data; boundary={boundary}"}
-    # 只有建立 source 會讓對外服務開始處理；後面的 command poll 屬同一筆工作。
+    # 拒絕同步時也不得先刪除舊 source。建立與替換都先通過守衛。
     with cost_guard("open_notebook", "sources.sync") as guard_outcome:
+        if replace_source_id:
+            try:
+                request_json(f"{base_url}/api/sources/{replace_source_id}", auth_headers,
+                             method="DELETE", timeout=30)
+                replaced = True
+            except RuntimeError as exc:
+                if "HTTP 404" not in str(exc):
+                    raise
         response = post_json(sources_url, headers, body)
         source_id = response.get("id") or ""
         if source_id:

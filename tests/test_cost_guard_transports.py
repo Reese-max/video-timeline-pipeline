@@ -257,10 +257,10 @@ class GuardAccountingTests(unittest.TestCase):
                 pipeline.minimax_chat([{"role": "user", "content": "hi"}], "mm-key", "MiniMax-M3")
 
         usage = rows(self.root, "usage_costs")
-        self.assertEqual(len(usage), 1)
-        self.assertEqual(usage[0]["status"], "unknown")
+        self.assertEqual(len(usage), 4)
+        self.assertEqual([row["status"] for row in usage], ["unknown"] * 4)
         # An unproven attempt keeps its risk: the reservation must stay outstanding.
-        self.assertEqual(rows(self.root, "budget_reservations")[0]["status"], "reserved")
+        self.assertEqual([row["status"] for row in rows(self.root, "budget_reservations")], ["reserved"] * 4)
 
     def test_remote_operation_id_is_kept_for_reconciliation(self) -> None:
         snapshot = "s_abc123"

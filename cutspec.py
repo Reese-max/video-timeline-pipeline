@@ -11,6 +11,7 @@ generation stays upstream; everything here is deterministic.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import csv
 import hashlib
 import io
@@ -454,13 +455,17 @@ def is_exportable(issues: List[ValidationIssue]) -> bool:
 def preview_cutspec(
     spec: CutSpec, current_source: Optional[SourceInfo] = None,
     *, evidence_manifest: Optional[dict] = None, job_dir: Optional[Path | str] = None,
+    frame_map: Optional[dict] = None,
 ) -> Dict[str, Any]:
-    """Read-only preview: clips, totals, gaps, flags. No subprocess, no network."""
+    """Read-only preview; optional measured frame mode decodes local media only."""
     issues = validate_cutspec(spec, current_source=current_source)
     evidence = _evidence_status(spec, evidence_manifest, job_dir,
                                 current_source.videoPath if current_source else None)
     if evidence["status"] == "failed":
         issues.append(ValidationIssue(evidence["code"], REJECT, None, evidence["failure"]))
+    frames = _frame_status(spec, frame_map, current_source.videoPath if current_source else None)
+    if frames["status"] == "failed":
+        issues.append(ValidationIssue(frames["code"], REJECT, None, frames["failure"]))
     per_segment: Dict[str, List[ValidationIssue]] = {}
     for issue in issues:
         if issue.segmentId:
@@ -511,6 +516,7 @@ def preview_cutspec(
     return {
         "specHash": spec.specHash,
         "evidence": evidence,
+        "frameMapping": frames,
         "cutSpecVersion": spec.cutSpecVersion,
         "source": {
             "videoPath": spec.source.videoPath,
@@ -593,11 +599,31 @@ def _require_export_evidence(spec: CutSpec, evidence_manifest: Optional[dict],
         raise ValueError(f"{evidence['code']}: {evidence['failure']}")
 
 
+def _frame_status(spec: CutSpec, frame_map: Optional[dict], video_path: Optional[Path | str] = None) -> dict:
+    if frame_map is None:
+        return {"status": "UNRESOLVED_FRAME_BOUNDARIES"}
+    import cut_frame_map
+    tracker = {"calls": 0}
+    try:
+        return {**cut_frame_map.validate_frame_map(spec, frame_map, video_path or spec.source.videoPath, _tracker=tracker),
+                "localSubprocessCalls": tracker["calls"]}
+    except cut_frame_map.FrameMapError as exc:
+        return {"status": "failed", "code": exc.code, "failure": str(exc), "localSubprocessCalls": tracker["calls"]}
+
+
+def _require_export_frames(spec: CutSpec, frame_map: Optional[dict]) -> None:
+    status = _frame_status(spec, frame_map)
+    if status["status"] == "failed":
+        raise ValueError(f"{status['code']}: {status['failure']}")
+
+
 def cutspec_to_csv(spec: CutSpec, redact_paths: bool = False, *,
                    evidence_manifest: Optional[dict] = None,
-                   job_dir: Optional[Path | str] = None) -> str:
+                   job_dir: Optional[Path | str] = None,
+                   frame_map: Optional[dict] = None) -> str:
     """Deterministic CSV interchange: one source row + one row per segment."""
     _require_export_evidence(spec, evidence_manifest, job_dir)
+    _require_export_frames(spec, frame_map)
     buffer = io.StringIO()
     writer = csv.writer(buffer, lineterminator="\n")
     writer.writerow(CSV_COLUMNS)
@@ -716,11 +742,33 @@ def _otio_time_range(start_sec: float, end_sec: float, timebase: str) -> Dict[st
     }
 
 
-def _otio_dict(spec: CutSpec, redact_paths: bool = False) -> Dict[str, Any]:
+def _otio_dict(spec: CutSpec, redact_paths: bool = False,
+               frame_map: Optional[dict] = None) -> Dict[str, Any]:
     timebase = spec.source.timebase
     url_path = _export_path(spec.source.videoPath, redact_paths)
     embedded = spec.to_dict()
     embedded["source"]["videoPath"] = url_path
+    frame_entries = {entry["segmentId"]: entry for entry in frame_map["entries"]} if frame_map else {}
+
+    def time_range(segment: CutSegment) -> dict:
+        if frame_map is None:
+            return _otio_time_range(segment.sourceRange["startSec"], segment.sourceRange["endSec"], timebase)
+        entry = frame_entries[segment.segmentId]
+        rate = float(1 / Fraction(frame_map["timeBase"]))
+        start, end = entry["startBoundary"]["pts"], entry["endBoundaryExclusive"]["pts"]
+        return {"OTIO_SCHEMA": "TimeRange.1",
+                "start_time": {"OTIO_SCHEMA": "RationalTime.1", "rate": rate, "value": start},
+                "duration": {"OTIO_SCHEMA": "RationalTime.1", "rate": rate, "value": end - start}}
+
+    available_range = _otio_time_range(0.0, spec.source.durationSec, timebase)
+    metadata = {"cutSpec": embedded}
+    if frame_map is not None:
+        import cut_frame_map
+        pts, rate = frame_map["boundaryPts"], float(1 / Fraction(frame_map["timeBase"]))
+        available_range = {"OTIO_SCHEMA": "TimeRange.1",
+                           "start_time": {"OTIO_SCHEMA": "RationalTime.1", "rate": rate, "value": pts[0]},
+                           "duration": {"OTIO_SCHEMA": "RationalTime.1", "rate": rate, "value": pts[-1] - pts[0]}}
+        metadata["frameMap"] = cut_frame_map.export_marker(frame_map)
     clips = []
     for seg in spec.segments:
         clips.append(
@@ -736,17 +784,13 @@ def _otio_dict(spec: CutSpec, redact_paths: bool = False) -> Dict[str, Any]:
                         "note": seg.note,
                     }
                 },
-                "source_range": _otio_time_range(
-                    seg.sourceRange["startSec"], seg.sourceRange["endSec"], timebase
-                ),
+                "source_range": time_range(seg),
                 "media_references": {
                     "DEFAULT_MEDIA": {
                         "OTIO_SCHEMA": "ExternalReference.1",
                         "name": "",
                         "target_url": url_path,
-                        "available_range": _otio_time_range(
-                            0.0, spec.source.durationSec, timebase
-                        ),
+                        "available_range": available_range,
                         "available_image_bounds": None,
                         "metadata": {},
                     }
@@ -761,7 +805,7 @@ def _otio_dict(spec: CutSpec, redact_paths: bool = False) -> Dict[str, Any]:
     return {
         "OTIO_SCHEMA": "Timeline.1",
         "name": f"cutspec-{spec.specHash[:12]}",
-        "metadata": {"cutspec": {"cutSpec": embedded}},
+        "metadata": {"cutspec": metadata},
         "tracks": {
             "OTIO_SCHEMA": "Stack.1",
             "name": "tracks",
@@ -781,11 +825,13 @@ def _otio_dict(spec: CutSpec, redact_paths: bool = False) -> Dict[str, Any]:
 
 def cutspec_to_otio_json(spec: CutSpec, redact_paths: bool = False, *,
                          evidence_manifest: Optional[dict] = None,
-                         job_dir: Optional[Path | str] = None) -> str:
+                         job_dir: Optional[Path | str] = None,
+                         frame_map: Optional[dict] = None) -> str:
     """Emit an OTIO timeline deterministically (sorted keys, compact)."""
     _require_export_evidence(spec, evidence_manifest, job_dir)
+    _require_export_frames(spec, frame_map)
     return json.dumps(
-        _otio_dict(spec, redact_paths=redact_paths),
+        _otio_dict(spec, redact_paths=redact_paths, frame_map=frame_map),
         ensure_ascii=True,
         sort_keys=True,
         indent=2,
@@ -959,6 +1005,7 @@ def verify_export(
     export_format: str,
     tolerance_sec: Optional[float] = None,
     *, evidence_manifest: Optional[dict] = None, job_dir: Optional[Path | str] = None,
+    frame_map: Optional[dict] = None,
 ) -> Dict[str, Any]:
     """Verify an export against the real source; emit a CutReceipt.
 
@@ -1016,6 +1063,18 @@ def verify_export(
     receipt["evidence"] = evidence
     if evidence["status"] == "failed":
         return refuse(evidence["code"], evidence["failure"])
+
+    if export_format == "otio" and frame_map is None:
+        try:
+            if "frameMap" in json.loads(export_text).get("metadata", {}).get("cutspec", {}):
+                return refuse("MISSING_FRAME_MAP", "frame-mapped OTIO requires its measured companion")
+        except (TypeError, ValueError, AttributeError):
+            pass  # Normal export parsing below emits INVALID_EXPORT.
+    frames = _frame_status(spec, frame_map, path)
+    receipt["frameMapping"] = frames
+    receipt["localSubprocessCalls"] += frames.get("localSubprocessCalls", 0)
+    if frames["status"] == "failed":
+        return refuse(frames["code"], frames["failure"])
 
     if not path.is_file():
         receipt["status"] = "MISSING_SOURCE"
@@ -1086,6 +1145,14 @@ def verify_export(
     except (TypeError, ValueError, KeyError, AttributeError, OverflowError):
         return refuse("INVALID_EXPORT", "export could not be parsed with its declared contract")
 
+    if frame_map is not None:
+        import cut_frame_map
+        try:
+            cut_frame_map.verify_imported(frame_map, imported_rows, export_text, export_format)
+        except cut_frame_map.FrameMapError as exc:
+            return refuse(exc.code, str(exc))
+    frame_entries = {entry["segmentId"]: entry for entry in frames.get("entries", [])}
+
     has_video = any(
         s.get("codec_type") == "video" for s in probe.get("streams", [])
     )
@@ -1094,6 +1161,11 @@ def verify_export(
     for seg in spec.segments:
         intended_start = seg.sourceRange["startSec"]
         intended_end = seg.sourceRange["endSec"]
+        expected_timeline = seg.timelineRange
+        mapped = frame_entries.get(seg.segmentId)
+        if mapped and export_format == "otio":
+            intended_start, intended_end = (mapped["normalizedSourceRange"][key] for key in ("startSec", "endSec"))
+            expected_timeline = mapped["normalizedTimelineRange"]
         entry: Dict[str, Any] = {
             "segmentId": seg.segmentId,
             "intendedSourceRange": {"startSec": intended_start, "endSec": intended_end},
@@ -1101,6 +1173,9 @@ def verify_export(
             "deltaImportSec": None,
             "deltaFFmpegSec": None,
         }
+        if mapped:
+            entry["requestedSourceRange"] = dict(seg.sourceRange)
+            entry["frameBoundaries"] = mapped
         got = imported.get(seg.segmentId)
         if got is None:
             entry["status"] = "failed"
@@ -1120,11 +1195,11 @@ def verify_export(
             ]
             if got.get("timelineStartSec") is not None:
                 deltas.append(
-                    abs(got["timelineStartSec"] - seg.timelineRange["startSec"])
+                    abs(got["timelineStartSec"] - expected_timeline["startSec"])
                 )
             if got.get("timelineEndSec") is not None:
                 deltas.append(
-                    abs(got["timelineEndSec"] - seg.timelineRange["endSec"])
+                    abs(got["timelineEndSec"] - expected_timeline["endSec"])
                 )
             entry["importedSourceRange"] = {
                 "startSec": got["sourceStartSec"],
@@ -1134,6 +1209,18 @@ def verify_export(
             if entry["deltaImportSec"] > tolerance:
                 entry["status"] = "failed"
                 entry["failure"] = "imported range drifted beyond tolerance"
+
+        if mapped:
+            # The full v:0 map was actually decoded and matched above. Its
+            # exact indices/terminal duration replace seek-point + nominal
+            # median-duration coverage estimates in measured frame mode.
+            entry["decodedFrames"] = mapped["endBoundaryExclusive"]["frameIndex"] - mapped["startBoundary"]["frameIndex"]
+            entry["observedCoverageSec"] = mapped["normalizedSourceRange"]
+            entry["deltaFFmpegSec"] = 0.0
+            if entry["status"] == "failed":
+                receipt["mismatches"] += 1
+            receipt["segments"].append(entry)
+            continue
 
         observed = _ffprobe_interval_seconds(
             path,
@@ -1169,6 +1256,8 @@ def verify_export(
         receipt["segments"].append(entry)
 
     receipt["status"] = "verified" if receipt["mismatches"] == 0 else "failed"
+    if frame_map is not None and pipeline.file_sha256(path) != spec.source.contentHash:
+        return refuse("STALE_SOURCE", "source changed during measured frame verification")
     receipt["stillNeedsHumanFix"] = receipt["mismatches"] > 0
     receipt["receiptId"] = hashlib.sha256(
         json.dumps(receipt, sort_keys=True).encode("utf-8")
@@ -1178,7 +1267,7 @@ def verify_export(
 
 def _write_atomic(path: Path, text: str) -> None:
     tmp = path.with_name(path.name + ".tmp")
-    tmp.write_text(text, encoding="utf-8")
+    tmp.write_bytes(text.encode("utf-8"))
     tmp.replace(path)
 
 
@@ -1209,6 +1298,11 @@ def _main(argv: Optional[List[str]] = None) -> int:
     p_evidence.add_argument("--out", required=True)
     p_evidence.add_argument("--evidence-manifest", required=True)
 
+    p_frames = sub.add_parser("map-frames", help="freeze actual decoded presentation PTS boundaries for a CutSpec")
+    p_frames.add_argument("--spec", required=True)
+    p_frames.add_argument("--video", required=True)
+    p_frames.add_argument("--out", required=True)
+
     p_preview = sub.add_parser("preview", help="read-only cut preview")
     p_preview.add_argument("--spec", required=True)
     p_preview.add_argument("--video", help="also check source revision")
@@ -1230,9 +1324,11 @@ def _main(argv: Optional[List[str]] = None) -> int:
     p_verify.add_argument("--format", choices=["csv", "otio"], required=True)
     p_verify.add_argument("--receipt")
 
-    for command in (p_preview, p_export, p_verify):
+    for command in (p_preview, p_export, p_verify, p_frames):
         command.add_argument("--job-dir", help="existing canonical source job for strict evidence resolution")
         command.add_argument("--evidence-manifest", help="versioned cut-evidence/1 companion")
+    for command in (p_preview, p_export, p_verify):
+        command.add_argument("--frame-map", help="measured cut-frame-map/1 companion; revalidated against actual decoded media")
 
     args = parser.parse_args(argv)
 
@@ -1280,9 +1376,11 @@ def _main(argv: Optional[List[str]] = None) -> int:
 
     if args.command == "preview":
         spec = CutSpec.from_json(Path(args.spec).read_text(encoding="utf-8"))
-        current = source_from_video(Path(args.video)) if args.video else None
         evidence = _load_evidence_manifest(args.evidence_manifest)
-        preview = preview_cutspec(spec, current, evidence_manifest=evidence, job_dir=args.job_dir)
+        with contextlib.redirect_stdout(sys.stderr) if args.frame_map else contextlib.nullcontext():
+            current = source_from_video(Path(args.video)) if args.video else None
+            preview = preview_cutspec(spec, current, evidence_manifest=evidence, job_dir=args.job_dir,
+                                      frame_map=_load_frame_map(args.frame_map))
         print(json.dumps(preview, ensure_ascii=False, indent=2))
         return 2 if preview["status"] == "rejected" else 0
 
@@ -1295,12 +1393,17 @@ def _main(argv: Optional[List[str]] = None) -> int:
                 if issue.severity == REJECT:
                     print(str(issue), file=sys.stderr)
             return 2
-        text = (
-            cutspec_to_csv(spec, redact_paths=not args.full_paths, evidence_manifest=evidence, job_dir=args.job_dir)
-            if args.format == "csv"
-            else cutspec_to_otio_json(spec, redact_paths=not args.full_paths, evidence_manifest=evidence, job_dir=args.job_dir)
-        )
+        with contextlib.redirect_stdout(sys.stderr) if args.frame_map else contextlib.nullcontext():
+            text = (
+                cutspec_to_csv(spec, redact_paths=not args.full_paths, evidence_manifest=evidence, job_dir=args.job_dir,
+                              frame_map=_load_frame_map(args.frame_map))
+                if args.format == "csv"
+                else cutspec_to_otio_json(spec, redact_paths=not args.full_paths, evidence_manifest=evidence, job_dir=args.job_dir,
+                                         frame_map=_load_frame_map(args.frame_map))
+            )
         if args.out:
+            if args.frame_map:
+                _check_frame_outputs([Path(args.out).resolve()], args, spec.source.videoPath)
             if args.job_dir:
                 _check_evidence_outputs([Path(args.out).resolve()], args.job_dir, spec.source.videoPath)
             _write_atomic(Path(args.out), text)
@@ -1310,18 +1413,33 @@ def _main(argv: Optional[List[str]] = None) -> int:
 
     if args.command == "verify":
         spec = CutSpec.from_json(Path(args.spec).read_text(encoding="utf-8"))
-        export_text = Path(args.export_file).read_text(encoding="utf-8")
+        export_text = Path(args.export_file).read_bytes().decode("utf-8")
         evidence = _load_evidence_manifest(args.evidence_manifest)
-        receipt = verify_export(spec, Path(args.video), export_text, args.format,
-                                evidence_manifest=evidence, job_dir=args.job_dir)
+        with contextlib.redirect_stdout(sys.stderr) if args.frame_map else contextlib.nullcontext():
+            receipt = verify_export(spec, Path(args.video), export_text, args.format,
+                                    evidence_manifest=evidence, job_dir=args.job_dir,
+                                    frame_map=_load_frame_map(args.frame_map))
         text = json.dumps(receipt, ensure_ascii=False, indent=2)
         if args.receipt:
+            if args.frame_map:
+                _check_frame_outputs([Path(args.receipt).resolve()], args, args.video, spec.source.videoPath)
             if args.job_dir:
                 _check_evidence_outputs([Path(args.receipt).resolve()], args.job_dir, args.video)
             _write_atomic(Path(args.receipt), text + "\n")
         else:
             print(text)
         return 0 if receipt["status"] == "verified" else 2
+
+    if args.command == "map-frames":
+        import cut_frame_map
+        spec = CutSpec.from_json(Path(args.spec).read_text(encoding="utf-8"))
+        _require_export_evidence(spec, _load_evidence_manifest(args.evidence_manifest), args.job_dir)
+        output = Path(args.out).resolve()
+        _check_frame_outputs([output], args, args.video, spec.source.videoPath)
+        with contextlib.redirect_stdout(sys.stderr):
+            manifest = cut_frame_map.build_frame_map(spec, args.video)
+        _write_atomic(output, json.dumps(manifest, ensure_ascii=False, sort_keys=True, indent=2) + "\n")
+        return 0
 
     return 1
 
@@ -1335,6 +1453,39 @@ def _load_evidence_manifest(path: Optional[str]) -> Optional[dict]:
         # Verification still emits a failed receipt for a missing/malformed
         # companion; preview/export reject the same unsupported shape.
         return {"schema": None}
+
+
+def _load_frame_map(path: Optional[str]) -> Optional[dict]:
+    if path is None:
+        return None
+    def unique(pairs):
+        result = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError("duplicate frame map key")
+            result[key] = value
+        return result
+    def invalid_constant(value):
+        raise ValueError("nonfinite frame map JSON")
+    try:
+        return json.loads(Path(path).read_text(encoding="utf-8"), object_pairs_hook=unique, parse_constant=invalid_constant)
+    except (OSError, ValueError, TypeError):
+        return {"schema": "invalid-frame-companion"}
+
+
+def _check_frame_outputs(outputs: List[Path], args: Any, video_path: Path | str,
+                         spec_source: Optional[Path | str] = None) -> None:
+    protected = {Path(video_path).resolve()}
+    if spec_source:
+        protected.add(Path(spec_source).resolve())
+    for field in ("spec", "frame_map", "evidence_manifest", "export_file"):
+        value = getattr(args, field, None)
+        if value:
+            protected.add(Path(value).resolve())
+    if any(output in protected or output.with_name(output.name + ".tmp").resolve() in protected for output in outputs):
+        raise ValueError("frame handoff outputs must not replace source media, spec or input companions")
+    if args.job_dir:
+        _check_evidence_outputs(outputs, args.job_dir, video_path)
 
 
 def _check_evidence_outputs(outputs: List[Path], job_dir: Path | str,
