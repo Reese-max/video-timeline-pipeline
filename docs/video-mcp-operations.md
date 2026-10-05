@@ -95,7 +95,10 @@ verification; healthy status alone is not proof of successful cleanup.
 
 Every generated URL carries an HMAC signature over its exact job, path and expiry.
 GET, HEAD and byte ranges use the same signature. Missing, expired, duplicated or
-tampered query fields are refused. Refresh links using `get_prepared_video`.
+tampered query fields are refused. Refresh links using `get_prepared_video`;
+when retention removed the source and segments but kept the manifest and
+analysis records, both `get_prepared_video` and a completed `prepare` result
+polled via `get_video_job` report `MEDIA_EXPIRED` instead of stale links.
 `MEDIA_EXPIRED` means the underlying media is no longer retained and requires new
 preparation; an operation deadline can instead be resumed.
 
