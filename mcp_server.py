@@ -860,6 +860,7 @@ def analyze_prepared_sync(job_id: str) -> dict[str, Any]:
         and cached.get("status") == "complete"
         and cached.get("cache_signature") == cache_signature
     ):
+        pipeline.record_cost_cache_hit("pipeline", "analysis", job=job_id, root=MCP_ROOT)
         return {**cached, "quality": analysis_quality(cached)}
 
     storage_policy().mark_managed(job_id)
