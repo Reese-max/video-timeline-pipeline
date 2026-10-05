@@ -501,7 +501,13 @@ python pipeline.py --ask '這些影片有提過怎麼設定 ffmpeg 嗎？'
 python pipeline.py --digest
 ```
 
-`--ask` 先讓模型把問句拆成檢索詞（整句丟進 FTS5 是 phrase 比對，長問句必定 0 筆），再用檢索到的片段生成答案，並標註 `[1]`、`[2]` 對應到影片標題與時間戳。提示詞限定只能引用片段內容，資訊不足時會直說找不到，不會臆造。
+`--ask` 先讓模型把問句拆成檢索詞（整句丟進 FTS5 是 phrase 比對，長問句必定 0 筆），再讓模型選擇要呈現的完整來源片段。程式核對原文與引用編號後，以 `[1]`、`[2]` 對應到影片標題與時間戳；模型自行改寫的答案不會直接發布。
+
+每個片段都有完整 SHA-256 的 `occurrence_id`，綁定 `library_id`、job、`analysis_revision`、類型、真實起訖（未知保持 NULL）、時間種類、文字雜湊、chunker 版本與有證據的原始 segment IDs。同一份來源及分析重建索引時 ID 不變；來源 URL／位元組版本、實際模型與分析參數、原始 timeline／summary 或明示 analysis revision 改變時，引用屬於新版本。`library-id.json` 是持久資料，搬移、備份與衍生資料庫重建時須保留；連同此檔複製的資料庫仍代表同一邏輯 library，獨立建立的 library 則有不同身分。搜尋與引用輸出保留上述來源欄位；沒有原始 segment ID 時輸出空陣列，不捏造。Ask 的模型回應須為 `{"claims":[{"support_kind":"source_quote","block_index":1,"quote":"完整原始片段文字"}]}`。原文須完整一致，不接受截去日期或否定詞的摘錄，也不接受跨越合併片段邊界的引文；非法編號、改寫、額外文字或模型提供的來源 URL 會使整份回答拒絕。無法核對時回傳 `insufficient_evidence=true`、空 `claims`，並保留檢索 evidence；合法的舊格式引用可保留供查閱，但舊格式主張不會發布。
+
+成功的 `claims` 由程式綁定原始 occurrence IDs，標記 `quote_verified=true`；`support_validation=exact_source_quote` 僅代表引文與已提供原文一致。逐字稿、視覺模型觀察與衍生摘要會分別標示來源類型。`semantic_support_verified` 一律仍是 `false`：尚未驗證片段是否回答問題、影片說法是否正確或舊價格是否適用於現在。跨片綜合、模型推論與當前外部事實仍拒絕生成；issue #5 的人工 golden evaluation 與完整語意支持驗證尚未完成。片段指令仍為不可信資料，核對失敗不會自動增加修復或驗證模型呼叫。
+
+Ask 以 UTF-8 byte 數保守估算 token，計入指令、問題、標題、時間範圍與 512 token 的回答預留；這是 context 規劃，並未限制供應商實際輸出長度。合併相鄰片段會保留全部來源 ID，合併後超出預算則維持分段；省略數與原因見 `packing`，只有命中多支影片時才限制單片占比。
 
 `--digest` 把各支影片的摘要合成 `digest.md`：主題分群、跨影片反覆出現的術語、建議觀看順序、涵蓋落差。只吃跑過完整流程的 job，`--local-only`／`--dry-run` 的 job 沒有真摘要會被跳過。
 
@@ -531,11 +537,23 @@ python pipeline.py --embed --embed-backend local  # 本機
 
 其他可用模型：`baai/bge-m3`、`qwen/qwen3-embedding-8b`（皆 US$0.01/M）、`nvidia/llama-nemotron-embed-vl-1b-v2:free`。
 
-OpenRouter 的 `/embeddings` 與 `/rerank` 端點在模型清單裡查不到、官方文件也沒寫，但實測可用。要注意 chat 的 `:free` 清單與 embedding 的模型池是分開的：chat 那些 id 打 embeddings 會回 `does not exist`；而 NVIDIA 那幾顆**必須加 `:free` 後綴**才有 provider，不加會回 `No endpoints found`。
+OpenRouter 有官方的 [embeddings](https://openrouter.ai/docs/api/reference/embeddings/overview) 與 [rerank](https://openrouter.ai/docs/guides/features/reranking) 端點文件。要注意 chat 的 `:free` 清單與 embedding 的模型池是分開的：chat 那些 id 打 embeddings 會回 `does not exist`；而 NVIDIA 那幾顆**必須加 `:free` 後綴**才有 provider，不加會回 `No endpoints found`。
 
 本機後端首次使用要下載約 2.2 GB 模型。CPU 實測約 94 筆/秒；裝的若是 `torch+cpu` 就吃不到 GPU，要 GPU 得另外裝 CUDA 版。
 
-`--embed` 只補算「這個模型還沒算過」的片段：重跑不重複付費，換模型則自動重算。`vectors` 表記錄了模型名稱，查詢時只用相符的向量——混用不同模型的向量算出來的相似度沒有意義。
+向量快取現在使用完整 `embedding-contract/v1` descriptor 的 SHA-256 namespace，綁定 backend/provider、模型名、**已解析的模型 revision**、維度與 preprocessing recipe/config/runtime；descriptor 另存於衍生 `vector_contracts` 表。只有目前 encoder metadata 與已存 descriptor 完全相同，且原文 hash／向量維度／有限值通過驗證時才沿用。舊裸模型名、`backend::model`，或缺 descriptor 的向量保留原始 bytes、隔離不沿用；預設模型名與 analysis revision 都不能證明歷史 embedding revision。已有完整契約的 namespace 可在本機原文無歧義時遷移 16 位文字 hash，保留舊列且不重新呼叫 provider。
+
+目前 OpenRouter 回應未提供可驗證的 immutable revision，因此其持久快取／generation／semantic query 契約為 **UNKNOWN**；不為探測契約或修復快取送出呼叫。Local resolver 只觀察**已載入**的 pinned Transformer/tokenizer 同 revision、configuration-only Pooling/Normalize、實際維度與 encode config/runtime；缺任一 metadata、未載入或不支援的 module 都是 UNKNOWN，不自動下載／載入模型。這是有限的 metadata identity，並非 weights 的密碼學 attestation 或真實供應商驗收。UNKNOWN 時 `--embed-plan` 回報 reusable=0、est_calls=null 與 blocked_reason；寫入／重建／strict semantic 拒絕，hybrid 明示 `embedding_contract_unknown` 並使用 FTS。要恢復真實 semantic 使用，仍須取得完整且可信的 resolved encoder metadata，不能以 requested revision、觀察到的維度或設定宣告替代。
+
+完整且相符的契約下，`--embed` 只補算新文字，所有後端仍驗證筆數、維度與有限值；generation/query 期間契約漂移拒絕保存／比較。`--embed-plan` 列出可重用／待補算筆數；若同模型有未證明契約的 legacy 列且需要補算，回報 quarantined_vectors 與 `legacy_embedding_contract_unknown`，拒絕靜默重算。明確 `--rebuild-embeddings` 可為**已知的目前契約**另建向量，保留 unknown 舊列；所有批次成功才在同一交易替換該完整契約，失敗保留舊向量（雲端 opt-in 與成本防護仍保留，並不代表 UNKNOWN 契約可呼叫）。測試的 pinned descriptor 是明示 fictional offline mock encoder，不能授權真實 provider、權利或人工 golden acceptance；issue #5 的語意 claim support 與人工品質驗收仍未完成。
+
+Local contract 目前還要求實際 Transformer backend 為 `torch`，並記錄該 backend；缺 backend 或 ONNX/OpenVINO 都是 UNKNOWN。PEFT／active adapter／已載入 adapter flag 也拒絕：base model 的 commit 不能證明另加 adapter weights 的 revision，不能用同一 namespace 沿用其向量。
+
+已載入 fast tokenizer 還須提供實際序列化的 vocabulary／normalizer／pre-tokenizer／postprocessor／added-token 狀態、truncation/padding side 與 special-token mapping；其雜湊及有效設定納入 preprocessing 身分。缺少或不支援的 tokenizer metadata 是 UNKNOWN。僅排除 pinned Transformer 每次明確指定的 backend padding/truncation 暫態；不儲存詞彙表，也不讀取 request/auth options。
+
+Tokenizer 的實際 `split_special_tokens` boolean、`model_input_names` 與 `tokenizers` runtime version 也納入身分；special-token split flag 不在 backend JSON 中，不能以序列化雜湊代替它。缺少或型別不符的 flag／input-name metadata 同樣拒絕重用。
+
+文字快取使用完整 SHA-256，與每段 occurrence 的 library／analysis revision 分開：不同影片相同原文仍共用一份向量。`--index` 僅用本機原始文字，把可唯一對應的舊 16-hex 快取鍵遷移到完整鍵，保存原向量位元組與實際文字，不呼叫模型；碰撞或找不到原文的舊列保留隔離，不當作可重用。`--embed-plan` 可先檢查待算數量，再依原本費用授權明確執行 `--embed`。快取原文不一致或雜湊契約錯誤會拒絕生成／重用，正常唯讀查詢不執行遷移；舊索引必須明確 `--index`。
 
 ### 為什麼不直接嵌入截圖
 
@@ -560,11 +578,26 @@ OpenRouter 的 `/embeddings` 與 `/rerank` 端點在模型清單裡查不到、�
 | `baai/bge-m3` | 0.61–0.75 | **0.34** |
 | `nvidia/nemotron-3-embed-1b:free` | 0.29–0.77 | **0.004** |
 
-寫死絕對門檻必定誤殺其中一種，所以預設取「最高分的一半」再加一個很低的地板（`SIMILARITY_FLOOR`）。要固定值就用 `--min-similarity`。
-
-輸出會標示相似度分數，低於 `0.35` 的視為不相關直接濾掉（`pipeline.py` 的 `MIN_SIMILARITY`）—— 少了下限，每次查詢都會回傳整個索引，末幾筆只是「最不像的那些」而不是命中。
+寫死絕對門檻必定誤殺其中一種，所以預設取「最高分的一半」（`SIMILARITY_RATIO = 0.5`）再加一個很低的地板（`SIMILARITY_FLOOR = 0.10`）。要固定值就用 `--min-similarity`。少了下限，每次查詢都會回傳整個索引，末幾筆只是「最不像的那些」而不是命中。
 
 `--ask --semantic` 會直接拿問句比對語意，跳過「先抽關鍵詞」那一步：少一次 API 呼叫，命中也更準。
+
+## 混合檢索與篩選
+
+`--hybrid` 把兩條路併起來：先用篩選條件劃出 eligible-set，全文檢索與向量各取候選，按 occurrence 去重後用 RRF（Reciprocal Rank Fusion）依名次融合——不直接相加異質分數。向量路不可用時明確降級為全文檢索（`degraded_reason`），`--strict-retrieval` 可改成直接失敗。
+
+```powershell
+python pipeline.py --search '時間軸' --hybrid
+python pipeline.py --ask '哪支影片提到密碼外洩？' --hybrid
+python pipeline.py --search '資安' --category '資安新聞' --since 2026-05-01
+python pipeline.py --search '合併' --hybrid --rerank --explain --json
+```
+
+篩選旗標（`--search`／`--ask` 共用）：`--kind speech,visual`、`--job`、`--platform`、`--author`、`--since/--until`（欄位由 `--date-field` 選 `published_at`／`first_completed_at`／`indexed_at`，預設 `published_at`）、`--include-unknown-dates`。套用日期篩選時，日期未知的影片預設排除並提示筆數；JSON 搜尋與 Ask 檢索資訊包含 `unknown_dates_excluded` 與 `date_field`。發布日不拿索引日冒充，完成日不拿建立日代替。分類是 JSON 精確比對，「資安」不會誤命中「資安新聞」。platform／author／published_at 由 manifest（含 RSS 發布日）與 yt-dlp `source.info.json` 可追溯回填，沒有證據就是 NULL。
+
+`--rerank` 是可選的 provider 重排（預設關閉，需 `OPENROUTER_API_KEY`，一般供應商失效時保留原排序；成本守衛拒絕時會停止，不自動降級或改呼叫其他供應商）。`--explain` 顯示每筆命中與 Ask 引用的 RRF／各路名次，只讀已存資料、不額外呼叫模型。`--json` 輸出完整結構（含 `occurrence_id`、`rank_detail`）；`retrieval_mode` 固定為機器可讀 token（`fts`／`semantic`／`hybrid`），人類可讀的檢索描述放在 `mode_label`。`--min-similarity` 同時約束 `--semantic` 與 `--hybrid` 的向量腿。`--search-limit`／`--ask-limit` 必須 ≥ 1；`--ask` 需要非空白問題。
+
+`--dry-run`／`--local-only` 會拒絕雲端 embedding、Ask、rerank、分類與 Digest；純全文搜尋與 `--embed-plan` 可使用。`--dry-run` 也禁止本機向量寫入與重建。離線 fake-provider 評估可重播，但尚未提供人工 golden evidence、FTS／semantic 基準比較或真實供應商驗收，不能據此宣稱完整 RAG 語意品質已驗證。
 
 ## Open Notebook 知識庫
 
@@ -620,7 +653,7 @@ OPEN_NOTEBOOK_PASSWORD=不要提交到版本控制
 |---|---|---|
 | Groq | `audio.transcriptions` | 每個音訊片段送出前（命中本機快取時不預留、不產生新費用） |
 | MiniMax | `vision.analyze_images`、`summarize.*`、`query.keywords`、`query.answer`、`digest.report`、`library.classify` | 每次送出前，同一則 `finish_reason` 重試會各自入帳 |
-| OpenRouter | `embeddings` | 每個 batch 送出前（向量已存在時不送出、不預留） |
+| OpenRouter | `embeddings`、`rerank` | 每個 embedding batch、query embedding 或 rerank 送出前（向量已存在時不送出、不預留） |
 | Meta Graph | `graph.query` | 每次分頁請求 |
 | Apify | `actor.run.start` | 只送出一次啟動 POST，不自動重試；金額以供應商端 `APIFY_MAX_TOTAL_CHARGE_USD` 封頂。timeout／5xx 保留未確認預留；後續 poll／dataset 讀取屬同一筆遠端工作，不重複計完整 Actor 費用 |
 | Bright Data | `datasets.trigger` | 寫入 `.submitted` 回執前；被拒絕時不會留下「送出狀態不明」的標記 |

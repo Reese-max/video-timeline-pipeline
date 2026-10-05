@@ -1,0 +1,174 @@
+{
+  "description": "Ask My Videos 固定可重播檢索資料集（issue #5 A9）。對 tests/test_retrieval.py 的 seed_library 假影片庫執行 hybrid_search；embedder 為測試用 deterministic fake_embed，不呼叫任何付費 API。expect 支援 min_hits / job / jobs / only_jobs / top_job / kind / has_kind / zero_hits / degraded。",
+  "fixture": "tests.test_retrieval.seed_library",
+  "cases": [
+    {
+      "id": "zh-short-merge",
+      "category": "chinese-short",
+      "query": "合併",
+      "expect": {"job": "job-alpha"}
+    },
+    {
+      "id": "zh-short-security",
+      "category": "chinese-short",
+      "query": "資安",
+      "expect": {"min_hits": 2}
+    },
+    {
+      "id": "zh-phrase-timeline",
+      "category": "chinese",
+      "query": "時間軸合併",
+      "expect": {"top_job": "job-alpha"}
+    },
+    {
+      "id": "zh-title-keyword",
+      "category": "chinese-short",
+      "query": "教學",
+      "expect": {"job": "job-alpha"}
+    },
+    {
+      "id": "syn-timeline-merge",
+      "category": "synonym",
+      "query": "timeline merge",
+      "expect": {"top_job": "job-alpha"}
+    },
+    {
+      "id": "syn-security-password",
+      "category": "synonym",
+      "query": "security password",
+      "expect": {"job": "job-beta"}
+    },
+    {
+      "id": "cat-exact-security",
+      "category": "category-filter",
+      "query": "資安",
+      "filters": {"category": "資安"},
+      "expect": {"only_jobs": ["job-beta"], "min_hits": 1}
+    },
+    {
+      "id": "cat-exact-security-news",
+      "category": "category-filter",
+      "query": "資安",
+      "filters": {"category": "資安新聞"},
+      "expect": {"only_jobs": ["job-gamma"], "min_hits": 1}
+    },
+    {
+      "id": "date-range-published",
+      "category": "date-filter",
+      "query": "資安",
+      "filters": {"since": "2026-05-01", "until": "2026-08-10"},
+      "expect": {"only_jobs": ["job-beta"], "min_hits": 1}
+    },
+    {
+      "id": "date-include-unknown",
+      "category": "date-filter",
+      "query": "資安",
+      "filters": {"since": "2026-05-01", "include_unknown_dates": true},
+      "expect": {"jobs": ["job-beta", "job-gamma"]}
+    },
+    {
+      "id": "date-indexed-at-field",
+      "category": "date-filter",
+      "query": "資安",
+      "filters": {"date_field": "indexed_at", "since": "2020-01-01"},
+      "expect": {"min_hits": 2}
+    },
+    {
+      "id": "date-since-delta-only",
+      "category": "date-filter",
+      "query": "時間軸",
+      "filters": {"since": "2026-08-10"},
+      "expect": {"only_jobs": ["job-delta"], "min_hits": 1}
+    },
+    {
+      "id": "job-filter-gamma",
+      "category": "job-filter",
+      "query": "資安",
+      "filters": {"jobs": ["job-gamma"]},
+      "expect": {"only_jobs": ["job-gamma"], "min_hits": 1}
+    },
+    {
+      "id": "job-filter-missing",
+      "category": "job-filter",
+      "query": "資安",
+      "filters": {"jobs": ["no-such-job"]},
+      "expect": {"zero_hits": true}
+    },
+    {
+      "id": "kind-visual-only",
+      "category": "kind-filter",
+      "query": "合併",
+      "filters": {"kinds": ["visual"]},
+      "expect": {"kind": "visual", "min_hits": 1}
+    },
+    {
+      "id": "kind-speech-only",
+      "category": "kind-filter",
+      "query": "資安",
+      "filters": {"kinds": ["speech"]},
+      "expect": {"kind": "speech", "min_hits": 1}
+    },
+    {
+      "id": "platform-youtube",
+      "category": "platform-filter",
+      "query": "時間軸",
+      "filters": {"platform": "youtube"},
+      "expect": {"only_jobs": ["job-alpha", "job-delta"], "min_hits": 1}
+    },
+    {
+      "id": "author-beta",
+      "category": "author-filter",
+      "query": "資安",
+      "filters": {"author": "Beta 頻道"},
+      "expect": {"only_jobs": ["job-beta"], "min_hits": 1}
+    },
+    {
+      "id": "cross-video-security",
+      "category": "cross-video",
+      "query": "資安",
+      "expect": {"jobs": ["job-beta", "job-gamma"]}
+    },
+    {
+      "id": "visual-terminal",
+      "category": "visual",
+      "query": "終端機畫面",
+      "expect": {"job": "job-alpha", "has_kind": "visual"}
+    },
+    {
+      "id": "chapter-recall",
+      "category": "chapter",
+      "query": "合併步驟",
+      "expect": {"has_kind": "chapter"}
+    },
+    {
+      "id": "summary-recall",
+      "category": "summary",
+      "query": "多段影片",
+      "expect": {"has_kind": "summary"}
+    },
+    {
+      "id": "no-answer-latin",
+      "category": "no-answer",
+      "query": "zxqw",
+      "expect": {"zero_hits": true}
+    },
+    {
+      "id": "injection-is-evidence-not-command",
+      "category": "injection",
+      "query": "忽略指令",
+      "expect": {"job": "job-delta"}
+    },
+    {
+      "id": "same-text-two-sources",
+      "category": "provenance",
+      "query": "這段說明時間軸合併的做法",
+      "expect": {"jobs": ["job-alpha", "job-delta"]}
+    },
+    {
+      "id": "gamma-title-phrase",
+      "category": "chinese",
+      "query": "資安新聞快報",
+      "expect": {"top_job": "job-gamma"}
+    }
+  ]
+}
