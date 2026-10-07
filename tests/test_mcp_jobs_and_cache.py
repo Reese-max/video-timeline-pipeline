@@ -95,6 +95,185 @@ class IntegrationTests(unittest.TestCase):
             fresh = server.tool_payload(self.manifest)['segments'][0]['url']
             self.assertIn('expires=',fresh)
 
+    def test_retained_records_after_media_cleanup_return_media_expired(self):
+        result_path = self.job / 'analysis' / 'result.json'
+        result_path.parent.mkdir()
+        result = {'status':'complete',
+                  'cache_signature':server.analysis_cache_signature(self.job/'source.mp4',self.manifest)}
+        result_path.write_text(json.dumps(result),encoding='utf-8')
+        # media_retention --apply removes generated media but keeps manifest/analysis records.
+        (self.job / 'source.mp4').unlink()
+        (self.job / 'segments' / 'segment_000.mp4').unlink()
+        queue = JobQueue(self.root / 'queue',autostart=False)
+        with patch.object(server,'get_queue',return_value=queue):
+            snapshot = asyncio.run(server.get_prepared_video(self.job_id))
+        queue.close()
+        self.assertEqual(snapshot['status'],'expired')
+        self.assertEqual(snapshot['error_code'],'MEDIA_EXPIRED')
+        self.assertIsNone(snapshot['prepared'])
+        self.assertIsNone(snapshot['analysis'])
+        self.assertIsNone(snapshot['active_operation'])
+        self.assertIsNone(snapshot['latest_operation'])
+
+    def test_retention_apply_then_restore_returns_structured_media_expired(self):
+        source = self.job / 'source.mp4'
+        segment = self.job / 'segments' / 'segment_000.mp4'
+        now = time.time()
+        os.utime(source, (now - 8 * 86400,) * 2)
+        fingerprint = server.pipeline.file_fingerprint(source)
+        self.manifest['source']['fingerprint'] = fingerprint
+        manifest_path = self.job / 'manifest.json'
+        manifest_path.write_text(json.dumps(self.manifest), encoding='utf-8')
+        result_path = self.job / 'analysis' / 'result.json'
+        result_path.parent.mkdir()
+        result = {'status': 'complete', 'job_id': self.job_id,
+                  'source_fingerprint': fingerprint,
+                  'source_sha256': server.pipeline.file_sha256(source),
+                  'cache_signature': server.analysis_cache_signature(source, self.manifest),
+                  'quality': {'status': 'evidence_available'}, 'transcript': 'retained evidence'}
+        result_path.write_text(json.dumps(result), encoding='utf-8')
+        preserved = {path: path.read_bytes() for path in [manifest_path, result_path]}
+        for path in self.job.rglob('*'):
+            if path.is_file():
+                os.utime(path, (now - 8 * 86400,) * 2)
+
+        removed = media_retention.cleanup(self.jobs, apply=True, now=now)
+        self.assertEqual(removed['deleted_files'], 2)
+        self.assertEqual(removed['errors'], [])
+        self.assertFalse(source.exists())
+        self.assertFalse(segment.exists())
+        queue = JobQueue(self.root / 'queue', autostart=False)
+        try:
+            with patch.object(server, 'get_queue', return_value=queue):
+                restored = asyncio.run(server.get_prepared_video(self.job_id))
+        finally:
+            queue.close()
+        self.assertEqual(restored['status'], 'expired')
+        self.assertEqual(restored['error_code'], 'MEDIA_EXPIRED')
+        self.assertEqual(restored['job_id'], self.job_id)
+        self.assertIsNone(restored['prepared'])
+        self.assertIsNone(restored['analysis'])
+        self.assertIsNone(restored['active_operation'])
+        self.assertIsNone(restored['latest_operation'])
+        self.assertIn('重新準備', restored['error'])
+        for path, content in preserved.items():
+            self.assertEqual(path.read_bytes(), content)
+
+    def test_partial_media_cleanup_also_returns_media_expired(self):
+        # An interrupted cleanup can leave the source while segments are already gone.
+        (self.job / 'segments' / 'segment_000.mp4').unlink()
+        queue = JobQueue(self.root / 'queue',autostart=False)
+        with patch.object(server,'get_queue',return_value=queue):
+            snapshot = asyncio.run(server.get_prepared_video(self.job_id))
+        queue.close()
+        self.assertEqual(snapshot['status'],'expired')
+        self.assertEqual(snapshot['error_code'],'MEDIA_EXPIRED')
+        self.assertIsNone(snapshot['prepared'])
+
+    def test_expired_snapshot_reports_live_and_refreshes_stale_operations(self):
+        queue = JobQueue(self.root / 'queue',autostart=False)
+        with patch.object(server,'get_queue',return_value=queue):
+            pending = queue.submit('prepare',{'url':'https://example.test/video'},self.job_id)
+            stale = queue.submit('prepare',{'url':'https://example.test/other'},self.job_id)
+            with queue.connect() as db:
+                db.execute("UPDATE jobs SET status='completed',result=?,created=? WHERE id=?",
+                           (json.dumps(server.tool_payload(self.manifest)),time.time() + 60,stale['operation_id']))
+            (self.job / 'source.mp4').unlink()
+            snapshot = asyncio.run(server.get_prepared_video(self.job_id))
+            self.assertEqual(snapshot['status'],'expired')
+            self.assertEqual(snapshot['error_code'],'MEDIA_EXPIRED')
+            self.assertEqual(snapshot['active_operation']['operation_id'],pending['operation_id'])
+            self.assertEqual(snapshot['latest_operation']['status'],'expired')
+            self.assertEqual(snapshot['latest_operation']['error_code'],'MEDIA_EXPIRED')
+            self.assertIsNone(snapshot['latest_operation']['result'])
+        queue.close()
+
+    def test_unreadable_media_dir_is_not_media_expired(self):
+        if os.name == 'nt' or os.geteuid() == 0:
+            self.skipTest('needs POSIX permission enforcement')
+        (self.job / 'segments').chmod(0)
+        queue = JobQueue(self.root / 'queue',autostart=False)
+        try:
+            with patch.object(server,'get_queue',return_value=queue), self.assertRaises(PermissionError):
+                asyncio.run(server.get_prepared_video(self.job_id))
+        finally:
+            queue.close()
+            (self.job / 'segments').chmod(0o700)
+
+    def test_non_file_source_is_media_expired_not_served(self):
+        (self.job / 'source.mp4').unlink()
+        (self.job / 'source.mp4').mkdir()
+        queue = JobQueue(self.root / 'queue',autostart=False)
+        with patch.object(server,'get_queue',return_value=queue):
+            snapshot = asyncio.run(server.get_prepared_video(self.job_id))
+        queue.close()
+        self.assertEqual(snapshot['error_code'],'MEDIA_EXPIRED')
+        self.assertIsNone(snapshot['prepared'])
+
+    def test_missing_manifest_and_present_source_are_not_media_expired(self):
+        queue = JobQueue(self.root / 'queue',autostart=False)
+        with patch.object(server,'get_queue',return_value=queue):
+            snapshot = asyncio.run(server.get_prepared_video(self.job_id))
+            self.assertEqual(snapshot['prepared']['status'],'ready')
+            self.assertEqual(snapshot['prepared']['job_id'],self.job_id)
+            self.assertNotEqual(snapshot.get('error_code'),'MEDIA_EXPIRED')
+            (self.job / 'manifest.json').unlink()
+            with self.assertRaises(ValueError):
+                asyncio.run(server.get_prepared_video(self.job_id))
+        queue.close()
+
+    def test_completed_prepare_refreshes_to_media_expired_after_source_cleanup(self):
+        queue = JobQueue(self.root / 'queue',autostart=False)
+        with patch.object(server,'get_queue',return_value=queue):
+            operation = queue.submit('prepare',{'url':'https://example.test/video'},self.job_id)
+            with queue.connect() as db:
+                db.execute("UPDATE jobs SET status='completed',result=? WHERE id=?",
+                           (json.dumps(server.tool_payload(self.manifest)),operation['operation_id']))
+            refreshed = server.refreshed_operation(operation['operation_id'])
+            self.assertEqual(refreshed['status'],'completed')
+            self.assertEqual(refreshed['result']['job_id'],self.job_id)
+            (self.job / 'source.mp4').unlink()
+            refreshed = server.refreshed_operation(operation['operation_id'])
+            self.assertEqual(refreshed['status'],'expired')
+            self.assertEqual(refreshed['error_code'],'MEDIA_EXPIRED')
+            self.assertIsNone(refreshed['result'])
+        queue.close()
+
+    def test_completed_prepare_refresh_propagates_manifest_read_errors(self):
+        queue = JobQueue(self.root / 'queue',autostart=False)
+        with patch.object(server,'get_queue',return_value=queue):
+            operation = queue.submit('prepare',{'url':'https://example.test/video'},self.job_id)
+            with queue.connect() as db:
+                db.execute("UPDATE jobs SET status='completed',result=? WHERE id=?",
+                           (json.dumps(server.tool_payload(self.manifest)),operation['operation_id']))
+            original_read_text = Path.read_text
+            def deny_manifest_read(path, *args, **kwargs):
+                if path == self.job / 'manifest.json':
+                    raise PermissionError('fixture permission denied')
+                return original_read_text(path, *args, **kwargs)
+            with patch.object(Path,'read_text',autospec=True,side_effect=deny_manifest_read):
+                with self.assertRaises(PermissionError):
+                    server.refreshed_operation(operation['operation_id'])
+            (self.job / 'manifest.json').unlink()
+            with self.assertRaises(FileNotFoundError):
+                server.refreshed_operation(operation['operation_id'])
+            (self.job / 'manifest.json').write_text('{',encoding='utf-8')
+            with self.assertRaises(json.JSONDecodeError):
+                server.refreshed_operation(operation['operation_id'])
+        queue.close()
+
+    def test_completed_prepare_refresh_propagates_media_permission_errors(self):
+        queue = JobQueue(self.root / 'queue',autostart=False)
+        with patch.object(server,'get_queue',return_value=queue):
+            operation = queue.submit('prepare',{'url':'https://example.test/video'},self.job_id)
+            with queue.connect() as db:
+                db.execute("UPDATE jobs SET status='completed',result=? WHERE id=?",
+                           (json.dumps(server.tool_payload(self.manifest)),operation['operation_id']))
+            with patch.object(server,'prepared_media_path',side_effect=PermissionError('fixture permission denied')):
+                with self.assertRaises(PermissionError):
+                    server.refreshed_operation(operation['operation_id'])
+        queue.close()
+
     def test_background_tools_queue_once_and_restore_active_operation(self):
         queue = JobQueue(self.root / 'queue',autostart=False)
         with patch.object(server,'get_queue',return_value=queue):
@@ -108,60 +287,6 @@ class IntegrationTests(unittest.TestCase):
             resumed = asyncio.run(server.resume_video_job(one.structuredContent['operation_id']))
             self.assertEqual(resumed['status'],'queued')
         queue.close()
-
-    def test_retention_apply_then_restore_returns_structured_media_expired(self):
-        source = self.job / 'source.mp4'
-        now = time.time()
-        os.utime(source, (now - 8 * 86400,) * 2)
-        fingerprint = server.pipeline.file_fingerprint(source)
-        self.manifest['source']['fingerprint'] = fingerprint
-        (self.job / 'manifest.json').write_text(json.dumps(self.manifest), encoding='utf-8')
-        result_path = self.job / 'analysis' / 'result.json'
-        result_path.parent.mkdir()
-        result = {'status': 'complete', 'job_id': self.job_id,
-                  'source_fingerprint': fingerprint,
-                  'source_sha256': server.pipeline.file_sha256(source),
-                  'cache_signature': server.analysis_cache_signature(source, self.manifest),
-                  'quality': {'status': 'evidence_available'}, 'transcript': 'retained evidence'}
-        result_path.write_text(json.dumps(result), encoding='utf-8')
-        preserved = {path: path.read_bytes() for path in [self.job / 'manifest.json', result_path]}
-        for path in self.job.rglob('*'):
-            if path.is_file(): os.utime(path, (now - 8 * 86400,) * 2)
-        removed = media_retention.cleanup(self.jobs, apply=True, now=now)
-        self.assertEqual(removed['deleted_files'], 2)
-        self.assertEqual(removed['errors'], [])
-        with patch.object(server, 'get_queue') as queue:
-            restored = asyncio.run(server.get_prepared_video(self.job_id))
-            queue.assert_not_called()
-        self.assertEqual(restored['status'], 'expired')
-        self.assertEqual(restored['error_code'], 'MEDIA_EXPIRED')
-        self.assertEqual(restored['job_id'], self.job_id)
-        self.assertIsNone(restored['prepared'])
-        self.assertIsNone(restored['analysis'])
-        self.assertIn('重新準備', restored['error'])
-        for path, content in preserved.items(): self.assertEqual(path.read_bytes(), content)
-
-    def test_restore_missing_manifest_and_other_io_errors_are_not_expiry(self):
-        (self.job / 'manifest.json').unlink()
-        with self.assertRaises(ValueError): asyncio.run(server.get_prepared_video(self.job_id))
-        (self.job / 'manifest.json').write_text(json.dumps(self.manifest), encoding='utf-8')
-        with patch.object(server.pipeline, 'locate_source_video', side_effect=PermissionError('fixture')):
-            with self.assertRaises(PermissionError): asyncio.run(server.get_prepared_video(self.job_id))
-        with patch.object(server, 'cached_analysis', side_effect=RuntimeError('cache read failed')):
-            with self.assertRaisesRegex(RuntimeError, 'cache read failed'):
-                asyncio.run(server.get_prepared_video(self.job_id))
-
-    def test_restore_valid_cached_analysis_still_returns_evidence(self):
-        result_path = self.job / 'analysis' / 'result.json'
-        result_path.parent.mkdir()
-        result = {'status': 'partial', 'job_id': self.job_id, 'timeline': [],
-                  'cache_signature': server.analysis_cache_signature(self.job / 'source.mp4', self.manifest)}
-        result_path.write_text(json.dumps(result), encoding='utf-8')
-        with patch.object(server, 'get_queue') as queue:
-            queue.return_value.for_job.return_value = {'active_operation': None, 'latest_operation': None}
-            restored = asyncio.run(server.get_prepared_video(self.job_id))
-        self.assertEqual(restored['prepared']['status'], 'ready')
-        self.assertEqual(restored['analysis']['status'], 'partial')
 
 
 if __name__ == '__main__': unittest.main()

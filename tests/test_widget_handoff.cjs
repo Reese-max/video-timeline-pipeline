@@ -129,16 +129,65 @@ async function test(name, run) { await run(); count++; console.log('ok ' + count
   await test('media retention expiry requires new preparation', async () => {
     const h = harness({ snapshot: { prepared: job('first'), analysis: null, latest_operation: { ...pending(), status: 'expired', error_code: 'MEDIA_EXPIRED', error: 'fixture retention expiry' } } }); await h.flush(); assert.equal(h.elements.get('resume').hidden, true); assert.match(h.elements.get('status').textContent, /保留期限/); assert.equal(h.calls.length, 1);
   });
-  await test('expired prepared-media snapshot clears stale evidence and disables work', async () => {
-    const h = harness({ snapshot: { status: 'expired', job_id: 'first', error_code: 'MEDIA_EXPIRED', error: '請重新準備影片。', prepared: null, analysis: null, active_operation: null, latest_operation: null }, saved: { privateContent: { jobId: 'first', operationId: 'stale-analysis' } } });
-    await h.flush(); assert.deepEqual(h.calls.map(c => c.name), ['get_prepared_video']);
-    assert.match(h.elements.get('status').textContent, /保留期限/);
-    for (const id of ['analyze', 'drive', 'ask']) assert.equal(h.elements.get(id).disabled, true);
-    for (const id of ['resume', 'media', 'findings', 'drive-handoff']) assert.equal(h.elements.get(id).hidden, true);
+  for (const reprepare of [false, true]) await test('expiry clears existing evidence and Drive before same-job reprepare=' + reprepare, async () => {
+    let expired = false;
+    const h = harness({ respond(name) {
+      if (name === 'get_prepared_video') return expired
+        ? { status: 'expired', error_code: 'MEDIA_EXPIRED', job_id: 'first', prepared: null, analysis: null, active_operation: reprepare ? pending('re-after-expiry', 'prepare') : null }
+        : { prepared: job('first'), analysis: analysis('first'), drive: drive('first'), active_operation: null, latest_operation: null };
+      if (name === 'get_video_job') return completed(job('first'), 'prepared', 're-after-expiry');
+      throw new Error('Unexpected ' + name);
+    } });
+    await h.flush();
+    assert.equal(h.elements.get('findings').hidden, false);
+    assert.equal(h.elements.get('drive-handoff').hidden, false);
+    expired = true;
+    await h.click('refresh');
+    assert.equal(h.elements.get('findings').hidden, true);
+    assert.equal(h.elements.get('evidence').children.length, 0);
+    assert.equal(h.elements.get('drive-handoff').hidden, true);
+    assert.equal(h.elements.get('drive-prompt').value, '');
+    assert.equal(h.elements.get('ask').disabled, true);
     assert.equal(h.elements.get('player').getAttribute('src'), null);
-    assert.equal(h.openai.widgetState.privateContent.operationId, null);
+    assert.equal(h.openai.widgetState.privateContent.jobId, 'first');
+    if (reprepare) {
+      await h.poll();
+      assert.equal(h.elements.get('findings').hidden, true);
+      assert.equal(h.elements.get('ask').disabled, true);
+      assert.equal(h.elements.get('analyze').disabled, false);
+    }
     assert.equal(h.prompts.length, 0);
-    await h.click('refresh'); assert.equal(h.calls.at(-1).name, 'get_prepared_video');
+  });
+  await test('expired snapshot is not an unknown restore failure', async () => {
+    const h = harness({ snapshot: { status: 'expired', error_code: 'MEDIA_EXPIRED', error: '影片已過保留期限，請重新準備。', job_id: 'first', prepared: null, analysis: null, active_operation: null, latest_operation: null } });
+    await h.flush();
+    assert.deepEqual(h.calls.map(c => c.name), ['get_prepared_video']);
+    assert.equal(h.elements.get('resume').hidden, true);
+    assert.equal(h.elements.get('analyze').disabled, true);
+    assert.equal(h.elements.get('drive').disabled, true);
+    assert.equal(h.elements.get('media').hidden, true);
+    assert.equal(h.elements.get('player').getAttribute('src'), null);
+    assert.match(h.elements.get('status').textContent, /保留期限/);
+    assert.match(h.elements.get('status').textContent, /重新準備/);
+  });
+  await test('expired state persists across remount without prepared data', async () => {
+    const h = harness({ output: null, saved: { privateContent: { jobId: 'first' } }, snapshot: { status: 'expired', error_code: 'MEDIA_EXPIRED', error: 'fixture retention expiry', prepared: null, analysis: null, active_operation: null, latest_operation: null } });
+    await h.flush();
+    assert.match(h.elements.get('status').textContent, /保留期限/);
+    assert.equal(h.openai.widgetState.privateContent.jobId, 'first');
+    assert.equal(h.elements.get('analyze').disabled, true);
+  });
+  await test('expired snapshot follows a live re-prepare operation', async () => {
+    const h = harness({ respond(name) {
+      if (name === 'get_prepared_video') return { status: 'expired', error_code: 'MEDIA_EXPIRED', error: 'fixture retention expiry', prepared: null, analysis: null, active_operation: pending('re-1', 'prepare'), latest_operation: null };
+      if (name === 'get_video_job') return completed(job('first'), 'prepared', 're-1');
+      throw new Error('Unexpected ' + name);
+    } });
+    await h.flush();
+    await h.poll();
+    assert.deepEqual(h.calls.map(c => c.name), ['get_prepared_video', 'get_video_job']);
+    assert.equal(h.elements.get('title').textContent, '影片 first');
+    assert.equal(h.elements.get('analyze').disabled, false);
   });
   await test('pending preparation restores without job ID', async () => {
     const h = harness({ output: { ...pending('prepare-1', 'prepare'), job_id: undefined }, respond(name) { assert.equal(name, 'get_video_job'); return completed(job('first'), 'prepared', 'prepare-1'); } }); await h.flush(); await h.poll(); assert.equal(h.elements.get('title').textContent, '影片 first'); assert.equal(h.calls.length, 1); assert.equal(h.elements.get('analyze').disabled, false);

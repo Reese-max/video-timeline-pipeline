@@ -120,7 +120,7 @@ function saveState() {
   try {
     const state = {
       modelContent: data ? `目前影片「${data.title || "未命名"}」，job_id=${data.job_id}。${analysisResult ? "已有伺服器分析；需核對證據與缺漏。" : "尚未確認分析完成。"} Drive 上傳不表示已讀取原片。` : "影片背景工作尚在準備。",
-      privateContent: { schemaVersion: 2, jobId: data?.job_id || (activeOperation?.operation === "prepare" ? null : saved.jobId || null),
+      privateContent: { schemaVersion: 2, jobId: data?.job_id || (activeOperation?.operation === "prepare" && activeOperation?.error_code !== "MEDIA_EXPIRED" ? null : saved.jobId || null),
         operationId: activeOperation?.operation_id || null, followUps: { ...receipts },
         filter: $("filter").value || "all", selectedSegment },
     };
@@ -329,8 +329,10 @@ function acceptOperation(value, version, expectedKind) {
     else if (value.result_kind === "analysis") { applyAnalysis(value.result); status("分析完成。可核對下方證據，再點選交給 ChatGPT 整理。"); }
     else if (value.result_kind === "drive") applyDrive(value.result);
     else throw new Error("工作完成，但結果類型無法辨識。");
-  } else if (terminal.has(value.status)) status(`${value.error_code === "MEDIA_EXPIRED" ? "影片已超過保留期限，請重新準備影片" : value.status === "expired" ? "工作執行逾時，可由下方手動續跑" : value.status === "cancelled" ? "工作已取消，可由下方手動續跑" : "工作未完成，可手動續跑或重新取得狀態"}。${value.error ? " " + errorText(value.error) : ""}`);
-  else throw new Error("未知的背景工作狀態，請重新取得狀態。");
+  } else if (terminal.has(value.status)) {
+    if (value.error_code === "MEDIA_EXPIRED") clearExpiredMedia(value.job_id || data?.job_id || saved.jobId);
+    status(`${value.error_code === "MEDIA_EXPIRED" ? "影片已超過保留期限，請重新準備影片" : value.status === "expired" ? "工作執行逾時，可由下方手動續跑" : value.status === "cancelled" ? "工作已取消，可由下方手動續跑" : "工作未完成，可手動續跑或重新取得狀態"}。${value.error ? " " + errorText(value.error) : ""}`);
+  } else throw new Error("未知的背景工作狀態，請重新取得狀態。");
   updateButtons();
 }
 async function pollOperation(version = generation, epoch = pollEpoch) {
@@ -347,6 +349,15 @@ async function pollOperation(version = generation, epoch = pollEpoch) {
     status("暫時無法取得背景工作狀態。伺服器工作可能仍在執行；按「重新取得狀態」繼續查看。" + error.message);
   }
 }
+function clearExpiredMedia(jobId) {
+  // Keep only the job identity for remount recovery; all previous media and evidence are stale.
+  data = { job_id: jobId, segments: [] };
+  analysisResult = null; evidenceRows = []; shownCount = 60; pendingSeek = null;
+  $("media").hidden = true; $("player").removeAttribute("src"); $("player").load();
+  $("segment-link").hidden = true; $("segment-link").removeAttribute("href");
+  $("segment").replaceChildren(); $("findings").hidden = true; $("evidence").replaceChildren();
+  $("drive-handoff").hidden = true; $("drive-prompt").value = "";
+}
 async function restoreJob() {
   const version = generation, id = data?.job_id || saved.jobId;
   let viewVersion = version;
@@ -361,14 +372,16 @@ async function restoreJob() {
     }
     const snapshot = await callTool("get_prepared_video", { job_id: id }, version);
     checkCurrent(version);
-    if (snapshot.status === "expired" && snapshot.error_code === "MEDIA_EXPIRED") {
-      if (snapshot.job_id !== id) throw new Error("恢復資料的工作不符。");
-      stopPolling(); activeOperation = snapshot; restoredOperationId = null; uncertainStart = false;
-      analysisResult = null; evidenceRows = [];
-      for (const name of ["media", "findings", "drive-handoff"]) $(name).hidden = true;
-      $("drive-prompt").value = ""; $("player").removeAttribute("src"); $("player").load();
-      showOperation(); saveState();
-      status("影片已超過保留期限，請重新準備影片。" + errorText(snapshot.error));
+    if (snapshot.error_code === "MEDIA_EXPIRED") {
+      // Expiry invalidates evidence even if an operation prepares the same deterministic job ID.
+      generation++; viewVersion = generation; stopPolling();
+      clearExpiredMedia(id); restoredOperationId = null; uncertainStart = false; sending = false;
+      if (snapshot.active_operation) { await acceptOperation(snapshot.active_operation, viewVersion); viewVersion = generation; return; }
+      activeOperation = { operation: "prepare", operation_id: null, status: "expired", error_code: "MEDIA_EXPIRED", error: snapshot.error || "" };
+      restoredOperationId = null;
+      stopPolling(); showOperation(); saveState();
+      status(`影片已超過保留期限，請重新準備影片。${snapshot.error ? " " + errorText(snapshot.error) : ""}`);
+      updateButtons();
       return;
     }
     if (snapshot.prepared?.job_id !== id) throw new Error("恢復資料的工作不符。");
@@ -441,7 +454,7 @@ function receiveToolResult(value, initial = false) {
     }
     if (!isPending(payload) || payload.operation_id === currentPrepareId || payload.operation_id === activeOperation?.operation_id) return;
     if (currentPrepareId) supersededPrepares.add(currentPrepareId);
-    if (activeOperation?.operation === "prepare") supersededPrepares.add(activeOperation.operation_id);
+    if (activeOperation?.operation === "prepare" && activeOperation.operation_id) supersededPrepares.add(activeOperation.operation_id);
     currentPrepareId = payload.operation_id;
     generation++; stopPolling(); data = null; analysisResult = null; acting = false; sending = false; restoring = false; uncertainStart = false;
     $("title").textContent = "正在準備新影片"; $("summary").textContent = "準備完成後可開始分析。";

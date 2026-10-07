@@ -2,3 +2,7 @@
 mcp>=1.20,<2
 yt-dlp[default,curl-cffi]>=2026.8.19
 Pillow
+# IANA timezone database fallback for zoneinfo on Windows and other systems without system data.
+tzdata
+# Official parser for the optional CutSpec research interchange verification.
+opentimelineio>=0.18.1

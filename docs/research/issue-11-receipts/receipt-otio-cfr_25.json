@@ -1,0 +1,69 @@
+{
+  "schema": "cut-receipt/1",
+  "specHash": "cadee9e075264366d1d7b069eec78bf194ff914e94d4574c95b3bc9810211fef",
+  "exportFormat": "otio",
+  "expectedContentHash": "570a40aa7a8dbdfeb1b7505028f0438a0eb57862136f9c17e02ee592f74c98e7",
+  "observedContentHash": "570a40aa7a8dbdfeb1b7505028f0438a0eb57862136f9c17e02ee592f74c98e7",
+  "toleranceSec": 0.06,
+  "nleImport": "NLE_IMPORT_UNVERIFIED",
+  "externalApiCalls": 0,
+  "localSubprocessCalls": 3,
+  "segments": [
+    {
+      "segmentId": "seg-0",
+      "intendedSourceRange": {
+        "startSec": 0.5,
+        "endSec": 1.5
+      },
+      "status": "ok",
+      "deltaImportSec": 0.020000000000000018,
+      "deltaFFmpegSec": 0.0,
+      "importedSourceRange": {
+        "startSec": 0.52,
+        "endSec": 1.52
+      },
+      "ffprobe": {
+        "frames": 38,
+        "firstPtsSec": 0.0,
+        "lastPtsSec": 1.48,
+        "medianFrameDurSec": 0.040000000000000036
+      },
+      "observedCoverageSec": {
+        "startSec": 0.0,
+        "endSec": 1.52
+      }
+    },
+    {
+      "segmentId": "seg-1",
+      "intendedSourceRange": {
+        "startSec": 2.0,
+        "endSec": 3.0
+      },
+      "status": "ok",
+      "deltaImportSec": 0.0,
+      "deltaFFmpegSec": 0.0,
+      "importedSourceRange": {
+        "startSec": 2.0,
+        "endSec": 3.0
+      },
+      "ffprobe": {
+        "frames": 75,
+        "firstPtsSec": 0.0,
+        "lastPtsSec": 2.96,
+        "medianFrameDurSec": 0.040000000000000036
+      },
+      "observedCoverageSec": {
+        "startSec": 0.0,
+        "endSec": 3.0
+      }
+    }
+  ],
+  "mismatches": 0,
+  "stillNeedsHumanFix": false,
+  "status": "verified",
+  "parser": "opentimelineio-0.18.1",
+  "specIssues": [],
+  "sourceFingerprint": "16191:1789664373733397257",
+  "adapterVersion": "opentimelineio-0.18.1",
+  "receiptId": "527913f94b99d99e"
+}
