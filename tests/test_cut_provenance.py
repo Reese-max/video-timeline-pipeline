@@ -187,6 +187,25 @@ class ProvenanceTests(unittest.TestCase):
         self.change("manifest.json", lambda d: d.update(job_dir="jobs/abcdefabcdef"))
         self.assert_build_error("INVALID_SOURCE_JOB")
 
+    def test_native_manifest_paths_match_pipeline_output(self):
+        self.change("manifest.json", lambda d: d.update(
+            job_dir=str(Path("jobs") / JOB_ID),
+            artifacts={name: str(Path("jobs") / JOB_ID / f"{name}.json") for name in ("transcript", "timeline")}))
+        spec, companion = provenance.build_evidence_cutspec(self.job, self.video, SELECTIONS)
+        self.assertEqual(provenance.validate_evidence(spec, companion, self.job)["provenanceCoverage"], 1.0)
+
+    def test_native_path_compatibility_does_not_normalize_escapes(self):
+        original = json.loads((self.job / "manifest.json").read_text())
+        for value in (str(Path("jobs") / ".." / "jobs" / JOB_ID), str(self.root / "outside" / JOB_ID)):
+            with self.subTest(value=value):
+                write_json(self.job / "manifest.json", {**original, "job_dir": value})
+                self.assert_build_error("INVALID_SOURCE_JOB")
+        write_json(self.job / "manifest.json", original)
+        for value in (str(Path("jobs") / JOB_ID / ".." / JOB_ID / "transcript.json"), str(self.root / "transcript.json")):
+            with self.subTest(value=value):
+                self.change("manifest.json", lambda d: d["artifacts"].update(transcript=value))
+                self.assert_build_error("MALFORMED_EVIDENCE")
+
     def test_source_locator_must_match_actual_media(self):
         self.change("manifest.json", lambda d: d["source"].update(resolved_video=str(FIXTURES / "cfr_25.mp4")))
         self.assert_build_error("STALE_SOURCE")

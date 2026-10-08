@@ -46,6 +46,17 @@ class FrameMapTests(unittest.TestCase):
         result["manifestHash"] = frames.manifest_hash(result)
         return result
 
+    def test_source_duration_includes_positive_presentation_origin(self):
+        stream = {"codec_type": "video", "avg_frame_rate": "30/1", "r_frame_rate": "30/1",
+                  "time_base": "1/100", "start_pts": 25, "duration_ts": 100}
+        probe = {"format": {"duration": "1"}, "streams": [stream]}
+        self.assertEqual(cutspec.source_from_video(self.video, probe).durationSec, 1.25)
+        for invalid in ({"start_pts": -25}, {"start_pts": True}, {"duration_ts": None},
+                        {"duration_ts": -1}, {"time_base": "0/1"}, {"time_base": "bad"}):
+            with self.subTest(invalid=invalid):
+                probe["streams"] = [{**stream, **invalid}]
+                self.assertEqual(cutspec.source_from_video(self.video, probe).durationSec, 1.0)
+
     def receipt(self, *, manifest=None, text=None, fmt="otio", tolerance=0.15):
         return cutspec.verify_export(self.spec, self.video, text or self.otio, fmt,
                                      tolerance_sec=tolerance, frame_map=self.manifest if manifest is None else manifest)
@@ -54,10 +65,19 @@ class FrameMapTests(unittest.TestCase):
         video = FIXTURES / "vfr_30.mp4"
         spec = manual_spec(video)
         mapping = frames.build_frame_map(spec, video)
+        raw = json.loads(subprocess.check_output([
+            "ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries",
+            "stream=time_base:frame=pts,pkt_duration,duration", "-of", "json", str(video)], text=True))
+        last = raw["frames"][-1]
         self.assertEqual(mapping["timeBase"], "1/15360")
+        self.assertEqual(mapping["timeBase"], raw["streams"][0]["time_base"])
         self.assertEqual(mapping["boundaryPts"][0], 507)
-        self.assertEqual(mapping["boundaryPts"][-1] - mapping["boundaryPts"][-2], 5)
+        # This fixture has a 33 ms empty edit. FFmpeg 7 clipped its final
+        # duration to 5 ticks; newer demuxers report the complete 512 ticks.
+        self.assertEqual(mapping["boundaryPts"][-1], last["pts"] + last.get("duration", last.get("pkt_duration")))
         self.assertEqual(mapping["decodedFrames"], 96)
+        self.assertEqual(len(raw["frames"]), 96)
+        self.assertGreater(len({b - a for a, b in zip(mapping["boundaryPts"], mapping["boundaryPts"][1:-1])}), 1)
         selected = mapping["entries"][0]["startBoundary"]
         self.assertNotEqual(float(Fraction(selected["pts"]) * Fraction(mapping["timeBase"])),
                             cutspec.frames_to_seconds(selected["frameIndex"], spec.source.timebase))
@@ -72,7 +92,7 @@ class FrameMapTests(unittest.TestCase):
         with self.assertRaisesRegex(frames.FrameMapError, "outside"):
             frames.boundary_index(mapping, 2.01)
 
-    def test_actual_vfr_final_frame_uses_measured_short_terminal_duration(self):
+    def test_actual_vfr_final_frame_uses_measured_terminal_duration(self):
         video = FIXTURES / "vfr_30.mp4"
         actual = frames.decoded_map(video)
         tick = Fraction(actual["timeBase"])
@@ -84,7 +104,13 @@ class FrameMapTests(unittest.TestCase):
         receipt = cutspec.verify_export(spec, video, text, "otio", frame_map=manifest)
         self.assertEqual(receipt["status"], "verified", receipt)
         self.assertEqual(receipt["segments"][0]["decodedFrames"], 1)
-        self.assertEqual(manifest["entries"][0]["endBoundaryExclusive"]["pts"] - manifest["entries"][0]["startBoundary"]["pts"], 5)
+        raw = json.loads(subprocess.check_output([
+            "ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries",
+            "frame=pts,pkt_duration,duration", "-of", "json", str(video)], text=True))
+        last = raw["frames"][-1]
+        entry = manifest["entries"][0]
+        self.assertEqual(entry["startBoundary"]["pts"], last["pts"])
+        self.assertEqual(entry["endBoundaryExclusive"]["pts"], last["pts"] + last.get("duration", last.get("pkt_duration")))
 
     def test_companion_hash_is_self_excluding_and_binds_exact_spec(self):
         manifest = copy.deepcopy(self.manifest)

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import concurrent.futures
+from contextlib import closing
 import io
 import json
 import os
@@ -35,7 +36,7 @@ class Response:
 
 
 def rows(root, table):
-    with sqlite3.connect(root / "operations.db") as connection:
+    with closing(sqlite3.connect(root / "operations.db")) as connection:
         connection.row_factory = sqlite3.Row
         return [dict(row) for row in connection.execute("SELECT * FROM " + table + " ORDER BY rowid")]
 
@@ -206,7 +207,7 @@ class CostAttemptTests(unittest.TestCase):
 
     def test_paid_transport_holds_no_sqlite_writer_lock(self):
         def transport(_request, **_):
-            with sqlite3.connect(self.root / "operations.db", timeout=0) as connection:
+            with closing(sqlite3.connect(self.root / "operations.db", timeout=0)) as connection, connection:
                 connection.execute("BEGIN IMMEDIATE")
                 connection.rollback()
             return Response({"choices": [{"finish_reason": "stop", "message": {"content": "ok"}}]})
@@ -242,7 +243,7 @@ class CostAttemptTests(unittest.TestCase):
         cost_tracker.record_usage(self.root, provider="minimax", operation="legacy",
                                   estimated_micro_usd=123, status="succeeded")
         before = rows(self.root, "usage_costs")
-        with sqlite3.connect(self.root / "operations.db") as connection:
+        with closing(sqlite3.connect(self.root / "operations.db")) as connection, connection:
             connection.execute("ALTER TABLE usage_costs DROP COLUMN reservation_id")
         report = cost_tracker.get_cost_report(self.root)
         after = rows(self.root, "usage_costs")

@@ -99,12 +99,13 @@ def _snapshot(job_dir: Path | str, video_path: Path | str) -> dict:
         _require(manifest.get("status") in {"completed", "local-only"},
                  "INVALID_ANALYSIS", "canonical analysis job is incomplete")
         expected_job = f"jobs/{job.name}"
-        _require(manifest.get("job_dir") in {expected_job, str(job)},
+        _require(manifest.get("job_dir") in {expected_job, str(Path(expected_job)), str(job)},
                  "INVALID_SOURCE_JOB", "manifest belongs to another source job")
         declarations = manifest.get("artifacts")
         _require(isinstance(declarations, dict), "MALFORMED_EVIDENCE", "missing canonical artifact declarations")
         for name in ("transcript", "timeline"):
-            _require(declarations.get(name) in {f"{manifest['job_dir']}/{name}.json", str(job / f"{name}.json")},
+            _require(declarations.get(name) in {f"{manifest['job_dir']}/{name}.json",
+                                               str(Path(manifest["job_dir"]) / f"{name}.json"), str(job / f"{name}.json")},
                      "MALFORMED_EVIDENCE", f"invalid canonical {name} declaration")
         locator = source.get("resolved_video")
         _require(isinstance(locator, str) and locator, "MISSING_SOURCE", "manifest has no resolved media")

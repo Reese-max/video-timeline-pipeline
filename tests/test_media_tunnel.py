@@ -13,7 +13,7 @@ class MediaTunnelTests(unittest.TestCase):
     def test_launcher_rejects_stale_runtime_and_keeps_drive_available(self):
         script = (Path(__file__).resolve().parents[1] / "scripts/start-mcp-supervised.sh").read_text()
         selection = script[script.index('media_base="${MCP_MEDIA_BASE_URL:-}"'):script.index('process_matches()')]
-        guard = script[script.index('if [ -n "${pid}" ]; then'):script.index('printf -v run_script')]
+        guard = script[script.index('if [ -n "${pid}" ]; then'):script.index('command=(/bin/bash')]
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             launcher = root / "media-launcher"

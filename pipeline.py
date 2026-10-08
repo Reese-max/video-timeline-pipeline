@@ -857,7 +857,8 @@ def download_video(
     if max_filesize is not None:
         command += ["--max-filesize", str(max_filesize)]
     if max_duration is not None:
-        command += ["--match-filter", f"duration <= {max_duration}"]
+        # "<=?" lets direct-file URLs without duration metadata through; prepare re-checks the probed duration.
+        command += ["--match-filter", f"duration <=? {max_duration}"]
     command.append(url)
     hostname = (urllib.parse.urlsplit(url).hostname or "").lower()
     if hostname in {"instagram.com", "www.instagram.com", "m.instagram.com"}:
@@ -2404,6 +2405,580 @@ def reusable_visual_artifact(observations: Any, candidates: list[dict[str, Any]]
             for observation, candidate in zip(observations, candidates)
         )
     )
+
+
+
+def minimax_base_url() -> str:
+    base_url = os.getenv("MINIMAX_BASE_URL", "").rstrip("/")
+    allowed = {"https://api.minimax.io/v1", "https://api.minimaxi.com/v1"}
+    if base_url not in allowed:
+        raise RuntimeError(
+            "請依 Token Plan 帳戶平台設定 MINIMAX_BASE_URL 為 "
+            "https://api.minimax.io/v1 或 https://api.minimaxi.com/v1。"
+        )
+    return base_url
+
+
+MINIMAX_VIDEO_FILES_API_LIMIT_BYTES = 512 * 1024 * 1024
+MINIMAX_VIDEO_COMPRESS_TARGET_BYTES = 450 * 1024 * 1024  # mid of 400–480MB target band
+MINIMAX_VIDEO_COMPRESS_RETRY_BYTES = 350 * 1024 * 1024
+
+
+def choose_video_mp4_upload_strategy(
+    size_bytes: int,
+    limit_bytes: int = MINIMAX_VIDEO_FILES_API_LIMIT_BYTES,
+) -> str:
+    """Return 'direct' or 'compress_first' from Files API size threshold alone."""
+    if size_bytes > limit_bytes:
+        return "compress_first"
+    return "direct"
+
+
+def is_minimax_video_size_error(error: BaseException) -> bool:
+    """True when an upload/API failure looks like a MiniMax video size/limit reject."""
+    text = str(error).lower()
+    needles = (
+        "512 mb",
+        "512mb",
+        "file size",
+        "filesize",
+        "too large",
+        "entity too large",
+        "payload too large",
+        "content too large",
+        "exceed",
+        "size limit",
+        "upload limit",
+        "無法直接上傳",
+        "超過 minimax files api",
+        "413",
+    )
+    return any(needle in text for needle in needles)
+
+
+def compress_video_for_minimax_upload(
+    video_path: Path,
+    output_path: Path,
+    *,
+    target_bytes: int = MINIMAX_VIDEO_COMPRESS_TARGET_BYTES,
+    duration: float | None = None,
+) -> Path:
+    """Transcode to a temporary mp4 aimed under target_bytes; raises if ffmpeg missing/fails."""
+    ffmpeg = require_tool("ffmpeg")
+    seconds = float(duration or 0.0)
+    if seconds <= 0:
+        try:
+            seconds = video_duration(probe_video(video_path))
+        except Exception:
+            seconds = 0.0
+    if seconds <= 0:
+        seconds = 60.0
+    audio_bps = 96_000
+    # Leave ~10% headroom for container overhead so we stay under the Files API cap.
+    total_bits = max(1, int(target_bytes * 8 * 0.90))
+    video_bps = max(250_000, int(total_bits / seconds) - audio_bps)
+    video_kbps = max(250, video_bps // 1000)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = output_path.with_suffix(output_path.suffix + ".partial")
+    temporary.unlink(missing_ok=True)
+    run_external(
+        [
+            ffmpeg,
+            "-y",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-i",
+            str(video_path),
+            "-vf",
+            "scale='min(1280,iw)':-2",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "medium",
+            "-pix_fmt",
+            "yuv420p",
+            "-b:v",
+            f"{video_kbps}k",
+            "-maxrate",
+            f"{int(video_kbps * 1.5)}k",
+            "-bufsize",
+            f"{video_kbps * 2}k",
+            "-c:a",
+            "aac",
+            "-b:a",
+            "96k",
+            "-ac",
+            "2",
+            "-movflags",
+            "+faststart",
+            str(temporary),
+        ],
+        timeout=max(120.0, min(3600.0, seconds * 4.0)),
+    )
+    if not temporary.is_file() or temporary.stat().st_size <= 0:
+        temporary.unlink(missing_ok=True)
+        raise RuntimeError("ffmpeg compress produced empty output")
+    temporary.replace(output_path)
+    size = output_path.stat().st_size
+    print(
+        f"· MiniMax 壓縮影片完成：{size} bytes（目標 ≤{target_bytes}，bitrate≈{video_kbps}k）"
+    )
+    return output_path
+
+
+def minimax_upload_video_understanding(video_path: Path, api_key: str) -> str:
+    """Upload MP4 (or other supported video) for multimodal understanding; return file_id."""
+    size = video_path.stat().st_size
+    limit = MINIMAX_VIDEO_FILES_API_LIMIT_BYTES
+    if size > limit:
+        raise RuntimeError(
+            f"影片 {size} bytes 超過 MiniMax Files API 上限 512 MB，無法直接上傳理解。"
+        )
+    url = minimax_base_url() + "/files/upload"
+    # Upload units are bytes, not text tokens. No verified upload price/bound is
+    # available: estimated=0 records unknown cost, and strict mode still refuses I/O.
+    with cost_guard("minimax", "files.upload", request_units=size, estimated_micro_usd=0) as outcome:
+        body, boundary = multipart_body({"purpose": "video_understanding"}, "file", video_path)
+        raw = request_json(
+            url,
+            {
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": f"multipart/form-data; boundary={boundary}",
+            },
+            method="POST",
+            body=body,
+            timeout=300,
+            attempts=3,
+        )
+        base = raw.get("base_resp") if isinstance(raw.get("base_resp"), dict) else {}
+        if base and int(base.get("status_code") or 0) != 0:
+            raise RuntimeError(
+                f"MiniMax 上傳失敗：{base.get('status_code')} {base.get('status_msg')}"
+            )
+        file_obj = raw.get("file") if isinstance(raw.get("file"), dict) else {}
+        file_id = file_obj.get("file_id")
+        if file_id is None or str(file_id).strip() == "":
+            raise RuntimeError(f"MiniMax 上傳未回傳 file_id：{raw}")
+        outcome.provider_operation_id = str(file_id)
+    print(f"· MiniMax 已上傳 video_understanding file_id={file_id}（{size} bytes）")
+    return str(file_id)
+
+
+def visual_mode() -> str:
+    mode = os.getenv("ANALYZE_VISUAL_MODE", "video_mp4").strip().lower()
+    if mode in {"video", "video_mp4", "mp4"}:
+        return "video_mp4"
+    if mode in {"frames", "frame", "images", "image"}:
+        return "frames"
+    raise RuntimeError(
+        "ANALYZE_VISUAL_MODE 只能是 video_mp4 或 frames。"
+    )
+
+
+def _stamp_video_observations(
+    observations: list[dict[str, Any]],
+    *,
+    analysis_method: str,
+    source_video: Path,
+    file_id: str | None = None,
+    extra: dict[str, Any] | None = None,
+) -> list[dict[str, Any]]:
+    for observation in observations:
+        observation["analysis_method"] = analysis_method
+        observation["source_video"] = str(source_video)
+        if file_id is not None:
+            observation["minimax_file_id"] = file_id
+        if extra:
+            observation.update(extra)
+    return observations
+
+
+def _analyze_video_mp4_core(
+    video_path: Path,
+    api_key: str,
+    model: str,
+    *,
+    prompt: str,
+    fps_value: float,
+    detail_value: str,
+    timeout: int,
+    analysis_method: str,
+    source_video: Path,
+    extra_meta: dict[str, Any] | None = None,
+) -> tuple[list[dict[str, Any]], dict[str, Any] | None, str | None]:
+    """Upload + chat once. Raises on upload/API failures; incomplete chat returns incomplete obs."""
+    file_id = minimax_upload_video_understanding(video_path, api_key)
+    try:
+        response = minimax_chat(
+            [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": prompt},
+                        {
+                            "type": "video_url",
+                            "video_url": {
+                                "url": f"mm_file://{file_id}",
+                                "detail": detail_value,
+                                "fps": fps_value,
+                            },
+                        },
+                    ],
+                }
+            ],
+            api_key,
+            model,
+            timeout=timeout,
+        )
+        parsed = parse_json_object(response)
+    except MiniMaxIncompleteError as error:
+        incomplete = _stamp_video_observations(
+            [
+                {
+                    "timestamp": 0.0,
+                    "screen_type": "影片",
+                    "visible_text": [],
+                    "visual_summary": VISUAL_NOT_ANALYZED,
+                    "important_details": [],
+                    "confidence": None,
+                    "completion_status": "incomplete",
+                    "finish_reason": error.finish_reason or "missing",
+                }
+            ],
+            analysis_method=analysis_method,
+            source_video=source_video,
+            file_id=file_id,
+            extra=extra_meta,
+        )
+        return incomplete, None, file_id
+
+    events = parsed.get("events") if isinstance(parsed.get("events"), list) else []
+    observations: list[dict[str, Any]] = []
+    for event in events:
+        if not isinstance(event, dict):
+            continue
+        observation = {
+            "screen_type": event.get("screen_type") or "影片片段",
+            "visible_text": event.get("visible_text") if isinstance(event.get("visible_text"), list) else [],
+            "visual_summary": event.get("visual_summary") or "",
+            "important_details": event.get("important_details")
+            if isinstance(event.get("important_details"), list)
+            else [],
+            "confidence": event.get("confidence"),
+        }
+        try:
+            observation["timestamp"] = float(event.get("timestamp", 0.0))
+        except (TypeError, ValueError):
+            observation["timestamp"] = 0.0
+        if usable_visual_observation(observation):
+            observation["visual_schema_version"] = VISUAL_OBSERVATION_SCHEMA_VERSION
+            observation["completion_status"] = "complete"
+            observations.append(observation)
+
+    if not observations:
+        overall = parsed.get("overall_summary")
+        if isinstance(overall, str) and overall.strip():
+            observations = [
+                {
+                    "timestamp": 0.0,
+                    "screen_type": "整片摘要",
+                    "visible_text": [],
+                    "visual_summary": overall.strip(),
+                    "important_details": [],
+                    "confidence": 0.7,
+                    "visual_schema_version": VISUAL_OBSERVATION_SCHEMA_VERSION,
+                    "completion_status": "complete",
+                }
+            ]
+        else:
+            incomplete = _stamp_video_observations(
+                [
+                    {
+                        "timestamp": 0.0,
+                        "screen_type": "影片",
+                        "visible_text": [],
+                        "visual_summary": VISUAL_NOT_ANALYZED,
+                        "important_details": [],
+                        "confidence": None,
+                        "completion_status": "incomplete",
+                        "finish_reason": "unusable_video_response",
+                        "raw": parsed.get("raw") or parsed,
+                    }
+                ],
+                analysis_method=analysis_method,
+                source_video=source_video,
+                file_id=file_id,
+                extra=extra_meta,
+            )
+            return incomplete, parsed if isinstance(parsed, dict) else None, file_id
+
+    _stamp_video_observations(
+        observations,
+        analysis_method=analysis_method,
+        source_video=source_video,
+        file_id=file_id,
+        extra=extra_meta,
+    )
+    return observations, parsed if isinstance(parsed, dict) else None, file_id
+
+
+
+def analyze_video_mp4_frames_fallback(
+    video_path: Path,
+    api_key: str,
+    model: str,
+    *,
+    work_dir: Path,
+    duration: float | None = None,
+    frames_workers: int = 4,
+    max_frames: int | None = None,
+    cache_dir: Path | None = None,
+    fallback_reason: str,
+) -> list[dict[str, Any]]:
+    """Frame-sampling fallback when full MP4 upload cannot proceed; never labeled as full-video."""
+    seconds = float(duration or 0.0)
+    if seconds <= 0:
+        try:
+            seconds = video_duration(probe_video(video_path))
+        except Exception:
+            seconds = 60.0
+    frame_cap = vision_frame_limit(seconds, max_frames)
+    frames_dir = work_dir / "vision-fallback-frames"
+    frames_dir.mkdir(parents=True, exist_ok=True)
+    print(f"! video_mp4 改抽幀備援：{fallback_reason}")
+    candidates, stats = extract_budgeted_candidates(
+        video_path,
+        frames_dir,
+        seconds,
+        max_frames=frame_cap,
+        candidate_budget=240,
+    )
+    vision_cache = cache_dir if cache_dir is not None else frames_dir / "vision-cache"
+    observations = analyze_images(
+        candidates,
+        api_key,
+        model,
+        workers=frames_workers,
+        cache_dir=vision_cache,
+    )
+    extra = {
+        "fallback_reason": fallback_reason,
+        "fallback_from": "video_mp4",
+        "fallback_sampling": stats,
+    }
+    return _stamp_video_observations(
+        observations,
+        analysis_method="minimax_video_fallback_frames",
+        source_video=video_path,
+        extra=extra,
+    )
+
+
+def analyze_video_mp4(
+    video_path: Path,
+    api_key: str,
+    model: str,
+    *,
+    duration: float | None = None,
+    cache_dir: Path | None = None,
+    fps: float | None = None,
+    detail: str | None = None,
+    timeout: int = 600,
+    work_dir: Path | None = None,
+    frames_workers: int = 4,
+    max_frames: int | None = None,
+    allow_frames_fallback: bool = True,
+) -> list[dict[str, Any]]:
+    """Send the whole MP4 to MiniMax-M3 via Files API + video_url (not per-frame images).
+
+    When the source exceeds the Files API ~512MB limit or upload rejects for size,
+    prefer ffmpeg compress/transcode under ~450MB and retry. If compress is
+    unavailable, fails, or still too large, fall back to frame sampling and mark
+    analysis_method as minimax_video_fallback_frames (never silently as full-video).
+    """
+    if cache_dir is not None:
+        cache_dir.mkdir(parents=True, exist_ok=True)
+    fps_value = float(os.getenv("ANALYZE_VIDEO_FPS", "1") if fps is None else fps)
+    fps_value = max(0.2, min(5.0, fps_value))
+    detail_value = (detail or os.getenv("ANALYZE_VIDEO_DETAIL", "default")).strip().lower()
+    if detail_value not in {"low", "default", "high"}:
+        raise RuntimeError("ANALYZE_VIDEO_DETAIL 只能是 low、default 或 high。")
+    prompt = (
+        "請完整觀看這支影片，只輸出 JSON object，不要 Markdown。"
+        "欄位必須包含 events（陣列）與 overall_summary（字串）。"
+        "events 依時間順序列出關鍵畫面／情節（片長短可 3–8 筆，較長可到 20 筆）；"
+        "每筆必須含 timestamp（秒）、screen_type、visible_text（字串陣列）、"
+        "visual_summary、important_details（字串陣列）、confidence（0 到 1）。"
+        "描述文字一律用繁體中文，畫面上的原文照抄不要翻譯。"
+        "若看不清楚，保留空陣列並降低 confidence。"
+    )
+    if duration is not None and duration > 0:
+        prompt += f"\n影片長度約 {duration:.1f} 秒。"
+    cache_path: Path | None = None
+    if cache_dir is not None:
+        material = json.dumps(
+            {
+                "version": 1,
+                "mode": "video_mp4",
+                "model": model,
+                "prompt": prompt,
+                "fps": fps_value,
+                "detail": detail_value,
+                "video_sha256": file_sha256(video_path),
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        cache_path = cache_dir / (hashlib.sha256(material.encode("utf-8")).hexdigest() + ".json")
+        cached = reuse_artifact(cache_path)
+        if isinstance(cached, dict) and isinstance(cached.get("observations"), list):
+            observations = [item for item in cached["observations"] if usable_visual_observation(item)]
+            if observations:
+                return observations
+
+    source_size = video_path.stat().st_size
+    strategy = choose_video_mp4_upload_strategy(source_size)
+    failure_reasons: list[str] = []
+    owned_temp: tempfile.TemporaryDirectory[str] | None = None
+    scratch = work_dir
+    if scratch is None:
+        owned_temp = tempfile.TemporaryDirectory(prefix="minimax-video-")
+        scratch = Path(owned_temp.name)
+    else:
+        scratch.mkdir(parents=True, exist_ok=True)
+
+    def run_core(
+        path: Path,
+        *,
+        analysis_method: str,
+        extra_meta: dict[str, Any] | None = None,
+    ) -> tuple[list[dict[str, Any]], dict[str, Any] | None, str | None]:
+        return _analyze_video_mp4_core(
+            path,
+            api_key,
+            model,
+            prompt=prompt,
+            fps_value=fps_value,
+            detail_value=detail_value,
+            timeout=timeout,
+            analysis_method=analysis_method,
+            source_video=video_path,
+            extra_meta=extra_meta,
+        )
+
+    def persist(observations: list[dict[str, Any]], parsed: dict[str, Any] | None, file_id: str | None) -> list[dict[str, Any]]:
+        if cache_path is not None and parsed is not None and all(
+            usable_visual_observation(item) for item in observations
+        ):
+            write_json(
+                cache_path,
+                {
+                    "observations": observations,
+                    "overall_summary": parsed.get("overall_summary"),
+                    "minimax_file_id": file_id,
+                },
+            )
+        return observations
+
+    def frames_or_raise(reason: str) -> list[dict[str, Any]]:
+        detail = reason
+        if failure_reasons:
+            detail = reason + " | prior: " + " ; ".join(failure_reasons)
+        if not allow_frames_fallback:
+            raise RuntimeError(f"video_mp4 無法繼續且 frames 備援已關閉：{detail}")
+        return analyze_video_mp4_frames_fallback(
+            video_path,
+            api_key,
+            model,
+            work_dir=scratch,
+            duration=duration,
+            frames_workers=frames_workers,
+            max_frames=max_frames,
+            cache_dir=None if cache_dir is None else cache_dir / "frames-fallback",
+            fallback_reason=detail,
+        )
+
+    try:
+        if strategy == "direct":
+            try:
+                observations, parsed, file_id = run_core(video_path, analysis_method="minimax_video")
+                return persist(observations, parsed, file_id)
+            except Exception as error:
+                if not is_minimax_video_size_error(error):
+                    raise
+                failure_reasons.append(str(error))
+                print(f"! MiniMax video_mp4 上傳因大小／上限失敗，改試壓縮：{error}")
+
+        # compress_first (oversized source) or retry after size reject
+        compressed_path = scratch / "minimax-compressed.mp4"
+        compress_error: Exception | None = None
+        for target in (MINIMAX_VIDEO_COMPRESS_TARGET_BYTES, MINIMAX_VIDEO_COMPRESS_RETRY_BYTES):
+            try:
+                print(
+                    f"· video_mp4 壓縮備援：目標 ≤{target // (1024 * 1024)}MB"
+                    f"（來源 {source_size} bytes）"
+                )
+                compress_video_for_minimax_upload(
+                    video_path,
+                    compressed_path,
+                    target_bytes=target,
+                    duration=duration,
+                )
+                compressed_size = compressed_path.stat().st_size
+                if compressed_size > MINIMAX_VIDEO_FILES_API_LIMIT_BYTES:
+                    raise RuntimeError(
+                        f"壓縮後仍有 {compressed_size} bytes，超過 MiniMax Files API 上限 512 MB。"
+                    )
+                meta = {
+                    "compressed_from_bytes": source_size,
+                    "compressed_bytes": compressed_size,
+                    "compress_target_bytes": target,
+                }
+                try:
+                    observations, parsed, file_id = run_core(
+                        compressed_path,
+                        analysis_method="minimax_video_compressed",
+                        extra_meta=meta,
+                    )
+                except Exception as upload_error:
+                    if is_minimax_video_size_error(upload_error):
+                        raise
+                    # Compress succeeded; non-size upload/analyze errors are not a frames fallback.
+                    raise
+                return persist(observations, parsed, file_id)
+            except Exception as error:
+                compress_error = error
+                failure_reasons.append(str(error))
+                message = str(error)
+                ffmpeg_unavailable = "找不到 ffmpeg" in message or (
+                    isinstance(error, RuntimeError) and "ffmpeg" in message.lower() and "外部指令失敗" in message
+                )
+                still_too_large = is_minimax_video_size_error(error)
+                compress_failed = (
+                    ffmpeg_unavailable
+                    or "compress produced empty" in message
+                    or "ffmpeg compress" in message.lower()
+                    or still_too_large
+                )
+                if compress_failed:
+                    print(f"! video_mp4 壓縮／大小重試失敗：{error}")
+                    if ffmpeg_unavailable:
+                        break
+                    continue
+                raise
+
+        reason = (
+            f"source {source_size} bytes requires fallback; compress failed"
+            if compress_error is None
+            else f"compress/upload failed: {compress_error}"
+        )
+        return frames_or_raise(reason)
+    finally:
+        if owned_temp is not None:
+            owned_temp.cleanup()
+
 
 
 def analyze_images(
@@ -7085,6 +7660,7 @@ def run_pipeline(args: argparse.Namespace) -> Path:
 
     source_name = args.url or str(Path(args.video).expanduser().resolve())
     artifact_config = {
+        "visual_mode": visual_mode(),
         "chunk_seconds": args.chunk_seconds,
         "frame_interval": args.frame_interval,
         "hash_threshold": args.hash_threshold,
@@ -7213,6 +7789,14 @@ def run_pipeline(args: argparse.Namespace) -> Path:
 
             def frame_stage() -> tuple[list[dict[str, Any]], dict[str, Any], str]:
                 cache_key = frame_candidate_cache_key(video_path, artifact_config)
+                if visual_mode() == "video_mp4" and has_video and not args.dry_run and not args.local_only:
+                    # Direct MP4 understanding does not need JPEG candidates.
+                    return [], {
+                        "method": "video_mp4",
+                        "candidate_count": 0,
+                        "ocr": {"enabled": False, "status": "not-applicable"},
+                        "visual_mode": "video_mp4",
+                    }, cache_key
                 cached_frames = reuse_frame_candidates(
                     job_dir / "frame_candidates.json", cache_key
                 )
@@ -7315,6 +7899,35 @@ def run_pipeline(args: argparse.Namespace) -> Path:
                     )
 
             def visual_stage() -> list[dict[str, Any]]:
+                if visual_mode() == "video_mp4":
+                    if not has_video:
+                        return []
+                    previous_mode = (previous.get("config") or {}).get("visual_mode")
+                    cached = (
+                        reuse_artifact(job_dir / "visual.json")
+                        if reuse_cloud
+                        and previous_mode == "video_mp4"
+                        and previous.get("models", {}).get("visual") == model
+                        and previous.get("source", {}).get("resolved_video")
+                        == artifact_path(video_path, root)
+                        else None
+                    )
+                    if isinstance(cached, list) and cached and all(
+                        usable_visual_observation(item) for item in cached
+                    ):
+                        print("· 重用既有整支影片視覺觀察")
+                        return cached
+                    print("· MiniMax 直接讀取 mp4（CLI）")
+                    return analyze_video_mp4(
+                        video_path,
+                        minimax_subscription_key(),
+                        model,
+                        duration=duration_seconds,
+                        cache_dir=None if args.refresh else job_dir / "vision-video-cache",
+                        work_dir=job_dir / "vision-video-work",
+                        frames_workers=args.vision_workers,
+                        max_frames=args.max_vision_frames,
+                    )
                 previous_config = previous.get("config") or {}
                 previous_frames_match = previous.get("frame_candidate_cache_key") == frame_cache_key
                 if not previous.get("frame_candidate_cache_key"):

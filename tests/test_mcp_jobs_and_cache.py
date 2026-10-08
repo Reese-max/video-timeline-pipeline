@@ -18,7 +18,7 @@ from job_queue import JobQueue
 class IntegrationTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
-        self.root = Path(self.temp.name)
+        self.root = Path(self.temp.name).resolve()
         self.jobs = self.root / 'mcp_jobs'
         self.job_id = '0123456789ab'
         self.job = self.jobs / self.job_id

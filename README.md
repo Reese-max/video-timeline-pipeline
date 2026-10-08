@@ -50,7 +50,11 @@ VidBee 完成的本機影音（或影片 URL） → FFmpeg
 | `summary-cache/` | 提示詞版本＋模型＋實際輸入；超長內容逐段保存後再整合 |
 | `library.db` 的 `index_state` | 時間軸、摘要與分類未變時，不再刪除並重建全文索引 |
 
-Groq 轉錄與 MiniMax 畫面分析會同時執行；超長逐字稿的 MiniMax 分段摘要也會受限並行。`--workers` 預設／最多 4；畫面分析另由 `--vision-workers` 控制，預設／最多 8。畫面張數預設依片長每 30 秒約 1 張、最少 8、最多 40；`--max-vision-frames N` 可手動覆寫。抽樣點會保持穩定，增加張數時可沿用已分析畫面的快取。不會為了速度切換到較不精確的 Whisper turbo。純色／空白畫面會先由 Pillow 判定，避免視覺模型捏造內容；MiniMax-M3 摘要使用官方 `thinking: {"type":"disabled"}` 直接回答，畫面分析仍保留 adaptive thinking。`reasoning_split` 只改回傳格式，不能關閉推理。
+Groq 轉錄與 MiniMax 畫面分析會同時執行；超長逐字稿的 MiniMax 分段摘要也會受限並行。`--workers` 預設／最多 4；畫面分析另由 `--vision-workers` 控制，預設／最多 8。畫面張數預設依片長每 30 秒約 1 張、最少 8、最多 40；`--max-vision-frames N` 可手動覆寫。抽樣點會保持穩定，增加張數時可沿用已分析畫面的快取。不會為了速度切換到較不精確的 Whisper turbo。純色／空白畫面會先由 Pillow 判定，避免視覺模型捏造內容；MiniMax-M3 摘要使用官方 `thinking: {"type":"disabled"}` 直接回答，畫面分析仍保留 adaptive thinking。
+
+視覺分析預設 `ANALYZE_VISUAL_MODE=video_mp4`：整支 MP4 經 MiniMax Files API 上傳後以 `video_url` 交給 MiniMax-M3 直接理解（不再抽 JPEG 逐張分析）。若要舊行為設 `ANALYZE_VISUAL_MODE=frames`。可調 `ANALYZE_VIDEO_FPS`（0.2–5）與 `ANALYZE_VIDEO_DETAIL`（low|default|high）。來源超過 Files API 約 512MB（或上傳因大小被拒）時，會先用 ffmpeg 壓到約 400–480MB 再重試；壓縮失敗或仍過大則改抽幀備援，並以 `analysis_method=minimax_video_fallback_frames`（或壓縮成功時的 `minimax_video_compressed`）標明，不會假裝成一般整支影片分析。
+
+`reasoning_split` 只改回傳格式，不能關閉推理。
 
 2026-09-01 以同一支 8 秒公開合成影片、全新輸出目錄與真實 Groq／MiniMax API 實測：調整前兩次首跑為 17.003、23.049 秒；調整後為 14.352、18.732 秒，兩次平均約縮短 17%。Groq 轉錄僅 0.438–0.484 秒，剩餘波動主要在 MiniMax；這是小樣本觀察值，不是供應商延遲保證。兩次輸出皆有 2 段逐字稿、5 題問答、有效引用、`notes.md` 與 `transcript.srt`。
 
@@ -620,6 +624,7 @@ OPEN_NOTEBOOK_PASSWORD=不要提交到版本控制
 |---|---|---|
 | Groq | `audio.transcriptions` | 每個音訊片段送出前（命中本機快取時不預留、不產生新費用） |
 | MiniMax | `vision.analyze_images`、`summarize.*`、`query.keywords`、`query.answer`、`digest.report`、`library.classify` | 每次送出前，同一則 `finish_reason` 重試會各自入帳 |
+| MiniMax | `files.upload` | 每次 upload attempt 送出前；bytes 是請求單位，未知價格記為 unknown，strict 模式拒絕送出 |
 | OpenRouter | `embeddings` | 每個 batch 送出前（向量已存在時不送出、不預留） |
 | Meta Graph | `graph.query` | 每次分頁請求 |
 | Apify | `actor.run.start` | 只送出一次啟動 POST，不自動重試；金額以供應商端 `APIFY_MAX_TOTAL_CHARGE_USD` 封頂。timeout／5xx 保留未確認預留；後續 poll／dataset 讀取屬同一筆遠端工作，不重複計完整 Actor 費用 |

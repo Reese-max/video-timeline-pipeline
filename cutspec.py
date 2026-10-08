@@ -240,11 +240,23 @@ def source_from_video(video_path: Path | str, probe: Optional[dict] = None) -> S
     video_stream = next(
         (s for s in probe.get("streams", []) if s.get("codec_type") == "video"), None
     )
+    duration = pipeline.video_duration(probe)
     if video_stream is not None:
         timebase, fps, vfr = _canonical_rate(
             video_stream.get("avg_frame_rate", "0/0"),
             video_stream.get("r_frame_rate", "0/0"),
         )
+        # Source ranges use absolute presentation PTS; duration excludes a
+        # positive origin (for example an MP4 empty edit).
+        try:
+            start, ticks = video_stream.get("start_pts"), video_stream.get("duration_ts")
+            clock = Fraction(video_stream.get("time_base", "0/1"))
+            if type(start) is int and start >= 0 and type(ticks) is int and ticks > 0 and clock > 0:
+                end = float((start + ticks) * clock)
+                if math.isfinite(end):
+                    duration = max(duration, end)
+        except (TypeError, ValueError, ZeroDivisionError, OverflowError):
+            pass  # Missing or invalid clocks retain the existing duration.
     else:
         audio = next(
             (s for s in probe.get("streams", []) if s.get("codec_type") == "audio"), {}
@@ -260,7 +272,7 @@ def source_from_video(video_path: Path | str, probe: Optional[dict] = None) -> S
         videoPath=str(path),
         contentHash=pipeline.file_sha256(path),
         fingerprint=pipeline.file_fingerprint(path),
-        durationSec=pipeline.video_duration(probe),
+        durationSec=duration,
         fps=fps,
         timebase=timebase,
         vfr=vfr,
