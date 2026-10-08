@@ -158,6 +158,74 @@ async function test(name, run) { await run(); count++; console.log('ok ' + count
     }
     assert.equal(h.prompts.length, 0);
   });
+  for (const withCompletedPrepare of [false, true]) await test('foreground same-job reprepare confirms fresh state; completed prepare=' + withCompletedPrepare, async () => {
+    let phase = 'ready', release;
+    const expired = { status: 'expired', error_code: 'MEDIA_EXPIRED', job_id: 'first', prepared: null, analysis: null, active_operation: null, latest_operation: null };
+    const h = harness({ respond(name) {
+      assert.equal(name, 'get_prepared_video');
+      if (phase === 'expired') return expired;
+      if (phase === 'reprepared') return new Promise(resolve => { release = resolve; });
+      return { prepared: job('first'), analysis: analysis('first'), drive: drive('first'), active_operation: null, latest_operation: null };
+    } });
+    await h.flush(); phase = 'expired'; await h.click('refresh');
+    phase = 'reprepared'; h.notifyTool(job('first')); await h.flush();
+    assert.equal(h.calls.length, 3, 'Same-job foreground ready must re-read authoritative state');
+    assert.equal(h.elements.get('analyze').disabled, true);
+    assert.equal(h.elements.get('drive').disabled, true);
+    assert.equal(h.elements.get('media').hidden, true);
+    assert.equal(h.elements.get('player').getAttribute('src'), null);
+    release({ prepared: job('first'), analysis: null, active_operation: null,
+      latest_operation: withCompletedPrepare ? completed(job('first'), 'prepared', 'old-prepare') : null }); await h.flush();
+    assert.equal(h.elements.get('analyze').disabled, false);
+    assert.equal(h.elements.get('drive').disabled, false);
+    assert.equal(h.elements.get('operation').hidden, !withCompletedPrepare);
+    assert.doesNotMatch(h.elements.get('status').textContent, /保留期限|過期/);
+    assert.equal(h.elements.get('findings').hidden, true);
+    assert.equal(h.elements.get('drive-handoff').hidden, true);
+    assert.equal(h.elements.get('ask').disabled, true);
+    assert.equal(h.openai.widgetState.privateContent.jobId, 'first');
+    assert.deepEqual(h.calls.map(c => c.name), ['get_prepared_video', 'get_prepared_video', 'get_prepared_video']);
+    assert.equal(h.prompts.length, 0);
+  });
+  await test('foreground same-job reprepare supersedes an older expiry read', async () => {
+    let phase = 'expired', release;
+    const expired = { status: 'expired', error_code: 'MEDIA_EXPIRED', job_id: 'first', prepared: null, analysis: null, active_operation: null, latest_operation: null };
+    const h = harness({ respond(name) {
+      assert.equal(name, 'get_prepared_video');
+      if (phase === 'refresh') return new Promise(resolve => { release = resolve; });
+      return phase === 'expired' ? expired : { prepared: job('first'), analysis: null, active_operation: null, latest_operation: null };
+    } });
+    await h.flush(); phase = 'refresh'; const refresh = h.click('refresh'); await h.flush();
+    phase = 'reprepared'; h.notifyTool(job('first')); await h.flush();
+    assert.equal(h.elements.get('analyze').disabled, false);
+    release(expired); await refresh;
+    assert.equal(h.elements.get('analyze').disabled, false);
+    assert.equal(h.elements.get('drive').disabled, false);
+    assert.equal(h.elements.get('media').hidden, false);
+    assert.doesNotMatch(h.elements.get('status').textContent, /保留期限|過期/);
+    assert.equal(h.calls.length, 3);
+    assert.equal(h.prompts.length, 0);
+  });
+  for (const outcome of ['expired', 'read-error', 'wrong-job']) await test('foreground same-job ready retains expiry protection after ' + outcome, async () => {
+    let refresh = false;
+    const expired = { status: 'expired', error_code: 'MEDIA_EXPIRED', job_id: 'first', prepared: null, analysis: null, active_operation: null, latest_operation: null };
+    const h = harness({ respond(name) {
+      assert.equal(name, 'get_prepared_video');
+      if (!refresh || outcome === 'expired') return expired;
+      if (outcome === 'read-error') throw new Error('fixture restore denied');
+      return { prepared: job('other'), analysis: null, active_operation: null, latest_operation: null };
+    } });
+    await h.flush(); refresh = true; h.notifyTool(job('first')); await h.flush();
+    assert.equal(h.calls.length, 2);
+    assert.equal(h.elements.get('analyze').disabled, true);
+    assert.equal(h.elements.get('drive').disabled, true);
+    assert.equal(h.elements.get('media').hidden, true);
+    assert.equal(h.elements.get('player').getAttribute('src'), null);
+    assert.equal(h.elements.get('resume').hidden, true);
+    assert.equal(h.elements.get('ask').disabled, true);
+    assert.equal(h.openai.widgetState.privateContent.jobId, 'first');
+    assert.equal(h.prompts.length, 0);
+  });
   await test('expired snapshot is not an unknown restore failure', async () => {
     const h = harness({ snapshot: { status: 'expired', error_code: 'MEDIA_EXPIRED', error: '影片已過保留期限，請重新準備。', job_id: 'first', prepared: null, analysis: null, active_operation: null, latest_operation: null } });
     await h.flush();

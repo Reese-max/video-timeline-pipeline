@@ -385,6 +385,7 @@ async function restoreJob() {
       return;
     }
     if (snapshot.prepared?.job_id !== id) throw new Error("恢復資料的工作不符。");
+    if (activeOperation?.error_code === "MEDIA_EXPIRED") status("");
     renderPrepared(snapshot.prepared);
     const restoredVersion = generation;
     viewVersion = restoredVersion; uncertainStart = false;
@@ -440,6 +441,11 @@ async function askChatGPT() {
 function receiveToolResult(value, initial = false) {
   const payload = normalize(value);
   if (payload.status === "ready" && Array.isArray(payload.segments)) {
+    if (payload.job_id === data?.job_id && activeOperation?.error_code === "MEDIA_EXPIRED") {
+      // A same-job ready notification needs fresh server confirmation before lifting expiry.
+      generation++; stopPolling(); restoreJob();
+      return;
+    }
     const changed = renderPrepared(payload);
     if (changed) { restoredOperationId = saved.jobId === payload.job_id ? saved.operationId : null; restoreJob(); }
   } else if (payload.operation === "prepare" && payload.operation_id) {
