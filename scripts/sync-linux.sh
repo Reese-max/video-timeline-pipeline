@@ -2,7 +2,7 @@
 # Reuse sand-desktop supervision; one pull-based worker, no second MCP service.
 set -eu
 shared="${MCP_BASE_DIR:-/home/box/video-timeline-pipeline}"
-home="${MCP_DEPLOY_HOME:-/home/box/video-timeline-deploy}"
+home="${MCP_DEPLOY_HOME:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}"
 shared="$(readlink -f "$shared")"
 home="$(readlink -f "$home")"
 stable="${home}/sync-linux.sh"
@@ -61,7 +61,7 @@ case "${1:-}" in
             pid="$!"
             printf '%s\n' "$pid" >"$pidfile"
         fi
-        sand_desktop_register d1 video-timeline-git-sync 7 "${home}/sync.log" "$pid" "$pidfile" -- /bin/bash "$stable" --run-loop
+        sand_desktop_register d1 video-timeline-git-sync 7 "${home}/sync.log" "$pid" "$pidfile" -- /usr/bin/env "MCP_BASE_DIR=$shared" "MCP_DEPLOY_HOME=$home" /bin/bash "$stable" --run-loop
         ;;
     *) echo 'Usage: sync-linux.sh [--once|--run-loop]' >&2; exit 2 ;;
 esac

@@ -69,6 +69,11 @@ class LinuxDeployTests(unittest.TestCase):
             deploy.tools_compatible(TOOLS, newer[1:])
         self.assertFalse(deploy.schema_compatible(
             {"type": "object", "required": ["id"]}, {"type": "object"}, output=True))
+        closed = {"type": "object", "properties": {"id": {"type": "string"}},
+                  "additionalProperties": False}
+        expanded = copy.deepcopy(closed)
+        expanded["properties"]["optional"] = {"type": "string"}
+        self.assertFalse(deploy.schema_compatible(closed, expanded, output=True))
 
     def test_archive_excludes_runtime_credentials_and_rejects_traversal(self):
         with tempfile.TemporaryDirectory() as name:

@@ -174,6 +174,9 @@ def schema_compatible(old: dict, new: dict, *, output: bool = False) -> bool:
     old_required, new_required = set(old.get("required", [])), set(new.get("required", []))
     if not (old_required.issubset(new_required) if output else new_required.issubset(old_required)):
         return False
+    if (output and old.get("additionalProperties", True) is not True
+            and new.get("properties", {}).keys() - old.get("properties", {}).keys()):
+        return False
     for name, value in old.get("properties", {}).items():
         if name not in new.get("properties", {}) or not schema_compatible(value, new["properties"][name], output=output):
             return False

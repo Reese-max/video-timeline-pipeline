@@ -21,8 +21,8 @@ if ($StateDir.Equals($RepoPath, [StringComparison]::OrdinalIgnoreCase) -or
     throw 'StateDir must be outside the repository.'
 }
 $account = [Security.Principal.WindowsIdentity]::GetCurrent().Name
-$arguments = '-NoProfile -NonInteractive -File "' + $scriptPath + '" -RepoPath "' + $RepoPath + '" -StateDir "' + $StateDir + '" -Transport ' + $Transport
-$action = New-ScheduledTaskAction -Execute $pwsh -Argument $arguments
+$arguments = '-NoProfile -NonInteractive -WindowStyle Hidden -File "' + $scriptPath + '" -RepoPath "' + $RepoPath + '" -StateDir "' + $StateDir + '" -Transport ' + $Transport
+$action = New-ScheduledTaskAction -Execute $pwsh -Argument $arguments -WorkingDirectory $PSScriptRoot
 $triggers = @(
     New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(1) -RepetitionInterval (New-TimeSpan -Minutes 15)
     New-ScheduledTaskTrigger -AtLogOn -User $account

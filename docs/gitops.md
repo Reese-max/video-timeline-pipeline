@@ -30,6 +30,8 @@ pwsh -NoProfile -NonInteractive -File scripts\sync-windows.ps1 -RepoPath C:\User
 
 控制器 `deploy_linux.py`、`sync-linux.sh` 安裝在 deploy home；用既有開機入口恢復 sand-desktop 的 MCP 與同步工作。只註冊同步 loop 到易失的 `/tmp` registry 不足以證明開機恢復。不得同時啟用另一套 MCP service。
 
+應用程式 release 自動更新；穩定控制器與共用啟動器的變更需另經備份、測試與受控安裝，不會在自身執行途中換掉控制器。
+
 ```bash
 python3 scripts/deploy_linux.py --check-only
 python3 scripts/deploy_linux.py --prepare-only
