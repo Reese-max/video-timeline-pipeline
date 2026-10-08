@@ -2436,7 +2436,25 @@ def choose_video_mp4_upload_strategy(
 
 def is_minimax_video_size_error(error: BaseException) -> bool:
     """True when an upload/API failure looks like a MiniMax video size/limit reject."""
+    if isinstance(error, budget_blocked_error()) or type(error).__name__ == "BudgetBlockedError":
+        return False
+    if getattr(error, "status_code", None) == 429:
+        return False
     text = str(error).lower()
+    negative_needles = (
+        "429",
+        "rate limit",
+        "rate_limit",
+        "rate-limit",
+        "too many requests",
+        "quota",
+        "budget",
+        "daily limit",
+        "tpm",
+        "rpm",
+    )
+    if any(needle in text for needle in negative_needles):
+        return False
     needles = (
         "512 mb",
         "512mb",
@@ -2446,7 +2464,6 @@ def is_minimax_video_size_error(error: BaseException) -> bool:
         "entity too large",
         "payload too large",
         "content too large",
-        "exceed",
         "size limit",
         "upload limit",
         "無法直接上傳",
@@ -2905,6 +2922,8 @@ def analyze_video_mp4(
             try:
                 observations, parsed, file_id = run_core(video_path, analysis_method="minimax_video")
                 return persist(observations, parsed, file_id)
+            except budget_blocked_error():
+                raise
             except Exception as error:
                 if not is_minimax_video_size_error(error):
                     raise
@@ -2948,6 +2967,8 @@ def analyze_video_mp4(
                     # Compress succeeded; non-size upload/analyze errors are not a frames fallback.
                     raise
                 return persist(observations, parsed, file_id)
+            except budget_blocked_error():
+                raise
             except Exception as error:
                 compress_error = error
                 failure_reasons.append(str(error))
