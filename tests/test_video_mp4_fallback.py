@@ -84,6 +84,39 @@ class SizeErrorDetectionTests(unittest.TestCase):
         self.assertFalse(pipeline.is_minimax_video_size_error(RuntimeError("API HTTP 401：unauthorized")))
         self.assertFalse(pipeline.is_minimax_video_size_error(RuntimeError("network timeout")))
 
+    def test_rate_limit_and_budget_errors_are_not_size_errors(self) -> None:
+        from cost_tracker import BudgetBlockedError
+
+        self.assertFalse(
+            pipeline.is_minimax_video_size_error(RuntimeError("API HTTP 429: rate limit exceeded"))
+        )
+        self.assertFalse(
+            pipeline.is_minimax_video_size_error(
+                RuntimeError("Budget blocked: projected (1.200 USD) exceeds daily limit (1.00 USD)")
+            )
+        )
+        self.assertFalse(
+            pipeline.is_minimax_video_size_error(RuntimeError("rate limit exceeded"))
+        )
+        self.assertFalse(
+            pipeline.is_minimax_video_size_error(RuntimeError("exceeds daily limit"))
+        )
+        self.assertFalse(
+            pipeline.is_minimax_video_size_error(RuntimeError("API HTTP 429: too many requests"))
+        )
+        self.assertFalse(
+            pipeline.is_minimax_video_size_error(RuntimeError("monthly quota exceeded"))
+        )
+        self.assertFalse(
+            pipeline.is_minimax_video_size_error(
+                BudgetBlockedError(
+                    "Budget blocked: projected (1.200 USD) exceeds daily limit (1.00 USD)",
+                    provider="minimax",
+                    operation="files.upload",
+                )
+            )
+        )
+
 
 class AnalyzeVideoMp4FallbackTests(unittest.TestCase):
     def _touch_fake_mp4(self, path: Path, size: int) -> Path:
@@ -278,6 +311,95 @@ class AnalyzeVideoMp4FallbackTests(unittest.TestCase):
             self.assertEqual(observations[0]["fallback_reason"], "compress failed")
             self.assertEqual(observations[0]["fallback_from"], "video_mp4")
             self.assertNotEqual(observations[0]["analysis_method"], "minimax_video")
+
+    def test_upload_rate_limit_exceeded_raises_without_compress_or_frames_fallback(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            video = root / "clip.mp4"
+            video.write_bytes(b"fake-mp4")
+            with mock.patch.object(
+                pipeline,
+                "minimax_upload_video_understanding",
+                side_effect=RuntimeError("API HTTP 429: rate limit exceeded"),
+            ) as upload, \
+                 mock.patch.object(pipeline, "compress_video_for_minimax_upload") as compress, \
+                 mock.patch.object(pipeline, "analyze_video_mp4_frames_fallback") as frames:
+                with self.assertRaises(RuntimeError) as ctx:
+                    pipeline.analyze_video_mp4(
+                        video, "key", "MiniMax-M3", duration=8.0, work_dir=root / "work"
+                    )
+                self.assertIn("rate limit exceeded", str(ctx.exception))
+            self.assertEqual(upload.call_count, 1)
+            compress.assert_not_called()
+            frames.assert_not_called()
+
+    def test_upload_budget_blocked_raises_without_compress_or_frames_fallback(self) -> None:
+        from cost_tracker import BudgetBlockedError
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            video = root / "clip.mp4"
+            video.write_bytes(b"fake-mp4")
+            with mock.patch.object(
+                pipeline,
+                "minimax_upload_video_understanding",
+                side_effect=BudgetBlockedError(
+                    "Budget blocked: projected (1.200 USD) exceeds daily limit (1.00 USD)",
+                    provider="minimax",
+                    operation="files.upload",
+                ),
+            ) as upload, \
+                 mock.patch.object(pipeline, "compress_video_for_minimax_upload") as compress, \
+                 mock.patch.object(pipeline, "analyze_video_mp4_frames_fallback") as frames:
+                with self.assertRaises(BudgetBlockedError) as ctx:
+                    pipeline.analyze_video_mp4(
+                        video, "key", "MiniMax-M3", duration=8.0, work_dir=root / "work"
+                    )
+                self.assertIn("exceeds daily limit", str(ctx.exception))
+            self.assertEqual(upload.call_count, 1)
+            compress.assert_not_called()
+            frames.assert_not_called()
+
+    def test_oversize_upload_rate_limit_raises_without_retry_or_frames(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            video = root / "huge.mp4"
+            video.write_bytes(b"fake")
+
+            def fake_compress(src, dest, **kwargs):
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                dest.write_bytes(b"compressed")
+                return dest
+
+            real_stat = Path.stat
+
+            def fake_stat(self, *args, **kwargs):
+                result = real_stat(self, *args, **kwargs)
+                if self == video:
+                    return mock.Mock(
+                        st_size=pipeline.MINIMAX_VIDEO_FILES_API_LIMIT_BYTES + 10,
+                        st_mtime_ns=result.st_mtime_ns,
+                        st_mode=result.st_mode,
+                    )
+                return result
+
+            with mock.patch.object(Path, "stat", fake_stat), \
+                 mock.patch.object(pipeline, "compress_video_for_minimax_upload", side_effect=fake_compress) as compress, \
+                 mock.patch.object(
+                     pipeline,
+                     "minimax_upload_video_understanding",
+                     side_effect=RuntimeError("API HTTP 429: rate limit exceeded"),
+                 ) as upload, \
+                 mock.patch.object(pipeline, "analyze_video_mp4_frames_fallback") as frames:
+                with self.assertRaises(RuntimeError) as ctx:
+                    pipeline.analyze_video_mp4(
+                        video, "key", "MiniMax-M3", duration=120.0, work_dir=root / "work"
+                    )
+                self.assertIn("rate limit exceeded", str(ctx.exception))
+            self.assertEqual(compress.call_count, 1)
+            self.assertEqual(upload.call_count, 1)
+            frames.assert_not_called()
+
 
 
 if __name__ == "__main__":
