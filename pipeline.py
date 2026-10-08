@@ -2441,8 +2441,10 @@ def is_minimax_video_size_error(error: BaseException) -> bool:
     if getattr(error, "status_code", None) == 429:
         return False
     text = str(error).lower()
+    # HTTP429 must not match digits embedded in a legitimate file byte count.
+    if re.search(r"(?<!\d)429(?!\d)", text):
+        return False
     negative_needles = (
-        "429",
         "rate limit",
         "rate_limit",
         "rate-limit",
