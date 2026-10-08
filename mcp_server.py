@@ -16,11 +16,12 @@ import time
 import atexit
 from pathlib import Path
 from typing import Annotated, Any, Literal
-from urllib.parse import urlsplit
+from urllib.parse import urljoin, urlsplit
 
+import requests
 import pipeline
 import drive_storage
-from job_queue import JobQueue, report_progress, TERMINAL
+from job_queue import JobQueue, JobBusyError, report_progress, TERMINAL
 from media_lifecycle import StoragePolicy, MediaSigner
 from execution_control import DeadlineExceeded, ExecutionCancelled
 from mcp import types
@@ -97,10 +98,36 @@ TRANSPORT_SECURITY = TransportSecuritySettings(
     allowed_hosts=ALLOWED_HOSTS,
     allowed_origins=ALLOWED_ORIGINS,
 )
+EGRESS_FAKE_IP_NETWORKS = tuple(
+    ipaddress.ip_network(item.strip(), strict=False)
+    for item in os.getenv("MCP_EGRESS_FAKE_IP_CIDRS", "198.18.0.0/15").split(",")
+    if item.strip()
+)
+KNOWN_PUBLIC_VIDEO_HOSTS = (
+    "facebook.com",
+    "fb.watch",
+    "instagram.com",
+    "youtube.com",
+    "youtu.be",
+    "tiktok.com",
+    "x.com",
+    "twitter.com",
+    "threads.net",
+    "threads.com",
+)
+DOH_ENDPOINTS = (
+    "https://1.1.1.1/dns-query",
+    "https://dns.google/resolve",
+)
 # ponytail: global lock, per-job locks if concurrent public jobs become necessary.
 JOB_LOCK = threading.Lock()
 RUNTIME_SHA256 = {name: hashlib.sha256((ROOT / name).read_bytes()).hexdigest()
-                  for name in ("mcp_server.py", "pipeline.py", "job_worker.py", "media_retention.py", "media_lifecycle.py")}
+                  for name in ("mcp_server.py", "pipeline.py", "job_worker.py", "job_queue.py", "execution_control.py",
+                               "media_retention.py", "media_lifecycle.py", "drive_storage.py", "cost_tracker.py",
+                               "scoring.py", "notifications.py", "web/widget.html", "requirements.txt")}
+RELEASE_SHA = os.getenv("MCP_RELEASE_SHA", "")
+if RELEASE_SHA and not re.fullmatch(r"[0-9a-f]{40}", RELEASE_SHA):
+    raise RuntimeError("Invalid MCP_RELEASE_SHA")
 _QUEUE = None
 _QUEUE_INIT_LOCK = threading.Lock()
 
@@ -138,10 +165,6 @@ def check_job_capacity(job_id: str, additional_bytes: int = 0):
     if MCP_STORAGE_CLEANUP_ENABLED:
         policy.cleanup(dry_run=False, protected_job_ids=protected)
     return policy.ensure_capacity(job_id, additional_bytes, protected_job_ids=protected)
-
-
-class JobBusyError(RuntimeError):
-    """No work started; safe for a caller to retry after backoff."""
 
 
 UI_META = {
@@ -323,6 +346,199 @@ def normalize_file_references(files: list[dict]) -> list[dict]:
     return normalized
 
 
+def address_is_public(address: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
+    mapped = getattr(address, "ipv4_mapped", None)
+    return address.is_global and (mapped is None or mapped.is_global)
+
+
+def dns_json_addresses(data: dict, host: str, record_type: int) -> set[ipaddress.IPv4Address | ipaddress.IPv6Address]:
+    def name(value: str) -> str:
+        return value.encode("idna").decode("ascii").lower().rstrip(".")
+
+    if not isinstance(data, dict) or type(data.get("Status")) is not int or data["Status"] not in (0, 3):
+        raise ValueError("DoH 回應狀態無效。")
+    if data.get("TC", False) is not False:
+        raise ValueError("DoH 回應不完整。")
+    questions = data.get("Question")
+    if not isinstance(questions, list) or len(questions) != 1:
+        raise ValueError("DoH 回應缺少唯一查詢。")
+    question = questions[0]
+    if not isinstance(question, dict) or type(question.get("type")) is not int or name(question.get("name", "")) != name(host) or question.get("type") != record_type:
+        raise ValueError("DoH 回應查詢與影片主機不符。")
+    answers = data.get("Answer", [])
+    if not isinstance(answers, list) or (data["Status"] == 3 and answers):
+        raise ValueError("DoH 回應紀錄無效。")
+    cnames: dict[str, str] = {}
+    for answer in answers:
+        if not isinstance(answer, dict) or type(answer.get("type")) is not int:
+            raise ValueError("DoH 回應紀錄無效。")
+        if answer.get("type") == 5:
+            owner, target = name(answer.get("name", "")), name(answer.get("data", ""))
+            if not owner or not target or (owner in cnames and cnames[owner] != target):
+                raise ValueError("DoH CNAME 紀錄無效。")
+            cnames[owner] = target
+    owners = {name(host)}
+    current = name(host)
+    while current in cnames:
+        current = cnames[current]
+        if current in owners or len(owners) >= 16:
+            raise ValueError("DoH CNAME 循環或超過驗證上限。")
+        owners.add(current)
+    if any(owner not in owners for owner in cnames):
+        raise ValueError("DoH CNAME 與影片主機無關。")
+    addresses: set[ipaddress.IPv4Address | ipaddress.IPv6Address] = set()
+    for answer in answers:
+        if answer.get("type") in (1, 28):
+            if answer["type"] != record_type:
+                raise ValueError("DoH 位址紀錄與查詢類型不符。")
+            if name(answer.get("name", "")) not in owners:
+                raise ValueError("DoH 位址紀錄與影片主機無關。")
+            address = ipaddress.ip_address(answer.get("data", "").strip())
+            if address.version != (4 if answer["type"] == 1 else 6):
+                raise ValueError("DoH 位址與紀錄類型不符。")
+            addresses.add(address)
+    return addresses
+
+
+def public_dns_addresses(host: str) -> set[ipaddress.IPv4Address | ipaddress.IPv6Address]:
+    for endpoint in DOH_ENDPOINTS:
+        try:
+            addresses: set[ipaddress.IPv4Address | ipaddress.IPv6Address] = set()
+            for record_type, number in (("A", 1), ("AAAA", 28)):
+                response = requests.get(
+                    endpoint,
+                    params={"name": host, "type": record_type},
+                    headers={"accept": "application/dns-json"},
+                    timeout=5,
+                    allow_redirects=False,
+                )
+                try:
+                    if response.status_code != 200:
+                        raise RuntimeError(f"DoH 請求失敗: HTTP {response.status_code}")
+                    resolved = dns_json_addresses(response.json(), host, number)
+                    # A private authoritative answer must never become a retry
+                    # that can be replaced by a different resolver's public answer.
+                    if any(not address_is_public(address) for address in resolved):
+                        return resolved
+                    addresses.update(resolved)
+                finally:
+                    response.close()
+            return addresses
+        except (requests.RequestException, OSError, ValueError, TypeError, AttributeError, RuntimeError):
+            continue
+    return set()
+
+
+def check_public_host(host: str, port: int | None = None) -> None:
+    if host.startswith("[") and host.endswith("]"):
+        host = host[1:-1]
+    try:
+        normalized_host = host.encode("idna").decode("ascii").lower().rstrip(".")
+    except (UnicodeError, ValueError) as exc:
+        raise ValueError("影片 URL 的主機或連接埠無效。") from exc
+    if not normalized_host or normalized_host in {"localhost", "localhost.localdomain"} or normalized_host.endswith(".local"):
+        raise ValueError("為避免 SSRF，不接受本機或 .local 影片 URL。")
+
+    try:
+        ip = ipaddress.ip_address(normalized_host)
+        is_ip = True
+    except ValueError:
+        is_ip = False
+
+    if is_ip:
+        if not address_is_public(ip):
+            raise ValueError("為避免 SSRF，影片 URL 必須解析到公開 IP。")
+        return
+
+    try:
+        addresses = {
+            ipaddress.ip_address(item[4][0])
+            for item in socket.getaddrinfo(normalized_host, port or 443)
+        }
+    except OSError:
+        addresses = set()
+
+    if not addresses:
+        raise ValueError("無法確認影片主機解析至公開 IP。")
+
+    if all(address_is_public(address) for address in addresses):
+        return
+
+    bad = [address for address in addresses if not address_is_public(address)]
+    if any(not any(address in net for net in EGRESS_FAKE_IP_NETWORKS) for address in bad):
+        raise ValueError("為避免 SSRF，影片 URL 必須解析到公開 IP。")
+
+    public = public_dns_addresses(normalized_host)
+    if public:
+        if any(not address_is_public(address) for address in public):
+            raise ValueError("為避免 SSRF，影片 URL 必須解析到公開 IP。")
+        return
+
+    raise ValueError("無法確認影片主機解析至公開 IP。")
+
+
+def validate_share_redirects(url: str, max_hops: int = 5) -> None:
+    parsed = urlsplit(url)
+    try:
+        host = (parsed.hostname or "").encode("idna").decode("ascii").lower().rstrip(".")
+    except (UnicodeError, ValueError):
+        return
+    is_fb_watch = host == "fb.watch" or host.endswith(".fb.watch")
+    is_fb = host == "facebook.com" or host.endswith(".facebook.com")
+    if not (is_fb_watch or (is_fb and parsed.path.startswith("/share/"))):
+        return
+
+    current_url = url
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/120.0.0.0 Safari/537.36"
+        )
+    }
+    visited = {current_url}
+    for _ in range(max_hops):
+        current_parsed = urlsplit(current_url)
+        check_public_host(current_parsed.hostname or "", current_parsed.port or (443 if current_parsed.scheme.lower() == "https" else 80))
+        try:
+            resp = requests.get(
+                current_url,
+                allow_redirects=False,
+                stream=True,
+                timeout=8,
+                headers=headers,
+            )
+        except (requests.RequestException, OSError) as exc:
+            raise ValueError("無法驗證影片重定向；請稍後重試。") from exc
+
+        try:
+            if resp.status_code not in {301, 302, 303, 307, 308}:
+                return
+            location = resp.headers.get("Location") or resp.headers.get("location")
+            if not location:
+                raise ValueError("影片重定向缺少 Location。")
+            next_url = urljoin(current_url, location)
+            if next_url in visited:
+                raise ValueError("影片重定向形成循環。")
+            visited.add(next_url)
+            next_parsed = urlsplit(next_url)
+            if next_parsed.scheme.lower() not in {"http", "https"}:
+                raise ValueError("重定向目標協定必須是 HTTP 或 HTTPS。")
+            if next_parsed.username or next_parsed.password:
+                raise ValueError("重定向目標不可包含帳號或密碼。")
+            try:
+                next_host = (next_parsed.hostname or "").encode("idna").decode("ascii").lower().rstrip(".")
+                next_port = next_parsed.port
+            except (UnicodeError, ValueError) as exc:
+                raise ValueError("重定向目標的主機或連接埠無效。") from exc
+            check_public_host(next_host, next_port or (443 if next_parsed.scheme.lower() == "https" else 80))
+            current_url = next_url
+        finally:
+            if hasattr(resp, "close"):
+                resp.close()
+    raise ValueError(f"影片重定向超過 {max_hops} 次驗證上限。")
+
+
 def validate_source_url(value: str) -> str:
     value = pipeline.require_http_url(value, "影片 URL")
     if len(value) > 2048:
@@ -332,21 +548,11 @@ def validate_source_url(value: str) -> str:
         raise ValueError("影片 URL 不可包含帳號或密碼。")
     try:
         host = (parsed.hostname or "").encode("idna").decode("ascii").lower().rstrip(".")
-        parsed.port
+        port = parsed.port
     except (UnicodeError, ValueError) as exc:
         raise ValueError("影片 URL 的主機或連接埠無效。") from exc
-    if not host or host in {"localhost", "localhost.localdomain"} or host.endswith(".local"):
-        raise ValueError("為避免 SSRF，不接受本機或 .local 影片 URL。")
-
-    try:
-        addresses = {
-            ipaddress.ip_address(item[4][0])
-            for item in socket.getaddrinfo(host, parsed.port or (443 if parsed.scheme == "https" else 80))
-        }
-    except OSError:
-        addresses = set()
-    if addresses and any(not address.is_global for address in addresses):
-        raise ValueError("為避免 SSRF，影片 URL 必須解析到公開 IP。")
+    check_public_host(host, port or (443 if parsed.scheme == "https" else 80))
+    validate_share_redirects(value)
     return value
 
 
@@ -667,6 +873,9 @@ def run_job(operation, *args):
     try:
         # ponytail: one writer across processes; use per-job locks if throughput requires it.
         with pipeline.file_writer_lock(MCP_JOBS_ROOT / ".writer.lock"):
+            # Accepted background work drains normally; only new synchronous work is refused.
+            if os.getenv("VIDEO_JOB_WORKER") != "1" and (MCP_ROOT / ".video-state" / "deployment-draining").exists():
+                raise JobBusyError("MCP 正在安全更新，請稍後重試；本次未開始分析或上傳。")
             return operation(*args)
     except pipeline.WriterBusyError:
         raise JobBusyError("MCP 正在處理另一個影片工作或清理；請稍後重試，本次未加入背景佇列。") from None
@@ -748,6 +957,8 @@ def tool_result(manifest: dict) -> types.CallToolResult:
 
 
 def tool_error_result(error: Exception) -> types.CallToolResult:
+    if isinstance(error, JobBusyError):
+        return job_busy_result(error)
     detail = str(error).strip() or error.__class__.__name__
     return types.CallToolResult(
         isError=True,
@@ -817,7 +1028,7 @@ def analysis_quality(result: dict[str, Any]) -> dict[str, Any]:
 def analysis_cache_signature(video_path: Path, manifest: dict) -> str:
     """Hash actual bytes and all analysis choices; never include credential values."""
     configuration = {
-        "schema": 3, "source_sha256": pipeline.file_sha256(video_path),
+        "schema": 4, "source_sha256": pipeline.file_sha256(video_path),
         "server_code": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
         "pipeline_code": hashlib.sha256(Path(pipeline.__file__).read_bytes()).hexdigest(),
         "vision_model": pipeline.minimax_model(),
@@ -830,6 +1041,9 @@ def analysis_cache_signature(video_path: Path, manifest: dict) -> str:
         "local_compute": os.getenv("WHISPER_COMPUTE", "int8"),
         "audio_chunk_seconds": max(15, int(manifest.get("segment_seconds") or 120)),
         "sampling": {"version": 1, "max_frames": 40, "candidate_budget": 240},
+        "visual_mode": pipeline.visual_mode(),
+        "video_fps": float(os.getenv("ANALYZE_VIDEO_FPS", "1") or 1),
+        "video_detail": os.getenv("ANALYZE_VIDEO_DETAIL", "default").strip().lower() or "default",
     }
     return hashlib.sha256(json.dumps(configuration, sort_keys=True).encode()).hexdigest()
 
@@ -885,6 +1099,34 @@ def analyze_prepared_sync(job_id: str) -> dict[str, Any]:
     visual_status = "pending"
 
     def visual_stage() -> list[dict[str, Any]]:
+        mode = pipeline.visual_mode()
+        if mode == "video_mp4":
+            report_progress("upload", 20, "上傳整支影片給 MiniMax 直接理解")
+            sampling_stats.update({
+                "mode": "video_mp4",
+                "fps": float(os.getenv("ANALYZE_VIDEO_FPS", "1") or 1),
+                "detail": os.getenv("ANALYZE_VIDEO_DETAIL", "default").strip().lower() or "default",
+                "source_bytes": video_path.stat().st_size,
+            })
+            check_job_capacity(job_id)
+            report_progress("evidence", 40, "MiniMax 直接讀取 mp4")
+            observations = pipeline.analyze_video_mp4(
+                video_path,
+                minimax_key,
+                model,
+                duration=duration,
+                cache_dir=analysis_dir / "vision-video-cache",
+                work_dir=analysis_dir / "vision-video-work",
+            )
+            if observations:
+                method = observations[0].get("analysis_method")
+                if method and method != "minimax_video":
+                    sampling_stats["analysis_method"] = method
+                    if observations[0].get("fallback_reason"):
+                        sampling_stats["fallback_reason"] = observations[0]["fallback_reason"]
+                    if observations[0].get("compressed_bytes") is not None:
+                        sampling_stats["compressed_bytes"] = observations[0]["compressed_bytes"]
+            return observations
         report_progress("sampling", 20, "按全片時間範圍與畫面變化取樣")
         candidates, stats = pipeline.extract_budgeted_candidates(
             video_path, analysis_dir, duration, max_frames=max_frames, candidate_budget=240)
@@ -1166,7 +1408,7 @@ async def prepare_video_for_chatgpt(
     description=(
         "Use this after prepare_video_for_chatgpt as the primary server-side analysis step. "
         "It reads the prepared local MP4 bytes on the MCP host, uses FFmpeg to extract audio and "
-        "frames, Groq or faster-whisper for speech, and MiniMax (including MiniMax-M3 when configured) "
+        "the prepared MP4 (MiniMax-M3 video_url), Groq or faster-whisper for speech, and MiniMax "
         "for visual analysis. ChatGPT composes the final summary from transcript and timeline evidence. "
         "The result is a server-side analysis; "
         "do not describe it as ChatGPT directly reading the video attachment. "
@@ -1404,6 +1646,9 @@ async def health(_: Request) -> JSONResponse:
     return JSONResponse({"status": "ok", "service": "video-timeline-pipeline", "version": 12,
                          "jobs": queue.stats(), "media_links": "signed", "legacy_media_until": MCP_LEGACY_MEDIA_UNTIL,
                          "writer_busy": JOB_LOCK.locked(), "runtime_sha256": RUNTIME_SHA256,
+                         "commit_sha": RELEASE_SHA or None,
+                         "public_base_url": MCP_PUBLIC_BASE_URL,
+                         "deployment_draining": (MCP_ROOT / ".video-state" / "deployment-draining").exists(),
                          "retention": {"days": 7, "whole_job_delete": False}})
 
 

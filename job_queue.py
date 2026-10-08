@@ -17,6 +17,10 @@ from contextlib import contextmanager
 TERMINAL = {"completed", "failed", "cancelled", "expired", "interrupted"}
 
 
+class JobBusyError(RuntimeError):
+    """No new operation started; retry after the deployment or writer releases."""
+
+
 def atomic_json(path: Path, value: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     temp = path.with_suffix(f".{uuid.uuid4().hex}.tmp")
@@ -158,6 +162,8 @@ class JobQueue:
         now = time.time()
         with self.connect() as db:
             db.execute("BEGIN IMMEDIATE")
+            if (self.root / "deployment-draining").exists():
+                raise JobBusyError("MCP 正在安全更新，請稍後重試；本次未加入背景佇列。")
             row = db.execute("SELECT id FROM jobs WHERE input_hash=? AND status IN ('queued','running') "
                              "ORDER BY created LIMIT 1", (key,)).fetchone()
             if row:
@@ -269,11 +275,31 @@ class JobQueue:
             work.mkdir(mode=0o700, exist_ok=True)
             atomic_json(work / "input.json", {"operation": row["operation"], "inputs": json.loads(row["inputs"])})
             output.unlink(missing_ok=True)
-            process = subprocess.Popen([sys.executable, str(self.worker), str(work)], stdin=subprocess.PIPE,
+            command = [sys.executable, str(self.worker), str(work)]
+            if os.name == "nt":
+                # venv/Store launchers spawn Python before it can be assigned to the job.
+                import ctypes
+                from ctypes import wintypes as w
+                api = ctypes.WinDLL("kernel32", use_last_error=True)
+                api.GetModuleFileNameW.argtypes = [w.HMODULE, w.LPWSTR, w.DWORD]
+                api.GetModuleFileNameW.restype = w.DWORD
+                executable = ctypes.create_unicode_buffer(32768)
+                if not api.GetModuleFileNameW(None, executable, len(executable)):
+                    raise OSError("Cannot resolve the running Python executable")
+                command[0] = executable.value
+                env["__PYVENV_LAUNCHER__"] = sys.executable
+                # Bind the Windows job before worker code can spawn any descendants.
+                command[1:1] = ["-c", "import sys,runpy,os; assert sys.stdin.buffer.read(1)==b'1'; "
+                                     f"sys.executable={executable.value!r}; os.environ['__PYVENV_LAUNCHER__']={sys.executable!r}; "
+                                     "sys.argv=sys.argv[1:]; runpy.run_path(sys.argv[0],run_name='__main__')"]
+            process = subprocess.Popen(command, stdin=subprocess.PIPE,
                                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env,
                                        start_new_session=os.name != "nt",
                                        creationflags=subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0)
             bind_windows_job(process)
+            if os.name == "nt":
+                process.stdin.write(b"1")
+                process.stdin.flush()
             self._process = process
             while process.poll() is None:
                 status = self._row(operation_id)["status"]

@@ -1,5 +1,7 @@
 import asyncio
+import ipaddress
 import json
+import socket
 import tempfile
 import unittest
 from pathlib import Path
@@ -90,6 +92,123 @@ class MCPValidationTests(unittest.TestCase):
             mcp_server.validate_source_url("http://127.0.0.1/video.mp4")
         with self.assertRaises(ValueError):
             mcp_server.validate_source_url("https://user:pass@example.com/video.mp4")
+
+    def test_validate_source_url_facebook_share_accepts_with_fake_ip_and_doh(self) -> None:
+        url = "https://www.facebook.com/share/v/1ExtCtwPgg/?mibextid=wwXIfr"
+        mock_response = MagicMock(status_code=200)
+        with (
+            patch.object(mcp_server.socket, "getaddrinfo", return_value=[(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("198.18.0.1", 443))]),
+            patch.object(mcp_server, "public_dns_addresses", return_value={ipaddress.ip_address("57.145.2.1")}),
+            patch.object(mcp_server.requests, "get", return_value=mock_response),
+        ):
+            self.assertEqual(mcp_server.validate_source_url(url), url)
+
+    def test_validate_source_url_facebook_share_reel_follows_public_redirect(self) -> None:
+        url = "https://www.facebook.com/share/r/1FZQnH1JoV/?mibextid=wwXIfr"
+        hop = MagicMock(status_code=302, headers={"Location": "https://www.facebook.com/reel/1234567890/"})
+        final = MagicMock(status_code=200, headers={})
+        with (
+            patch.object(mcp_server.socket, "getaddrinfo", return_value=[(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("198.18.0.1", 443))]),
+            patch.object(mcp_server, "public_dns_addresses", return_value={ipaddress.ip_address("57.145.2.1")}),
+            patch.object(mcp_server.requests, "get", side_effect=[hop, final]) as get,
+        ):
+            self.assertEqual(mcp_server.validate_source_url(url), url)
+        self.assertEqual(get.call_count, 2)
+        self.assertEqual(get.call_args_list[1].args[0], "https://www.facebook.com/reel/1234567890/")
+
+    def test_validate_source_url_fake_ip_empty_doh_known_vs_unknown_host(self) -> None:
+        fb_url = "https://www.facebook.com/share/v/1ExtCtwPgg/?mibextid=wwXIfr"
+        mock_response = MagicMock(status_code=200)
+        with (
+            patch.object(mcp_server.socket, "getaddrinfo", return_value=[(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("198.18.0.1", 443))]),
+            patch.object(mcp_server, "public_dns_addresses", return_value=set()),
+            patch.object(mcp_server.requests, "get", return_value=mock_response),
+        ):
+            with self.assertRaisesRegex(ValueError, "無法確認"):
+                mcp_server.validate_source_url(fb_url)
+
+        evil_url = "https://evil.example/video.mp4"
+        with (
+            patch.object(mcp_server.socket, "getaddrinfo", return_value=[(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("198.18.0.1", 443))]),
+            patch.object(mcp_server, "public_dns_addresses", return_value=set()),
+        ):
+            with self.assertRaises(ValueError):
+                mcp_server.validate_source_url(evil_url)
+
+    def test_validate_source_url_fake_ip_doh_private_ip_rejected(self) -> None:
+        url = "https://www.facebook.com/share/v/1ExtCtwPgg/?mibextid=wwXIfr"
+        with (
+            patch.object(mcp_server.socket, "getaddrinfo", return_value=[(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("198.18.0.1", 443))]),
+            patch.object(mcp_server, "public_dns_addresses", return_value={ipaddress.ip_address("10.0.0.5")}),
+        ):
+            with self.assertRaises(ValueError):
+                mcp_server.validate_source_url(url)
+
+    def test_validate_source_url_ip_literals_rejected(self) -> None:
+        urls = [
+            "http://127.0.0.1/",
+            "http://169.254.169.254/latest/meta-data/",
+            "http://100.100.100.100/",
+            "http://198.18.0.1/",
+            "http://[::1]/",
+        ]
+        for url in urls:
+            with self.subTest(url=url):
+                with self.assertRaises(ValueError):
+                    mcp_server.validate_source_url(url)
+
+    def test_validate_source_url_resolving_to_link_local_rejected(self) -> None:
+        url = "https://metadata.internal.example/video.mp4"
+        with patch.object(
+            mcp_server.socket,
+            "getaddrinfo",
+            return_value=[(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("169.254.169.254", 443))],
+        ):
+            with self.assertRaises(ValueError):
+                mcp_server.validate_source_url(url)
+
+    def test_validate_source_url_share_redirect_hop_to_link_local_rejected(self) -> None:
+        url = "https://www.facebook.com/share/v/1ExtCtwPgg/?mibextid=wwXIfr"
+        mock_response = MagicMock()
+        mock_response.status_code = 302
+        mock_response.headers = {"Location": "http://169.254.169.254/"}
+        with (
+            patch.object(mcp_server.socket, "getaddrinfo", return_value=[(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("198.18.0.1", 443))]),
+            patch.object(mcp_server, "public_dns_addresses", return_value={ipaddress.ip_address("57.145.2.1")}),
+            patch.object(mcp_server.requests, "get", return_value=mock_response),
+        ):
+            with self.assertRaises(ValueError):
+                mcp_server.validate_source_url(url)
+
+    def test_public_dns_addresses_parsing_and_fallback(self) -> None:
+        bad_response = MagicMock(status_code=500)
+        good_a = MagicMock(status_code=200)
+        good_a.json.return_value = {
+            "Status": 0,
+            "Question": [{"name": "example.com.", "type": 1}],
+            "Answer": [
+                {"name": "example.com", "type": 5, "data": "cname.example.com."},
+                {"name": "cname.example.com", "type": 1, "data": "93.184.216.34"},
+            ],
+        }
+        good_aaaa = MagicMock(status_code=200)
+        good_aaaa.json.return_value = {
+            "Status": 0,
+            "Question": [{"name": "example.com.", "type": 28}],
+            "Answer": [
+                {"name": "example.com", "type": 5, "data": "cname.example.com."},
+                {"name": "cname.example.com", "type": 28, "data": "2606:2800:220:1:248:1893:25c8:1946"},
+            ],
+        }
+        with patch.object(mcp_server.requests, "get", side_effect=[bad_response, good_a, good_aaaa]):
+            addrs = mcp_server.public_dns_addresses("example.com")
+            self.assertEqual(
+                addrs,
+                {
+                    ipaddress.ip_address("93.184.216.34"),
+                    ipaddress.ip_address("2606:2800:220:1:248:1893:25c8:1946"),
+                },
+            )
 
     def test_media_path_rejects_traversal(self) -> None:
         self.assertIsNone(mcp_server.safe_media_path("0123456789ab", "segments/../source.mp4"))
@@ -287,7 +406,7 @@ class MCPValidationTests(unittest.TestCase):
                 patch.object(mcp_server.pipeline, "create_summary") as create_summary_mock,
                 patch.object(mcp_server.pipeline, "file_sha256", return_value="sha"),
                 patch.object(mcp_server.pipeline, "write_json"),
-                patch.dict(mcp_server.os.environ, {"GROQ_API_KEY": "groq"}, clear=False),
+                patch.dict(mcp_server.os.environ, {"GROQ_API_KEY": "groq", "ANALYZE_VISUAL_MODE": "frames"}, clear=False),
             ):
                 result = mcp_server.analyze_prepared_sync("0123456789ab")
 
