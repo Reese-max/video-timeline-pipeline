@@ -2595,6 +2595,93 @@ def visual_mode() -> str:
     )
 
 
+def parse_video_timestamp(value: Any) -> float | None:
+    """Parse a model-reported video timestamp into original-video seconds.
+
+    Issue #56: MiniMax-M3 sometimes answers with MM:SS strings (or other
+    free-form time text) while the event parser only accepted float() —
+    unparseable stamps silently collapsed to 0.0 and piled evidence at the
+    start of the timeline. Unparseable input now returns None so the caller
+    can drop the event instead of fabricating a timestamp.
+    """
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        number = float(value)
+        return number if math.isfinite(number) and number >= 0 else None
+    if not isinstance(value, str):
+        return None
+    text = value.strip().lower().replace("，", "").replace(",", "")
+    if not text:
+        return None
+    for suffix in ("秒", "s", "sec", "secs", "second", "seconds"):
+        if text.endswith(suffix):
+            text = text[: -len(suffix)].strip()
+            break
+    match = re.fullmatch(r"(?:(\d+)\s*(?:時|小时|h))?\s*(?:(\d+)\s*(?:分|m))?\s*(\d+(?:\.\d+)?)\s*(?:秒|s)?", text)
+    if match and (match.group(1) or match.group(2)):
+        hours = float(match.group(1) or 0)
+        minutes = float(match.group(2) or 0)
+        seconds = float(match.group(3) or 0)
+        total = hours * 3600 + minutes * 60 + seconds
+        return total if math.isfinite(total) and total >= 0 else None
+    if re.fullmatch(r"\d+(?:\.\d+)?", text or ""):
+        number = float(text)
+        return number if math.isfinite(number) and number >= 0 else None
+    parts = text.split(":")
+    if 2 <= len(parts) <= 3 and all(re.fullmatch(r"\d+(?:\.\d+)?", part.strip() or "x") for part in parts):
+        numbers = [float(part.strip()) for part in parts]
+        total = numbers[-1] + numbers[-2] * 60 + (numbers[-3] * 3600 if len(numbers) == 3 else 0)
+        return total if math.isfinite(total) and total >= 0 else None
+    return None
+
+
+def video_timestamps_cover_duration(observations: list[dict[str, Any]], duration: float | None) -> bool:
+    """Check that visual evidence actually spans the video (issue #56).
+
+    A 166.6s video whose events peak at 6.9s is a compressed timeline, not a
+    20x rescale away from correct — the offsets are not proportional. Short
+    clips (max stamp only needs min(duration-30, duration/2)) stay exempt so
+    a single genuine event never forces a retry.
+    """
+    if duration is None or duration <= 0:
+        return True
+    if not observations:
+        return True
+    try:
+        peak = max(float(item.get("timestamp", 0.0)) for item in observations)
+    except (TypeError, ValueError):
+        return False
+    return peak >= min(duration - 30.0, duration * 0.5)
+
+
+def _parse_video_mp4_events(parsed: dict[str, Any]) -> list[dict[str, Any]]:
+    """Build observations from a video_url chat response; drop bad timestamps."""
+    events = parsed.get("events") if isinstance(parsed.get("events"), list) else []
+    observations: list[dict[str, Any]] = []
+    for event in events:
+        if not isinstance(event, dict):
+            continue
+        stamp = parse_video_timestamp(event.get("timestamp", 0.0))
+        if stamp is None:
+            continue
+        observation = {
+            "timestamp": stamp,
+            "screen_type": event.get("screen_type") or "影片片段",
+            "visible_text": event.get("visible_text") if isinstance(event.get("visible_text"), list) else [],
+            "visual_summary": event.get("visual_summary") or "",
+            "important_details": event.get("important_details")
+            if isinstance(event.get("important_details"), list)
+            else [],
+            "confidence": event.get("confidence"),
+        }
+        if usable_visual_observation(observation):
+            observation["visual_schema_version"] = VISUAL_OBSERVATION_SCHEMA_VERSION
+            observation["completion_status"] = "complete"
+            observations.append(observation)
+    return observations
+
+
 def _stamp_video_observations(
     observations: list[dict[str, Any]],
     *,
@@ -2625,33 +2712,71 @@ def _analyze_video_mp4_core(
     analysis_method: str,
     source_video: Path,
     extra_meta: dict[str, Any] | None = None,
+    duration_hint: float | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, Any] | None, str | None]:
     """Upload + chat once. Raises on upload/API failures; incomplete chat returns incomplete obs."""
     file_id = minimax_upload_video_understanding(video_path, api_key)
-    try:
-        response = minimax_chat(
-            [
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": prompt},
-                        {
-                            "type": "video_url",
-                            "video_url": {
-                                "url": f"mm_file://{file_id}",
-                                "detail": detail_value,
-                                "fps": fps_value,
+    current_prompt = prompt
+    parsed: dict[str, Any] | None = None
+    observations: list[dict[str, Any]] = []
+    for attempt in range(2):
+        try:
+            response = minimax_chat(
+                [
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": current_prompt},
+                            {
+                                "type": "video_url",
+                                "video_url": {
+                                    "url": f"mm_file://{file_id}",
+                                    "detail": detail_value,
+                                    "fps": fps_value,
+                                },
                             },
-                        },
-                    ],
-                }
-            ],
-            api_key,
-            model,
-            timeout=timeout,
-        )
-        parsed = parse_json_object(response)
-    except MiniMaxIncompleteError as error:
+                        ],
+                    }
+                ],
+                api_key,
+                model,
+                timeout=timeout,
+            )
+            parsed = parse_json_object(response)
+        except MiniMaxIncompleteError as error:
+            incomplete = _stamp_video_observations(
+                [
+                    {
+                        "timestamp": 0.0,
+                        "screen_type": "影片",
+                        "visible_text": [],
+                        "visual_summary": VISUAL_NOT_ANALYZED,
+                        "important_details": [],
+                        "confidence": None,
+                        "completion_status": "incomplete",
+                        "finish_reason": error.finish_reason or "missing",
+                    }
+                ],
+                analysis_method=analysis_method,
+                source_video=source_video,
+                file_id=file_id,
+                extra=extra_meta,
+            )
+            return incomplete, None, file_id
+        observations = _parse_video_mp4_events(parsed)
+        if video_timestamps_cover_duration(observations, duration_hint):
+            break
+        if attempt == 0 and duration_hint is not None and duration_hint > 0:
+            peak = max((item["timestamp"] for item in observations), default=0.0)
+            current_prompt = (
+                f"{prompt}\n上一次回答的 timestamp 最大只到 {peak:.1f} 秒，"
+                f"但影片長 {duration_hint:.1f} 秒：請把每個事件對應到從 0 起算的"
+                f"原片實際秒數（0 到 {duration_hint:.1f}），依時間遞增重排後只輸出修正後的 JSON object。"
+            )
+    if not video_timestamps_cover_duration(observations, duration_hint):
+        # Issue #56: compressed timelines are not proportionally rescalable,
+        # so fail closed instead of caching bad evidence as complete.
+        peak = max((item["timestamp"] for item in observations), default=0.0)
         incomplete = _stamp_video_observations(
             [
                 {
@@ -2662,7 +2787,10 @@ def _analyze_video_mp4_core(
                     "important_details": [],
                     "confidence": None,
                     "completion_status": "incomplete",
-                    "finish_reason": error.finish_reason or "missing",
+                    "finish_reason": "timestamp_coverage",
+                    "max_observed_timestamp": peak,
+                    "duration_seconds": duration_hint,
+                    "raw": parsed.get("raw") or parsed,
                 }
             ],
             analysis_method=analysis_method,
@@ -2670,30 +2798,7 @@ def _analyze_video_mp4_core(
             file_id=file_id,
             extra=extra_meta,
         )
-        return incomplete, None, file_id
-
-    events = parsed.get("events") if isinstance(parsed.get("events"), list) else []
-    observations: list[dict[str, Any]] = []
-    for event in events:
-        if not isinstance(event, dict):
-            continue
-        observation = {
-            "screen_type": event.get("screen_type") or "影片片段",
-            "visible_text": event.get("visible_text") if isinstance(event.get("visible_text"), list) else [],
-            "visual_summary": event.get("visual_summary") or "",
-            "important_details": event.get("important_details")
-            if isinstance(event.get("important_details"), list)
-            else [],
-            "confidence": event.get("confidence"),
-        }
-        try:
-            observation["timestamp"] = float(event.get("timestamp", 0.0))
-        except (TypeError, ValueError):
-            observation["timestamp"] = 0.0
-        if usable_visual_observation(observation):
-            observation["visual_schema_version"] = VISUAL_OBSERVATION_SCHEMA_VERSION
-            observation["completion_status"] = "complete"
-            observations.append(observation)
+        return incomplete, parsed if isinstance(parsed, dict) else None, file_id
 
     if not observations:
         overall = parsed.get("overall_summary")
@@ -2829,11 +2934,17 @@ def analyze_video_mp4(
         "events 依時間順序列出關鍵畫面／情節（片長短可 3–8 筆，較長可到 20 筆）；"
         "每筆必須含 timestamp（秒）、screen_type、visible_text（字串陣列）、"
         "visual_summary、important_details（字串陣列）、confidence（0 到 1）。"
+        "timestamp 一律是從 0 起算的原片秒數（純數字；不要 MM:SS、毫秒、幀數或 0–10 的相對分數）。"
         "描述文字一律用繁體中文，畫面上的原文照抄不要翻譯。"
         "若看不清楚，保留空陣列並降低 confidence。"
     )
     if duration is not None and duration > 0:
-        prompt += f"\n影片長度約 {duration:.1f} 秒。"
+        prompt += (
+            f"\n影片長度約 {duration:.1f} 秒：events 須依 timestamp 遞增覆蓋全片，"
+            f"最後一筆須落在片尾附近（約 {duration:.1f} 秒）。"
+        )
+    else:
+        prompt += "\nevents 須依 timestamp 遞增覆蓋全片直到片尾。"
     cache_path: Path | None = None
     if cache_dir is not None:
         material = json.dumps(
@@ -2885,6 +2996,7 @@ def analyze_video_mp4(
             analysis_method=analysis_method,
             source_video=video_path,
             extra_meta=extra_meta,
+            duration_hint=duration,
         )
 
     def persist(observations: list[dict[str, Any]], parsed: dict[str, Any] | None, file_id: str | None) -> list[dict[str, Any]]:
