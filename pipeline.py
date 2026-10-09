@@ -1529,6 +1529,74 @@ def is_silence(no_speech: Any) -> bool:
     return isinstance(no_speech, (int, float)) and not isinstance(no_speech, bool) and no_speech > NO_SPEECH_PROB_LIMIT
 
 
+# Whisper 切段逐字稿斷層回填（issue #55）：job 16fae7864ca8 的第二段音訊
+# （120 秒起）在 120.0–149.6 整整漏掉一個 Whisper 視窗（30 秒），畫面字幕
+# 證明講者一直在說話。硬切的切段開頭若撞上半句話，解碼器可能整個視窗交白卷；
+# 這是模型側行為，放寬 no_speech 過濾救不回來（還會召回幻覺），所以合併後
+# 偵測內部斷層、對斷層帶上下文補轉一次。
+TRANSCRIPT_MAX_GAP = 5.0  # 驗收：片頭片尾之外，逐字稿不得有超過 5 秒空白
+TRANSCRIPT_GAP_PAD = 15.0  # 補轉時前後各取的上下文，避免斷層起點又是硬切半句
+TRANSCRIPT_GAP_TOL = 1.0  # 補轉段落落在斷層 ±1 秒內才合併，上下文重轉直接丟棄
+TRANSCRIPT_MAX_BACKFILLS = 8  # 單次轉錄最多補轉幾個斷層（成本上限）
+
+
+def find_transcript_gaps(
+    segments: list[dict[str, Any]], max_gap: float = TRANSCRIPT_MAX_GAP
+) -> list[dict[str, float]]:
+    """回傳內部斷層 [{"start", "end"}]；開頭（0–首段）與結尾（末段–完）不算。"""
+    ordered: list[tuple[float, float]] = []
+    for segment in segments or []:
+        try:
+            ordered.append((float(segment["start"]), float(segment["end"])))
+        except (KeyError, TypeError, ValueError):
+            continue
+    ordered.sort()
+    gaps: list[dict[str, float]] = []
+    covered_until: float | None = None
+    for cur_start, cur_end in ordered:
+        # 以已覆蓋的最遠位置為準：巢狀／重疊段落（Whisper 時間戳偶爾前後交錯）
+        # 不能把內層段落的結尾誤判為覆蓋邊界。
+        if covered_until is not None and cur_start - covered_until > max_gap:
+            gaps.append({"start": round(covered_until, 3), "end": round(cur_start, 3)})
+        covered_until = cur_end if covered_until is None else max(covered_until, cur_end)
+    return gaps
+
+
+def _extract_gap_audio(source_path: Path, start: float, end: float, dest: Path) -> Path:
+    """從來源影音擷取 [start, end) 音訊（16k 單聲道 mp3，與切段同規格）。"""
+    duration = end - start
+    if duration <= 0:
+        raise ValueError("補轉音訊長度必須大於 0。")
+    run_external(
+        [
+            require_tool("ffmpeg"),
+            "-y",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-ss",
+            f"{start:.3f}",
+            "-i",
+            str(source_path),
+            "-t",
+            f"{duration:.3f}",
+            "-map",
+            "0:a:0",
+            "-vn",
+            "-ac",
+            "1",
+            "-ar",
+            "16000",
+            "-c:a",
+            "libmp3lame",
+            "-b:a",
+            "64k",
+            str(dest),
+        ],
+    )
+    return dest
+
+
 RETRY_STATUS = {408, 425, 429, 500, 502, 503, 504}
 # urllib 預設送 Python-urllib/3.x，Groq 前面的 Cloudflare 會直接 403（error code 1010）。
 USER_AGENT = "video-library-pipeline/1.0"
@@ -1938,6 +2006,8 @@ def transcribe_all(
     workers: int,
     cache_dir: Path,
     word_timestamps: bool = False,
+    source_path: Path | str | None = None,
+    max_gap: float = TRANSCRIPT_MAX_GAP,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     if not chunks:
         return (
@@ -1947,6 +2017,8 @@ def transcribe_all(
                 "language": language,
                 "segments": [],
                 "cache": {"hits": 0, "misses": 0},
+                "gap_check": {"max_gap": max_gap, "remaining": []},
+                "backfill_errors": [],
             },
             {"provider": "none", "reason": "source has no audio", "chunks": []},
         )
@@ -2024,12 +2096,141 @@ def transcribe_all(
                 if key in segment:
                     item[key] = segment[key]
             segments.append(item)
+    backfill_raw: list[dict[str, Any]] = []
+    backfill_errors: list[dict[str, Any]] = []
+    if source_path is not None and segments:
+        # 切段邊界漏轉（issue #55）在合併後表現為內部斷層；對每個斷層帶
+        # 上下文補轉一次，落在斷層內的新內容才合併，上下文重轉直接丟棄。
+        # 斷層超過上限時先補最大的：同樣的 API 花費下覆蓋最多的遺失語音。
+        pending_gaps = sorted(
+            find_transcript_gaps(segments, max_gap),
+            key=lambda gap: (gap["end"] - gap["start"], gap["start"]),
+            reverse=True,
+        )[:TRANSCRIPT_MAX_BACKFILLS]
+        coverage_points: list[float] = []
+        for covered in segments:
+            try:
+                coverage_points.append(float(covered["start"]))
+                coverage_points.append(float(covered["end"]))
+            except (KeyError, TypeError, ValueError):
+                continue
+        coverage_end = max(coverage_points, default=0.0)
+        upload_limit_mb = float(os.getenv("GROQ_MAX_UPLOAD_MB", "25"))
+        for backfill_index, gap in enumerate(pending_gaps):
+            window_start = max(0.0, gap["start"] - TRANSCRIPT_GAP_PAD)
+            # 右緣只取到逐字稿覆蓋處：再往外不是靜默就是驗收排除的片尾，
+            # 模型最需要的右側語音上下文不受影響。
+            window_end = min(coverage_end, gap["end"] + TRANSCRIPT_GAP_PAD)
+            if window_end - window_start <= 0:
+                continue
+            try:
+                with tempfile.TemporaryDirectory(prefix="vtp-gap-") as temporary:
+                    audio_path = Path(temporary) / f"gap-{backfill_index:02d}.mp3"
+                    _extract_gap_audio(Path(source_path), window_start, window_end, audio_path)
+                    if audio_path.stat().st_size > upload_limit_mb * 1024 * 1024:
+                        raise RuntimeError(
+                            f"Groq 補轉片段超過設定上傳限制 {upload_limit_mb:g} MB："
+                            f"gap-{backfill_index:02d}；請縮小斷層範圍後重試。"
+                        )
+                    audio_sha = file_sha256(audio_path)
+                    material = json.dumps(
+                        {
+                            "audio_sha256": audio_sha,
+                            "model": model,
+                            "language": language,
+                            "response_format": "verbose_json",
+                            "timestamp_granularities": ["segment", "word"] if word_timestamps else ["segment"],
+                            "gap_start": gap["start"],
+                            "gap_end": gap["end"],
+                        },
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    )
+                    cache_key = hashlib.sha256(material.encode("utf-8")).hexdigest()
+                    cache_path = cache_dir / f"{cache_key}.json"
+                    cached = reuse_artifact(cache_path)
+                    if isinstance(cached, dict) and (cached.get("segments") or cached.get("text")):
+                        record_cost_cache_hit("groq", "audio.transcriptions", model=model)
+                        backfill_result = cached
+                        hits += 1
+                        request_seconds = 0.0
+                    else:
+                        started = time.monotonic()
+                        backfill_result = groq_transcribe(
+                            audio_path, api_key, model, language, word_timestamps
+                        )
+                        write_json(cache_path, backfill_result)
+                        misses += 1
+                        request_seconds = time.monotonic() - started
+                backfill_raw.append(
+                    {
+                        "index": f"gap-{backfill_index}",
+                        "source_start": window_start,
+                        "source_end": window_end,
+                        "audio_sha256": audio_sha,
+                        "cache_key": cache_key,
+                        "request_seconds": round(request_seconds, 3),
+                        "response": backfill_result,
+                    }
+                )
+                gap_segments = backfill_result.get("segments") or []
+                if not gap_segments and backfill_result.get("text"):
+                    gap_segments = [
+                        {
+                            "start": 0,
+                            "end": window_end - window_start,
+                            "text": backfill_result["text"],
+                        }
+                    ]
+                for gap_segment in gap_segments:
+                    if not isinstance(gap_segment, dict):
+                        continue  # 供應商／快取回應混入非段落元素：跳過，不整批作廢
+                    gap_text = str(gap_segment.get("text", "")).strip()
+                    if not gap_text or is_silence(gap_segment.get("no_speech_prob")):
+                        continue
+                    try:
+                        raw_start = float(gap_segment.get("start", 0))
+                        raw_end = float(gap_segment.get("end", window_end - window_start))
+                    except (TypeError, ValueError):
+                        continue  # 壞了一個段落的時間戳：跳過，不整批作廢
+                    gap_start = round(raw_start + window_start, 3)
+                    gap_end = round(raw_end + window_start, 3)
+                    if (
+                        gap_start < gap["start"] - TRANSCRIPT_GAP_TOL
+                        or gap_end > gap["end"] + TRANSCRIPT_GAP_TOL
+                    ):
+                        continue
+                    gap_item: dict[str, Any] = {
+                        "start": gap_start,
+                        "end": gap_end,
+                        "text": gap_text,
+                        # 回填段用字串命名空間標記來源：呼叫端只讀 start/end/text，
+                        # 全 repo 無 int(chunk)／數字排序／chunks[chunk] 這類讀法。
+                        "chunk": f"gap-{backfill_index}",
+                    }
+                    for field in ("avg_logprob", "compression_ratio", "no_speech_prob"):
+                        if field in gap_segment:
+                            gap_item[field] = gap_segment[field]
+                    segments.append(gap_item)
+            except (DeadlineExceeded, ExecutionCancelled, budget_blocked_error()):
+                raise
+            except Exception as exc:
+                # 單一斷層補轉失敗（缺檔、ffmpeg、單次 API 波動、超大斷層）不得
+                # 丟掉整份逐字稿：初版切段結果照常回傳，gap_check.remaining 如實
+                # 記載未補起的斷層。預算／取消／超時是全域停損，照原樣往上拋。
+                backfill_errors.append(
+                    {"gap": gap, "error": f"{type(exc).__name__}: {exc}"[:500]}
+                )
+                continue
+        segments.sort(key=lambda x: x["start"])
     transcript = {
         "provider": "groq",
         "model": model,
         "language": detected,
         "segments": sorted(segments, key=lambda x: x["start"]),
         "cache": {"hits": hits, "misses": misses},
+        "gap_check": {"max_gap": max_gap, "remaining": find_transcript_gaps(segments, max_gap)},
+        "backfill_errors": backfill_errors,
     }
     raw = {
         "provider": "groq",
@@ -2048,7 +2249,8 @@ def transcribe_all(
                 "response": results[index],
             }
             for index in sorted(results)
-        ],
+        ]
+        + backfill_raw,
     }
     return transcript, raw
 
@@ -2192,10 +2394,14 @@ def transcribe_local(
                     "no_speech_prob": getattr(segment, "no_speech_prob", None),
                 }
             )
+    sorted_segments = sorted(segments, key=lambda item: item["start"])
     return {
         "model": f"faster-whisper/{model_size}",
         "language": detected,
-        "segments": sorted(segments, key=lambda item: item["start"]),
+        "segments": sorted_segments,
+        # 本機後端不斷層補轉（缺來源影音與 API 金鑰的呼叫鏈），但同樣回報驗收狀態。
+        "gap_check": {"max_gap": TRANSCRIPT_MAX_GAP, "remaining": find_transcript_gaps(sorted_segments)},
+        "backfill_errors": [],
     }
 
 
@@ -7919,6 +8125,7 @@ def run_pipeline(args: argparse.Namespace) -> Path:
                         args.workers,
                         job_dir / "transcription-cache",
                         args.word_timestamps,
+                        source_path=video_path,
                     )
 
             def visual_stage() -> list[dict[str, Any]]:

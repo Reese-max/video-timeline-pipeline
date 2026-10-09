@@ -1161,6 +1161,7 @@ def analyze_prepared_sync(job_id: str) -> dict[str, Any]:
             language,
             2,
             analysis_dir / "transcription-cache",
+            source_path=video_path,
         )
         return transcript_result
 
