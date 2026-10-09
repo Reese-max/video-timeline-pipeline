@@ -209,8 +209,10 @@ class JobQueue:
         with self.connect() as db:
             rows = db.execute("SELECT id,status FROM jobs WHERE job_id=? ORDER BY created DESC", (job_id,)).fetchall()
         active = next((row for row in rows if row["status"] in {"queued", "running"}), None)
+        pending = [self.get(row["id"]) for row in rows if row["status"] in {"queued", "running"}]
         return {"active_operation": self.get(active["id"]) if active else None,
-                "latest_operation": self.get(rows[0]["id"]) if rows else None}
+                "latest_operation": self.get(rows[0]["id"]) if rows else None,
+                "pending_operations": pending}
 
     def protected_job_ids(self):
         with self.connect() as db:
