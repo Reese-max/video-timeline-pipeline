@@ -1640,6 +1640,72 @@ async def ingest_video_segments(
     )
 
 
+@mcp.tool(
+    name="uploadFile",
+    title="Upload file to ChatGPT file library",
+    description="Upload a file to the ChatGPT file library. When library=true, the file is stored with purpose=assistants for use with assistants. The file can later be referenced via file_id in assistant threads.",
+    annotations=types.ToolAnnotations(
+        readOnlyHint=False,
+        destructiveHint=False,
+        idempotentHint=False,
+        openWorldHint=True,
+    ),
+    meta={
+        "openai/widgetAccessible": True,
+        "openai/fileParams": ["file"],
+        "openai/toolInvocation/invoking": "正在上傳檔案至 ChatGPT 檔案庫",
+        "openai/toolInvocation/invoked": "檔案已上傳至 ChatGPT 檔案庫",
+    },
+)
+@mcp.tool(
+    name="uploadFile",
+    title="Upload file to ChatGPT file library",
+    description="Upload a file to the ChatGPT file library. When library=true, the file is stored with purpose=assistants for use with assistants. The file can later be referenced via file_id in assistant threads.",
+    annotations=types.ToolAnnotations(
+        readOnlyHint=False,
+        destructiveHint=False,
+        idempotentHint=False,
+        openWorldHint=True,
+    ),
+    meta={
+        "openai/widgetAccessible": True,
+        "openai/fileParams": ["file"],
+        "openai/toolInvocation/invoking": "正在上傳檔案至 ChatGPT 檔案庫",
+        "openai/toolInvocation/invoked": "檔案已上傳至 ChatGPT 檔案庫",
+    },
+)
+async def upload_file(
+    file: str,
+    library: bool = False,
+) -> types.CallToolResult:
+    import openai
+    try:
+        purpose = "assistants" if library else "auto"
+        with open(file, "rb") as f:
+            result = openai.File.create(file=f, purpose=purpose)
+        return types.CallToolResult(
+            structuredContent={
+                "status": "uploaded",
+                "file_id": result.id,
+                "object": result.object,
+                "bytes": result.bytes,
+                "created": result.created,
+                "filename": result.filename,
+                "mime_type": result.mime_type,
+                "library": library,
+            },
+            content=[types.TextContent(
+                type="text",
+                text=f"檔案上傳成功：file_id={result.id}，名稱={result.filename}，大小={result.bytes} bytes，purpose={purpose}",
+            )],
+        )
+    except Exception as error:
+        return types.CallToolResult(
+            structuredContent={"status": "error", "error": str(error)},
+            content=[types.TextContent(type="text", text=f"檔案上傳失敗：{error}")],
+            isError=True,
+        )
+
 @mcp.custom_route("/health", methods=["GET"], include_in_schema=False)
 async def health(_: Request) -> JSONResponse:
     queue = get_queue()

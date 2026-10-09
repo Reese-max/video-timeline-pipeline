@@ -33,7 +33,7 @@ class ProtocolSmokeTests(unittest.TestCase):
                     headers['MCP-Protocol-Version'] = result['protocolVersion']
                     self.assertEqual(client.post('/mcp', headers=headers, json={'jsonrpc': '2.0', 'method': 'notifications/initialized'}).status_code, 202)
                     tools = {tool['name']: tool for tool in call('tools/list', {}, 2)['tools']}
-                    self.assertEqual(set(tools), {'prepare_video_for_chatgpt', 'analyze_prepared_video', 'upload_prepared_video_to_drive', 'get_prepared_video', 'get_video_job', 'cancel_video_job', 'resume_video_job', 'collect_social_post', 'ingest_video_segments'})
+                    self.assertEqual(set(tools), {'prepare_video_for_chatgpt', 'analyze_prepared_video', 'upload_prepared_video_to_drive', 'get_prepared_video', 'get_video_job', 'cancel_video_job', 'resume_video_job', 'collect_social_post', 'ingest_video_segments', 'uploadFile'})
                     self.assertEqual(tools['get_video_job']['inputSchema']['required'], ['operation_id'])
                     self.assertIn('background', tools['prepare_video_for_chatgpt']['inputSchema']['properties'])
                     resource = call('resources/list', {}, 3)['resources'][0]
