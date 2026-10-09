@@ -76,6 +76,9 @@ class ParseVideoTimestampTests(unittest.TestCase):
         self.assertAlmostEqual(pipeline.parse_video_timestamp("02:17"), 137.0)
         self.assertAlmostEqual(pipeline.parse_video_timestamp("1:04:05"), 3845.0)
         self.assertAlmostEqual(pipeline.parse_video_timestamp("56s"), 56.0)
+        self.assertAlmostEqual(pipeline.parse_video_timestamp("56secs"), 56.0)
+        self.assertAlmostEqual(pipeline.parse_video_timestamp("56seconds"), 56.0)
+        self.assertAlmostEqual(pipeline.parse_video_timestamp("2分30秒"), 150.0)
 
     def test_garbage_returns_none_instead_of_zero(self) -> None:
         self.assertIsNone(pipeline.parse_video_timestamp(None))
@@ -143,6 +146,36 @@ class TimestampCoverageTests(unittest.TestCase):
         observations, chat = self._run_mp4([payload], 5.0)
         self.assertEqual(chat.call_count, 1)
         self.assertTrue(all(pipeline.usable_visual_observation(item) for item in observations))
+
+    def test_timestamps_past_the_end_of_video_are_rejected(self) -> None:
+        payload = json.dumps(
+            {
+                "events": [
+                    {
+                        "timestamp": 8.0,
+                        "screen_type": "開場",
+                        "visible_text": [],
+                        "visual_summary": "開場畫面",
+                        "important_details": [],
+                        "confidence": 0.9,
+                    },
+                    {
+                        "timestamp": 500.0,
+                        "screen_type": "結尾",
+                        "visible_text": [],
+                        "visual_summary": "超片長畫面",
+                        "important_details": [],
+                        "confidence": 0.9,
+                    },
+                ],
+                "overall_summary": "整片摘要",
+            },
+            ensure_ascii=False,
+        )
+        observations, chat = self._run_mp4([payload, payload], 166.6)
+        self.assertEqual(chat.call_count, 2)
+        usable = [item for item in observations if pipeline.usable_visual_observation(item)]
+        self.assertEqual(usable, [])
 
     def test_clock_string_event_is_placed_on_timeline(self) -> None:
         payload = json.dumps(

@@ -2614,7 +2614,7 @@ def parse_video_timestamp(value: Any) -> float | None:
     text = value.strip().lower().replace("，", "").replace(",", "")
     if not text:
         return None
-    for suffix in ("秒", "s", "sec", "secs", "second", "seconds"):
+    for suffix in ("seconds", "second", "secs", "sec", "秒", "s"):
         if text.endswith(suffix):
             text = text[: -len(suffix)].strip()
             break
@@ -2640,9 +2640,10 @@ def video_timestamps_cover_duration(observations: list[dict[str, Any]], duration
     """Check that visual evidence actually spans the video (issue #56).
 
     A 166.6s video whose events peak at 6.9s is a compressed timeline, not a
-    20x rescale away from correct — the offsets are not proportional. Short
-    clips (max stamp only needs min(duration-30, duration/2)) stay exempt so
-    a single genuine event never forces a retry.
+    20x rescale away from correct — the offsets are not proportional. Events
+    past the end of the video (beyond duration + 30s tolerance) fail too.
+    Short clips (max stamp only needs min(duration-30, duration/2)) stay
+    exempt so a single genuine event never forces a retry.
     """
     if duration is None or duration <= 0:
         return True
@@ -2652,7 +2653,7 @@ def video_timestamps_cover_duration(observations: list[dict[str, Any]], duration
         peak = max(float(item.get("timestamp", 0.0)) for item in observations)
     except (TypeError, ValueError):
         return False
-    return peak >= min(duration - 30.0, duration * 0.5)
+    return min(duration - 30.0, duration * 0.5) <= peak <= duration + 30.0
 
 
 def _parse_video_mp4_events(parsed: dict[str, Any]) -> list[dict[str, Any]]:
@@ -2714,7 +2715,10 @@ def _analyze_video_mp4_core(
     extra_meta: dict[str, Any] | None = None,
     duration_hint: float | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, Any] | None, str | None]:
-    """Upload + chat once. Raises on upload/API failures; incomplete chat returns incomplete obs."""
+    """Upload once, then chat (one repair retry on compressed timestamps).
+
+    Raises on upload/API failures; incomplete chat returns incomplete obs.
+    """
     file_id = minimax_upload_video_understanding(video_path, api_key)
     current_prompt = prompt
     parsed: dict[str, Any] | None = None
