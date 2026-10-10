@@ -208,7 +208,93 @@ class RealReportQueueTests(unittest.TestCase):
     def owned_queue_order(self, fast):
         with tempfile.TemporaryDirectory() as raw:
             root=Path(raw).resolve();worker=root/'inert_worker.py'
-            worker.write_text("import json,sys,time\nfrom pathlib import Path\nw=Path(sys.argv[1]);t=json.loads((w/'input.json').read_text());time.sleep(t['inputs'].get('delay',.15));(w/'output.json').write_text(json.dumps({'ok':True,'result':{'job_id':t['inputs']['job_id'],'operation':t['operation'],'finished':time.time()}}))\n",encoding='utf-8')
+            coordination=root/'completion-order';coordination.mkdir()
+            protocol={'version':1,'nonce':os.urandom(16).hex(),'job_id':'0123456789ab',
+                'first_completed':fast,'directory':str(coordination),'queue_root':str(root/'q')}
+            worker.write_text("""import hashlib,json,os,stat,sys,time
+from pathlib import Path
+
+w=Path(sys.argv[1]).resolve()
+t=json.loads((w/'input.json').read_text())
+inputs=t['inputs'];operation=t['operation']
+protocol=inputs.get('completion_protocol')
+deadline=time.monotonic()+4
+
+def bounded_wait(path):
+    while not path.exists():
+        if time.monotonic()>=deadline:
+            raise TimeoutError('Owned completion coordination did not finish within four seconds')
+        time.sleep(.01)
+    if path.is_symlink() or not stat.S_ISREG(path.stat().st_mode):
+        raise ValueError('Owned coordination record must be a regular file')
+    return json.loads(path.read_bytes())
+
+def publish(name,value):
+    path=coord/name;temporary=coord/(name+'.tmp-'+w.name)
+    if path.exists():
+        raise ValueError('Duplicate owned coordination record')
+    with temporary.open('x',encoding='utf-8') as stream:
+        json.dump(value,stream)
+    os.replace(temporary,path)
+
+def output(finished):
+    raw=json.dumps({'ok':True,'result':{'job_id':inputs['job_id'],
+        'operation':operation,'finished':finished}}).encode('utf-8')
+    (w/'output.json').write_bytes(raw)
+    return raw
+
+if protocol is None:
+    # Report jobs retain the original ordinary inert-worker path.
+    time.sleep(inputs.get('delay',.15))
+    output(time.time())
+else:
+    if operation not in ('analyze','drive') or set(protocol)!={
+        'version','nonce','job_id','first_completed','directory','queue_root'}:
+        raise ValueError('Unexpected owned completion protocol')
+    coord=Path(protocol['directory']);queue_root=Path(protocol['queue_root'])
+    if (protocol['version']!=1 or protocol['job_id']!=inputs['job_id']
+        or protocol['first_completed'] not in ('analyze','drive')
+        or len(protocol['nonce'])!=32 or any(c not in '0123456789abcdef' for c in protocol['nonce'])
+        or len(w.name)!=32 or any(c not in '0123456789abcdef' for c in w.name)
+        or coord.is_symlink() or not coord.is_dir() or coord.resolve()!=coord
+        or queue_root.is_symlink() or not queue_root.is_dir() or queue_root.resolve()!=queue_root
+        or w.parent!=queue_root or coord.parent!=queue_root.parent
+        or coord.name!='completion-order'):
+        raise ValueError('Completion coordination escaped its owned task identity')
+    identity={'version':1,'nonce':protocol['nonce'],'job_id':inputs['job_id'],
+        'operation':operation,'operation_id':w.name}
+    publish(operation+'-ready.json',identity)
+    other='drive' if operation=='analyze' else 'analyze'
+    peer=bounded_wait(coord/(other+'-ready.json'))
+    if (set(peer)!=set(identity) or peer['version']!=1 or peer['nonce']!=identity['nonce']
+        or peer['job_id']!=identity['job_id'] or peer['operation']!=other
+        or not isinstance(peer['operation_id'],str) or len(peer['operation_id'])!=32
+        or any(c not in '0123456789abcdef' for c in peer['operation_id'])
+        or peer['operation_id']==w.name):
+        raise ValueError('Readiness does not identify the other owned worker')
+    # Both real workers have published readiness before either finishes.
+    time.sleep(inputs.get('delay',.15))
+    if operation!=protocol['first_completed']:
+        completed=bounded_wait(coord/(other+'-completed.json'))
+        if (set(completed)!=set(peer)|{'finished','output_sha256'}
+            or any(completed[key]!=value for key,value in peer.items())):
+            raise ValueError('Completion does not match the ready owned worker')
+        peer_work=queue_root/peer['operation_id'];peer_output=peer_work/'output.json'
+        if (peer_work.is_symlink() or not peer_work.is_dir() or peer_work.resolve()!=peer_work
+            or peer_output.is_symlink() or not stat.S_ISREG(peer_output.stat().st_mode)):
+            raise ValueError('Completed output escaped the other owned worker')
+        raw=peer_output.read_bytes()
+        if hashlib.sha256(raw).hexdigest()!=completed['output_sha256'] or json.loads(raw)!={
+            'ok':True,'result':{'job_id':inputs['job_id'],'operation':other,'finished':completed['finished']}}:
+            raise ValueError('Completion was not published after the exact closed result')
+    if time.monotonic()>=deadline:
+        raise TimeoutError('Owned completion coordination did not finish within four seconds')
+    finished=time.monotonic_ns()
+    raw=output(finished)
+    # write_bytes has closed output.json before this atomic completion publication.
+    publish(operation+'-completed.json',{**identity,'finished':finished,
+        'output_sha256':hashlib.sha256(raw).hexdigest()})
+""",encoding='utf-8')
             observed=[];queue=None
             def idle(q):
                 if q.report_prerequisites_stopped('0123456789ab'):
@@ -221,7 +307,7 @@ class RealReportQueueTests(unittest.TestCase):
             queue=JobQueue(root/'q',worker=worker,autostart=False,timeout_seconds=60,
                 paired_same_job=True,writer_path=writer,writer_context=lambda:server.pipeline.file_writer_lock(writer),**kwargs)
             try:
-                a=queue.submit('analyze',{'job_id':'0123456789ab','delay':.1 if fast=='analyze' else .3},'0123456789ab');b=queue.submit('drive',{'job_id':'0123456789ab','delay':.1 if fast=='drive' else .3},'0123456789ab');queue.start()
+                a=queue.submit('analyze',{'job_id':'0123456789ab','completion_protocol':protocol,'delay':.1 if fast=='analyze' else .3},'0123456789ab');b=queue.submit('drive',{'job_id':'0123456789ab','completion_protocol':protocol,'delay':.1 if fast=='drive' else .3},'0123456789ab');queue.start()
                 deadline=time.time()+5
                 while time.time()<deadline and (queue.get(a['operation_id'])['status']!='completed' or queue.get(b['operation_id'])['status']!='completed' or not observed):time.sleep(.02)
                 self.assertEqual(queue.get(a['operation_id'])['status'],'completed');self.assertEqual(queue.get(b['operation_id'])['status'],'completed')
