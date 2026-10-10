@@ -13,6 +13,80 @@ import drive_storage as drive
 import mcp_server as server
 
 
+class TranscriptGapQualityTests(unittest.TestCase):
+    def setUp(self):
+        self.result = {"status": "complete", "audio_status": "complete", "visual_status": "complete",
+                       "transcript": {"segments": [{"text": "hello"}],
+                                      "gap_check": {"max_gap": 5.0, "remaining": []}, "backfill_errors": []},
+                       "errors": [], "timeline": [{"type": "visual", "data": {
+                           "visual_summary": "A visible sign", "confidence": 0.9}}]}
+
+    def test_remaining_gap_requires_review_with_time_range(self):
+        self.result["transcript"]["gap_check"]["remaining"] = [{"start": 118.0, "end": 150.0}]
+        quality = server.analysis_quality(self.result)
+        self.assertEqual(quality["status"], "needs_review")
+        self.assertEqual(len(quality["reasons"]), 1)
+        self.assertIn("超過 5 秒", quality["reasons"][0])
+        self.assertIn("1:58–2:30", quality["reasons"][0])
+        self.assertTrue(quality["reasons"][0].endswith("。"))
+
+    def test_remaining_gaps_show_only_three_ranges(self):
+        self.result["transcript"]["gap_check"]["remaining"] = [
+            {"start": start, "end": start + 10} for start in (60, 120, 180, 240, 300)]
+        quality = server.analysis_quality(self.result)
+        self.assertEqual(quality["status"], "needs_review")
+        reason = quality["reasons"][0]
+        for interval in ("1:00–1:10", "2:00–2:10", "3:00–3:10"):
+            self.assertIn(interval, reason)
+        self.assertNotIn("4:00", reason)
+        self.assertNotIn("5:00", reason)
+        self.assertEqual(reason.count("–"), 3)
+        self.assertIn("等 5 段", reason)
+
+    def test_backfill_errors_without_remaining_gaps_require_review(self):
+        self.result["transcript"]["backfill_errors"] = [{"error": "Groq 503"}]
+        quality = server.analysis_quality(self.result)
+        self.assertEqual(quality["status"], "needs_review")
+        self.assertEqual(quality["reasons"], ["逐字稿補轉失敗，可能漏字。"])
+
+    def test_remaining_gap_and_backfill_error_share_one_reason(self):
+        self.result["transcript"]["gap_check"]["remaining"] = [{"start": 118, "end": 150}]
+        self.result["transcript"]["backfill_errors"] = [{"error": "Groq 503"}]
+        quality = server.analysis_quality(self.result)
+        self.assertEqual(quality["status"], "needs_review")
+        self.assertEqual(len(quality["reasons"]), 1)
+        self.assertIn("1:58–2:30", quality["reasons"][0])
+        self.assertIn("補轉失敗，可能漏字", quality["reasons"][0])
+
+    def test_empty_gap_metadata_adds_no_reason(self):
+        quality = server.analysis_quality(self.result)
+        self.assertEqual(quality["status"], "evidence_available")
+        self.assertEqual(quality["reasons"], [])
+
+    def test_old_transcript_without_gap_metadata_adds_no_reason(self):
+        del self.result["transcript"]["gap_check"]
+        del self.result["transcript"]["backfill_errors"]
+        quality = server.analysis_quality(self.result)
+        self.assertEqual(quality["status"], "evidence_available")
+        self.assertEqual(quality["reasons"], [])
+
+    def test_invalid_gap_times_are_skipped_without_raising(self):
+        for value in (None, float("nan"), float("inf"), float("-inf"), "118", True):
+            with self.subTest(value=value):
+                self.result["transcript"]["gap_check"]["remaining"] = [
+                    {"start": value, "end": 150}, {"start": 118, "end": value},
+                    {"start": 118, "end": 150}]
+                quality = server.analysis_quality(self.result)
+                self.assertEqual(quality["status"], "needs_review")
+                self.assertEqual(quality["reasons"][0].count("–"), 1)
+                self.assertIn("1:58–2:30", quality["reasons"][0])
+                self.assertNotIn("等", quality["reasons"][0])
+        self.result["transcript"]["gap_check"]["remaining"] = [{"start": None, "end": float("nan")}]
+        quality = server.analysis_quality(self.result)
+        self.assertEqual(quality["status"], "needs_review")
+        self.assertNotIn("–", quality["reasons"][0])
+
+
 class ReliabilityTests(unittest.TestCase):
     def test_analysis_quality_requires_usable_evidence_not_just_api_success(self):
         good = {"status": "complete", "audio_status": "complete", "visual_status": "complete",
