@@ -1547,7 +1547,10 @@ def find_transcript_gaps(
     ordered: list[tuple[float, float]] = []
     for segment in segments or []:
         try:
-            ordered.append((float(segment["start"]), float(segment["end"])))
+            start, end = float(segment["start"]), float(segment["end"])
+            if not (math.isfinite(start) and math.isfinite(end) and 0 <= start < end):
+                continue
+            ordered.append((start, end))
         except (KeyError, TypeError, ValueError):
             continue
     ordered.sort()
@@ -2193,6 +2196,8 @@ def transcribe_all(
                         raw_end = float(gap_segment.get("end", window_end - window_start))
                     except (TypeError, ValueError):
                         continue  # 壞了一個段落的時間戳：跳過，不整批作廢
+                    if not (math.isfinite(raw_start) and math.isfinite(raw_end) and 0 <= raw_start < raw_end):
+                        continue
                     gap_start = round(raw_start + window_start, 3)
                     gap_end = round(raw_end + window_start, 3)
                     if (
@@ -2869,7 +2874,7 @@ def _parse_video_mp4_events(parsed: dict[str, Any]) -> list[dict[str, Any]]:
     for event in events:
         if not isinstance(event, dict):
             continue
-        stamp = parse_video_timestamp(event.get("timestamp", 0.0))
+        stamp = parse_video_timestamp(event.get("timestamp"))
         if stamp is None:
             continue
         observation = {
@@ -2929,6 +2934,7 @@ def _analyze_video_mp4_core(
     current_prompt = prompt
     parsed: dict[str, Any] | None = None
     observations: list[dict[str, Any]] = []
+    timestamp_coverage_ok = True
     for attempt in range(2):
         try:
             response = minimax_chat(
@@ -2974,7 +2980,10 @@ def _analyze_video_mp4_core(
             )
             return incomplete, None, file_id
         observations = _parse_video_mp4_events(parsed)
-        if video_timestamps_cover_duration(observations, duration_hint):
+        timestamp_coverage_ok = video_timestamps_cover_duration(observations, duration_hint) and not (
+            isinstance(parsed.get("events"), list) and parsed["events"] and not observations
+        )
+        if timestamp_coverage_ok:
             break
         if attempt == 0 and duration_hint is not None and duration_hint > 0:
             peak = max((item["timestamp"] for item in observations), default=0.0)
@@ -2983,7 +2992,7 @@ def _analyze_video_mp4_core(
                 f"但影片長 {duration_hint:.1f} 秒：請把每個事件對應到從 0 起算的"
                 f"原片實際秒數（0 到 {duration_hint:.1f}），依時間遞增重排後只輸出修正後的 JSON object。"
             )
-    if not video_timestamps_cover_duration(observations, duration_hint):
+    if not timestamp_coverage_ok:
         # Issue #56: compressed timelines are not proportionally rescalable,
         # so fail closed instead of caching bad evidence as complete.
         peak = max((item["timestamp"] for item in observations), default=0.0)
