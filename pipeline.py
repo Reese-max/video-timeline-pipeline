@@ -1529,6 +1529,77 @@ def is_silence(no_speech: Any) -> bool:
     return isinstance(no_speech, (int, float)) and not isinstance(no_speech, bool) and no_speech > NO_SPEECH_PROB_LIMIT
 
 
+# Whisper 切段逐字稿斷層回填（issue #55）：job 16fae7864ca8 的第二段音訊
+# （120 秒起）在 120.0–149.6 整整漏掉一個 Whisper 視窗（30 秒），畫面字幕
+# 證明講者一直在說話。硬切的切段開頭若撞上半句話，解碼器可能整個視窗交白卷；
+# 這是模型側行為，放寬 no_speech 過濾救不回來（還會召回幻覺），所以合併後
+# 偵測內部斷層、對斷層帶上下文補轉一次。
+TRANSCRIPT_MAX_GAP = 5.0  # 驗收：片頭片尾之外，逐字稿不得有超過 5 秒空白
+TRANSCRIPT_GAP_PAD = 15.0  # 補轉時前後各取的上下文，避免斷層起點又是硬切半句
+TRANSCRIPT_GAP_TOL = 1.0  # 補轉段落落在斷層 ±1 秒內才合併，上下文重轉直接丟棄
+TRANSCRIPT_MAX_BACKFILLS = 8  # 單次轉錄最多補轉幾個斷層（成本上限）
+
+
+def find_transcript_gaps(
+    segments: list[dict[str, Any]], max_gap: float = TRANSCRIPT_MAX_GAP
+) -> list[dict[str, float]]:
+    """回傳內部斷層 [{"start", "end"}]；開頭（0–首段）與結尾（末段–完）不算。"""
+    ordered: list[tuple[float, float]] = []
+    for segment in segments or []:
+        try:
+            start, end = float(segment["start"]), float(segment["end"])
+            if not (math.isfinite(start) and math.isfinite(end) and 0 <= start < end):
+                continue
+            ordered.append((start, end))
+        except (KeyError, TypeError, ValueError):
+            continue
+    ordered.sort()
+    gaps: list[dict[str, float]] = []
+    covered_until: float | None = None
+    for cur_start, cur_end in ordered:
+        # 以已覆蓋的最遠位置為準：巢狀／重疊段落（Whisper 時間戳偶爾前後交錯）
+        # 不能把內層段落的結尾誤判為覆蓋邊界。
+        if covered_until is not None and cur_start - covered_until > max_gap:
+            gaps.append({"start": round(covered_until, 3), "end": round(cur_start, 3)})
+        covered_until = cur_end if covered_until is None else max(covered_until, cur_end)
+    return gaps
+
+
+def _extract_gap_audio(source_path: Path, start: float, end: float, dest: Path) -> Path:
+    """從來源影音擷取 [start, end) 音訊（16k 單聲道 mp3，與切段同規格）。"""
+    duration = end - start
+    if duration <= 0:
+        raise ValueError("補轉音訊長度必須大於 0。")
+    run_external(
+        [
+            require_tool("ffmpeg"),
+            "-y",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-ss",
+            f"{start:.3f}",
+            "-i",
+            str(source_path),
+            "-t",
+            f"{duration:.3f}",
+            "-map",
+            "0:a:0",
+            "-vn",
+            "-ac",
+            "1",
+            "-ar",
+            "16000",
+            "-c:a",
+            "libmp3lame",
+            "-b:a",
+            "64k",
+            str(dest),
+        ],
+    )
+    return dest
+
+
 RETRY_STATUS = {408, 425, 429, 500, 502, 503, 504}
 # urllib 預設送 Python-urllib/3.x，Groq 前面的 Cloudflare 會直接 403（error code 1010）。
 USER_AGENT = "video-library-pipeline/1.0"
@@ -1938,6 +2009,8 @@ def transcribe_all(
     workers: int,
     cache_dir: Path,
     word_timestamps: bool = False,
+    source_path: Path | str | None = None,
+    max_gap: float = TRANSCRIPT_MAX_GAP,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     if not chunks:
         return (
@@ -1947,6 +2020,8 @@ def transcribe_all(
                 "language": language,
                 "segments": [],
                 "cache": {"hits": 0, "misses": 0},
+                "gap_check": {"max_gap": max_gap, "remaining": []},
+                "backfill_errors": [],
             },
             {"provider": "none", "reason": "source has no audio", "chunks": []},
         )
@@ -2024,12 +2099,143 @@ def transcribe_all(
                 if key in segment:
                     item[key] = segment[key]
             segments.append(item)
+    backfill_raw: list[dict[str, Any]] = []
+    backfill_errors: list[dict[str, Any]] = []
+    if source_path is not None and segments:
+        # 切段邊界漏轉（issue #55）在合併後表現為內部斷層；對每個斷層帶
+        # 上下文補轉一次，落在斷層內的新內容才合併，上下文重轉直接丟棄。
+        # 斷層超過上限時先補最大的：同樣的 API 花費下覆蓋最多的遺失語音。
+        pending_gaps = sorted(
+            find_transcript_gaps(segments, max_gap),
+            key=lambda gap: (gap["end"] - gap["start"], gap["start"]),
+            reverse=True,
+        )[:TRANSCRIPT_MAX_BACKFILLS]
+        coverage_points: list[float] = []
+        for covered in segments:
+            try:
+                coverage_points.append(float(covered["start"]))
+                coverage_points.append(float(covered["end"]))
+            except (KeyError, TypeError, ValueError):
+                continue
+        coverage_end = max(coverage_points, default=0.0)
+        upload_limit_mb = float(os.getenv("GROQ_MAX_UPLOAD_MB", "25"))
+        for backfill_index, gap in enumerate(pending_gaps):
+            window_start = max(0.0, gap["start"] - TRANSCRIPT_GAP_PAD)
+            # 右緣只取到逐字稿覆蓋處：再往外不是靜默就是驗收排除的片尾，
+            # 模型最需要的右側語音上下文不受影響。
+            window_end = min(coverage_end, gap["end"] + TRANSCRIPT_GAP_PAD)
+            if window_end - window_start <= 0:
+                continue
+            try:
+                with tempfile.TemporaryDirectory(prefix="vtp-gap-") as temporary:
+                    audio_path = Path(temporary) / f"gap-{backfill_index:02d}.mp3"
+                    _extract_gap_audio(Path(source_path), window_start, window_end, audio_path)
+                    if audio_path.stat().st_size > upload_limit_mb * 1024 * 1024:
+                        raise RuntimeError(
+                            f"Groq 補轉片段超過設定上傳限制 {upload_limit_mb:g} MB："
+                            f"gap-{backfill_index:02d}；請縮小斷層範圍後重試。"
+                        )
+                    audio_sha = file_sha256(audio_path)
+                    material = json.dumps(
+                        {
+                            "audio_sha256": audio_sha,
+                            "model": model,
+                            "language": language,
+                            "response_format": "verbose_json",
+                            "timestamp_granularities": ["segment", "word"] if word_timestamps else ["segment"],
+                            "gap_start": gap["start"],
+                            "gap_end": gap["end"],
+                        },
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    )
+                    cache_key = hashlib.sha256(material.encode("utf-8")).hexdigest()
+                    cache_path = cache_dir / f"{cache_key}.json"
+                    cached = reuse_artifact(cache_path)
+                    if isinstance(cached, dict) and (cached.get("segments") or cached.get("text")):
+                        record_cost_cache_hit("groq", "audio.transcriptions", model=model)
+                        backfill_result = cached
+                        hits += 1
+                        request_seconds = 0.0
+                    else:
+                        started = time.monotonic()
+                        backfill_result = groq_transcribe(
+                            audio_path, api_key, model, language, word_timestamps
+                        )
+                        write_json(cache_path, backfill_result)
+                        misses += 1
+                        request_seconds = time.monotonic() - started
+                backfill_raw.append(
+                    {
+                        "index": f"gap-{backfill_index}",
+                        "source_start": window_start,
+                        "source_end": window_end,
+                        "audio_sha256": audio_sha,
+                        "cache_key": cache_key,
+                        "request_seconds": round(request_seconds, 3),
+                        "response": backfill_result,
+                    }
+                )
+                gap_segments = backfill_result.get("segments") or []
+                if not gap_segments and backfill_result.get("text"):
+                    gap_segments = [
+                        {
+                            "start": 0,
+                            "end": window_end - window_start,
+                            "text": backfill_result["text"],
+                        }
+                    ]
+                for gap_segment in gap_segments:
+                    if not isinstance(gap_segment, dict):
+                        continue  # 供應商／快取回應混入非段落元素：跳過，不整批作廢
+                    gap_text = str(gap_segment.get("text", "")).strip()
+                    if not gap_text or is_silence(gap_segment.get("no_speech_prob")):
+                        continue
+                    try:
+                        raw_start = float(gap_segment.get("start", 0))
+                        raw_end = float(gap_segment.get("end", window_end - window_start))
+                    except (TypeError, ValueError):
+                        continue  # 壞了一個段落的時間戳：跳過，不整批作廢
+                    if not (math.isfinite(raw_start) and math.isfinite(raw_end) and 0 <= raw_start < raw_end):
+                        continue
+                    gap_start = round(raw_start + window_start, 3)
+                    gap_end = round(raw_end + window_start, 3)
+                    if (
+                        gap_start < gap["start"] - TRANSCRIPT_GAP_TOL
+                        or gap_end > gap["end"] + TRANSCRIPT_GAP_TOL
+                    ):
+                        continue
+                    gap_item: dict[str, Any] = {
+                        "start": gap_start,
+                        "end": gap_end,
+                        "text": gap_text,
+                        # 回填段用字串命名空間標記來源：呼叫端只讀 start/end/text，
+                        # 全 repo 無 int(chunk)／數字排序／chunks[chunk] 這類讀法。
+                        "chunk": f"gap-{backfill_index}",
+                    }
+                    for field in ("avg_logprob", "compression_ratio", "no_speech_prob"):
+                        if field in gap_segment:
+                            gap_item[field] = gap_segment[field]
+                    segments.append(gap_item)
+            except (DeadlineExceeded, ExecutionCancelled, budget_blocked_error()):
+                raise
+            except Exception as exc:
+                # 單一斷層補轉失敗（缺檔、ffmpeg、單次 API 波動、超大斷層）不得
+                # 丟掉整份逐字稿：初版切段結果照常回傳，gap_check.remaining 如實
+                # 記載未補起的斷層。預算／取消／超時是全域停損，照原樣往上拋。
+                backfill_errors.append(
+                    {"gap": gap, "error": f"{type(exc).__name__}: {exc}"[:500]}
+                )
+                continue
+        segments.sort(key=lambda x: x["start"])
     transcript = {
         "provider": "groq",
         "model": model,
         "language": detected,
         "segments": sorted(segments, key=lambda x: x["start"]),
         "cache": {"hits": hits, "misses": misses},
+        "gap_check": {"max_gap": max_gap, "remaining": find_transcript_gaps(segments, max_gap)},
+        "backfill_errors": backfill_errors,
     }
     raw = {
         "provider": "groq",
@@ -2048,7 +2254,8 @@ def transcribe_all(
                 "response": results[index],
             }
             for index in sorted(results)
-        ],
+        ]
+        + backfill_raw,
     }
     return transcript, raw
 
@@ -2192,10 +2399,14 @@ def transcribe_local(
                     "no_speech_prob": getattr(segment, "no_speech_prob", None),
                 }
             )
+    sorted_segments = sorted(segments, key=lambda item: item["start"])
     return {
         "model": f"faster-whisper/{model_size}",
         "language": detected,
-        "segments": sorted(segments, key=lambda item: item["start"]),
+        "segments": sorted_segments,
+        # 本機後端不斷層補轉（缺來源影音與 API 金鑰的呼叫鏈），但同樣回報驗收狀態。
+        "gap_check": {"max_gap": TRANSCRIPT_MAX_GAP, "remaining": find_transcript_gaps(sorted_segments)},
+        "backfill_errors": [],
     }
 
 
@@ -2595,6 +2806,94 @@ def visual_mode() -> str:
     )
 
 
+def parse_video_timestamp(value: Any) -> float | None:
+    """Parse a model-reported video timestamp into original-video seconds.
+
+    Issue #56: MiniMax-M3 sometimes answers with MM:SS strings (or other
+    free-form time text) while the event parser only accepted float() —
+    unparseable stamps silently collapsed to 0.0 and piled evidence at the
+    start of the timeline. Unparseable input now returns None so the caller
+    can drop the event instead of fabricating a timestamp.
+    """
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        number = float(value)
+        return number if math.isfinite(number) and number >= 0 else None
+    if not isinstance(value, str):
+        return None
+    text = value.strip().lower().replace("，", "").replace(",", "")
+    if not text:
+        return None
+    for suffix in ("seconds", "second", "secs", "sec", "秒", "s"):
+        if text.endswith(suffix):
+            text = text[: -len(suffix)].strip()
+            break
+    match = re.fullmatch(r"(?:(\d+)\s*(?:時|小时|h))?\s*(?:(\d+)\s*(?:分|m))?\s*(\d+(?:\.\d+)?)\s*(?:秒|s)?", text)
+    if match and (match.group(1) or match.group(2)):
+        hours = float(match.group(1) or 0)
+        minutes = float(match.group(2) or 0)
+        seconds = float(match.group(3) or 0)
+        total = hours * 3600 + minutes * 60 + seconds
+        return total if math.isfinite(total) and total >= 0 else None
+    if re.fullmatch(r"\d+(?:\.\d+)?", text or ""):
+        number = float(text)
+        return number if math.isfinite(number) and number >= 0 else None
+    parts = text.split(":")
+    if 2 <= len(parts) <= 3 and all(re.fullmatch(r"\d+(?:\.\d+)?", part.strip() or "x") for part in parts):
+        numbers = [float(part.strip()) for part in parts]
+        total = numbers[-1] + numbers[-2] * 60 + (numbers[-3] * 3600 if len(numbers) == 3 else 0)
+        return total if math.isfinite(total) and total >= 0 else None
+    return None
+
+
+def video_timestamps_cover_duration(observations: list[dict[str, Any]], duration: float | None) -> bool:
+    """Check that visual evidence actually spans the video (issue #56).
+
+    A 166.6s video whose events peak at 6.9s is a compressed timeline, not a
+    20x rescale away from correct — the offsets are not proportional. Events
+    past the end of the video (beyond duration + 30s tolerance) fail too.
+    Short clips (max stamp only needs min(duration-30, duration/2)) stay
+    exempt so a single genuine event never forces a retry.
+    """
+    if duration is None or duration <= 0:
+        return True
+    if not observations:
+        return True
+    try:
+        peak = max(float(item.get("timestamp", 0.0)) for item in observations)
+    except (TypeError, ValueError):
+        return False
+    return min(duration - 30.0, duration * 0.5) <= peak <= duration + 30.0
+
+
+def _parse_video_mp4_events(parsed: dict[str, Any]) -> list[dict[str, Any]]:
+    """Build observations from a video_url chat response; drop bad timestamps."""
+    events = parsed.get("events") if isinstance(parsed.get("events"), list) else []
+    observations: list[dict[str, Any]] = []
+    for event in events:
+        if not isinstance(event, dict):
+            continue
+        stamp = parse_video_timestamp(event.get("timestamp"))
+        if stamp is None:
+            continue
+        observation = {
+            "timestamp": stamp,
+            "screen_type": event.get("screen_type") or "影片片段",
+            "visible_text": event.get("visible_text") if isinstance(event.get("visible_text"), list) else [],
+            "visual_summary": event.get("visual_summary") or "",
+            "important_details": event.get("important_details")
+            if isinstance(event.get("important_details"), list)
+            else [],
+            "confidence": event.get("confidence"),
+        }
+        if usable_visual_observation(observation):
+            observation["visual_schema_version"] = VISUAL_OBSERVATION_SCHEMA_VERSION
+            observation["completion_status"] = "complete"
+            observations.append(observation)
+    return observations
+
+
 def _stamp_video_observations(
     observations: list[dict[str, Any]],
     *,
@@ -2625,33 +2924,78 @@ def _analyze_video_mp4_core(
     analysis_method: str,
     source_video: Path,
     extra_meta: dict[str, Any] | None = None,
+    duration_hint: float | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, Any] | None, str | None]:
-    """Upload + chat once. Raises on upload/API failures; incomplete chat returns incomplete obs."""
+    """Upload once, then chat (one repair retry on compressed timestamps).
+
+    Raises on upload/API failures; incomplete chat returns incomplete obs.
+    """
     file_id = minimax_upload_video_understanding(video_path, api_key)
-    try:
-        response = minimax_chat(
-            [
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": prompt},
-                        {
-                            "type": "video_url",
-                            "video_url": {
-                                "url": f"mm_file://{file_id}",
-                                "detail": detail_value,
-                                "fps": fps_value,
+    current_prompt = prompt
+    parsed: dict[str, Any] | None = None
+    observations: list[dict[str, Any]] = []
+    timestamp_coverage_ok = True
+    for attempt in range(2):
+        try:
+            response = minimax_chat(
+                [
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": current_prompt},
+                            {
+                                "type": "video_url",
+                                "video_url": {
+                                    "url": f"mm_file://{file_id}",
+                                    "detail": detail_value,
+                                    "fps": fps_value,
+                                },
                             },
-                        },
-                    ],
-                }
-            ],
-            api_key,
-            model,
-            timeout=timeout,
+                        ],
+                    }
+                ],
+                api_key,
+                model,
+                timeout=timeout,
+            )
+            parsed = parse_json_object(response)
+        except MiniMaxIncompleteError as error:
+            incomplete = _stamp_video_observations(
+                [
+                    {
+                        "timestamp": 0.0,
+                        "screen_type": "影片",
+                        "visible_text": [],
+                        "visual_summary": VISUAL_NOT_ANALYZED,
+                        "important_details": [],
+                        "confidence": None,
+                        "completion_status": "incomplete",
+                        "finish_reason": error.finish_reason or "missing",
+                    }
+                ],
+                analysis_method=analysis_method,
+                source_video=source_video,
+                file_id=file_id,
+                extra=extra_meta,
+            )
+            return incomplete, None, file_id
+        observations = _parse_video_mp4_events(parsed)
+        timestamp_coverage_ok = video_timestamps_cover_duration(observations, duration_hint) and not (
+            isinstance(parsed.get("events"), list) and parsed["events"] and not observations
         )
-        parsed = parse_json_object(response)
-    except MiniMaxIncompleteError as error:
+        if timestamp_coverage_ok:
+            break
+        if attempt == 0 and duration_hint is not None and duration_hint > 0:
+            peak = max((item["timestamp"] for item in observations), default=0.0)
+            current_prompt = (
+                f"{prompt}\n上一次回答的 timestamp 最大只到 {peak:.1f} 秒，"
+                f"但影片長 {duration_hint:.1f} 秒：請把每個事件對應到從 0 起算的"
+                f"原片實際秒數（0 到 {duration_hint:.1f}），依時間遞增重排後只輸出修正後的 JSON object。"
+            )
+    if not timestamp_coverage_ok:
+        # Issue #56: compressed timelines are not proportionally rescalable,
+        # so fail closed instead of caching bad evidence as complete.
+        peak = max((item["timestamp"] for item in observations), default=0.0)
         incomplete = _stamp_video_observations(
             [
                 {
@@ -2662,7 +3006,10 @@ def _analyze_video_mp4_core(
                     "important_details": [],
                     "confidence": None,
                     "completion_status": "incomplete",
-                    "finish_reason": error.finish_reason or "missing",
+                    "finish_reason": "timestamp_coverage",
+                    "max_observed_timestamp": peak,
+                    "duration_seconds": duration_hint,
+                    "raw": parsed.get("raw") or parsed,
                 }
             ],
             analysis_method=analysis_method,
@@ -2670,30 +3017,7 @@ def _analyze_video_mp4_core(
             file_id=file_id,
             extra=extra_meta,
         )
-        return incomplete, None, file_id
-
-    events = parsed.get("events") if isinstance(parsed.get("events"), list) else []
-    observations: list[dict[str, Any]] = []
-    for event in events:
-        if not isinstance(event, dict):
-            continue
-        observation = {
-            "screen_type": event.get("screen_type") or "影片片段",
-            "visible_text": event.get("visible_text") if isinstance(event.get("visible_text"), list) else [],
-            "visual_summary": event.get("visual_summary") or "",
-            "important_details": event.get("important_details")
-            if isinstance(event.get("important_details"), list)
-            else [],
-            "confidence": event.get("confidence"),
-        }
-        try:
-            observation["timestamp"] = float(event.get("timestamp", 0.0))
-        except (TypeError, ValueError):
-            observation["timestamp"] = 0.0
-        if usable_visual_observation(observation):
-            observation["visual_schema_version"] = VISUAL_OBSERVATION_SCHEMA_VERSION
-            observation["completion_status"] = "complete"
-            observations.append(observation)
+        return incomplete, parsed if isinstance(parsed, dict) else None, file_id
 
     if not observations:
         overall = parsed.get("overall_summary")
@@ -2829,11 +3153,17 @@ def analyze_video_mp4(
         "events 依時間順序列出關鍵畫面／情節（片長短可 3–8 筆，較長可到 20 筆）；"
         "每筆必須含 timestamp（秒）、screen_type、visible_text（字串陣列）、"
         "visual_summary、important_details（字串陣列）、confidence（0 到 1）。"
+        "timestamp 一律是從 0 起算的原片秒數（純數字；不要 MM:SS、毫秒、幀數或 0–10 的相對分數）。"
         "描述文字一律用繁體中文，畫面上的原文照抄不要翻譯。"
         "若看不清楚，保留空陣列並降低 confidence。"
     )
     if duration is not None and duration > 0:
-        prompt += f"\n影片長度約 {duration:.1f} 秒。"
+        prompt += (
+            f"\n影片長度約 {duration:.1f} 秒：events 須依 timestamp 遞增覆蓋全片，"
+            f"最後一筆須落在片尾附近（約 {duration:.1f} 秒）。"
+        )
+    else:
+        prompt += "\nevents 須依 timestamp 遞增覆蓋全片直到片尾。"
     cache_path: Path | None = None
     if cache_dir is not None:
         material = json.dumps(
@@ -2885,6 +3215,7 @@ def analyze_video_mp4(
             analysis_method=analysis_method,
             source_video=video_path,
             extra_meta=extra_meta,
+            duration_hint=duration,
         )
 
     def persist(observations: list[dict[str, Any]], parsed: dict[str, Any] | None, file_id: str | None) -> list[dict[str, Any]]:
@@ -7919,6 +8250,7 @@ def run_pipeline(args: argparse.Namespace) -> Path:
                         args.workers,
                         job_dir / "transcription-cache",
                         args.word_timestamps,
+                        source_path=video_path,
                     )
 
             def visual_stage() -> list[dict[str, Any]]:
