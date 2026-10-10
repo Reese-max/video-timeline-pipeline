@@ -410,3 +410,96 @@ def _upload_prepared_segments(
     state.update(status="drive_ready", files=files)
     write_json(cache_path, state)
     return state
+
+
+def _matches_report(remote: dict | None, file_id: str, report: dict, folder_id: str) -> bool:
+    return bool(remote and str(remote.get("id")) == file_id and not remote.get("trashed")
+                and remote.get("name") == "A_server_analysis.md" and remote.get("mimeType") == "text/markdown"
+                and str(remote.get("size")) == str(report["size_bytes"])
+                and remote.get("sha256Checksum") == report["report_sha256"]
+                and remote.get("parents") == [folder_id] and remote.get("webViewLink"))
+
+
+def upload_analysis_report(job_dir: Path, report: dict, segments: dict) -> dict:
+    """A distinct FIFO task: verify the original segment folder; never replace user files."""
+    if not UPLOAD_LOCK.acquire(blocking=False):
+        raise RuntimeError("Google Drive 正在處理另一個上傳，請稍後重試。")
+    try:
+        if not configured():
+            raise DriveNotConfigured("Google Drive fallback 尚未設定；報告未上傳。")
+        if report.get("summary_status") != "caller_submitted" or segments.get("status") != "drive_ready":
+            raise ValueError("Report or segments are not ready")
+        if report.get("job_id") != segments.get("job_id") or report.get("source_fingerprint") != segments.get("source_fingerprint"):
+            raise ValueError("Report and segment source differ")
+        digest = str(report.get("report_sha256") or "")
+        folder_id = str(segments.get("folder_id") or "")
+        if not re.fullmatch(r"[0-9a-f]{64}", digest) or not re.fullmatch(r"[A-Za-z0-9_-]+", folder_id):
+            raise ValueError("Invalid report or folder identity")
+        path = job_dir / "reports" / digest / "A_server_analysis.md"
+        if any(p.is_symlink() for p in (job_dir, path.parent.parent, path.parent, path)):
+            raise ValueError("Report path is not owned")
+        if _sha256(path) != digest or path.stat().st_size != report["size_bytes"]:
+            raise ValueError("Report bytes changed")
+        local = segments.get("local_segments")
+        files = segments.get("files")
+        if not isinstance(local, list) or not local or not isinstance(files, list) or len(local) != len(files):
+            raise ValueError("Segment verification is missing")
+        names = set()
+        for row, saved in zip(local, files):
+            if not isinstance(row, dict) or not isinstance(saved, dict):
+                raise ValueError("Invalid segment verification shape")
+            filename = row.get("filename")
+            if (not isinstance(filename, str) or not re.fullmatch(r"segment_\d{3,}\.mp4", filename)
+                    or filename in names or saved.get("file_name") != filename or saved.get("verified") is not True
+                    or not re.fullmatch(r"[A-Za-z0-9_-]+", str(saved.get("file_id") or ""))
+                    or not re.fullmatch(r"[0-9a-f]{64}", str(row.get("sha256") or ""))
+                    or type(row.get("size_bytes")) is not int or row["size_bytes"] <= 0):
+                raise ValueError("Invalid segment verification metadata")
+            names.add(filename)
+            raw_segment = job_dir / "segments" / filename
+            segment = raw_segment.resolve()
+            if (raw_segment.is_symlink() or segment.parent != (job_dir / "segments").resolve()
+                    or not segment.is_file() or _sha256(segment) != row["sha256"]
+                    or segment.stat().st_size != row["size_bytes"]):
+                raise ValueError("Original segment bytes changed; no transport")
+        token = _access_token()
+        folder = _get_file(token, folder_id)
+        parent_id = str(segments.get("parent_id") or "")
+        if (not folder or folder.get("trashed") or folder.get("mimeType") != FOLDER_MIME
+                or str(folder.get("id")) != folder_id or (parent_id and parent_id not in folder.get("parents", []))
+                or parent_id != _env("GOOGLE_DRIVE_FOLDER_ID")):
+            raise ValueError("Original segment folder changed; no report write")
+        for row, saved in zip(local, files):
+            if not _matches_file(_get_file(token, saved["file_id"]), saved["file_id"], row, folder_id):
+                raise ValueError("Original MP4 verification changed; no report write")
+        key = hashlib.sha256(json.dumps({k: report[k] for k in ("job_id", "analysis_sha256", "report_sha256")}, sort_keys=True).encode() + folder_id.encode()).hexdigest()
+        state_path = path.parent / ("drive-" + key + ".json")
+        binding = {k: report[k] for k in ("job_id", "analysis_sha256", "report_sha256", "source_sha256", "source_fingerprint", "size_bytes")}
+        binding.update(folder_id=folder_id, file_name="A_server_analysis.md", mime_type="text/markdown")
+        if state_path.exists():
+            if state_path.is_symlink():
+                raise ValueError("Report upload state is not owned")
+            state = json.loads(state_path.read_bytes())
+            if not isinstance(state, dict) or any(state.get(k) != v for k, v in binding.items()) or not re.fullmatch(r"[A-Za-z0-9_-]+", str(state.get("file_id") or "")):
+                raise ValueError("Unknown existing report upload state")
+        else:
+            state = {**binding, "file_id": _new_id(token), "status": "reserved", "verified": False}
+            write_json(state_path, state)  # ID is durable BEFORE any POST/PUT.
+        file_id = state["file_id"]
+        remote = _get_file(token, file_id)
+        if not _matches_report(remote, file_id, report, folder_id):
+            if remote or state.get("verified"):
+                raise ValueError("Existing report was moved, changed or deleted; never overwrite")
+            state.update(status="uploading")
+            write_json(state_path, state)
+            _upload_file(token, path, "A_server_analysis.md", folder_id, "text/markdown", file_id=file_id)
+            remote = _get_file(token, file_id)
+            if not _matches_report(remote, file_id, report, folder_id):
+                raise ValueError("Uploaded report identity/bytes/parent verification failed")
+        if _sha256(path) != digest or path.stat().st_size != report["size_bytes"]:
+            raise ValueError("Report changed during upload")
+        state.update(status="report_ready", verified=True, url=str(remote["webViewLink"]))
+        write_json(state_path, state)
+        return state
+    finally:
+        UPLOAD_LOCK.release()
