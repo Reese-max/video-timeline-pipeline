@@ -158,6 +158,126 @@ class TranscribeBackfillTest(unittest.TestCase):
             # 回填Receipt：機器可驗的驗收狀態。
             self.assertEqual(transcript["gap_check"]["remaining"], [])
 
+    def _check_backfill_filter(self, segment: dict, accepted: bool) -> None:
+        import tempfile
+        from unittest.mock import patch
+
+        import pipeline
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            chunks = self._chunks(root)
+
+            def fake_transcribe(audio_path: Path, *args, **kwargs) -> dict:
+                name = Path(audio_path).name
+                if "gap" in name:
+                    return {"segments": [{"start": 15.0, "end": 44.6, **segment}]}
+                if "0000" in name:
+                    return {"segments": [{"start": 0.0, "end": 120.0, "text": "第一段內容"}]}
+                return {"segments": [{"start": 29.6, "end": 46.0, "text": "第二段內容"}]}
+
+            def fake_extract(source: Path, start: float, end: float, dest: Path) -> Path:
+                dest.write_bytes(b"gap-audio")
+                return dest
+
+            with patch.object(pipeline, "groq_transcribe", side_effect=fake_transcribe) as transcribe, \
+                    patch.object(pipeline, "_extract_gap_audio", side_effect=fake_extract):
+                # 第二次從舊格式快取讀取，仍須在合併時過濾。
+                for _ in range(2):
+                    transcript, _ = pipeline.transcribe_all(
+                        chunks, "key", "whisper-large-v3", "auto", 2,
+                        root / "cache", source_path=root / "source.mp4",
+                    )
+                    backfills = [s for s in transcript["segments"] if s["chunk"] == "gap-0"]
+                    self.assertEqual(len(backfills), int(accepted))
+                    self.assertEqual(
+                        transcript["gap_check"]["remaining"],
+                        [] if accepted else [{"start": 120.0, "end": 149.6}],
+                    )
+                    self.assertEqual(transcript["backfill_errors"], [])
+                self.assertEqual(transcribe.call_count, 3)
+
+    def test_backfill_rejects_english_hallucinations(self) -> None:
+        for text in ("Thank you.", "Thanks for watching", "you", "Please subscribe"):
+            with self.subTest(text=text):
+                self._check_backfill_filter({"text": text, "no_speech_prob": 0.3}, False)
+
+    def test_backfill_rejects_chinese_hallucinations(self) -> None:
+        for text in ("字幕由Amara.org社区提供", "请不吝点赞订阅转发打赏支持明镜与点点栏目", "谢谢观看"):
+            with self.subTest(text=text):
+                self._check_backfill_filter({"text": text}, False)
+
+    def test_backfill_rejects_low_logprob(self) -> None:
+        self._check_backfill_filter({"text": "這是正常句子", "avg_logprob": -1.5}, False)
+
+    def test_backfill_rejects_high_compression_ratio(self) -> None:
+        self._check_backfill_filter({"text": "這是正常句子", "compression_ratio": 3.0}, False)
+
+    def test_backfill_rejects_nearby_duplicates(self) -> None:
+        for start, end, text in (
+            (14.0, 44.6, "第一段，內容！"),
+            (16.0, 44.6, "第一段內"),
+            (15.0, 45.6, "第二段內容還有後續"),
+        ):
+            with self.subTest(start=start, end=end, text=text):
+                self._check_backfill_filter({"start": start, "end": end, "text": text}, False)
+
+    def test_backfill_accepts_normal_speech(self) -> None:
+        self._check_backfill_filter(
+            {"text": "這是正常句子", "avg_logprob": -0.3, "compression_ratio": 1.5}, True,
+        )
+
+    def test_backfill_accepts_short_contained_text(self) -> None:
+        from pipeline import accept_backfill_segment
+
+        for text, previous in (("是", "是這樣沒錯"), ("是這樣沒錯", "是"),
+                               ("ok", "looks ok"), ("第一段", "第一段內容")):
+            with self.subTest(text=text, previous=previous):
+                self.assertTrue(accept_backfill_segment(
+                    {"start": 10.0, "end": 11.0, "text": text},
+                    [{"start": 9.0, "end": 10.0, "text": previous}],
+                ))
+
+    def test_backfill_rejects_long_contained_text(self) -> None:
+        from pipeline import accept_backfill_segment
+
+        for text, previous in (("是這樣沒錯", "對，是這樣沒錯啊"),
+                               ("第一段內", "第一段內容"), ("第一段內容", "第一段內")):
+            with self.subTest(text=text, previous=previous):
+                self.assertFalse(accept_backfill_segment(
+                    {"start": 10.0, "end": 11.0, "text": text},
+                    [{"start": 9.0, "end": 10.0, "text": previous}],
+                ))
+
+    def test_backfill_rejects_identical_short_text(self) -> None:
+        from pipeline import accept_backfill_segment
+
+        self.assertFalse(accept_backfill_segment(
+            {"start": 10.0, "end": 11.0, "text": "好"},
+            [{"start": 9.0, "end": 10.0, "text": "好"}],
+        ))
+
+    def test_backfill_accepts_missing_confidence(self) -> None:
+        self._check_backfill_filter({"text": "這是正常句子"}, True)
+
+    def test_backfill_accepts_nonfinite_confidence(self) -> None:
+        for value in (float("nan"), float("-inf"), float("inf"), None, "bad", True):
+            with self.subTest(value=value):
+                self._check_backfill_filter(
+                    {"text": "這是正常句子", "avg_logprob": value, "compression_ratio": value}, True,
+                )
+
+    def test_backfill_accepts_threshold_boundaries(self) -> None:
+        self._check_backfill_filter(
+            {"text": "這是正常句子", "avg_logprob": -1.0, "compression_ratio": 2.4}, True,
+        )
+
+    def test_backfill_accepts_distinct_or_distant_text(self) -> None:
+        for text in ("第一段內容延伸出不同語句", "這句提到 Thank you 但有正常內容"):
+            with self.subTest(text=text):
+                # 起點距前段 2 秒：文字包含也不能當作重複。
+                self._check_backfill_filter({"start": 17.0, "text": text}, True)
+
     def test_backfill_result_is_cached(self) -> None:
         import tempfile
 

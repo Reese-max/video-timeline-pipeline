@@ -1540,6 +1540,33 @@ TRANSCRIPT_GAP_TOL = 1.0  # 補轉段落落在斷層 ±1 秒內才合併，上�
 TRANSCRIPT_MAX_BACKFILLS = 8  # 單次轉錄最多補轉幾個斷層（成本上限）
 
 
+def accept_backfill_segment(
+    segment: dict[str, Any], existing_segments: list[dict[str, Any]]
+) -> bool:
+    """補轉合併時排除幻覺、低信心與鄰近重複文字，亦適用舊快取。"""
+    normalized = re.sub(r"[\W_]+", "", segment["text"].lower())
+    if re.fullmatch(r"(?:thankyou|thanksforwatching|you|pleasesubscribe|"
+                    r"字幕由amaraorg社区提供|请不吝点赞订阅转发打赏支持明镜与点点栏目|谢谢观看)+", normalized):
+        return False
+    for field, threshold in (("avg_logprob", -1.0), ("compression_ratio", 2.4)):
+        value = segment.get(field)
+        if isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value):
+            if (field == "avg_logprob" and value < threshold) or (field == "compression_ratio" and value > threshold):
+                return False
+    for existing in existing_segments:
+        if (segment["start"] > existing["end"] + TRANSCRIPT_GAP_TOL
+                or existing["start"] > segment["end"] + TRANSCRIPT_GAP_TOL):
+            continue
+        previous = re.sub(r"[\W_]+", "", existing["text"].lower())
+        if normalized and previous and (
+            normalized == previous
+            or (min(len(normalized), len(previous)) >= 4
+                and (normalized in previous or previous in normalized))
+        ):
+            return False
+    return True
+
+
 def find_transcript_gaps(
     segments: list[dict[str, Any]], max_gap: float = TRANSCRIPT_MAX_GAP
 ) -> list[dict[str, float]]:
@@ -2216,7 +2243,8 @@ def transcribe_all(
                     for field in ("avg_logprob", "compression_ratio", "no_speech_prob"):
                         if field in gap_segment:
                             gap_item[field] = gap_segment[field]
-                    segments.append(gap_item)
+                    if accept_backfill_segment(gap_item, segments):
+                        segments.append(gap_item)
             except (DeadlineExceeded, ExecutionCancelled, budget_blocked_error()):
                 raise
             except Exception as exc:
