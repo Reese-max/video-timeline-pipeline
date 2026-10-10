@@ -273,9 +273,10 @@ function renderEvidence() {
   const rows = evidenceRows.filter(row => $("filter").value === "all" || row.type === $("filter").value);
   $("evidence").replaceChildren();
   for (const row of rows.slice(0, shownCount)) {
-    const item = document.createElement("li"), time = document.createElement(row.timestamp === null ? "span" : "button");
-    time.textContent = formatTime(row.timestamp) + (row.end !== null ? "–" + formatTime(row.end) : "");
-    if (row.timestamp !== null) { time.type = "button"; time.setAttribute("aria-label", `核對原片 ${time.textContent}`); time.addEventListener("click", () => seekEvidence(row.timestamp)); }
+    const canSeek = row.timestamp !== null && row.timestamp_reliable !== false;
+    const item = document.createElement("li"), time = document.createElement(canSeek ? "button" : "span");
+    time.textContent = formatTime(row.timestamp) + (row.end !== null ? "–" + formatTime(row.end) : "") + (row.timestamp_reliable === false ? "（時間碼不可靠）" : "");
+    if (canSeek) { time.type = "button"; time.setAttribute("aria-label", `核對原片 ${time.textContent}`); time.addEventListener("click", () => seekEvidence(row.timestamp)); }
     const badge = document.createElement("span"); badge.className = "badge"; badge.textContent = row.type === "speech" ? "逐字稿" : "畫面觀察（抽樣）";
     item.append(time, badge);
     const text = document.createElement("p"); text.textContent = row.text || "此筆沒有可顯示的內容。"; item.append(text);
@@ -299,10 +300,10 @@ function applyAnalysis(result) {
     const observation = row.data || {}, details = [];
     if (Array.isArray(observation.visible_text) && observation.visible_text.length) details.push("畫面文字：" + observation.visible_text.join("；"));
     if (typeof observation.confidence === "number") details.push("模型自評信心：" + observation.confidence + "（不代表已人工核對）");
-    evidenceRows.push({ type: "visual", timestamp: numericTime(row.timestamp), end: null, text: String(observation.visual_summary || ""), detail: details.join("\n") });
+    evidenceRows.push({ type: "visual", timestamp: numericTime(row.timestamp), timestamp_reliable: observation.timestamp_reliable, end: null, text: String(observation.visual_summary || ""), detail: details.join("\n") });
   }
   evidenceRows.sort((a, b) => (a.timestamp ?? Infinity) - (b.timestamp ?? Infinity));
-  const gaps = [...(result.quality?.reasons || []), ...(result.errors || [])];
+  const gaps = [...(result.quality?.reasons || []), ...(result.quality?.warnings || []), ...(result.errors || [])];
   if (!evidenceRows.some(row => row.type === "speech")) gaps.push(result.audio_status === "skipped" ? "沒有語音逐字稿；音軌可能無語音或未執行辨識。" : "缺少可用逐字稿，不能以畫面推測說話內容。");
   if (!evidenceRows.some(row => row.type === "visual")) gaps.push("缺少畫面觀察，不能以逐字稿代替畫面證據。");
   if (evidenceRows.some(row => row.timestamp === null)) gaps.push("部分證據缺少時間碼，無法直接跳到原片核對。");
