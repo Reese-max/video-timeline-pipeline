@@ -1702,9 +1702,41 @@ def report_queue_idle(queue):
         jobs = [row[0] for row in db.execute("SELECT DISTINCT job_id FROM jobs WHERE job_id IS NOT NULL AND operation IN ('analyze','drive')")]
     for job_id in jobs:
         try:
-            run_job(schedule_ready_report, queue, job_id)
-        except (JobBusyError, ValueError, OSError, RuntimeError):
+            pointer = prepared_job_dir(job_id) / "analysis-report.json"
+            if pointer.is_symlink():
+                continue
+            stat = pointer.stat()
+            signature = (stat.st_mtime_ns, stat.st_size)
+            report = json.loads(pointer.read_bytes())
+            if not isinstance(report, dict) or report.get("summary_status") != "caller_submitted" or report.get("operation_id"):
+                queue._report_idle_failures.pop(job_id, None)
+                continue
+            with queue.connect() as db:
+                signature += tuple(db.execute("SELECT count(*), max(updated) FROM jobs WHERE job_id=?", (job_id,)).fetchone())
+            for name in ("drive-manifest.json", "manifest.json"):
+                try:
+                    state_stat = (pointer.parent / name).stat()
+                except FileNotFoundError:
+                    signature += (None,)
+                else:
+                    signature += ((state_stat.st_mtime_ns, state_stat.st_size),)
+        except (ValueError, OSError):
             continue  # Invalid/stale local state never authorizes a cloud write.
+        if queue._report_idle_failures.get(job_id) == signature or not queue.report_prerequisites_stopped(job_id):
+            continue
+        try:
+            operation = run_job(schedule_ready_report, queue, job_id)
+        except JobBusyError:
+            continue  # Lock contention has not validated this candidate yet.
+        except Exception as exc:
+            queue._report_idle_failures[job_id] = signature
+            if not isinstance(exc, (ValueError, OSError, RuntimeError)):
+                raise  # _notify_idle logs unexpected failures and keeps scheduling.
+        else:
+            if operation is None:
+                queue._report_idle_failures[job_id] = signature
+            else:
+                queue._report_idle_failures.pop(job_id, None)
 
 
 def finalize_analysis_report_sync(job_id: str, cache_signature: str, analysis_sha256: str,

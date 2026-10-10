@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
 from pathlib import Path
 import signal
@@ -139,6 +140,7 @@ class JobQueue:
         self._lease = None
         self._cleanup_failed = False
         self.idle_callback = idle_callback
+        self._report_idle_failures = {}
         self.paired_same_job = bool(paired_same_job)
         if self.paired_same_job and (writer_context is None or writer_path is None):
             raise ValueError("Paired work requires a parent-owned writer lock")
@@ -316,7 +318,10 @@ class JobQueue:
 
     def _notify_idle(self):
         if self.idle_callback is not None and not self._stop.is_set() and not self._cleanup_failed:
-            self.idle_callback(self)
+            try:
+                self.idle_callback(self)
+            except Exception:
+                logging.getLogger(__name__).exception("佇列閒置回呼失敗；排程將繼續。")
 
     def _paired_loop(self):
         # The oldest queued operation remains the primary FIFO entry. Only one
