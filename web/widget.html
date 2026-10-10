@@ -508,7 +508,12 @@ async function restoreJob() {
       activeOperation = null; restoredOperationId = null; stopPolling(); showOperation(); saveState();
       status(snapshot.analysis ? "已恢復分析結果；沒有重新分析或自動送出追問。" : snapshot.analysis_invalidated ? "來源或分析設定已更新，舊分析不再使用。請點選「開始分析」產生新證據。" : "影片已準備完成，點選「開始分析」執行背景分析。");
     }
-    if (allowAutoStart && current(viewVersion)) await autoStartParallel(viewVersion);
+    if (allowAutoStart && current(viewVersion)) {
+      // The authoritative snapshot is adopted; mutation acknowledgements have
+      // their own acting flags and must not hold ready Drive handoff actions.
+      restoring = false; updateButtons();
+      await autoStartParallel(viewVersion);
+    }
     updateButtons();
   } catch (error) { if (current(viewVersion)) status("無法恢復工作狀態：" + error.message + "。未自動重新分析或上傳。"); }
   finally { if (current(viewVersion)) { restoring = false; updateButtons(); } }
