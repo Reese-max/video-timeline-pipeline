@@ -329,7 +329,9 @@ class MCPValidationTests(unittest.TestCase):
         }
         result = mcp_server.drive_tool_result(payload)
         self.assertEqual([item.type for item in result.content], ["text"])
-        self.assertEqual(result.structuredContent, payload)
+        for key, value in payload.items():
+            self.assertEqual(result.structuredContent[key], value)
+        self.assertIn("file_1", result.structuredContent["handoff_text"])
         mcp_server.DriveUploadResult.model_validate(result.structuredContent)
         self.assertIn("download_raw_file=true", result.content[0].text)
         self.assertIn("include_base64=false", result.content[0].text)
@@ -504,7 +506,7 @@ class MCPValidationTests(unittest.TestCase):
             )
         self.assertEqual(result.structuredContent["status"], "ready")
         self.assertEqual(result.structuredContent["segments"][0]["filename"], "segment_000.mp4")
-        self.assertIn("analyze_prepared_video", result.content[0].text)
+        self.assertIn("自動同時啟動分析與 Drive 上傳", result.content[0].text)
         self.assertNotIn("先完成檔案交接", result.content[0].text)
 
 

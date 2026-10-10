@@ -28,6 +28,7 @@ MEDIA_PATTERN = re.compile(
     r"(?:segments/[A-Za-z0-9][A-Za-z0-9_.-]{0,180}\.mp4|"
     r"previews/[A-Za-z0-9][A-Za-z0-9_.-]{0,180}\.jpg)\Z"
 )
+REPORT_PATTERN = re.compile(r"reports/[0-9a-f]{64}/A_server_analysis\.md\Z")
 MARKER_NAME = ".media-lifecycle.json"
 
 
@@ -429,8 +430,8 @@ class MediaSigner:
     @staticmethod
     def _fields(job_id, relative_name, expires) -> tuple[str, str, int]:
         _job_id(job_id)
-        if not isinstance(relative_name, str) or not MEDIA_PATTERN.fullmatch(relative_name):
-            raise ValueError("Only segment MP4 and preview JPEG paths may be signed")
+        if not isinstance(relative_name, str) or not (MEDIA_PATTERN.fullmatch(relative_name) or REPORT_PATTERN.fullmatch(relative_name)):
+            raise ValueError("Only segment MP4, preview JPEG and canonical analysis report paths may be signed")
         if isinstance(expires, str):
             if not re.fullmatch(r"[1-9][0-9]{0,11}", expires):
                 raise ValueError("Expiry must be a positive canonical integer")
