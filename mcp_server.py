@@ -1019,12 +1019,34 @@ def analysis_quality(result: dict[str, Any]) -> dict[str, Any]:
     reasons = []
     if result.get("status") != "complete" or result.get("errors"):
         reasons.append("分析有失敗或未完成的階段。")
-    speech = [row for row in (result.get("transcript") or {}).get("segments", [])
+    transcript = result.get("transcript") or {}
+    speech = [row for row in transcript.get("segments", [])
               if str(row.get("text") or "").strip()]
     if result.get("audio_status") not in {"complete", "skipped"}:
         reasons.append("語音辨識未完成。")
     elif result.get("audio_status") == "complete" and not speech:
         reasons.append("有音軌但沒有可用逐字稿；可能無語音，仍需確認。")
+    gap_check = transcript.get("gap_check") or {}
+    remaining = gap_check.get("remaining") or []
+    backfill_errors = transcript.get("backfill_errors") or []
+    if remaining:
+        gaps = [row for row in remaining if isinstance(row, dict)
+                and all(isinstance(row.get(key), (int, float)) and not isinstance(row[key], bool)
+                        and math.isfinite(row[key]) for key in ("start", "end"))]
+        max_gap = gap_check.get("max_gap")
+        threshold = (f"超過 {max_gap:g} 秒的"
+                     if isinstance(max_gap, (int, float)) and not isinstance(max_gap, bool)
+                     and math.isfinite(max_gap) else "")
+        reason = f"逐字稿仍有{threshold}空白"
+        ranges = ["–".join(pipeline.format_timestamp(row[key]).removeprefix("00:").removeprefix("0")
+                           for key in ("start", "end")) for row in gaps[:3]]
+        if ranges:
+            reason += "（" + "、".join(ranges) + (f" 等 {len(gaps)} 段" if len(gaps) > 3 else "") + "）"
+        if backfill_errors:
+            reason += "；補轉失敗，可能漏字"
+        reasons.append(reason + "。")
+    elif backfill_errors:
+        reasons.append("逐字稿補轉失敗，可能漏字。")
     frames = [row.get("data") or {} for row in result.get("timeline", []) if row.get("type") == "visual"]
     usable = [row for row in frames if str(row.get("visual_summary") or "").strip()
               and row.get("visual_summary") != "尚未執行 MiniMax 視覺理解。"
