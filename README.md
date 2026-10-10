@@ -52,7 +52,7 @@ VidBee 完成的本機影音（或影片 URL） → FFmpeg
 
 Groq 轉錄與 MiniMax 畫面分析會同時執行；超長逐字稿的 MiniMax 分段摘要也會受限並行。`--workers` 預設／最多 4；畫面分析另由 `--vision-workers` 控制，預設／最多 8。畫面張數預設依片長每 30 秒約 1 張、最少 8、最多 40；`--max-vision-frames N` 可手動覆寫。抽樣點會保持穩定，增加張數時可沿用已分析畫面的快取。不會為了速度切換到較不精確的 Whisper turbo。純色／空白畫面會先由 Pillow 判定，避免視覺模型捏造內容；MiniMax-M3 摘要使用官方 `thinking: {"type":"disabled"}` 直接回答，畫面分析仍保留 adaptive thinking。
 
-視覺分析預設 `ANALYZE_VISUAL_MODE=video_mp4`：整支 MP4 經 MiniMax Files API 上傳後以 `video_url` 交給 MiniMax-M3 直接理解（不再抽 JPEG 逐張分析）。若要舊行為設 `ANALYZE_VISUAL_MODE=frames`。可調 `ANALYZE_VIDEO_FPS`（0.2–5）與 `ANALYZE_VIDEO_DETAIL`（low|default|high）。來源超過 Files API 約 512MB（或上傳因大小被拒）時，會先用 ffmpeg 壓到約 400–480MB 再重試；壓縮失敗或仍過大則改抽幀備援，並以 `analysis_method=minimax_video_fallback_frames`（或壓縮成功時的 `minimax_video_compressed`）標明，不會假裝成一般整支影片分析。
+ 視覺分析預設 `ANALYZE_VISUAL_MODE=video_mp4`：整支 MP4 經 MiniMax Files API 上傳後以 `video_url` 交給 MiniMax-M3 直接理解（不再抽 JPEG 逐張分析）。若要舊行為設 `ANALYZE_VISUAL_MODE=frames`。可調 `ANALYZE_VIDEO_FPS`（0.2–5）與 `ANALYZE_VIDEO_DETAIL`（low|default|high）。來源超過 Files API 約 512MB（或上傳因大小被拒）時，會先用 ffmpeg 壓到約 400–480MB 再重試；壓縮失敗或仍過大則改抽幀備援，並以 `analysis_method=minimax_video_fallback_frames`（或壓縮成功時的 `minimax_video_compressed`）標明，不會假裝成一般整支影片分析。`video_mp4` 的畫面時間碼一律是從 0 起算的原片秒數：提示詞要求事件覆蓋全片到片尾，解析接受純數字與 `MM:SS`／中文時間並丟棄無法解析的事件（不再靜默記為 0.0）；事件峰值不到 `min(片長-30 秒, 片長一半)` 或超出片長 30 秒以上時只重問一次（沿用已上傳的檔案 ID，短片豁免），仍對不上就以 `finish_reason=timestamp_coverage` 標示未完成、不寫入可重用快取。
 
 `reasoning_split` 只改回傳格式，不能關閉推理。
 
@@ -416,6 +416,8 @@ python pipeline.py --url '...' --transcribe-backend local --whisper-model small
 | **Groq `whisper-large-v3`**（預設） | **in front of** ✅ | **trunks** ✅ | 59.3s |
 
 turbo 不只聽錯關鍵字，還把 "in front of" 縮成 "one of"，整句語意都變了。慢一倍換全對，對「處理一次、往後反覆查詢」的知識庫划算，所以預設用非 turbo 版。
+
+切段邊界漏轉會自動補轉（issue #55）：Groq 轉錄合併後若出現超過 5 秒的內部斷層（片頭片尾除外），會對斷層前後各取 15 秒上下文補轉一次再合併；補轉結果同樣走快取，重跑不再付費。逐字稿內的 `gap_check.remaining` 即為驗收狀態（空陣列＝無斷層）。單次最多補 8 個斷層（先補最大的）。單一斷層補轉失敗不丟整份逐字稿，只記在 `backfill_errors`；預算／取消／超時照常中斷。
 
 預設跑 CPU。`device="cuda"` 在建構時不會報錯，缺 `cublas64_12.dll` 要等真的開始轉錄才炸，那時音訊已經切完、時間也花掉了——所以要用 GPU 得明確設 `WHISPER_DEVICE=cuda`（另需 CUDA runtime 與 cuDNN）。
 

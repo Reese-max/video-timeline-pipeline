@@ -26,6 +26,8 @@ def main() -> int:
             ["ffmpeg", "-version"], ["ffprobe", "-version"], ["node", "--version"],
             [sys.executable, "-X", "utf8", "-B", "-m", "unittest", "discover", "-s", "tests", "-p", "test_*.py", "-v"],
             ["node", "tests/test_widget_handoff.cjs"],
+            ["node", "tests/test_parallel_submission.cjs"],
+            ["node", "tests/test_widget_analysis_report.cjs"],
         ):
             result = subprocess.run(command, cwd=root, env=env)
             if result.returncode:

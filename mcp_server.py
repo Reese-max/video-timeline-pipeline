@@ -21,7 +21,8 @@ from urllib.parse import urljoin, urlsplit
 import requests
 import pipeline
 import drive_storage
-from job_queue import JobQueue, JobBusyError, report_progress, TERMINAL
+import analysis_report
+from job_queue import JobQueue, JobBusyError, report_progress, TERMINAL, validate_parent_writer_lease
 from media_lifecycle import StoragePolicy, MediaSigner
 from execution_control import DeadlineExceeded, ExecutionCancelled
 from mcp import types
@@ -123,7 +124,7 @@ DOH_ENDPOINTS = (
 JOB_LOCK = threading.Lock()
 RUNTIME_SHA256 = {name: hashlib.sha256((ROOT / name).read_bytes()).hexdigest()
                   for name in ("mcp_server.py", "pipeline.py", "job_worker.py", "job_queue.py", "execution_control.py",
-                               "media_retention.py", "media_lifecycle.py", "drive_storage.py", "cost_tracker.py",
+                               "media_retention.py", "media_lifecycle.py", "drive_storage.py", "cost_tracker.py", "analysis_report.py",
                                "scoring.py", "notifications.py", "web/widget.html", "requirements.txt")}
 RELEASE_SHA = os.getenv("MCP_RELEASE_SHA", "")
 if RELEASE_SHA and not re.fullmatch(r"[0-9a-f]{40}", RELEASE_SHA):
@@ -136,7 +137,10 @@ def get_queue() -> JobQueue:
     global _QUEUE
     with _QUEUE_INIT_LOCK:
         if _QUEUE is None:
-            _QUEUE = JobQueue(MCP_ROOT / ".video-state", timeout_seconds=MCP_JOB_TIMEOUT, execution_lock=JOB_LOCK)
+            _QUEUE = JobQueue(MCP_ROOT / ".video-state", timeout_seconds=MCP_JOB_TIMEOUT, execution_lock=JOB_LOCK,
+                              paired_same_job=True, writer_path=MCP_JOBS_ROOT / ".writer.lock",
+                              writer_context=lambda: pipeline.file_writer_lock(MCP_JOBS_ROOT / ".writer.lock"),
+                              idle_callback=report_queue_idle)
             atexit.register(_QUEUE.close)
     return _QUEUE
 
@@ -866,12 +870,23 @@ def prepare_video_locked(url: str, segment_seconds: int, max_segments: int | Non
     return run_job(prepare_video_sync, url, segment_seconds, max_segments)
 
 
-def run_job(operation, *args):
+def run_job(operation, *args, _parent_writer=None):
     # MCP 工具會直接呼叫 pipeline 的付費傳輸，執行前先把成本帳本綁到 MCP_ROOT。
     pipeline.bind_cost_root(MCP_ROOT)
     if not JOB_LOCK.acquire(blocking=False):
         raise JobBusyError("MCP 正在處理另一個影片工作，請稍後重試；本次未加入背景佇列。")
     try:
+        if _parent_writer is not None:
+            work, lease = _parent_writer
+            validate_parent_writer_lease(work, lease, MCP_JOBS_ROOT / ".writer.lock")
+            # The private delegation must still be backed by an active OS lock.
+            # This is an internal worker path, not an MCP argument or env bypass.
+            try:
+                with pipeline.file_writer_lock(MCP_JOBS_ROOT / ".writer.lock"):
+                    pass
+            except pipeline.WriterBusyError:
+                return operation(*args)
+            raise JobBusyError("Parent writer lease is not active; no operation started")
         # ponytail: one writer across processes; use per-job locks if throughput requires it.
         with pipeline.file_writer_lock(MCP_JOBS_ROOT / ".writer.lock"):
             # Accepted background work drains normally; only new synchronous work is refused.
@@ -1076,6 +1091,8 @@ def analyze_prepared_sync(job_id: str) -> dict[str, Any]:
         and cached.get("cache_signature") == cache_signature
     ):
         pipeline.record_cost_cache_hit("pipeline", "analysis", job=job_id, root=MCP_ROOT)
+        if result_path.is_file():
+            analysis_report.record(job_dir, cached)
         return {**cached, "quality": analysis_quality(cached)}
 
     storage_policy().mark_managed(job_id)
@@ -1162,6 +1179,7 @@ def analyze_prepared_sync(job_id: str) -> dict[str, Any]:
             language,
             2,
             analysis_dir / "transcription-cache",
+            source_path=video_path,
         )
         return transcript_result
 
@@ -1243,6 +1261,8 @@ def analyze_prepared_sync(job_id: str) -> dict[str, Any]:
     result["quality"] = analysis_quality(result)
     # Partial evidence survives disconnect/restart; only complete results bypass work.
     pipeline.write_json(result_path, result)
+    if result_path.is_file():
+        analysis_report.record(job_dir, result)
     check_job_capacity(job_id)
     return result
 
@@ -1592,6 +1612,134 @@ async def upload_prepared_video_to_drive(
     return drive_tool_result(result)
 
 
+
+
+def report_snapshot(job_id: str, analysis: dict | None, queue=None) -> dict | None:
+    """A report-only read failure must not hide saved preparation, A evidence or Drive handoff."""
+    try:
+        return _report_snapshot_checked(job_id, analysis, queue)
+    except (OSError, ValueError, TypeError, KeyError, AttributeError):
+        # Do not reset, overwrite, queue, retry, or expose corrupt/private state.
+        return {"job_id": job_id, "cache_signature": analysis.get("cache_signature") if isinstance(analysis, dict) else None,
+                "evidence_status": analysis.get("status") if isinstance(analysis, dict) else None,
+                "status": "report_invalid", "error_code": "REPORT_STATE_INVALID",
+                "error": "報告狀態無法核對；未重新提交或上傳。", "summary_status": "unknown"}
+
+def _report_snapshot_checked(job_id: str, analysis: dict | None, queue=None) -> dict | None:
+    """Read-only: never submit/retry a task or perform any Drive I/O."""
+    job_dir = prepared_job_dir(job_id)
+    report = analysis_report.read(job_dir, analysis)
+    if not report:
+        return None
+    expires = int(time.time()) + MCP_MEDIA_TTL
+    signature = media_signer().sign(job_id, report["relative_path"], expires)
+    result = {**report, "status": "summary_pending" if report["summary_status"] != "caller_submitted" else "awaiting_segments",
+              "download_url": f"{MCP_MEDIA_BASE_URL}/media/{job_id}/{report['relative_path']}?expires={expires}&sig={signature}"}
+    queue_id = report.get("operation_id")
+    if queue_id and queue is not None:
+        operation = queue.get(queue_id)
+        result["operation"] = operation
+        result["status"] = operation["status"]
+        if operation["status"] == "completed":
+            remote = operation["result"]
+            if all(remote.get(k) == report.get(k) for k in ("report_sha256", "analysis_sha256", "source_sha256", "cache_signature")):
+                result.update(remote)
+            else:
+                result["status"] = "stale_report_operation"
+    return result
+
+
+def schedule_ready_report(queue, job_id: str) -> dict | None:
+    """Caller owns the writer. Only enqueue after both paired children really stop."""
+    if not queue.report_prerequisites_stopped(job_id):
+        return None
+    job_dir = prepared_job_dir(job_id)
+    manifest = read_manifest(job_dir, strict=True)
+    if not isinstance(manifest, dict):
+        return None
+    source = prepared_media_path(job_dir, manifest)
+    if source is None:
+        return None
+    analysis = cached_analysis(job_id, manifest, source)
+    report = analysis_report.read(job_dir, analysis)
+    drive = completed_drive_state(job_dir, manifest)
+    if not report or report["summary_status"] != "caller_submitted" or not drive or not drive.get("folder_id"):
+        return None
+    if report["source_fingerprint"] != (manifest.get("source") or {}).get("fingerprint"):
+        raise ValueError("Report and prepared source differ")
+    operation = queue.submit("report", {"job_id": job_id, "report_sha256": report["report_sha256"],
+        "analysis_sha256": report["analysis_sha256"], "folder_id": drive["folder_id"]}, job_id)
+    report["operation_id"] = operation["operation_id"]
+    analysis_report.atomic_json(job_dir / "analysis-report.json", report)
+    return operation
+
+
+def report_queue_idle(queue):
+    """Queue callback performs local durable scheduling, not upload/provider work."""
+    with queue.connect() as db:
+        jobs = [row[0] for row in db.execute("SELECT DISTINCT job_id FROM jobs WHERE job_id IS NOT NULL AND operation IN ('analyze','drive')")]
+    for job_id in jobs:
+        try:
+            run_job(schedule_ready_report, queue, job_id)
+        except (JobBusyError, ValueError, OSError, RuntimeError):
+            continue  # Invalid/stale local state never authorizes a cloud write.
+
+
+def finalize_analysis_report_sync(job_id: str, cache_signature: str, analysis_sha256: str,
+                                  summary_text: str, provenance_note: str) -> dict:
+    job_dir = prepared_job_dir(job_id)
+    manifest = read_manifest(job_dir, strict=True)
+    if not isinstance(manifest, dict):
+        raise ValueError("Prepared manifest is unavailable")
+    source = prepared_media_path(job_dir, manifest)
+    if source is None:
+        raise ValueError("Prepared media expired")
+    analysis = cached_analysis(job_id, manifest, source)
+    if not analysis:
+        raise ValueError("Current server evidence is unavailable")
+    binding = analysis_report.analysis_binding(job_dir, analysis)
+    if binding["cache_signature"] != cache_signature or binding["analysis_sha256"] != analysis_sha256:
+        raise ValueError("Caller summary refers to stale analysis")
+    check_job_capacity(job_id, len(summary_text.encode("utf-8")))
+    analysis_report.record(job_dir, analysis, summary_text, provenance_note)
+    queue = get_queue()
+    schedule_ready_report(queue, job_id)
+    return report_snapshot(job_id, analysis, queue)
+
+
+@mcp.tool(name="finalize_analysis_report", title="Save explicitly caller-submitted A summary",
+          description="After composing a summary, first read get_prepared_video.report for the exact analysis_sha256/cache_signature. Submit only explicit summary text and its provenance note. The server records caller_submitted/not_independently_attested; it never independently verifies ChatGPT authorship. This writes a local immutable report and queues a separate same-folder Drive report only after both A/segment workers stop. No duplicate model call. Interrupted uploads require explicit resume_video_job, never getter/remount retry.",
+          annotations=types.ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=True, openWorldHint=True),
+          meta=ANALYSIS_META)
+async def finalize_analysis_report(job_id: str, cache_signature: str, analysis_sha256: str,
+                                   summary_text: str, provenance_note: str) -> types.CallToolResult:
+    try:
+        result = await asyncio.to_thread(run_job, finalize_analysis_report_sync, job_id, cache_signature,
+                                         analysis_sha256, summary_text, provenance_note)
+        return operation_tool_result(result)
+    except Exception as error:
+        return analysis_tool_error_result(error)
+
+
+def upload_analysis_report_sync(job_id: str, report_sha256: str, analysis_sha256: str, folder_id: str) -> dict:
+    job_dir = prepared_job_dir(job_id)
+    manifest = read_manifest(job_dir, strict=True)
+    if not isinstance(manifest, dict):
+        raise ValueError("Prepared manifest is unavailable")
+    source = prepared_media_path(job_dir, manifest)
+    if source is None:
+        raise ValueError("Prepared source expired before report upload")
+    analysis = cached_analysis(job_id, manifest, source)
+    report = analysis_report.read(job_dir, analysis)
+    drive = completed_drive_state(job_dir, manifest)
+    if (not report or not drive or report["report_sha256"] != report_sha256
+            or report["analysis_sha256"] != analysis_sha256 or drive["folder_id"] != folder_id):
+        raise ValueError("Queued report identity or folder changed")
+    segments = json.loads((job_dir / "drive-manifest.json").read_bytes())
+    state = drive_storage.upload_analysis_report(job_dir, report, segments)
+    return {**report, **state, "status": "report_ready", "merge_text": analysis_report.merge_text(state)}
+
+
 def upload_prepared_drive_sync(job_id: str) -> dict:
     report_progress("drive", 20, "上傳 Google Drive（與伺服器分析並行）")
     job_dir = prepared_job_dir(job_id)
@@ -1681,7 +1829,8 @@ async def get_prepared_video(job_id: str) -> dict[str, Any]:
         return {"prepared": tool_payload(manifest), "analysis": analysis,
                 "analysis_invalidated": bool(invalidated),
                 "drive_configured": drive_storage.configured(),
-                "drive": completed_drive_state(job_dir, manifest), **operations}
+                "drive": completed_drive_state(job_dir, manifest),
+                "report": report_snapshot(job_id, analysis, get_queue()), **operations}
     return await asyncio.to_thread(read)
 
 
@@ -1791,6 +1940,11 @@ async def media(request: Request):
     if not valid:
         return PlainTextResponse("Link expired or invalid; refresh with get_prepared_video.", status_code=403)
     path = safe_media_path(request.path_params["job_id"], relative_name)
+    if path is None and re.fullmatch(r"reports/[0-9a-f]{64}/A_server_analysis\.md", relative_name) and re.fullmatch(r"[0-9a-f]{12}", job_id):
+        job_dir = MCP_JOBS_ROOT / job_id
+        report_path = job_dir / relative_name
+        if not any(p.is_symlink() for p in (job_dir, job_dir / "reports", report_path.parent, report_path)) and report_path.is_file() and pipeline.file_sha256(report_path) == relative_name.split("/")[1]:
+            path = report_path
     if path is None:
         return PlainTextResponse("not found", status_code=404)
     media_type = mimetypes.guess_type(path.name)[0] or "application/octet-stream"

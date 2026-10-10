@@ -12,18 +12,19 @@ from unittest import mock
 import pipeline
 
 
-def _good_video_response() -> str:
+def _good_video_response(timestamps: tuple[float, ...] = (1.0,)) -> str:
     return json.dumps(
         {
             "events": [
                 {
-                    "timestamp": 1.0,
+                    "timestamp": stamp,
                     "screen_type": "開場",
                     "visible_text": ["Hello"],
                     "visual_summary": "測試畫面摘要",
                     "important_details": ["細節"],
                     "confidence": 0.9,
                 }
+                for stamp in timestamps
             ],
             "overall_summary": "整片摘要",
         },
@@ -174,7 +175,7 @@ class AnalyzeVideoMp4FallbackTests(unittest.TestCase):
             with mock.patch.object(Path, "stat", fake_stat), \
                  mock.patch.object(pipeline, "compress_video_for_minimax_upload", side_effect=fake_compress) as compress, \
                  mock.patch.object(pipeline, "minimax_upload_video_understanding", return_value="fid-c") as upload, \
-                 mock.patch.object(pipeline, "minimax_chat", return_value=_good_video_response()), \
+                 mock.patch.object(pipeline, "minimax_chat", return_value=_good_video_response((1.0, 118.5))), \
                  mock.patch.object(pipeline, "analyze_video_mp4_frames_fallback") as frames:
                 observations = pipeline.analyze_video_mp4(
                     video, "key", "MiniMax-M3", duration=120.0, work_dir=root / "work"
@@ -185,6 +186,10 @@ class AnalyzeVideoMp4FallbackTests(unittest.TestCase):
             self.assertEqual(observations[0]["analysis_method"], "minimax_video_compressed")
             self.assertEqual(observations[0]["minimax_file_id"], "fid-c")
             self.assertIn("compressed_from_bytes", observations[0])
+            self.assertTrue(all(pipeline.usable_visual_observation(item) for item in observations))
+            self.assertEqual(
+                sorted(item["timestamp"] for item in observations), [1.0, 118.5]
+            )
 
     def test_upload_size_failure_triggers_compress(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

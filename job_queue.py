@@ -21,6 +21,31 @@ class JobBusyError(RuntimeError):
     """No new operation started; retry after the deployment or writer releases."""
 
 
+def validate_parent_writer_lease(work: Path, lease: dict, writer_path: Path) -> None:
+    """Validate an internal queue delegation, never a caller-supplied MCP input."""
+    work = Path(work)
+    keys = {"owner_pid", "token", "writer_path", "operation_id", "operation", "job_id"}
+    if not isinstance(lease, dict) or set(lease) != keys:
+        raise ValueError("Invalid parent writer lease")
+    ident = lease["operation_id"]
+    token = lease["token"]
+    if (not isinstance(ident, str) or len(ident) != 32 or any(c not in "0123456789abcdef" for c in ident)
+            or work.name != ident or work.absolute() != work.resolve()
+            or not isinstance(token, str) or len(token) != 32 or any(c not in "0123456789abcdef" for c in token)
+            or lease["owner_pid"] != os.getppid() or os.getenv("VIDEO_JOB_WORKER") != "1"
+            or lease["operation"] not in {"prepare", "analyze", "drive"}
+            or lease["writer_path"] != str(Path(writer_path).resolve())):
+        raise ValueError("Invalid parent writer lease")
+    file = work.parent / "paired-writer.json"
+    if file.is_symlink():
+        raise ValueError("Invalid parent writer lease")
+    owner = json.loads(file.read_text(encoding="utf-8"))
+    entry = {key: lease[key] for key in ("operation_id", "operation", "job_id")}
+    if (owner.get("owner_pid") != lease["owner_pid"] or owner.get("token") != token
+            or owner.get("writer_path") != lease["writer_path"] or entry not in owner.get("operations", [])):
+        raise ValueError("Parent writer lease is no longer current")
+
+
 def atomic_json(path: Path, value: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     temp = path.with_suffix(f".{uuid.uuid4().hex}.tmp")
@@ -97,7 +122,8 @@ def stop_process_tree(process: subprocess.Popen) -> bool:
 
 class JobQueue:
     def __init__(self, root: Path, *, worker: Path | None = None, timeout_seconds=3600,
-                 max_queued=64, execution_lock=None, autostart=True):
+                 max_queued=64, execution_lock=None, autostart=True,
+                 paired_same_job=False, writer_context=None, writer_path: Path | None = None, idle_callback=None):
         self.root = Path(root).resolve()
         self.root.mkdir(parents=True, exist_ok=True, mode=0o700)
         if os.name != "nt": os.chmod(self.root, 0o700)
@@ -112,6 +138,16 @@ class JobQueue:
         self._thread = None
         self._lease = None
         self._cleanup_failed = False
+        self.idle_callback = idle_callback
+        self.paired_same_job = bool(paired_same_job)
+        if self.paired_same_job and (writer_context is None or writer_path is None):
+            raise ValueError("Paired work requires a parent-owned writer lock")
+        self.writer_context = writer_context
+        self.writer_path = Path(writer_path).resolve() if writer_path is not None else None
+        self._pair_context = None
+        self._pair_threads = []
+        self._pair_processes = {}
+        self._pair_process_lock = threading.Lock()
         with self.connect() as db:
             db.execute("""CREATE TABLE IF NOT EXISTS jobs (
                 id TEXT PRIMARY KEY, operation TEXT NOT NULL, inputs TEXT NOT NULL,
@@ -150,13 +186,13 @@ class JobQueue:
         self._lease = lease
         with self.connect() as db:
             # Prepare/analyze resume from their stage caches. Cloud writes need explicit retry.
-            db.execute("UPDATE jobs SET status=CASE WHEN operation='drive' THEN 'interrupted' ELSE 'queued' END, "
+            db.execute("UPDATE jobs SET status=CASE WHEN operation IN ('drive','report') THEN 'interrupted' ELSE 'queued' END, "
                        "updated=?, error='service_restarted', deadline=NULL WHERE status='running'", (time.time(),))
         self._thread = threading.Thread(target=self._loop, name="video-job-queue", daemon=True)
         self._thread.start()
 
     def submit(self, operation: str, inputs: dict, job_id: str | None = None) -> dict:
-        if operation not in {"prepare", "analyze", "drive"}: raise ValueError("Unknown operation")
+        if operation not in {"prepare", "analyze", "drive", "report"}: raise ValueError("Unknown operation")
         packed = json.dumps(inputs, sort_keys=True, separators=(",", ":"))
         key = hashlib.sha256(f"{operation}:{packed}".encode()).hexdigest()
         now = time.time()
@@ -164,8 +200,8 @@ class JobQueue:
             db.execute("BEGIN IMMEDIATE")
             if (self.root / "deployment-draining").exists():
                 raise JobBusyError("MCP 正在安全更新，請稍後重試；本次未加入背景佇列。")
-            row = db.execute("SELECT id FROM jobs WHERE input_hash=? AND status IN ('queued','running') "
-                             "ORDER BY created LIMIT 1", (key,)).fetchone()
+            selection = "1=1" if operation == "report" else "status IN ('queued','running')"
+            row = db.execute("SELECT id FROM jobs WHERE input_hash=? AND " + selection + " ORDER BY created LIMIT 1", (key,)).fetchone()
             if row:
                 operation_id = row[0]
             else:
@@ -191,7 +227,7 @@ class JobQueue:
                    "job_id": row["job_id"], "created_at": row["created"], "updated_at": row["updated"],
                    "attempts": row["attempts"]}
         if row["status"] == "completed":
-            payload.update(result_kind={"prepare": "prepared", "analyze": "analysis", "drive": "drive"}[row["operation"]],
+            payload.update(result_kind={"prepare": "prepared", "analyze": "analysis", "drive": "drive", "report": "report"}[row["operation"]],
                            result=json.loads(row["result"]))
         else:
             payload["progress"] = {"stage": row["status"], "current": 0, "total": 100,
@@ -221,7 +257,7 @@ class JobQueue:
     def stats(self):
         with self.connect() as db:
             counts = {row[0]: row[1] for row in db.execute("SELECT status,count(*) FROM jobs GROUP BY status")}
-        return {"worker_limit": 1, "scheduler_alive": bool(self._thread and self._thread.is_alive()),
+        return {"worker_limit": 2 if self.paired_same_job else 1, "scheduler_alive": bool(self._thread and self._thread.is_alive()),
                 "cleanup_failed": self._cleanup_failed, "counts": counts}
 
     def cancel(self, operation_id):
@@ -235,6 +271,11 @@ class JobQueue:
     def resume(self, operation_id):
         row = self._row(operation_id)
         if row["status"] in {"completed", "queued", "running"}: return self.get(operation_id)
+        if row["operation"] == "report":
+            with self.connect() as db:
+                db.execute("UPDATE jobs SET status='queued',updated=?,error=NULL,deadline=NULL WHERE id=? AND status IN ('failed','cancelled','expired','interrupted')", (time.time(), operation_id))
+            self._wake.set()
+            return self.get(operation_id)
         return self.submit(row["operation"], json.loads(row["inputs"]), row["job_id"])
 
     def close(self):
@@ -244,10 +285,14 @@ class JobQueue:
             raise RuntimeError("Scheduler is still stopping; ownership lock retained")
         if self._cleanup_failed and self._process and self._process.poll() is None:
             raise RuntimeError("Worker cleanup incomplete; ownership lock retained")
+        if self.paired_same_job and (self._cleanup_failed or any(thread.is_alive() for thread in self._pair_threads)):
+            raise RuntimeError("Paired worker cleanup incomplete; ownership locks retained")
         if self._lease:
             self._lease.close(); self._lease = None
 
     def _loop(self):
+        if self.paired_same_job:
+            return self._paired_loop()
         while not self._stop.is_set():
             if not self.execution_lock.acquire(blocking=False):
                 self._stop.wait(.2); continue
@@ -261,7 +306,100 @@ class JobQueue:
             finally: self.execution_lock.release()
             self._wake.wait(.2); self._wake.clear()
 
-    def _execute(self, row):
+    def report_prerequisites_stopped(self, job_id):
+        if self._cleanup_failed or any(t.is_alive() for t in self._pair_threads): return False
+        if self._process is not None and self._process.poll() is None: return False
+        with self._pair_process_lock:
+            if self._pair_processes: return False
+        with self.connect() as db:
+            return db.execute("SELECT count(*) FROM jobs WHERE job_id=? AND operation IN ('prepare','analyze','drive') AND status IN ('queued','running')", (job_id,)).fetchone()[0] == 0
+
+    def _notify_idle(self):
+        if self.idle_callback is not None and not self._stop.is_set() and not self._cleanup_failed:
+            self.idle_callback(self)
+
+    def _paired_loop(self):
+        # The oldest queued operation remains the primary FIFO entry. Only one
+        # opposite operation for that same prepared job may join its lifetime.
+        while not self._stop.is_set():
+            try:
+                with self.connect() as db:
+                    primary = db.execute("SELECT * FROM jobs WHERE status='queued' ORDER BY created LIMIT 1").fetchone()
+            except Exception:
+                self._stop.wait(.5); continue
+            if primary is None:
+                self._notify_idle()
+                self._wake.wait(.2); self._wake.clear(); continue
+            if not self.execution_lock.acquire(blocking=False):
+                self._stop.wait(.2); continue
+            if primary["operation"] == "report":
+                try: self._execute(dict(primary))
+                finally: self.execution_lock.release()
+                self._notify_idle()
+                continue
+            threads = []
+            owner = None
+            try:
+                primary = dict(primary)
+                context = self.writer_context()
+                context.__enter__()
+                self._pair_context = context
+                owner = {"owner_pid": os.getpid(), "token": uuid.uuid4().hex,
+                         "writer_path": str(self.writer_path), "operations": []}
+
+                def start(row):
+                    entry = {"operation_id": row["id"], "operation": row["operation"], "job_id": row["job_id"]}
+                    owner["operations"].append(entry)
+                    atomic_json(self.root / "paired-writer.json", owner)
+                    lease = {key: owner[key] for key in ("owner_pid", "token", "writer_path")}
+                    lease.update(entry)
+                    thread = threading.Thread(target=self._execute, args=(row, lease), daemon=True,
+                                              name="video-paired-" + row["operation"])
+                    threads.append(thread)
+                    self._pair_threads = threads
+                    thread.start()
+
+                start(primary)
+                companion_started = False
+                while any(thread.is_alive() for thread in threads):
+                    if (not self._stop.is_set() and not companion_started and primary["job_id"]
+                            and primary["operation"] in {"analyze", "drive"}
+                            and json.loads(primary["inputs"]).get("job_id") == primary["job_id"]
+                            and self._row(primary["id"])["status"] == "running"):
+                        opposite = "drive" if primary["operation"] == "analyze" else "analyze"
+                        with self.connect() as db:
+                            candidates = db.execute("SELECT * FROM jobs WHERE status='queued' AND job_id=? AND operation=? "
+                                                    "ORDER BY created", (primary["job_id"], opposite)).fetchall()
+                        mate = next((item for item in candidates if json.loads(item["inputs"]).get("job_id") == primary["job_id"]), None)
+                        if mate:
+                            companion_started = True
+                            start(dict(mate))
+                    self._wake.wait(.05); self._wake.clear()
+            except Exception:
+                # A lock collision leaves the queued entry untouched. Any
+                # uncertainty while children exist stops scheduling fail closed.
+                if any(thread.is_alive() for thread in threads):
+                    self._stop.set(); self._cleanup_failed = True
+                self._stop.wait(.5)
+            finally:
+                if self._cleanup_failed or any(thread.is_alive() for thread in threads):
+                    self._stop.set(); self._cleanup_failed = True
+                    # Retain both writer and execution locks while cleanup is unknown.
+                    return
+                if self._pair_context:
+                    try:
+                        (self.root / "paired-writer.json").unlink(missing_ok=True)
+                        self._pair_context.__exit__(None, None, None)
+                        self._pair_context = None
+                    except Exception:
+                        self._stop.set(); self._cleanup_failed = True
+                        raise
+                self._pair_threads = []
+                self.execution_lock.release()
+            self._notify_idle()
+            self._wake.wait(.2); self._wake.clear()
+
+    def _execute(self, row, parent_writer_lease=None):
         operation_id = row["id"]
         work = self.root / operation_id
         deadline = time.time() + self.timeout_seconds
@@ -275,7 +413,10 @@ class JobQueue:
         process = None
         try:
             work.mkdir(mode=0o700, exist_ok=True)
-            atomic_json(work / "input.json", {"operation": row["operation"], "inputs": json.loads(row["inputs"])})
+            task = {"operation": row["operation"], "inputs": json.loads(row["inputs"])}
+            if parent_writer_lease is not None:
+                task["parent_writer_lease"] = parent_writer_lease
+            atomic_json(work / "input.json", task)
             output.unlink(missing_ok=True)
             command = [sys.executable, str(self.worker), str(work)]
             if os.name == "nt":
@@ -302,7 +443,11 @@ class JobQueue:
             if os.name == "nt":
                 process.stdin.write(b"1")
                 process.stdin.flush()
-            self._process = process
+            if parent_writer_lease is None:
+                self._process = process
+            else:
+                with self._pair_process_lock:
+                    self._pair_processes[operation_id] = process
             while process.poll() is None:
                 status = self._row(operation_id)["status"]
                 if status == "cancelled" or self._stop.is_set() or time.time() >= deadline:
@@ -312,7 +457,7 @@ class JobQueue:
             if current == "cancelled": return
             result = None
             if self._stop.is_set():
-                status, error = ("interrupted" if row["operation"] == "drive" else "queued"), "service_stopped"
+                status, error = ("interrupted" if row["operation"] in {"drive", "report"} else "queued"), "service_stopped"
             elif time.time() >= deadline:
                 status, error = "expired", "工作已達總時間上限；可從已完成階段續跑。"
             else:
@@ -345,4 +490,8 @@ class JobQueue:
                 # remove any remaining descendants in its dedicated process group.
                 try: os.killpg(process.pid, signal.SIGKILL)
                 except ProcessLookupError: pass
-            self._process = process if self._cleanup_failed else None
+            if parent_writer_lease is None:
+                self._process = process if self._cleanup_failed else None
+            elif not self._cleanup_failed:
+                with self._pair_process_lock:
+                    self._pair_processes.pop(operation_id, None)
