@@ -117,6 +117,33 @@ async function test(name, run) { await run(); count++; console.log('ok ' + count
   await test('timestamp seeks correct local offset; unknown times and source text stay explicit', async () => {
     const h = harness({ snapshot: { prepared: job('first'), analysis: analysis('first') } }); await h.flush(); const rows = h.elements.get('evidence').children; assert.equal(rows.length, 3); await rows[1].children[0].fire('click'); h.elements.get('player').fire('loadedmetadata'); assert.equal(h.elements.get('segment').value, '1'); assert.equal(h.elements.get('player').currentTime, 5); assert.equal(h.elements.get('player').focused, true); assert.equal(rows[2].children[0].tagName, 'SPAN'); assert.match(h.elements.get('gaps').children.map(el => el.textContent).join(' '), /缺少時間碼/); assert.equal(rows[1].children[2].textContent, 'source speech <script>not code</script>');
   });
+  await test('unreliable visual timestamp is text without seek; legacy visual still seeks', async () => {
+    const result = analysis('first');
+    result.timeline[0].data.timestamp_reliable = false;
+    result.timeline.push({ timestamp: 5, type: 'visual', data: { visual_summary: 'legacy frame' } });
+    const h = harness({ snapshot: { prepared: job('first'), analysis: result } }); await h.flush();
+    const rows = h.elements.get('evidence').children;
+    assert.equal(rows[0].children[0].tagName, 'SPAN');
+    assert.match(rows[0].children[0].textContent, /時間碼不可靠/);
+    await rows[0].children[0].fire('click');
+    assert.equal(h.elements.get('player').currentTime, 0);
+    assert.equal(rows[1].children[0].tagName, 'BUTTON');
+    await rows[1].children[0].fire('click'); h.elements.get('player').fire('loadedmetadata');
+    assert.equal(h.elements.get('player').currentTime, 5);
+  });
+  await test('quality warnings appear in gaps without changing evidence status', async () => {
+    for (const review of [false, true]) {
+      const result = analysis('first');
+      result.quality.status = review ? 'needs_review' : 'evidence_available';
+      result.quality.reasons = review ? ['逐字稿補轉失敗，可能漏字。'] : [];
+      result.quality.warnings = ['1 筆畫面時間碼不可靠，未提供跳轉。', '逐字稿有空白，可能是無人說話或音樂。'];
+      const h = harness({ snapshot: { prepared: job('first'), analysis: result } }); await h.flush();
+      const gaps = h.elements.get('gaps').children.map(el => el.textContent);
+      for (const warning of result.quality.warnings) assert.ok(gaps.includes(warning));
+      for (const reason of result.quality.reasons) assert.ok(gaps.includes(reason));
+      assert.match(h.elements.get('quality').textContent, review ? /結果需要覆核/ : /已取得伺服器分析證據/);
+    }
+  });
   await test('unsafe segment URL never reaches player/link', async () => {
     const prepared = job('first'); prepared.segments[0].url = 'javascript:alert(1)'; const h = harness({ output: prepared, snapshot: { prepared, analysis: null } }); await h.flush(); assert.equal(h.elements.get('player').getAttribute('src'), null); assert.equal(h.elements.get('segment-link').hidden, true);
   });

@@ -238,6 +238,7 @@ class FileHandoffResult(BaseModel):
 class AnalysisQuality(BaseModel):
     status: Literal["evidence_available", "needs_review"]
     reasons: list[str]
+    warnings: list[str] = []
     visual_frames: int
     speech_segments: int
     limitation: str
@@ -1017,6 +1018,7 @@ def prepared_job_dir(job_id: str) -> Path:
 def analysis_quality(result: dict[str, Any]) -> dict[str, Any]:
     """Conservative evidence checks, not a semantic accuracy score."""
     reasons = []
+    warnings = []
     if result.get("status") != "complete" or result.get("errors"):
         reasons.append("分析有失敗或未完成的階段。")
     transcript = result.get("transcript") or {}
@@ -1037,20 +1039,24 @@ def analysis_quality(result: dict[str, Any]) -> dict[str, Any]:
         threshold = (f"超過 {max_gap:g} 秒的"
                      if isinstance(max_gap, (int, float)) and not isinstance(max_gap, bool)
                      and math.isfinite(max_gap) else "")
-        reason = f"逐字稿仍有{threshold}空白"
+        reason = f"逐字稿{'仍' if backfill_errors else ''}有{threshold}空白"
         ranges = ["–".join(pipeline.format_timestamp(row[key]).removeprefix("00:").removeprefix("0")
                            for key in ("start", "end")) for row in gaps[:3]]
         if ranges:
             reason += "（" + "、".join(ranges) + (f" 等 {len(gaps)} 段" if len(gaps) > 3 else "") + "）"
         if backfill_errors:
-            reason += "；補轉失敗，可能漏字"
-        reasons.append(reason + "。")
+            reasons.append(reason + "；補轉失敗，可能漏字。")
+        else:
+            warnings.append(reason + "，可能是無人說話或音樂，必要時核對原片。")
     elif backfill_errors:
         reasons.append("逐字稿補轉失敗，可能漏字。")
     frames = [row.get("data") or {} for row in result.get("timeline", []) if row.get("type") == "visual"]
     usable = [row for row in frames if str(row.get("visual_summary") or "").strip()
               and row.get("visual_summary") != "尚未執行 MiniMax 視覺理解。"
               and row.get("completion_status") != "incomplete" and not row.get("raw")]
+    unreliable = sum(row.get("timestamp_reliable") is False for row in usable)
+    if unreliable:
+        warnings.append(f"{unreliable} 筆畫面時間碼不可靠，未提供跳轉。")
     if result.get("visual_status") != "complete" or not usable or len(usable) != len(frames):
         reasons.append("缺少可用畫面觀察，或部分畫面回應不完整。")
     # ponytail: model confidence is an uncalibrated warning, not proof of correctness.
@@ -1059,6 +1065,7 @@ def analysis_quality(result: dict[str, Any]) -> dict[str, Any]:
            or not 0.5 < row["confidence"] <= 1 for row in usable):
         reasons.append("部分畫面信心不足或缺少信心資訊。")
     return {"status": "needs_review" if reasons else "evidence_available", "reasons": reasons,
+            "warnings": warnings,
             "visual_frames": len(usable), "speech_segments": len(speech),
             "limitation": "僅檢查證據完整性與模型自報信心，不保證語意正確；畫面為抽樣，非逐幀檢視。"}
 
@@ -1305,6 +1312,8 @@ def analysis_tool_result(result: dict[str, Any]) -> types.CallToolResult:
     text += f"\n證據檢查：{quality['status']}。{quality['limitation']}"
     if quality["reasons"]:
         text += "\n需覆核：" + "；".join(quality["reasons"])
+    if quality.get("warnings"):
+        text += "\n注意：" + "；".join(quality["warnings"])
     text += "\n這是伺服器分析，不是 ChatGPT 直接讀取 MP4。"
     text += ("證據不足，請停止摘要，使用 widget 的 Drive 交接入口轉一般對話讀取原片。"
              if quality["status"] == "needs_review"

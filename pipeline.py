@@ -2834,7 +2834,7 @@ def visual_mode() -> str:
     )
 
 
-def parse_video_timestamp(value: Any) -> float | None:
+def parse_video_timestamp(value: Any, *, allow_negative: bool = False) -> float | None:
     """Parse a model-reported video timestamp into original-video seconds.
 
     Issue #56: MiniMax-M3 sometimes answers with MM:SS strings (or other
@@ -2843,11 +2843,14 @@ def parse_video_timestamp(value: Any) -> float | None:
     start of the timeline. Unparseable input now returns None so the caller
     can drop the event instead of fabricating a timestamp.
     """
+    if allow_negative and isinstance(value, str) and value.strip().startswith("-"):
+        magnitude = parse_video_timestamp(value.strip()[1:])
+        return -magnitude if magnitude is not None else None
     if isinstance(value, bool):
         return None
     if isinstance(value, (int, float)):
         number = float(value)
-        return number if math.isfinite(number) and number >= 0 else None
+        return number if math.isfinite(number) and (number >= 0 or allow_negative) else None
     if not isinstance(value, str):
         return None
     text = value.strip().lower().replace("，", "").replace(",", "")
@@ -2902,11 +2905,14 @@ def _parse_video_mp4_events(parsed: dict[str, Any]) -> list[dict[str, Any]]:
     for event in events:
         if not isinstance(event, dict):
             continue
-        stamp = parse_video_timestamp(event.get("timestamp"))
+        stamp = parse_video_timestamp(event.get("timestamp"), allow_negative=True)
         if stamp is None:
             continue
         observation = {
             "timestamp": stamp,
+            "timestamp_original": event.get("timestamp"),
+            "timestamp_reliable": True,
+            "timestamp_issue": None,
             "screen_type": event.get("screen_type") or "影片片段",
             "visible_text": event.get("visible_text") if isinstance(event.get("visible_text"), list) else [],
             "visual_summary": event.get("visual_summary") or "",
@@ -2922,6 +2928,16 @@ def _parse_video_mp4_events(parsed: dict[str, Any]) -> list[dict[str, Any]]:
     return observations
 
 
+def reusable_video_artifact(observations: Any) -> bool:
+    """MP4 caches require per-event validation; sampled frames use ffmpeg time."""
+    return isinstance(observations, list) and bool(observations) and all(
+        usable_visual_observation(item)
+        and (isinstance(item.get("timestamp_reliable"), bool)
+             or item.get("analysis_method") == "minimax_video_fallback_frames")
+        for item in observations
+    )
+
+
 def _stamp_video_observations(
     observations: list[dict[str, Any]],
     *,
@@ -2931,6 +2947,12 @@ def _stamp_video_observations(
     extra: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
     for observation in observations:
+        if analysis_method in {"minimax_video", "minimax_video_compressed"}:
+            observation.setdefault("timestamp_original", None)
+            observation.setdefault("timestamp_reliable", False)
+            observation.setdefault("timestamp_issue", "整片摘要沒有可核對的時間碼"
+                                   if observation.get("screen_type") == "整片摘要"
+                                   else "畫面分析未完成，無法驗證時間碼")
         observation["analysis_method"] = analysis_method
         observation["source_video"] = str(source_video)
         if file_id is not None:
@@ -3084,6 +3106,27 @@ def _analyze_video_mp4_core(
             )
             return incomplete, parsed if isinstance(parsed, dict) else None, file_id
 
+    known_duration = duration_hint is not None and math.isfinite(duration_hint) and duration_hint > 0
+    for observation in observations:
+        stamp = observation["timestamp"]
+        if not known_duration:
+            observation["timestamp"] = max(0.0, stamp)
+            observation["timestamp_reliable"] = False
+            observation["timestamp_issue"] = "缺少影片長度，無法驗證時間碼"
+        elif stamp < 0 or stamp > duration_hint:
+            observation["timestamp"] = max(0.0, min(stamp, duration_hint))
+            if stamp < 0 or stamp > duration_hint + 1.0:
+                observation["timestamp_reliable"] = False
+                observation["timestamp_issue"] = f"原始時間碼 {observation['timestamp_original']} 超出影片範圍，已夾住"
+    # ponytail: concentration flags suspicious times; exact alignment requires source-frame review.
+    if known_duration and duration_hint >= 60 and len(observations) >= 5:
+        front = [row for row in observations if row["timestamp"] <= duration_hint * 0.1]
+        if len(front) / len(observations) >= 0.8:
+            for observation in front:
+                observation["timestamp_reliable"] = False
+                if not observation.get("timestamp_issue"):
+                    observation["timestamp_issue"] = "時間碼疑似被壓縮，需覆核原片"
+
     _stamp_video_observations(
         observations,
         analysis_method=analysis_method,
@@ -3211,9 +3254,8 @@ def analyze_video_mp4(
         cache_path = cache_dir / (hashlib.sha256(material.encode("utf-8")).hexdigest() + ".json")
         cached = reuse_artifact(cache_path)
         if isinstance(cached, dict) and isinstance(cached.get("observations"), list):
-            observations = [item for item in cached["observations"] if usable_visual_observation(item)]
-            if observations:
-                return observations
+            if reusable_video_artifact(cached["observations"]):
+                return cached["observations"]
 
     source_size = video_path.stat().st_size
     strategy = choose_video_mp4_upload_strategy(source_size)
@@ -3936,6 +3978,8 @@ def render_knowledge_markdown(
             lines.append(f"- {stamp} 語音：{event.get('text', '')}")
             continue
         data = event.get("data") or {}
+        if data.get("timestamp_reliable") is False:
+            stamp = f"`{timestamp}`（時間碼不可靠，需覆核原片）"
         screen_type = data.get("screen_type", "畫面")
         visual_summary = data.get("visual_summary", "")
         ocr_text = data.get("local_ocr_text") or "／".join(data.get("visible_text") or [])
@@ -8295,9 +8339,7 @@ def run_pipeline(args: argparse.Namespace) -> Path:
                         == artifact_path(video_path, root)
                         else None
                     )
-                    if isinstance(cached, list) and cached and all(
-                        usable_visual_observation(item) for item in cached
-                    ):
+                    if reusable_video_artifact(cached):
                         print("· 重用既有整支影片視覺觀察")
                         return cached
                     print("· MiniMax 直接讀取 mp4（CLI）")
