@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import csv
 import hashlib
 import ipaddress
@@ -1093,12 +1094,29 @@ def analysis_cache_signature(video_path: Path, manifest: dict) -> str:
     return hashlib.sha256(json.dumps(configuration, sort_keys=True).encode()).hexdigest()
 
 
+def refreshed_analysis(result: dict[str, Any]) -> dict[str, Any]:
+    """Read-time safety only: preserve stored evidence and never trigger paid work."""
+    result = copy.deepcopy(result)
+    for row in result.get("timeline", []):
+        if row.get("type") != "visual":
+            continue
+        issue = pipeline.saved_visual_timestamp_issue(row, result.get("duration_seconds"))
+        if issue:
+            data = row["data"] = row.get("data") or {}
+            data.setdefault("timestamp_original", row.get("timestamp"))
+            data.update(timestamp=None, timestamp_reliable=False, timestamp_issue=issue)
+            # Unknown positions must not become fabricated start/end seek targets.
+            row["timestamp"] = None
+    result["quality"] = analysis_quality(result)
+    return result
+
+
 def cached_analysis(job_id: str, manifest: dict, video_path: Path | None = None) -> dict | None:
     job_dir = prepared_job_dir(job_id)
     video_path = video_path or pipeline.locate_source_video(job_dir)
     cached = pipeline.reuse_artifact(job_dir / "analysis" / "result.json")
     if isinstance(cached, dict) and cached.get("cache_signature") == analysis_cache_signature(video_path, manifest):
-        return {**cached, "quality": analysis_quality(cached)}
+        return refreshed_analysis(cached)
     return None
 
 
@@ -1122,7 +1140,7 @@ def analyze_prepared_sync(job_id: str) -> dict[str, Any]:
         pipeline.record_cost_cache_hit("pipeline", "analysis", job=job_id, root=MCP_ROOT)
         if result_path.is_file():
             analysis_report.record(job_dir, cached)
-        return {**cached, "quality": analysis_quality(cached)}
+        return refreshed_analysis(cached)
 
     storage_policy().mark_managed(job_id)
     check_job_capacity(job_id, video_path.stat().st_size)
@@ -1297,6 +1315,7 @@ def analyze_prepared_sync(job_id: str) -> dict[str, Any]:
 
 
 def analysis_tool_result(result: dict[str, Any]) -> types.CallToolResult:
+    result = refreshed_analysis(result)
     status = str(result.get("status") or "error")
     summary = result.get("summary") or {}
     headline = str(summary.get("short_summary") or "分析證據已回傳；最終摘要待 ChatGPT 整理。")
@@ -1308,12 +1327,13 @@ def analysis_tool_result(result: dict[str, Any]) -> types.CallToolResult:
     )
     if result.get("errors"):
         text += "\n" + "；".join(str(item) for item in result["errors"])
-    quality = result.get("quality") or analysis_quality(result)
+    quality = result["quality"]
     text += f"\n證據檢查：{quality['status']}。{quality['limitation']}"
     if quality["reasons"]:
         text += "\n需覆核：" + "；".join(quality["reasons"])
     if quality.get("warnings"):
         text += "\n注意：" + "；".join(quality["warnings"])
+        text += "不可靠的時間碼不可作為精確時間軸，也不可自行推算或比例縮放。"
     text += "\n這是伺服器分析，不是 ChatGPT 直接讀取 MP4。"
     text += ("證據不足，請停止摘要，使用 widget 的 Drive 交接入口轉一般對話讀取原片。"
              if quality["status"] == "needs_review"
@@ -1835,6 +1855,8 @@ def refreshed_operation(operation_id: str) -> dict:
         if prepared_media_path(job_dir, manifest) is None:
             return {**payload, "status": "expired", "error_code": "MEDIA_EXPIRED", "error": "影片已過保留期限，請重新準備。", "result": None}
         payload["result"] = tool_payload(manifest)
+    elif payload.get("status") == "completed" and payload.get("result_kind") == "analysis":
+        payload = {**payload, "result": refreshed_analysis(payload["result"])}
     return payload
 
 
@@ -1889,6 +1911,8 @@ async def get_prepared_video(job_id: str) -> dict[str, Any]:
         invalidated = latest.get("status") == "completed" and latest.get("result_kind") == "analysis" and analysis is None
         if invalidated:
             operations["latest_operation"] = None
+        elif latest.get("status") == "completed" and latest.get("result_kind") == "analysis":
+            operations["latest_operation"] = {**latest, "result": refreshed_analysis(latest["result"])}
         return {"prepared": tool_payload(manifest), "analysis": analysis,
                 "analysis_invalidated": bool(invalidated),
                 "drive_configured": drive_storage.configured(),
@@ -2010,7 +2034,7 @@ async def media(request: Request):
             path = report_path
     if path is None:
         return PlainTextResponse("not found", status_code=404)
-    media_type = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
+    media_type = "text/markdown" if path.suffix.lower() == ".md" else mimetypes.guess_type(path.name)[0] or "application/octet-stream"
     response = FileResponse(path, media_type=media_type)
     response.headers["Access-Control-Allow-Origin"] = "*"
     response.headers["Cross-Origin-Resource-Policy"] = "cross-origin"

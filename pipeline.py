@@ -2878,6 +2878,25 @@ def parse_video_timestamp(value: Any, *, allow_negative: bool = False) -> float 
     return None
 
 
+def saved_visual_timestamp_issue(event: dict[str, Any], duration: Any) -> str | None:
+    """Recheck saved evidence at read/retention boundaries without provider work."""
+    data = event.get("data") or {}
+    if data.get("timestamp_reliable") is False:
+        return str(data.get("timestamp_issue") or "畫面時間碼未通過驗證，需覆核原片")
+    stamp = parse_video_timestamp(event.get("timestamp"), allow_negative=True)
+    if stamp is None:
+        return "缺少或無效的畫面時間碼，需覆核原片"
+    seconds = parse_video_timestamp(duration)
+    if stamp < 0 or (seconds is not None and seconds > 0 and stamp > seconds):
+        return "原始時間碼超出影片範圍，需覆核原片"
+    if data.get("analysis_method") in {"minimax_video", "minimax_video_compressed"}:
+        if not seconds:
+            return "缺少影片長度，無法驗證時間碼"
+        if data.get("timestamp_reliable") is not True:
+            return "舊影片分析未記錄時間碼驗證，需覆核原片"
+    return None
+
+
 def video_timestamps_cover_duration(observations: list[dict[str, Any]], duration: float | None) -> bool:
     """Check that visual evidence actually spans the video (issue #56).
 

@@ -42,7 +42,10 @@ def eligible_media(job: Path, cutoff: float) -> tuple[list[Path], str]:
         result = json.loads(result_path.read_text(encoding="utf-8"))
         if (manifest["status"] != "ready" or manifest["job_id"] != job.name
                 or result["status"] != "complete" or result["job_id"] != job.name
-                or result.get("errors") or result["quality"]["status"] != "evidence_available"):
+                or result.get("errors") or result["quality"]["status"] != "evidence_available"
+                or result["quality"].get("warnings")
+                or any(pipeline.saved_visual_timestamp_issue(row, result.get("duration_seconds"))
+                       for row in result.get("timeline", []) if row.get("type") == "visual")):
             return [], "not_complete_or_needs_review"
         source = pipeline.locate_source_video(job)
         if not source.is_file() or result["source_fingerprint"] != manifest["source"]["fingerprint"]:
