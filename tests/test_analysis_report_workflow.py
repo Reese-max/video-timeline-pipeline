@@ -88,6 +88,158 @@ class AnalysisReportTests(unittest.TestCase):
         text=paths[0].read_text(encoding='utf-8');self.assertIn('owned visual',text);self.assertIn('owned speech',text);self.assertIn('pending_chatgpt',text)
         self.assertIn(result['source_sha256'],text);self.assertIn('Transcript',text);self.assertIn('not proof',text)
 
+    def idle_queue(self, name='idle-queue'):
+        queue = JobQueue(self.root/name, autostart=False)
+        self.addCleanup(queue.close)
+        queue.submit('analyze', {'job_id':self.job_id}, self.job_id)
+        with queue.connect() as db:
+            db.execute("UPDATE jobs SET status='completed'")
+        return queue
+
+    def test_idle_without_pending_caller_report_does_no_hash_or_validation(self):
+        self.analyze()
+        queue = self.idle_queue()
+        pointer = self.job/'analysis-report.json'
+        pending = json.loads(pointer.read_bytes())
+        for state in (None, pending, {**pending, 'summary_status':'caller_submitted', 'operation_id':'a'*32}):
+            with self.subTest(state=state):
+                if state is None:
+                    pointer.unlink()
+                else:
+                    atomic_json(pointer, state)
+                with patch.object(server, 'cached_analysis', wraps=server.cached_analysis) as cached, \
+                     patch.object(server.pipeline, 'file_sha256', wraps=server.pipeline.file_sha256) as hashed, \
+                     patch.object(server, 'run_job', wraps=server.run_job) as locked:
+                    for _ in range(3): server.report_queue_idle(queue)
+                cached.assert_not_called(); hashed.assert_not_called(); locked.assert_not_called()
+
+    def test_idle_caller_report_schedules_once_without_revalidating(self):
+        _, _, report, drive = self.ready()
+        atomic_json(self.job/'drive-manifest.json', drive)
+        queue = self.idle_queue()
+        with patch.object(server, 'cached_analysis', wraps=server.cached_analysis) as cached:
+            for _ in range(3): server.report_queue_idle(queue)
+        self.assertEqual(cached.call_count, 1)
+        saved = json.loads((self.job/'analysis-report.json').read_bytes())
+        operation = queue.get(saved['operation_id'])
+        self.assertEqual((operation['operation'], operation['status']), ('report', 'queued'))
+        self.assertEqual(queue._row(operation['operation_id'])['inputs'], json.dumps({
+            'job_id':self.job_id, 'report_sha256':report['report_sha256'],
+            'analysis_sha256':report['analysis_sha256'], 'folder_id':drive['folder_id']},
+            sort_keys=True, separators=(',', ':')))
+
+    def test_idle_failed_candidate_retries_only_after_pointer_changes(self):
+        self.ready()
+        pointer = self.job/'analysis-report.json'
+        for outcome in (None, ValueError('stale'), KeyError('broken'), TypeError('broken')):
+            with self.subTest(outcome=outcome):
+                queue = self.idle_queue('idle-'+str(type(outcome).__name__))
+                kwargs = {'return_value':None} if outcome is None else {'side_effect':outcome}
+                with patch.object(server, 'cached_analysis', **kwargs) as cached, \
+                     patch('logging.Logger.exception'):
+                    queue.idle_callback = server.report_queue_idle
+                    for _ in range(3): queue._notify_idle()
+                    self.assertEqual(cached.call_count, 1)
+                    state = json.loads(pointer.read_bytes())
+                    atomic_json(pointer, {**state, 'fixture_revision':'changed'})
+                    queue._notify_idle()
+                    self.assertEqual(cached.call_count, 2)
+                    queue._notify_idle()
+                    self.assertEqual(cached.call_count, 2)
+
+    def test_idle_failed_drive_candidate_schedules_after_drive_completes(self):
+        _, _, _, drive = self.ready()
+        pointer = self.job/'analysis-report.json'
+        before = pointer.read_bytes(), pointer.stat().st_mtime_ns
+        atomic_json(self.job/'drive-manifest.json', {**drive, 'status':'interrupted'})
+        queue = self.idle_queue()
+        operation = queue.submit('drive', {'job_id':self.job_id}, self.job_id)
+        with queue.connect() as db:
+            db.execute("UPDATE jobs SET status='interrupted' WHERE id=?", (operation['operation_id'],))
+        with patch.object(server, 'cached_analysis', wraps=server.cached_analysis) as cached:
+            for _ in range(3): server.report_queue_idle(queue)
+            self.assertEqual(cached.call_count, 1)
+            self.assertNotIn('operation_id', json.loads(pointer.read_bytes()))
+            atomic_json(self.job/'drive-manifest.json', drive)
+            with queue.connect() as db:
+                db.execute("UPDATE jobs SET status='completed',updated=updated+1 WHERE id=?", (operation['operation_id'],))
+            self.assertEqual((pointer.read_bytes(), pointer.stat().st_mtime_ns), before)
+            server.report_queue_idle(queue)
+            self.assertEqual(cached.call_count, 2)
+            server.report_queue_idle(queue)
+            self.assertEqual(cached.call_count, 2)
+        saved = json.loads(pointer.read_bytes())
+        scheduled = queue.get(saved['operation_id'])
+        self.assertEqual((scheduled['operation'], scheduled['status']), ('report', 'queued'))
+
+    def test_idle_failure_signature_tracks_each_external_state(self):
+        self.ready()
+        for change in ('updated', 'count', 'drive-manifest.json', 'manifest.json'):
+            with self.subTest(change=change):
+                queue = self.idle_queue('idle-state-'+change)
+                with patch.object(server, 'schedule_ready_report', return_value=None) as schedule:
+                    for _ in range(3): server.report_queue_idle(queue)
+                    self.assertEqual(schedule.call_count, 1)
+                    if change == 'updated':
+                        with queue.connect() as db:
+                            db.execute("UPDATE jobs SET updated=updated+1 WHERE job_id=?", (self.job_id,))
+                    elif change == 'count':
+                        with queue.connect() as db:
+                            updated = db.execute("SELECT max(updated) FROM jobs").fetchone()[0]
+                        operation = queue.submit('prepare', {'job_id':self.job_id}, self.job_id)
+                        with queue.connect() as db:
+                            db.execute("UPDATE jobs SET status='completed',updated=? WHERE id=?", (updated, operation['operation_id']))
+                    else:
+                        path = self.job/change
+                        atomic_json(path, {'fixture_revision':'changed'})
+                    server.report_queue_idle(queue)
+                    self.assertEqual(schedule.call_count, 2)
+                    server.report_queue_idle(queue)
+                    self.assertEqual(schedule.call_count, 2)
+                    if change.endswith('.json'):
+                        path.unlink()
+                        server.report_queue_idle(queue)
+                        self.assertEqual(schedule.call_count, 3)
+                        server.report_queue_idle(queue)
+                        self.assertEqual(schedule.call_count, 3)
+
+    def test_idle_busy_writer_is_retried_without_caching_a_validation_failure(self):
+        _, _, _, drive = self.ready()
+        atomic_json(self.job/'drive-manifest.json', drive)
+        queue = self.idle_queue()
+        with patch.object(server, 'cached_analysis', wraps=server.cached_analysis) as cached:
+            server.JOB_LOCK.acquire()
+            try: server.report_queue_idle(queue)
+            finally: server.JOB_LOCK.release()
+            cached.assert_not_called()
+            server.report_queue_idle(queue)
+        self.assertEqual(cached.call_count, 1)
+        self.assertIn('operation_id', json.loads((self.job/'analysis-report.json').read_bytes()))
+
+    def test_idle_waits_for_prerequisites_before_validation(self):
+        _, _, _, drive = self.ready()
+        atomic_json(self.job/'drive-manifest.json', drive)
+        queue = self.idle_queue()
+        with queue.connect() as db: db.execute("UPDATE jobs SET status='running'")
+        with patch.object(server, 'cached_analysis', wraps=server.cached_analysis) as cached:
+            server.report_queue_idle(queue)
+            cached.assert_not_called()
+            with queue.connect() as db: db.execute("UPDATE jobs SET status='completed'")
+            server.report_queue_idle(queue)
+        self.assertEqual(cached.call_count, 1)
+        self.assertIn('operation_id', json.loads((self.job/'analysis-report.json').read_bytes()))
+
+    def test_idle_candidate_keeps_report_integrity_validation(self):
+        _, _, report, drive = self.ready()
+        atomic_json(self.job/'drive-manifest.json', drive)
+        (self.job/report['relative_path']).write_bytes(b'changed')
+        queue = self.idle_queue()
+        with patch.object(server, 'cached_analysis', wraps=server.cached_analysis) as cached, \
+             patch.object(queue, 'submit', side_effect=AssertionError('Invalid report must not queue')) as submit:
+            for _ in range(3): server.report_queue_idle(queue)
+        self.assertEqual(cached.call_count, 1)
+        submit.assert_not_called()
+
     def test_caller_text_exact_provenance_immutable_bytes_and_stale_summary_rejected(self):
         result,module,report,_=self.ready();path=self.job/report['relative_path'];before=path.read_bytes()
         self.assertIn(b'caller_submitted',before);self.assertIn(b'not_independently_attested',before)

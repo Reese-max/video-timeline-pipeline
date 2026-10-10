@@ -4,6 +4,7 @@ import json
 import os
 from pathlib import Path
 import tempfile
+import threading
 import time
 import unittest
 from unittest.mock import patch
@@ -183,6 +184,26 @@ class PairedQueueExecutionTests(unittest.TestCase):
         queue.start()
         self.assertEqual(self.await_state(queue, job["operation_id"])["status"], "failed")
         self.assertFalse(marker.exists(), "A forged internal lease must never reach the operation body")
+
+    def test_idle_callback_keyerror_keeps_scheduler_alive_and_executes_later_work(self):
+        queue = self.queue()
+        notified = threading.Event()
+        def idle(unused):
+            notified.set()
+            raise KeyError('owned idle failure')
+        queue.idle_callback = idle
+        with self.assertLogs('job_queue', level='ERROR') as logs:
+            queue.start()
+            self.assertTrue(notified.wait(5))
+            until = time.monotonic() + 5
+            while time.monotonic() < until and not logs.output: time.sleep(.02)
+            self.assertTrue(queue._thread.is_alive())
+            operation, marker, _ = self.submit(queue, 'analyze', 'after-idle-error')
+            self.await_marker(marker)
+            self.assertEqual(self.await_state(queue, operation['operation_id'])['status'], 'completed')
+            self.assertTrue(queue._thread.is_alive())
+            queue.close()
+        self.assertTrue(any('KeyError' in entry for entry in logs.output))
 
 if __name__ == "__main__":
     unittest.main()
