@@ -105,7 +105,13 @@ async function test(name, run) { await run(); count++; console.log('ok ' + count
     await h.flush(); await h.poll(); await h.click('cancel'); release(); await h.flush(); assert.equal(h.elements.get('findings').hidden, true); assert.match(h.elements.get('status').textContent, /已取消/);
   });
   for (const back of [false, true]) await test('old result ignored after switch' + (back ? ' A-B-A' : ''), async () => {
-    let release; const h = harness({ respond(name, args) { if (name === 'get_prepared_video') return { prepared: job(args.job_id), analysis: null }; if (name === 'analyze_prepared_video') return new Promise(resolve => { release = () => resolve(completed(analysis('first'))); }); throw new Error('Unexpected ' + name); } });
+    let release, analyzeCalls = 0;
+    const h = harness({ respond(name, args) {
+      if (name === 'get_prepared_video') return { prepared: job(args.job_id), analysis: null };
+      if (name === 'analyze_prepared_video') { analyzeCalls++; if (analyzeCalls === 1) return new Promise(resolve => { release = () => resolve(completed(analysis('first'))); }); return pending('analyze-auto-' + analyzeCalls, 'analyze'); }
+      if (name === 'upload_prepared_video_to_drive') return completed(drive(args.job_id), 'drive', 'drive-auto-' + args.job_id);
+      throw new Error('Unexpected ' + name);
+    } });
     await h.flush(); const running = h.click('analyze'); await h.flush(); h.notifyTool(job('second')); await h.flush(); if (back) { h.notifyTool(job('first')); await h.flush(); } release(); await running; assert.equal(h.elements.get('findings').hidden, true); assert.equal(h.prompts.length, 0); assert.equal(h.openai.widgetState.privateContent.jobId, back ? 'first' : 'second');
   });
   await test('timestamp seeks correct local offset; unknown times and source text stay explicit', async () => {
@@ -130,12 +136,16 @@ async function test(name, run) { await run(); count++; console.log('ok ' + count
     const h = harness({ snapshot: { prepared: job('first'), analysis: null, latest_operation: { ...pending(), status: 'expired', error_code: 'MEDIA_EXPIRED', error: 'fixture retention expiry' } } }); await h.flush(); assert.equal(h.elements.get('resume').hidden, true); assert.match(h.elements.get('status').textContent, /保留期限/); assert.equal(h.calls.length, 1);
   });
   for (const reprepare of [false, true]) await test('expiry clears existing evidence and Drive before same-job reprepare=' + reprepare, async () => {
-    let expired = false;
+    let expired = false, mounted = false;
     const h = harness({ respond(name) {
-      if (name === 'get_prepared_video') return expired
-        ? { status: 'expired', error_code: 'MEDIA_EXPIRED', job_id: 'first', prepared: null, analysis: null, active_operation: reprepare ? pending('re-after-expiry', 'prepare') : null }
-        : { prepared: job('first'), analysis: analysis('first'), drive: drive('first'), active_operation: null, latest_operation: null };
-      if (name === 'get_video_job') return completed(job('first'), 'prepared', 're-after-expiry');
+      if (name === 'get_prepared_video') {
+        if (!mounted) { mounted = true; return { prepared: job('first'), analysis: analysis('first'), drive: drive('first'), active_operation: null, latest_operation: null }; }
+        if (expired) return { status: 'expired', error_code: 'MEDIA_EXPIRED', job_id: 'first', prepared: null, analysis: null, active_operation: reprepare ? pending('re-after-expiry', 'prepare') : null };
+        return { prepared: job('first'), analysis: null, drive: null, drive_configured: true, active_operation: null, latest_operation: null };
+      }
+      if (name === 'get_video_job') { expired = false; return completed(job('first'), 'prepared', 're-after-expiry'); }
+      if (name === 'upload_prepared_video_to_drive') return pending('drive-re', 'drive');
+      if (name === 'analyze_prepared_video') return pending('analyze-re', 'analyze');
       throw new Error('Unexpected ' + name);
     } });
     await h.flush();
@@ -151,10 +161,13 @@ async function test(name, run) { await run(); count++; console.log('ok ' + count
     assert.equal(h.elements.get('player').getAttribute('src'), null);
     assert.equal(h.openai.widgetState.privateContent.jobId, 'first');
     if (reprepare) {
-      await h.poll();
+      await h.poll(); await h.flush();
       assert.equal(h.elements.get('findings').hidden, true);
       assert.equal(h.elements.get('ask').disabled, true);
-      assert.equal(h.elements.get('analyze').disabled, false);
+      // re-prepare 完成會自動重新並行 A＋B，不需手動按鈕。
+      assert.deepEqual(h.calls.map(c => c.name).slice(-2), ['upload_prepared_video_to_drive', 'analyze_prepared_video']);
+      assert.equal(h.elements.get('analyze').disabled, true);
+      assert.equal(h.elements.get('drive').disabled, true);
     }
     assert.equal(h.prompts.length, 0);
   });
@@ -178,23 +191,52 @@ async function test(name, run) { await run(); count++; console.log('ok ' + count
     assert.equal(h.elements.get('analyze').disabled, true);
   });
   await test('expired snapshot follows a live re-prepare operation', async () => {
+    let expired = true;
     const h = harness({ respond(name) {
-      if (name === 'get_prepared_video') return { status: 'expired', error_code: 'MEDIA_EXPIRED', error: 'fixture retention expiry', prepared: null, analysis: null, active_operation: pending('re-1', 'prepare'), latest_operation: null };
+      if (name === 'get_prepared_video') {
+        if (expired) { expired = false; return { status: 'expired', error_code: 'MEDIA_EXPIRED', error: 'fixture retention expiry', prepared: null, analysis: null, active_operation: pending('re-1', 'prepare'), latest_operation: null }; }
+        return { prepared: job('first'), analysis: null, drive_configured: true };
+      }
       if (name === 'get_video_job') return completed(job('first'), 'prepared', 're-1');
+      if (name === 'upload_prepared_video_to_drive') return completed(drive('first'), 'drive', 'drive-1');
+      if (name === 'analyze_prepared_video') return pending('analyze-1', 'analyze');
       throw new Error('Unexpected ' + name);
     } });
     await h.flush();
-    await h.poll();
-    assert.deepEqual(h.calls.map(c => c.name), ['get_prepared_video', 'get_video_job']);
+    await h.poll(); await h.flush();
+    assert.deepEqual(h.calls.map(c => c.name), ['get_prepared_video', 'get_video_job', 'get_prepared_video', 'upload_prepared_video_to_drive', 'analyze_prepared_video']);
     assert.equal(h.elements.get('title').textContent, '影片 first');
-    assert.equal(h.elements.get('analyze').disabled, false);
+    assert.equal(h.elements.get('drive-handoff').hidden, false);
+    assert.equal(h.elements.get('findings').hidden, true);
   });
-  await test('pending preparation restores without job ID', async () => {
-    const h = harness({ output: { ...pending('prepare-1', 'prepare'), job_id: undefined }, respond(name) { assert.equal(name, 'get_video_job'); return completed(job('first'), 'prepared', 'prepare-1'); } }); await h.flush(); await h.poll(); assert.equal(h.elements.get('title').textContent, '影片 first'); assert.equal(h.calls.length, 1); assert.equal(h.elements.get('analyze').disabled, false);
+  await test('live prepare completion auto-starts drive then analysis without clicks', async () => {
+    const h = harness({ output: { ...pending('prepare-1', 'prepare'), job_id: undefined }, respond(name) {
+      if (name === 'get_video_job') return completed(job('first'), 'prepared', 'prepare-1');
+      if (name === 'get_prepared_video') return { prepared: job('first'), analysis: null, drive_configured: true };
+      if (name === 'upload_prepared_video_to_drive') return pending('drive-1', 'drive');
+      if (name === 'analyze_prepared_video') return pending('analyze-1', 'analyze');
+      throw new Error('Unexpected ' + name);
+    } });
+    await h.flush(); await h.poll(); await h.flush();
+    assert.equal(h.elements.get('title').textContent, '影片 first');
+    assert.deepEqual(h.calls.map(c => c.name), ['get_video_job', 'get_prepared_video', 'upload_prepared_video_to_drive', 'analyze_prepared_video']);
+    assert.equal(h.elements.get('analyze').disabled, true);
+    assert.equal(h.elements.get('drive').disabled, true);
+    assert.equal(h.prompts.length, 0);
   });
-  await test('saved operation-only restore completes preparation without stuck restoring flag', async () => {
-    const h = harness({ output: null, saved: { privateContent: { operationId: 'prepare-old' } }, respond(name) { assert.equal(name, 'get_video_job'); return completed(job('first'), 'prepared', 'prepare-old'); } });
-    await h.flush(); assert.equal(h.elements.get('analyze').disabled, false); assert.equal(h.elements.get('drive').disabled, false); assert.equal(h.elements.get('refresh').disabled, false); assert.equal(h.calls.length, 1);
+  await test('saved operation-only restore completes preparation and auto-starts parallel work', async () => {
+    const h = harness({ output: null, saved: { privateContent: { operationId: 'prepare-old' } }, respond(name, args) {
+      if (name === 'get_video_job' && args.operation_id === 'prepare-old') return completed(job('first'), 'prepared', 'prepare-old');
+      if (name === 'get_prepared_video') return { prepared: job('first'), analysis: null, drive_configured: true };
+      if (name === 'upload_prepared_video_to_drive') return pending('drive-1', 'drive');
+      if (name === 'analyze_prepared_video') return pending('analyze-1', 'analyze');
+      throw new Error('Unexpected ' + name + ' ' + JSON.stringify(args));
+    } });
+    await h.flush(); await h.flush();
+    assert.equal(h.elements.get('title').textContent, '影片 first');
+    assert.deepEqual(h.calls.map(c => c.name), ['get_video_job', 'get_prepared_video', 'upload_prepared_video_to_drive', 'analyze_prepared_video']);
+    assert.equal(h.elements.get('refresh').disabled, false);
+    assert.equal(h.prompts.length, 0);
   });
   await test('authoritative invalidation cannot resurrect cached operation result', async () => {
     const h = harness({ saved: { privateContent: { jobId: 'first', operationId: 'obsolete-analysis', followUps: { ['first:' + 'a'.repeat(64)]: 'sent' } } }, snapshot: { prepared: job('first'), analysis: null, analysis_invalidated: true, active_operation: null, latest_operation: null } });
@@ -204,13 +246,23 @@ async function test(name, run) { await run(); count++; console.log('ok ' + count
   await test('late prepare A response cannot replace newer prepare B', async () => {
     let release;
     const h = harness({ output: { ...pending('prepare-A', 'prepare'), job_id: undefined }, respond(name, args) {
-      assert.equal(name, 'get_video_job');
-      if (args.operation_id === 'prepare-A') return new Promise(resolve => { release = () => resolve(completed(job('old'), 'prepared', 'prepare-A')); });
-      return completed(job('new'), 'prepared', 'prepare-B');
+      if (name === 'get_video_job') {
+        if (args.operation_id === 'prepare-A') return new Promise(resolve => { release = () => resolve(completed(job('old'), 'prepared', 'prepare-A')); });
+        if (args.operation_id === 'prepare-B') return completed(job('new'), 'prepared', 'prepare-B');
+        throw new Error('Unexpected get_video_job ' + args.operation_id);
+      }
+      if (name === 'get_prepared_video') return { prepared: job('new'), analysis: null, drive_configured: true };
+      if (name === 'upload_prepared_video_to_drive') return completed(drive('new'), 'drive', 'drive-new');
+      if (name === 'analyze_prepared_video') return pending('analyze-1', 'analyze');
+      throw new Error('Unexpected ' + name);
     } });
     await h.flush(); await h.poll(); h.notifyTool({ ...pending('prepare-B', 'prepare'), job_id: undefined }); await h.flush();
-    release(); await h.flush(); assert.equal(h.openai.widgetState.privateContent.operationId, 'prepare-B'); assert.notEqual(h.elements.get('title').textContent, '影片 old');
-    await h.poll(); assert.equal(h.elements.get('title').textContent, '影片 new'); assert.equal(h.elements.get('analyze').disabled, false);
+    release(); await h.flush(); assert.notEqual(h.elements.get('title').textContent, '影片 old');
+    await h.poll(); await h.flush();
+    assert.equal(h.elements.get('title').textContent, '影片 new');
+    assert.equal(h.elements.get('drive-handoff').hidden, false);
+    assert.equal(h.elements.get('findings').hidden, true);
+    assert.equal(h.prompts.length, 0);
   });
   await test('refresh after completion renews prepared media and invalidates old evidence', async () => {
     let refresh = false;
@@ -231,6 +283,119 @@ async function test(name, run) { await run(); count++; console.log('ok ' + count
   });
   await test('legacy immediate result supported', async () => {
     const h = harness({ respond(name, args) { return name === 'get_prepared_video' ? { prepared: job(args.job_id), analysis: null } : analysis(args.job_id); } }); await h.flush(); await h.click('analyze'); assert.equal(h.elements.get('findings').hidden, false); assert.equal(h.prompts.length, 0);
+  });
+  await test('drive handoff appears while analysis still runs, with copy and new-chat actions', async () => {
+    let driveDone = false, copied = null, opened = null;
+    const h = harness({ output: { ...pending('prepare-1', 'prepare'), job_id: undefined }, respond(name, args) {
+      if (name === 'get_video_job') {
+        if (args.operation_id === 'prepare-1') return completed(job('first'), 'prepared', 'prepare-1');
+        if (args.operation_id === 'drive-1') {
+          if (!driveDone) return pending('drive-1', 'drive', 'running');
+          return completed(drive('first'), 'drive', 'drive-1');
+        }
+        if (args.operation_id === 'analyze-1') return pending('analyze-1', 'analyze', 'running');
+        throw new Error('Unexpected get_video_job ' + args.operation_id);
+      }
+      if (name === 'get_prepared_video') return { prepared: job('first'), analysis: null, drive_configured: true };
+      if (name === 'upload_prepared_video_to_drive') return pending('drive-1', 'drive');
+      if (name === 'analyze_prepared_video') return pending('analyze-1', 'analyze');
+      throw new Error('Unexpected ' + name);
+    } });
+    await h.flush(); await h.poll(); await h.flush();
+    assert.deepEqual(h.calls.map(c => c.name), ['get_video_job', 'get_prepared_video', 'upload_prepared_video_to_drive', 'analyze_prepared_video']);
+    assert.equal(h.elements.get('drive-handoff').hidden, true);
+    assert.equal(h.elements.get('copy-handoff').disabled, true);
+    driveDone = true;
+    await h.poll(); await h.flush();
+    assert.equal(h.elements.get('drive-handoff').hidden, false);
+    assert.equal(h.elements.get('findings').hidden, true);
+    const text = h.elements.get('drive-prompt').value;
+    for (const required of ['first-file-0', 'first-file-1', '8 bytes', 'segment_000.mp4: 0–30 秒', 'download_raw_file=true', 'SHA-256', '一句話重點', '分段表', '限制說明', '合併', '不要讀取']) assert(text.includes(required), 'missing: ' + required);
+    for (const leaked of ['source speech', 'source frame', 'visual_summary', 'transcript']) assert(!text.includes(leaked), 'leaks A result: ' + leaked);
+    assert.equal(h.elements.get('copy-handoff').disabled, false);
+    assert.equal(h.elements.get('open-chat').disabled, false);
+    h.context.navigator = { clipboard: { writeText(value) { copied = value; return Promise.resolve(); } } };
+    await h.click('copy-handoff'); assert.equal(copied, text);
+    h.context.window.open = url => { opened = url; return {}; };
+    await h.click('open-chat'); assert.equal(opened, 'https://chatgpt.com/');
+    assert.equal(h.elements.get('findings').hidden, true);
+    assert.equal(h.elements.get('drive').disabled, true);
+    assert.equal(h.elements.get('analyze').disabled, true);
+  });
+  await test('drive auto-start failure does not block analysis', async () => {
+    const h = harness({ output: { ...pending('prepare-1', 'prepare'), job_id: undefined }, respond(name, args) {
+      if (name === 'get_video_job') {
+        if (args.operation_id === 'prepare-1') return completed(job('first'), 'prepared', 'prepare-1');
+        if (args.operation_id === 'analyze-1') return completed(analysis('first'), 'analysis', 'analyze-1');
+        throw new Error('Unexpected get_video_job ' + args.operation_id);
+      }
+      if (name === 'get_prepared_video') return { prepared: job('first'), analysis: null, drive_configured: true };
+      if (name === 'upload_prepared_video_to_drive') throw new Error('Google Drive 未設定');
+      if (name === 'analyze_prepared_video') return pending('analyze-1', 'analyze');
+      throw new Error('Unexpected ' + name);
+    } });
+    await h.flush(); await h.poll(); await h.flush();
+    assert.deepEqual(h.calls.map(c => c.name), ['get_video_job', 'get_prepared_video', 'upload_prepared_video_to_drive', 'analyze_prepared_video']);
+    await h.poll(); await h.flush();
+    assert.equal(h.elements.get('findings').hidden, false);
+    assert.equal(h.elements.get('drive-handoff').hidden, true);
+    assert.equal(h.elements.get('copy-handoff').disabled, true);
+  });
+  await test('unconfigured drive skips upload but still auto-starts analysis', async () => {
+    const h = harness({ output: { ...pending('prepare-1', 'prepare'), job_id: undefined }, respond(name, args) {
+      if (name === 'get_video_job') return completed(job('first'), 'prepared', 'prepare-1');
+      if (name === 'get_prepared_video') return { prepared: job('first'), analysis: null, drive_configured: false };
+      if (name === 'analyze_prepared_video') return pending('analyze-1', 'analyze');
+      throw new Error('Unexpected ' + name);
+    } });
+    await h.flush(); await h.poll(); await h.flush();
+    assert.deepEqual(h.calls.map(c => c.name), ['get_video_job', 'get_prepared_video', 'analyze_prepared_video']);
+    assert.match(h.elements.get('status').textContent, /Drive 未設定/);
+  });
+  await test('server handoff text is preferred when present', async () => {
+    const h = harness({ output: { ...pending('prepare-1', 'prepare'), job_id: undefined }, respond(name, args) {
+      if (name === 'get_video_job') return completed(job('first'), 'prepared', 'prepare-1');
+      if (name === 'get_prepared_video') return { prepared: job('first'), analysis: null, drive_configured: true };
+      if (name === 'upload_prepared_video_to_drive') return completed({ ...drive('first'), handoff_text: 'SERVER HANDOFF 伺服器交接' }, 'drive', 'drive-1');
+      if (name === 'analyze_prepared_video') return pending('analyze-1', 'analyze');
+      throw new Error('Unexpected ' + name);
+    } });
+    await h.flush(); await h.poll(); await h.flush();
+    assert.equal(h.elements.get('drive-prompt').value, 'SERVER HANDOFF 伺服器交接');
+  });
+  await test('remount adopts running drive and analysis from pending operations', async () => {
+    const h = harness({ snapshot: { prepared: job('first'), analysis: null, drive_configured: true,
+      active_operation: pending('analyze-1', 'analyze', 'running'),
+      latest_operation: pending('analyze-1', 'analyze', 'running'),
+      pending_operations: [pending('analyze-1', 'analyze', 'running'), pending('drive-1', 'drive', 'running')] },
+      respond(name, args) {
+        if (name === 'get_prepared_video') return { prepared: job('first'), analysis: null, drive_configured: true,
+          active_operation: pending('analyze-1', 'analyze', 'running'),
+          latest_operation: pending('analyze-1', 'analyze', 'running'),
+          pending_operations: [pending('analyze-1', 'analyze', 'running'), pending('drive-1', 'drive', 'running')] };
+        if (name === 'get_video_job') {
+          if (args.operation_id === 'drive-1') return completed(drive('first'), 'drive', 'drive-1');
+          if (args.operation_id === 'analyze-1') return pending('analyze-1', 'analyze', 'running');
+          throw new Error('Unexpected get_video_job ' + args.operation_id);
+        }
+        throw new Error('Unexpected ' + name);
+      } });
+    await h.flush(); await h.flush();
+    assert.deepEqual(h.calls.map(c => c.name), ['get_prepared_video']);
+    assert.equal(h.elements.get('drive-handoff').hidden, true);
+    await h.poll(); await h.flush();
+    assert.equal(h.elements.get('drive-handoff').hidden, false);
+    assert.equal(h.elements.get('findings').hidden, true);
+    assert.equal(h.prompts.length, 0);
+  });
+  await test('handoff actions degrade to manual steps without clipboard or popup', async () => {
+    const h = harness({ snapshot: { prepared: job('first'), analysis: null, drive: drive('first') } });
+    await h.flush();
+    assert.equal(h.elements.get('copy-handoff').disabled, false);
+    await h.click('copy-handoff');
+    assert.match(h.elements.get('status').textContent, /手動選取/);
+    await h.click('open-chat');
+    assert.match(h.elements.get('status').textContent, /手動開啟/);
   });
   await test('evidence filter and bounded pagination', async () => {
     const result = analysis('first'); result.transcript.segments = Array.from({ length: 85 }, (_, i) => ({ start: i / 2, text: 'line ' + i })); const h = harness({ snapshot: { prepared: job('first'), analysis: result } }); await h.flush(); assert.equal(h.elements.get('evidence').children.length, 60); await h.click('more'); assert.equal(h.elements.get('evidence').children.length, 86); h.elements.get('filter').value = 'visual'; h.elements.get('filter').fire('change'); assert.equal(h.elements.get('evidence').children.length, 1); assert.equal(h.openai.widgetState.privateContent.filter, 'visual'); assert.match(html, /min-height: 44px/); assert.match(html, /:focus-visible/);
