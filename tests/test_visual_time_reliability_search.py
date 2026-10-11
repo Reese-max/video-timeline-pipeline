@@ -53,7 +53,8 @@ class VisualTimeReliabilitySearchTests(unittest.TestCase):
         with contextlib.redirect_stdout(output), \
              mock.patch("sys.argv", ["pipeline.py", "--root", str(self.root), *args]), \
              mock.patch.object(pipeline, "load_dotenv"), \
-             mock.patch.object(pipeline, "minimax_subscription_key", return_value="fake-key"):
+             mock.patch.object(pipeline, "minimax_subscription_key", return_value="fake-key"), \
+             mock.patch.object(pipeline, "minimax_model", return_value="fake-model"):
             self.assertEqual(pipeline.main(), 0)
         return output.getvalue()
 
