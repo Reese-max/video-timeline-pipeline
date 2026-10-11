@@ -3767,6 +3767,37 @@ def create_summary(
 # 輸出格式與外部整合
 
 
+def visual_time_reliable(data: Any) -> bool:
+    if not isinstance(data, dict):
+        return True
+    reliable = data.get("timestamp_reliable")
+    if isinstance(reliable, bool):
+        return reliable
+    return data.get("analysis_method") not in ("minimax_video", "minimax_video_compressed")
+
+
+def _timestamp_second(value: Any) -> int | None:
+    try:
+        return int(float(value))
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+
+def unreliable_visual_seconds(timeline: Any) -> set[int]:
+    bad: set[int] = set()
+    good: set[int] = set()
+    for event in timeline if isinstance(timeline, list) else []:
+        if not isinstance(event, dict):
+            continue
+        second = _timestamp_second(event.get("timestamp"))
+        if second is None:
+            continue
+        target = bad if event.get("type") == "visual" and not visual_time_reliable(event.get("data")) else good
+        target.add(second)
+    # ponytail: 整數秒啟發式；若需辨識模型挪動時間，改用來源事件 ID。
+    return bad - good
+
+
 def source_link(url: Any, timestamp: Any) -> str:
     """把來源 URL 加上時間戳，讓每筆結果都能直接跳到影片的那一秒。
 
@@ -3774,7 +3805,7 @@ def source_link(url: Any, timestamp: Any) -> str:
     """
     if not url or not isinstance(url, str):
         return ""
-    if isinstance(timestamp, bool) or not isinstance(timestamp, (int, float)):
+    if isinstance(timestamp, bool) or not isinstance(timestamp, (int, float)) or not math.isfinite(timestamp):
         return url
     seconds = max(0, int(timestamp))
     if not seconds:
@@ -3788,10 +3819,21 @@ def source_link(url: Any, timestamp: Any) -> str:
 
 
 def format_timestamp(value: Any) -> str:
-    total = max(0, int(float(value or 0)))
+    second = _timestamp_second(value or 0)
+    if second is None:
+        return str(value)
+    total = max(0, second)
     hours, remainder = divmod(total, 3600)
     minutes, seconds = divmod(remainder, 60)
     return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+
+
+def hit_time_label(hit: dict[str, Any]) -> str:
+    return "時間碼不可靠" if hit["timestamp"] is None else format_timestamp(hit["timestamp"])
+
+
+def hit_seek_link(hit: dict[str, Any]) -> str:
+    return "" if hit["timestamp"] is None else source_link(hit["source"], hit["timestamp"])
 
 
 def format_srt_timestamp(value: Any) -> str:
@@ -3885,6 +3927,7 @@ def render_knowledge_markdown(
     # 用真實影片標題；退回檔名的話每支影片在 Open Notebook 裡都叫「source」，認不出來。
     title = source.get("title") or Path(source.get("resolved_video") or video_path.name).stem
     lines = [f"# {title}", "", "## 來源", ""]
+    tainted = unreliable_visual_seconds(timeline)
     if source.get("url"):
         lines.append(f"- URL：{source['url']}")
     lines.extend(
@@ -3909,8 +3952,11 @@ def render_knowledge_markdown(
                 continue
             start = format_timestamp(chapter.get("start"))
             end = format_timestamp(chapter.get("end"))
-            jump = source_link(source.get("url"), chapter.get("start"))
+            unreliable = _timestamp_second(chapter.get("start")) in tainted
+            jump = "" if unreliable else source_link(source.get("url"), chapter.get("start"))
             label = f"[`{start}–{end}`]({jump})" if jump else f"`{start}–{end}`"
+            if unreliable:
+                label += "（時間碼不可靠，需覆核原片）"
             lines.append(f"- {label} **{chapter.get('title', '未命名')}**：{chapter.get('summary', '')}")
         lines.append("")
 
@@ -3980,9 +4026,12 @@ def render_knowledge_markdown(
         for item in fact_checks:
             if isinstance(item, dict):
                 # 待查證的東西最需要能一鍵跳回原片確認
-                jump = source_link(source.get("url"), item.get("timestamp"))
+                unreliable = _timestamp_second(item.get("timestamp")) in tainted
+                jump = "" if unreliable else source_link(source.get("url"), item.get("timestamp"))
                 stamp = format_timestamp(item.get("timestamp"))
                 label = f"[`{stamp}`]({jump})" if jump else f"`{stamp}`"
+                if unreliable:
+                    label += "（時間碼不可靠，需覆核原片）"
                 lines.append(f"- {label} {item.get('claim', '')}；原因：{item.get('reason', '')}")
         lines.append("")
 
@@ -3997,7 +4046,7 @@ def render_knowledge_markdown(
             lines.append(f"- {stamp} 語音：{event.get('text', '')}")
             continue
         data = event.get("data") or {}
-        if data.get("timestamp_reliable") is False:
+        if not visual_time_reliable(data):
             stamp = f"`{timestamp}`（時間碼不可靠，需覆核原片）"
         screen_type = data.get("screen_type", "畫面")
         visual_summary = data.get("visual_summary", "")
@@ -4214,7 +4263,7 @@ def index_job(connection: sqlite3.Connection, job_dir: Path) -> int:
     signature = text_hash(
         json.dumps(
             {
-                "version": 1,
+                "version": 2,
                 "source": {
                     "title": source.get("title"),
                     "url": source.get("url"),
@@ -4252,6 +4301,7 @@ def index_job(connection: sqlite3.Connection, job_dir: Path) -> int:
     )
 
     rows: list[tuple[str, Any, str, str]] = []
+    tainted: set[int] = set()
     if source.get("title"):  # 用影片名找片是最直覺的查法，標題也得進全文索引
         rows.append((job, 0, "title", str(source["title"])))
     if timeline_path.is_file():
@@ -4259,15 +4309,22 @@ def index_job(connection: sqlite3.Connection, job_dir: Path) -> int:
             timeline = json.loads(timeline_path.read_text(encoding="utf-8"))
         except (json.JSONDecodeError, OSError):
             timeline = []
+        tainted = unreliable_visual_seconds(timeline)
         for event in timeline:
             if not isinstance(event, dict):
                 continue
+            timestamp = event.get("timestamp")
             if event.get("type") == "speech":
                 text = str(event.get("text", "")).strip()
             else:
-                text = flatten_text(event.get("data")).strip()
+                data = event.get("data")
+                if not visual_time_reliable(data):
+                    timestamp = None
+                if isinstance(data, dict):
+                    data = {key: value for key, value in data.items() if not key.startswith("timestamp_")}
+                text = flatten_text(data).strip()
             if text:
-                rows.append((job, event.get("timestamp"), str(event.get("type", "")), text))
+                rows.append((job, timestamp, str(event.get("type", "")), text))
 
     if summary_path.is_file():
         try:
@@ -4284,7 +4341,9 @@ def index_job(connection: sqlite3.Connection, job_dir: Path) -> int:
                 if not isinstance(chapter, dict) or not chapter.get("title"):
                     continue
                 detail = f"{chapter['title']}：{chapter.get('summary', '')}".strip("：")
-                rows.append((job, chapter.get("start") or 0, "chapter", detail))
+                start = chapter.get("start")
+                timestamp = None if _timestamp_second(start) in tainted else start or 0
+                rows.append((job, timestamp, "chapter", detail))
 
     connection.executemany("INSERT INTO events VALUES (?, ?, ?, ?)", rows)
     connection.execute(
@@ -4618,7 +4677,7 @@ def answer_question(
                 if rank >= len(results):
                     continue
                 hit = results[rank]
-                key = (hit["job"], hit["timestamp"], hit["kind"])
+                key = (hit["job"], hit["timestamp"], hit["kind"], hit["text"][:80])
                 if key in seen:
                     continue
                 seen.add(key)
@@ -4631,7 +4690,7 @@ def answer_question(
         return {"question": question, "keywords": keywords, "answer": "索引裡找不到相關片段。", "citations": []}
 
     context = "\n".join(
-        f"[{index}] 《{hit['title'] or hit['job']}》 {format_timestamp(hit['timestamp'])} "
+        f"[{index}] 《{hit['title'] or hit['job']}》 {hit_time_label(hit)} "
         f"（{hit['kind']}）：{hit['text']}"
         for index, hit in enumerate(hits, 1)
     )
@@ -4907,6 +4966,7 @@ def show_video(root: Path, keyword: str) -> bool:
     item = matches[0]
     job_dir = root / "jobs" / item["job"]
     summary = reuse_artifact(job_dir / "summary.json", "short_summary") or {}
+    tainted = unreliable_visual_seconds(reuse_artifact(job_dir / "timeline.json"))
     print(f"# {item['title']}")
     print(f"  {item['url']}")
     print(f"  {item['minutes']} 分   分類：{'、'.join(item['categories']) or '未分類'}")
@@ -4915,9 +4975,12 @@ def show_video(root: Path, keyword: str) -> bool:
     if chapters:
         print("\n## 章節")
         for chapter in chapters:
-            jump = source_link(item["url"], chapter.get("start"))
-            print(f"  [{format_timestamp(chapter.get('start'))}] {chapter.get('title', '')}")
-            print(f"      {jump}")
+            unreliable = _timestamp_second(chapter.get("start")) in tainted
+            jump = "" if unreliable else source_link(item["url"], chapter.get("start"))
+            note = "（時間碼不可靠，需覆核原片）" if unreliable else ""
+            print(f"  [{format_timestamp(chapter.get('start'))}]{note} {chapter.get('title', '')}")
+            if jump:
+                print(f"      {jump}")
     terms = summary.get("tools_and_terms") or []
     if terms:
         print(f"\n## 工具與術語\n  {'、'.join(map(str, terms))}")
@@ -8692,9 +8755,11 @@ def main() -> int:
                 for hit in hits:
                     label = hit["title"] or hit["job"]
                     score = f" {hit['score']:.3f}" if "score" in hit else ""
-                    print(f"-{score} [{format_timestamp(hit['timestamp'])}] {label}（{hit['kind']}）")
+                    print(f"-{score} [{hit_time_label(hit)}] {label}（{hit['kind']}）")
                     print(f"    {hit['snippet']}")
-                    print(f"    {source_link(hit['source'], hit['timestamp'])}")
+                    jump = hit_seek_link(hit)
+                    if jump:
+                        print(f"    {jump}")
             if args.categorize:
                 cats, assigned = categorize_library(root, minimax_subscription_key(), minimax_model())
                 print(f"分類完成：{len(cats)} 個分類，{assigned} 支影片已歸類（記得重跑 --index）")
@@ -8719,8 +8784,10 @@ def main() -> int:
                     print("\n引用：")
                     for index, hit in enumerate(result["citations"], 1):
                         label = hit["title"] or hit["job"]
-                        print(f"  [{index}] {label} {format_timestamp(hit['timestamp'])}（{hit['kind']}）")
-                        print(f"      {source_link(hit['source'], hit['timestamp'])}")
+                        print(f"  [{index}] {label} {hit_time_label(hit)}（{hit['kind']}）")
+                        jump = hit_seek_link(hit)
+                        if jump:
+                            print(f"      {jump}")
                         # 附上原文：不點開影片就能判斷這個引用該不該信
                         excerpt = " ".join(str(hit.get("text") or "").split())
                         if excerpt:
