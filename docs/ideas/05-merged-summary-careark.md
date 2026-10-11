@@ -1,8 +1,8 @@
 # 05｜參考輸出：CareArk 影片 A＋B 合併摘要
 
-- **來源：** <https://www.facebook.com/share/v/1ExtCtwPgg/>（全長 2:47，job `16fae7864ca8`）
+- **來源：** <https://www.facebook.com/share/v/1ExtCtwPgg/>（全長 2:46＝166.6 秒，job `16fae7864ca8`）
 - **合併方式：**
-  - 講話內容取自 A（Whisper 逐字稿），漏轉的 2:00–2:18 用畫面字幕補；
+  - 講話內容取自 A（Whisper 逐字稿），漏轉的 2:00–2:29（Whisper 缺口 120.0–149.6 秒）用畫面字幕補；
   - 畫面上的數字取自 B（ChatGPT 經 Drive 讀檔）；
   - 分段時間以原片每 4 秒截圖校正。
 - **校正紀錄：** A 說「2:00 後旁白較少」→ 已更正；B 的空腹血糖 4.96 → 更正為 4.98。

@@ -1,5 +1,7 @@
 # 03｜A／B 並行＋合併 需求規格
 
+> 狀態（2026-10-11，對照 main 90734c1）：§4.1–§4.3 已由 #64 合入（widget 自動並行、交接內容與一鍵複製／開新一般對話、`A_server_analysis.md` 與合併指令）；§4.4 見 02 狀態；§4.5 真實影片驗收未做，#57／#58 仍開。與本規格的差異：A 的檔案不是 A 跑完就自動上傳，而是 ChatGPT 整理摘要並呼叫 `finalize_analysis_report` 之後，伺服器才把報告上傳到同一個 Drive 資料夾（報告標註 `caller_submitted`／`not_independently_attested`）。這是否要改成 A 跑完就上傳，是尚未決定的產品問題。
+
 ## 1. 定義
 
 - **路線 A：** 伺服器分析（Whisper 語音＋MiniMax 畫面）→ ChatGPT 整理摘要。

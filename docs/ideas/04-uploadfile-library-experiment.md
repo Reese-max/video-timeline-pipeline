@@ -1,5 +1,7 @@
 # 04｜實驗：用 `window.openai.uploadFile` 把影片存進 ChatGPT 檔案庫
 
+> 狀態（2026-10-11）：未實測。main 的小工具沒有 `uploadFile`。這個實驗必須做在小工具端（本檔 §3），不是伺服器端的 MCP 工具：`window.openai.uploadFile` 是 ChatGPT 宿主提供給小工具的用戶端 API。
+
 ## 1. 目的
 
 不經過 Google Drive，讓 ChatGPT 直接讀到伺服器上的 MP4。如果成功，甚至可能不用另開一般對話。

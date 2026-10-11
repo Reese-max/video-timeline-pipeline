@@ -12,14 +12,15 @@
   - 選單只有「編輯／下載 ZIP／上傳新版本」，沒有刪除。
   - Plugin Creator 回覆它不能刪除外掛。
   - 目前沒安裝，不會被呼叫，只是留在清單上。
+  - 追蹤：issue #60；README 說明見 PR #61。
 - **Open Design Cursor Tunnel v3：** 用的是「通道」連線，沒有網址欄位，不受主機名更改影響。目前沒建立連結，沒有實測。
 
 ## 2. 直接連 MCP 測試
 
 | 項目 | 結果 |
 |---|---|
-| `initialize` 握手 | ✅ HTTP 200，`video-timeline-pipeline` v1.30.0 |
-| `tools/list` | ✅ 9 個工具，約 0.9 秒：prepare_video_for_chatgpt、analyze_prepared_video、upload_prepared_video_to_drive、get_video_job、cancel_video_job、resume_video_job、get_prepared_video、collect_social_post、ingest_video_segments |
+| `initialize` 握手 | ✅ HTTP 200，`video-timeline-pipeline` v1.30.0（MCP SDK 版本） |
+| `tools/list` | ✅ 9 個工具，約 0.9 秒：prepare_video_for_chatgpt、analyze_prepared_video、upload_prepared_video_to_drive、get_video_job、cancel_video_job、resume_video_job、get_prepared_video、collect_social_post、ingest_video_segments（2026-10-08 清單；#64 之後 main 共 10 個，另有 finalize_analysis_report） |
 | `tools/call get_prepared_video` | ✅ 呼叫成功（用本機 cascade 跑的工作不在 MCP 工作清單裡，屬於正常情況） |
 
 ## 3. 路線 A：伺服器分析，在 ChatGPT 端從頭到尾實測
@@ -57,7 +58,7 @@
 
 | 面向 | A：伺服器分析 | B：Drive 直讀 |
 |---|---|---|
-| 講了什麼、為什麼 | ✅ 完整（兩週、開源、DeepSeek、三種歸檔分類、陪父母看病的初衷） | ❌ 聽不到聲音，結尾沒有內容 |
+| 講了什麼、為什麼 | ✅ 大致完整（兩週、開源、DeepSeek、三種歸檔分類、陪父母看病的初衷；2:00–2:29 漏轉，見 02 §1） | ❌ 聽不到聲音，結尾沒有內容 |
 | 畫面細節、數字 | ❌ 幾乎沒有 | ✅ 網址、金額、醫院數、選單都對 |
 | 分段時間 | ⚠️ 講者回到全畫面寫成 2:29，實際約 2:18 | ⚠️ 較粗，0:20–0:45 混在一起 |
 | 錯誤 | 說「2:00–2:29 旁白較少」（其實是漏轉） | 4.98 讀成 4.96；漏掉安裝步驟和 DeepSeek |
