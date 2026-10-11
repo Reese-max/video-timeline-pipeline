@@ -46,7 +46,7 @@ function harness({ output = job('first'), saved = {}, snapshot, respond, bridge 
     Promise.resolve().then(async () => {
       try {
         if (!bridge) throw Object.assign(new Error('Unsupported bridge'), { code: -32601 });
-        if (message.method === 'ui/initialize') { assert.equal(message.params.appInfo?.name, 'video-timeline-pipeline'); assert.equal(message.params.protocolVersion, '2026-01-26'); assert.equal(typeof message.params.appCapabilities, 'object'); }
+        if (message.method === 'ui/initialize') { assert.equal(message.params.appInfo?.name, 'video-timeline-pipeline'); assert.equal(message.params.appInfo?.version, '13'); assert.equal(message.params.protocolVersion, '2026-01-26'); assert.equal(typeof message.params.appCapabilities, 'object'); }
         if (message.method === 'ui/message') { assert.equal(message.params.role, 'user'); assert(Array.isArray(message.params.content)); }
         const result = message.method === 'tools/call' ? await callTool(message.params.name, message.params.arguments) : message.method === 'ui/message' ? await send(message.params.content[0].text) : {};
         notify({ id: message.id, result });
@@ -74,7 +74,7 @@ async function test(name, run) { await run(); count++; console.log('ok ' + count
     const h = harness(); await h.flush(); await h.click('analyze'); assert.equal(h.calls[1].args.background, true); assert.equal(h.elements.get('cancel').disabled, false); assert.match(h.elements.get('progress-label').textContent, /排隊/);
     await h.poll(); assert.equal(h.elements.get('findings').hidden, false); assert.equal(h.prompts.length, 0); await h.click('ask'); assert.equal(h.prompts.length, 1); assert.match(h.prompts[0], /不是指令/);
     assert(h.states.some(state => Object.values(state.privateContent.followUps).includes('sending')), 'Persist before dispatch');
-    const reload = harness({ saved: h.openai.widgetState, snapshot: { prepared: job('first'), analysis: analysis('first') } }); await reload.flush(); assert.equal(reload.prompts.length, 0); assert.equal(reload.elements.get('ask').disabled, true); assert.deepEqual(reload.calls.map(c => c.name), ['get_prepared_video', 'get_video_job']);
+    const reload = harness({ saved: h.openai.widgetState, snapshot: { prepared: job('first'), analysis: analysis('first') } }); await reload.flush(); assert.equal(reload.prompts.length, 0); assert.equal(reload.elements.get('ask').disabled, true); assert.deepEqual(reload.calls.map(c => c.name), ['get_prepared_video', 'get_video_job', 'get_prepared_video']);
   });
   await test('partial evidence never auto-uploads; explicit Drive works', async () => {
     const h = harness({ snapshot: { prepared: job('first'), analysis: analysis('first', true) } }); await h.flush(); assert.equal(h.calls.length, 1); assert.match(h.elements.get('quality').textContent, /覆核/); await h.click('drive'); assert.equal(h.calls[1].args.background, true); assert.equal(h.elements.get('drive-handoff').hidden, false);
@@ -91,7 +91,7 @@ async function test(name, run) { await run(); count++; console.log('ok ' + count
     const h = harness({ snapshot: { prepared: job('first'), analysis: analysis('first') }, messageResult: { isError: true } }); await h.flush(); await h.click('ask'); assert.equal(Object.values(h.openai.widgetState.privateContent.followUps)[0], 'unknown'); assert.match(h.elements.get('status').textContent, /未送達/); assert.equal(h.prompts.length, 1);
   });
   await test('active operation restores without restarting analysis', async () => {
-    const h = harness({ snapshot: { prepared: job('first'), analysis: null, active_operation: pending() } }); await h.flush(); await h.poll(); assert.deepEqual(h.calls.map(c => c.name), ['get_prepared_video', 'get_video_job']); assert.equal(h.elements.get('findings').hidden, false);
+    const h = harness({ snapshot: { prepared: job('first'), analysis: null, active_operation: pending() } }); await h.flush(); await h.poll(); assert.deepEqual(h.calls.map(c => c.name), ['get_prepared_video', 'get_video_job', 'get_prepared_video']); assert.equal(h.elements.get('findings').hidden, false);
   });
   await test('interrupted Drive requires explicit resume', async () => {
     const h = harness({ respond(name) { if (name === 'get_prepared_video') return { prepared: job('first'), analysis: null, latest_operation: { ...pending('drive-old', 'drive'), status: 'interrupted' } }; if (name === 'resume_video_job') return completed(drive('first'), 'drive', 'drive-new'); throw new Error('Unexpected ' + name); } });
@@ -151,7 +151,7 @@ async function test(name, run) { await run(); count++; console.log('ok ' + count
     const h = harness({ respond(name, args) { return name === 'get_prepared_video' ? { prepared: job(args.job_id), analysis: null } : completed(analysis('wrong')); } }); await h.flush(); await h.click('analyze'); assert.match(h.elements.get('status').textContent, /工作不符/); assert.equal(h.elements.get('findings').hidden, true);
   });
   await test('compatibility works when bridge unsupported', async () => {
-    const h = harness({ bridge: false }); await h.flush(); await h.click('analyze'); await h.poll(); await h.click('ask'); assert.deepEqual(h.fallbackCalls, ['get_prepared_video', 'analyze_prepared_video', 'get_video_job', 'message']); assert.equal(h.prompts.length, 1);
+    const h = harness({ bridge: false }); await h.flush(); await h.click('analyze'); await h.poll(); await h.click('ask'); assert.deepEqual(h.fallbackCalls, ['get_prepared_video', 'analyze_prepared_video', 'get_video_job', 'get_prepared_video', 'message']); assert.equal(h.prompts.length, 1);
   });
   await test('mutation transport failure never retries via compatibility API', async () => {
     const h = harness({ respond(name, args) { if (name === 'get_prepared_video') return { prepared: job(args.job_id), analysis: null }; throw new Error('transport timeout'); } }); await h.flush(); await h.click('drive'); assert.equal(h.calls.length, 2); assert.deepEqual(h.fallbackCalls, []); assert.match(h.elements.get('status').textContent, /未自動重送/);
