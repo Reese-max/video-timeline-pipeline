@@ -66,7 +66,7 @@ MCP_PUBLIC_BASE_URL = (
 MCP_MEDIA_BASE_URL = (
     os.getenv("MCP_MEDIA_BASE_URL", "") or MCP_PUBLIC_BASE_URL
 ).rstrip("/")
-UI_URI = f"ui://video-timeline-pipeline/v12-{hashlib.sha256(MCP_MEDIA_BASE_URL.encode()).hexdigest()[:12]}.html"
+UI_URI = f"ui://video-timeline-pipeline/v13-{hashlib.sha256(MCP_MEDIA_BASE_URL.encode()).hexdigest()[:12]}.html"
 PUBLIC_URL = urlsplit(MCP_PUBLIC_BASE_URL)
 MEDIA_URL = urlsplit(MCP_MEDIA_BASE_URL)
 UI_ORIGIN = f"{PUBLIC_URL.scheme}://{PUBLIC_URL.netloc}"
@@ -2001,7 +2001,7 @@ async def ingest_video_segments(
 @mcp.custom_route("/health", methods=["GET"], include_in_schema=False)
 async def health(_: Request) -> JSONResponse:
     queue = get_queue()
-    return JSONResponse({"status": "ok", "service": "video-timeline-pipeline", "version": 12,
+    return JSONResponse({"status": "ok", "service": "video-timeline-pipeline", "version": 13,
                          "jobs": queue.stats(), "media_links": "signed", "legacy_media_until": MCP_LEGACY_MEDIA_UNTIL,
                          "writer_busy": JOB_LOCK.locked(), "runtime_sha256": RUNTIME_SHA256,
                          "commit_sha": RELEASE_SHA or None,

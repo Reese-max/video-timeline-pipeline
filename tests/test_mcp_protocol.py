@@ -48,6 +48,9 @@ class ProtocolSmokeTests(unittest.TestCase):
                     self.assertFalse(health['writer_busy'])
                     self.assertFalse(health['deployment_draining'])
                     self.assertEqual(health['runtime_sha256'], server.RUNTIME_SHA256)
+                    self.assertEqual(health['version'], 13)
+                    self.assertIn('/v13-', str(resource['uri']))
+                    self.assertIn('version: "13"', contents[0]['text'])
                 finally:
                     if server._QUEUE is not None:
                         server._QUEUE.close()

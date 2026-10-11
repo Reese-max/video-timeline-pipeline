@@ -102,7 +102,7 @@ const normalize = value => value?.structuredContent || value || {};
 const pendingRequests = new Map();
 let nextRequestId = 1, bridgePromise, generation = 0, pollEpoch = 0, pollTimer, drivePollEpoch = 0, drivePollTimer;
 let data = null, analysisResult = null, activeOperation = null, driveOperation = null, acting = false, sending = false, restoring = false, uncertainStart = false;
-let driveActing = false, driveConfigured = true, autoStartArmed = false;
+let driveActing = false, driveConfigured = true, autoStartArmed = false, closed = false;
 // 同一 job 在此介面生命週期只自動啟動一次；重複 prepare 或失敗後改走手動按鈕（送出冪等由伺服器去重）。
 const autoStartedJobs = new Set();
 let lastPersisted = "";
@@ -127,7 +127,7 @@ const safeURL = value => {
   try { const url = new URL(value); return ["https:", "http:"].includes(url.protocol) ? url.href : null; }
   catch { return null; }
 };
-const current = version => version === generation;
+const current = version => !closed && version === generation;
 function checkCurrent(version) { if (!current(version)) throw new Error("影片已切換，忽略舊工作結果。"); }
 function status(message) { $("status").textContent = message; }
 function followUpKey() { return data?.job_id ? `${data.job_id}:${analysisResult?.cache_signature || analysisResult?.source_sha256 || "unverified"}` : ""; }
@@ -162,7 +162,7 @@ function request(method, params) {
 function ensureBridge() {
   if (!bridgePromise) bridgePromise = request("ui/initialize", {
     protocolVersion: "2026-01-26", appCapabilities: {},
-    appInfo: { name: "video-timeline-pipeline", version: "12" },
+    appInfo: { name: "video-timeline-pipeline", version: "13" },
   }).then(result => {
     window.parent.postMessage({ jsonrpc: "2.0", method: "ui/notifications/initialized", params: {} }, "*");
     return result;
@@ -394,7 +394,7 @@ function acceptOperation(value, version, expectedKind, opts = {}) {
   checkCurrent(version);
   if (value?.operation === "drive" && value?.operation_id) { adoptDriveOperation(value, version); return; }
   if (!value?.operation_id) {
-    if (expectedKind === "analysis") applyAnalysis(value);
+    if (expectedKind === "analysis") { applyAnalysis(value); refreshReport(version); }
     else if (expectedKind === "drive") applyDrive(value);
     else if (value?.segments) renderPrepared(value);
     else throw new Error("背景工作缺少識別碼，請重新取得狀態。");
@@ -414,7 +414,10 @@ function acceptOperation(value, version, expectedKind, opts = {}) {
       if (!opts.fromRestore) { autoStartArmed = true; restoreJob(); }
       return;
     }
-    else if (value.result_kind === "analysis") { applyAnalysis(value.result); status("分析完成。可核對下方證據，再點選交給 ChatGPT 整理。"); }
+    else if (value.result_kind === "analysis") {
+      applyAnalysis(value.result); status("A 分析已完成，等待 ChatGPT 整理摘要後才會上傳 A_server_analysis.md。");
+      if (!opts.fromRestore) refreshReport(version);
+    }
     else if (value.result_kind === "report") applyReport(value.result);
     else if (value.result_kind === "drive") applyDrive(value.result);
     else throw new Error("工作完成，但結果類型無法辨識。");
@@ -497,6 +500,7 @@ async function restoreJob() {
     const driveOp = candidates.find(item => item.operation === "drive");
     const latest = snapshot.latest_operation;
     let operation = snapshot.active_operation || (snapshot.analysis_invalidated && latest?.status === "completed" && latest?.result_kind === "analysis" ? null : latest);
+    if (operation?.operation === "report" && operation.operation_id === reportResult?.operation?.operation_id) operation = null;
     if (operation?.operation === "drive") {
       // 主槽讓給同工作的分析（若有）；Drive 另行追蹤，兩路互不等待。
       await adoptDriveOperation(operation, restoredVersion);
@@ -619,12 +623,13 @@ async function askChatGPT() {
   } finally { if (current(version)) { sending = false; updateButtons(); } }
 }
 function receiveToolResult(value, initial = false) {
+  if (closed) return;
   const payload = normalize(value);
   if (payload.status === "ready" && Array.isArray(payload.segments)) {
     const changed = renderPrepared(payload);
     // 初次掛載不自動啟動；只有開著介面時新完成的 prepare 才自動並行 A＋B。
     if (changed) { restoredOperationId = saved.jobId === payload.job_id ? saved.operationId : null; autoStartArmed = !initial; restoreJob(); }
-  } else if (payload.report_sha256 && payload.job_id === data?.job_id) { applyReport(payload);
+  } else if ((payload.report_sha256 || payload.status === "report_invalid") && payload.job_id === data?.job_id) { applyReport(payload);
   } else if (payload.operation === "prepare" && payload.operation_id) {
     if (supersededPrepares.has(payload.operation_id)) return;
     // Poll responses are consumed by their request, never by an out-of-order child notification.
@@ -650,7 +655,8 @@ window.addEventListener("message", event => {
   if (event.source !== window.parent || event.data?.jsonrpc !== "2.0") return;
   const message = event.data;
   if (message.method === "ui/resource-teardown") {
-    saveState(); stopPolling(); generation++;
+    saveState(); stopPolling(); stopDrivePolling(); stopReportPolling(); closed = true; generation++;
+    $("copy-merge").disabled = true;
     for (const pending of pendingRequests.values()) { clearTimeout(pending.timer); pending.reject(new Error("介面已關閉；未自動重送操作。")); }
     pendingRequests.clear();
     window.parent.postMessage({ jsonrpc: "2.0", id: message.id, result: {} }, "*");
@@ -661,17 +667,62 @@ window.addEventListener("message", event => {
   } else if (message.method === "ui/notifications/tool-result") receiveToolResult(message.params);
 });
 window.addEventListener("openai:set_globals", event => { if (event.detail?.globals?.toolOutput) receiveToolResult(event.detail.globals.toolOutput); });
-let reportResult = null, reportSubmitting = false;
-function clearReport() { reportResult = null; $("analysis-report").hidden = true; $("report-link").hidden = true; $("copy-merge").disabled = true; }
-function applyReport(result) {
+let reportResult = null, reportSubmitting = false, reportPollEpoch = 0, reportPollTimer;
+function stopReportPolling() { reportPollEpoch++; clearTimeout(reportPollTimer); }
+async function refreshReport(version) {
+  const id = data?.job_id;
+  try {
+    const snapshot = await callTool("get_prepared_video", { job_id: id }, version);
+    checkCurrent(version);
+    if (snapshot.prepared?.job_id !== id) throw new Error("報告快照回傳工作不符。");
+    if (snapshot.report && !applyReport(snapshot.report)) throw new Error("報告快照綁定不符；請重新取得狀態。");
+  } catch (error) { if (current(version)) status("A 分析已完成，但無法取得報告狀態：" + error.message); }
+}
+function scheduleReportPoll(version, seconds) {
+  const epoch = reportPollEpoch, delay = Math.min(10, Math.max(1, Number(seconds) || 2));
+  reportPollTimer = setTimeout(() => {
+    if (current(version) && epoch === reportPollEpoch) pollReportOperation(version, epoch, delay);
+  }, delay * 1000);
+}
+async function pollReportOperation(version, epoch, delay) {
+  const report = reportResult, id = report?.operation?.operation_id;
+  if (!id) return;
+  try {
+    const value = await callTool("get_video_job", { operation_id: id }, version);
+    if (!current(version) || epoch !== reportPollEpoch) return;
+    if (value.operation_id !== id || value.operation !== "report" || value.job_id !== data?.job_id) throw new Error("報告背景工作識別碼或工作不符。");
+    if (isPending(value)) {
+      applyReport({ ...report, status: value.status, operation: value }, delay * 2);
+    } else if (value.status === "completed") {
+      if (value.result_kind !== "report" || !value.result || ["job_id", "cache_signature", "analysis_sha256", "report_sha256"].some(key => value.result[key] !== report[key])) throw new Error("報告回傳綁定不符；請重新取得狀態。");
+      applyReport({ ...report, ...value.result, operation: value });
+    } else if (terminal.has(value.status)) {
+      applyReport({ ...report, status: value.status, operation: value });
+      status("A 報告上傳未完成：" + value.status + (value.error ? "；" + errorText(value.error) : ""));
+    } else throw new Error("未知的報告工作狀態，請重新取得狀態。");
+  } catch (error) {
+    if (!current(version) || epoch !== reportPollEpoch) return;
+    stopReportPolling();
+    status("無法取得 A 報告上傳狀態；未自動重送，請重新取得狀態。" + error.message);
+  }
+}
+function clearReport() { stopReportPolling(); reportSubmitting = false; reportResult = null; $("analysis-report").hidden = true; $("report-link").hidden = true; $("copy-merge").disabled = true; }
+function applyReport(result, seconds = result?.operation?.retry_after_seconds) {
   if (!analysisResult || result?.job_id !== data?.job_id || result.cache_signature !== analysisResult.cache_signature) return false;
-  reportResult = result;
+  stopReportPolling(); reportResult = result;
   $("analysis-report").hidden = false;
-  $("report-state").textContent = `A 證據=${result.evidence_status || "未知"}；摘要=${result.summary_status || "未知"}（caller_submitted，未獨立驗證作者）；報告=${result.status}。`;
+  const ready = result.status === "report_ready" && result.verified === true && result.file_id && result.merge_text && result.report_sha256;
+  const message = ready ? "A 已完成：A_server_analysis.md 已放進 Drive，可複製合併指令。"
+    : result.summary_status === "pending_chatgpt" ? "A 分析已完成，等待 ChatGPT 整理摘要後才會上傳 A_server_analysis.md。"
+    : isPending(result) ? "A 摘要已提交，報告排隊／上傳中；尚未確認 Drive 檔案。"
+    : "A 報告尚未確認上傳至 Drive，請核對下方狀態。";
+  const error = result.error || result.operation?.error;
+  $("report-state").textContent = message + `A 證據=${result.evidence_status || "未知"}；摘要=${result.summary_status || "未知"}（caller_submitted，未獨立驗證作者）；報告=${result.status}。` + (error ? " " + errorText(error) : "");
   const download = safeURL(result.download_url);
   $("report-link").hidden = !download; if (download) $("report-link").href = download;
-  $("copy-merge").disabled = !(result.status === "report_ready" && result.verified === true && result.file_id && result.merge_text && result.report_sha256);
+  $("copy-merge").disabled = !ready;
   $("finalize-report").disabled = reportSubmitting || !result.analysis_sha256;
+  if (isPending(result) && result.operation?.operation_id) scheduleReportPoll(generation, seconds);
   return true;
 }
 async function submitReportSummary() {

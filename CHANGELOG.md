@@ -2,7 +2,9 @@
 
 ## Unreleased
 
-- 新增 #57（A／B 並行 §4.1–§4.2）：prepare 完成後 widget 自動同時啟動 `analyze_prepared_video`（A）與 `upload_prepared_video_to_drive`（B，Drive 先送、互不等待、失敗隔離；未設定 Drive 時只跑分析）。Drive 完成即顯示交接內容，只放檔案 ID／網址／大小與原片分段時間，不含任何 A 的結果，並提供「一鍵複製」「開新一般對話」按鈕。伺服器在 Drive 結果與 `get_prepared_video` 附上同一份 `handoff_text`（B 固定輸出格式：一句話重點、分段表、限制說明；結尾提醒收到「合併」前不要讀取 A，#58 實作 A 檔案）。單 worker 佇列仍按送達順序執行；widget 雙軌追蹤兩路工作。離線驗證 `python3 -m pytest -q` 與 `node tests/test_widget_handoff.cjs`（39 項）皆通過。
+- 補強 #58：v13 widget 在 A 分析完成後自動讀取報告，明示摘要提交前尚未上傳；提交摘要後以 1–10 秒退避輪詢報告工作，驗證完成後顯示「A 已完成」並啟用合併複製。失敗保留完整錯誤，換 job／關閉停止輪詢。合併指令採 §4.3 原文，以「合併：」開頭並保留 file_id／SHA-256／未獨立驗證聲明；README 說明 paired worker 與 caller_submitted 上傳條件。UI URI 同步升為 `ui://video-timeline-pipeline/v13-<媒體網址 hash>.html`。
+
+- 新增 #57（A／B 並行 §4.1–§4.2）：prepare 完成後 widget 自動同時啟動 `analyze_prepared_video`（A）與 `upload_prepared_video_to_drive`（B，Drive 先送、互不等待、失敗隔離；未設定 Drive 時只跑分析）。Drive 完成即顯示交接內容，只放檔案 ID／網址／大小與原片分段時間，不含任何 A 的結果，並提供「一鍵複製」「開新一般對話」按鈕。伺服器在 Drive 結果與 `get_prepared_video` 附上同一份 `handoff_text`（B 固定輸出格式：一句話重點、分段表、限制說明；結尾提醒收到「合併」前不要讀取 A，#58 實作 A 檔案）。paired worker 允許同一 job 的分析與 Drive 片段上傳並行，最多兩個 worker；widget 雙軌追蹤兩路工作。離線驗證 `python3 -m pytest -q` 與 `node tests/test_widget_handoff.cjs`（39 項）皆通過。
 
 - 修正 #56：`video_mp4` 畫面證據的時間碼不再被壓縮在前幾秒。提示詞明定 timestamp 是從 0 起算的原片秒數且事件須覆蓋全片到片尾；解析接受純數字、`MM:SS`／中文時間，無法解析的事件直接丟棄（不再靜默記為 0.0）；事件峰值不到 `min(片長-30 秒, 片長一半)` 或超出片長 30 秒以上時沿用已上傳檔案 ID 只重問一次，仍對不上就以 `finish_reason=timestamp_coverage` 標示未完成、不寫入可重用快取。短片（單一事件即達豁免門檻）不受影響，仍只呼叫一次。
 

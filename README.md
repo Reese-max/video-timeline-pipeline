@@ -74,17 +74,19 @@ python pipeline.py --video 'D:\path\to\video.mp4' --dry-run --slide-extractor st
 
 ## ChatGPT 網頁 MCP 影片摘要
 
-`mcp_server.py` 是 ChatGPT Apps/MCP 入口：公開影片 URL → 既有下載器 → FFmpeg 分段 → Groq 語音辨識／MiniMax 抽樣畫面分析 → ChatGPT 根據工具證據整理時間軸。v12 widget 在準備完成後自動同時啟動伺服器分析（A）與 Drive 上傳（B，已設定時），兩者互不等待；再由「交給 ChatGPT 整理」送出整理要求；重新開啟不會自動重跑或重送。CLI 的 MiniMax 摘要流程不變；MCP 不另呼叫 MiniMax 產生摘要。影片放在 Git 忽略的 `mcp_jobs\`，工作佇列及簽章金鑰在私有 `.video-state/`。
+`mcp_server.py` 是 ChatGPT Apps/MCP 入口：公開影片 URL → 既有下載器 → FFmpeg 分段 → Groq 語音辨識／MiniMax 抽樣畫面分析 → ChatGPT 根據工具證據整理時間軸。v13 widget 在準備完成後自動同時啟動伺服器分析（A）與 Drive 上傳（B，已設定時），兩者互不等待；再由「交給 ChatGPT 整理」送出整理要求；重新開啟不會自動重跑或重送。CLI 的 MiniMax 摘要流程不變；MCP 不另呼叫 MiniMax 產生摘要。影片放在 Git 忽略的 `mcp_jobs\`，工作佇列及簽章金鑰在私有 `.video-state/`。
 
-### v12：背景工作、可核對證據與儲存管理
+### v13：背景工作、可核對證據與儲存管理
 
-準備／分析／Drive 工具支援 `background=true`；可用 `get_video_job` 查進度，`cancel_video_job` 取消，`resume_video_job` 續跑，`get_prepared_video` 恢復結果及更新下載網址。新介面使用背景模式，舊客戶端的同步預設仍相容。準備完成後 widget 自動同時送出分析與 Drive 背景工作（Drive 先送；單 worker 佇列按送達順序執行，Drive 先跑才能在分析還在跑時就顯示交接內容）；未設定 Drive 時只自動跑分析。兩路互不等待、失敗隔離；手動按鈕保留重試入口。交接內容只放檔案 ID／網址／大小與原片分段時間，不含任何 A 的結果，並提供「一鍵複製」與「開新一般對話」。
+準備／分析／Drive 工具支援 `background=true`；可用 `get_video_job` 查進度，`cancel_video_job` 取消，`resume_video_job` 續跑，`get_prepared_video` 恢復結果及更新下載網址。新介面使用背景模式，舊客戶端的同步預設仍相容。準備完成後 widget 自動同時送出分析與 Drive 背景工作（Drive 先送；paired worker 允許同一 job 的分析與 Drive 片段上傳並行，最多兩個 worker；其他工作依佇列排程）；未設定 Drive 時只自動跑分析。兩路互不等待、失敗隔離；手動按鈕保留重試入口。交接內容只放檔案 ID／網址／大小與原片分段時間，不含任何 A 的結果，並提供「一鍵複製」與「開新一般對話」。
+
+A 分析完成時，本機產生 `A_server_analysis.md`（逐字稿、畫面時間軸、品質與待整理摘要），widget 自動取得報告快照並提示等待 ChatGPT 整理摘要。「交給 ChatGPT 整理」要求 ChatGPT 先讀取目前證據與報告綁定，再呼叫 `finalize_analysis_report` 提交摘要及來源註記；也可在 widget 明確填寫後提交。只有 `summary_status=caller_submitted`、影片片段已在 Drive 且兩路 worker 已停止，才會排入獨立的報告上傳工作，放進同一個 Drive 資料夾。widget 追蹤 queued／running 報告；`report_ready` 且 `verified` 時顯示「A 已完成」並啟用「複製合併指令」。指令以「合併：」開頭，保留 file_id、SHA-256 與未獨立驗證聲明。
 
 長片最多使用 240 個低解析度探針、40 張入選影格；時間窗與場景變化兼顧全片範圍。快取比對來源 SHA-256、模型、語言、後端、取樣設定及程式版本。介面可切換逐字稿／畫面觀察、點時間碼核對原片，並顯示抽樣與缺漏限制。
 
 簽名下載網址預設 24 小時有效；受管媒體預設保留七天，總量 20 GiB、單工作 4 GiB、保留至少 1 GiB 空間。清理需 `MCP_STORAGE_CLEANUP_ENABLED=1`，只處理已明確納管且到期的工作，保護執行中工作及有效分享。舊工作不會在部署時被批次納管。設定、相容性及驗證界線詳見 [操作說明](docs/video-mcp-operations.md)。
 
-UI URI 已升為 `ui://video-timeline-pipeline/v12-<媒體網址 hash>.html`。更新服務後需重新整理外掛動作並產生新 widget；歷史 widget 不會自動更新。以下 v8–v11 段落保留歷史修復紀錄，操作以 v12 說明為準。
+UI URI 已升為 `ui://video-timeline-pipeline/v13-<媒體網址 hash>.html`。更新服務後需重新整理外掛動作並產生新 widget；歷史 widget 不會自動更新。以下 v8–v11 段落保留歷史修復紀錄，操作以 v13 說明為準。
 
 ### MCP 影音暫存保留 7 天
 
