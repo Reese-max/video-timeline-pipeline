@@ -23,7 +23,9 @@
     a, p, li, label, h1, h2 { overflow-wrap: anywhere; }
     ol, ul { margin: 0; padding-left: 24px; }
     #evidence { display: grid; gap: 12px; }
-    #evidence li { padding: 12px; border: 1px solid #858585; border-radius: 8px; }
+    #evidence li, #library-list li { padding: 12px; border: 1px solid #858585; border-radius: 8px; }
+    #library-list { list-style: none; padding: 0; display: grid; gap: 12px; }
+    #library-list p { white-space: pre-wrap; }
     #evidence p { white-space: pre-wrap; margin-top: 6px; }
     .badge { font-size: .85rem; margin-left: 8px; }
     video { width: 100%; max-height: 360px; border-radius: 8px; background: #111; }
@@ -84,6 +86,14 @@
     </div>
     <a id="open-chat-link" class="external" href="https://chatgpt.com/" target="_blank" rel="noopener noreferrer" hidden>開啟 ChatGPT，建立一般對話</a>
   </section>
+  <details id="library-experiment" hidden>
+    <summary>實驗：存到 ChatGPT 檔案庫（#59）</summary>
+    <p id="library-caps" class="muted"></p>
+    <p>只有點擊才會下載並上傳此片段。成功回傳 fileId 不代表已進檔案庫或模型能讀取；大小與型別上限未驗證。失敗不會自動重送，再按一次可能產生重複檔案。</p>
+    <ol id="library-list"></ol>
+    <button id="library-ask" type="button" disabled>請模型讀這個檔案（最近一次成功上傳）</button>
+    <p id="library-message" role="status" aria-live="polite"></p>
+  </details>
 </main>
 <section id="analysis-report" hidden aria-label="A summary and report">
   <h2>A 摘要／報告（未独立驗證作者或原片）</h2><p id="report-state" role="status"></p>
@@ -113,6 +123,9 @@ const saved = host()?.widgetState?.privateContent || {};
 const receipts = { ...(saved.followUps || {}) };
 let restoredOperationId = saved.operationId || null;
 let persistenceAvailable = typeof host()?.setWidgetState === "function";
+// ponytail: 同時只上傳一個片段；需要並行時再改成逐片段鎖。
+const libraryBusy = new Set(), libraryResults = new Map();
+let libraryRows = [], libraryModel = null, librarySending = false, libraryEpoch = 0;
 const terminal = new Set(["failed", "cancelled", "expired", "interrupted"]);
 const isPending = value => ["queued", "running"].includes(value?.status);
 const errorText = value => typeof value === "string" ? value : value?.message || "未提供錯誤說明";
@@ -131,20 +144,30 @@ const current = version => !closed && version === generation;
 function checkCurrent(version) { if (!current(version)) throw new Error("影片已切換，忽略舊工作結果。"); }
 function status(message) { $("status").textContent = message; }
 function followUpKey() { return data?.job_id ? `${data.job_id}:${analysisResult?.cache_signature || analysisResult?.source_sha256 || "unverified"}` : ""; }
-function saveState() {
-  if (!persistenceAvailable) return;
-  try {
-    const state = {
+function buildState() {
+  const state = {
       modelContent: data ? `目前影片「${data.title || "未命名"}」，job_id=${data.job_id}。${analysisResult ? "已有伺服器分析；需核對證據與缺漏。" : "尚未確認分析完成。"} Drive 上傳不表示已讀取原片。` : "影片背景工作尚在準備。",
       privateContent: { schemaVersion: 2, jobId: data?.job_id || (activeOperation?.operation === "prepare" && activeOperation?.error_code !== "MEDIA_EXPIRED" ? null : saved.jobId || null),
         operationId: activeOperation?.operation_id || null, followUps: { ...receipts },
         filter: $("filter").value || "all", selectedSegment },
-    };
+  };
+  if (libraryModel) state.modelContent += "\n檔案庫實驗（未確認模型可讀取）：" + JSON.stringify({ uploaded_file_ids: [libraryModel.fileId], filename: libraryModel.filename, size: libraryModel.size });
+  return state;
+}
+function saveState(experimental = false) {
+  if (!persistenceAvailable) {
+    if (experimental) throw new Error("此宿主沒有可用的 setWidgetState，無法提交檔案實驗狀態。");
+    return;
+  }
+  try {
+    const state = buildState();
     const serialized = JSON.stringify(state);
     if (serialized === lastPersisted) return;
-    host().setWidgetState(state);
+    const result = host().setWidgetState(state);
+    if (experimental) return Promise.resolve(result).then(() => { if (serialized === JSON.stringify(buildState())) lastPersisted = serialized; });
+    Promise.resolve(result).catch(() => {});
     lastPersisted = serialized;
-  } catch { persistenceAvailable = false; }
+  } catch (error) { if (experimental) throw error; persistenceAvailable = false; }
   $("persistence").hidden = persistenceAvailable;
   if (!persistenceAvailable) $("persistence").textContent = "此宿主無法保存介面狀態。伺服器工作仍可恢復；重新開啟後，請先檢查對話是否已收到整理要求。";
 }
@@ -162,7 +185,7 @@ function request(method, params) {
 function ensureBridge() {
   if (!bridgePromise) bridgePromise = request("ui/initialize", {
     protocolVersion: "2026-01-26", appCapabilities: {},
-    appInfo: { name: "video-timeline-pipeline", version: "13" },
+    appInfo: { name: "video-timeline-pipeline", version: "14" },
   }).then(result => {
     window.parent.postMessage({ jsonrpc: "2.0", method: "ui/notifications/initialized", params: {} }, "*");
     return result;
@@ -206,6 +229,112 @@ function updateButtons() {
   const handoffReady = Boolean($("drive-prompt").value);
   $("copy-handoff").disabled = !handoffReady || restoring;
   $("open-chat").disabled = !handoffReady || restoring;
+  $("library-experiment").hidden = !data?.segments?.length;
+  $("library-caps").textContent = ["uploadFile", "getFileDownloadUrl", "selectFiles", "setWidgetState", "sendFollowUpMessage"].map(name => `${name}：${typeof host()?.[name] === "function" ? "可用" : "缺少"}`).join(" · ");
+  for (const row of libraryRows) for (const button of row.buttons) button.disabled = typeof host()?.uploadFile !== "function" || !ready || restoring || closed || libraryBusy.size > 0 || librarySending;
+  $("library-ask").disabled = !ready || restoring || closed || librarySending || libraryBusy.size > 0 || !libraryResults.size;
+}
+const redactLibrary = value => String(value).replace(/(?:https?(?::|%3a))?(?:\/\/|%2f%2f|\\\/\\\/)\S+/gi, "[URL]").replace(/(?:sig|expires)(?:=|%3d|\\u003d)[^\s&]+/gi, "[URL]");
+function libraryError(error) {
+  let name = "Error", message = "(無法轉成文字的例外)";
+  try { name = String(error?.name || name); } catch {}
+  try { message = String(error?.message || error); } catch {}
+  return redactLibrary(`${name}: ${message}`);
+}
+const nowMs = () => typeof performance !== "undefined" ? performance.now() : Date.now();
+const libraryName = segment => String(segment.filename || "segment.mp4").replace(/[^\w.-]/g, "_");
+function resetLibrary() {
+  libraryEpoch++;
+  libraryBusy.clear(); libraryResults.clear(); libraryRows = []; libraryModel = null; librarySending = false;
+  $("library-list").replaceChildren(); $("library-message").textContent = ""; $("library-ask").disabled = true;
+  $("library-experiment").hidden = true;
+}
+function renderLibrary() {
+  const version = generation;
+  $("library-list").replaceChildren();
+  libraryRows = (data?.segments || []).map((segment, index) => {
+    let row = libraryRows[index];
+    if (!row) {
+      const item = document.createElement("li"), label = document.createElement("p");
+      const buttons = [document.createElement("button"), document.createElement("button")];
+      const outputs = [document.createElement("p"), document.createElement("p")];
+      row = { item, label, buttons, outputs };
+      buttons.forEach((button, attempt) => {
+        button.type = "button"; button.textContent = attempt ? "改用一般上傳（不進檔案庫）" : "存到 ChatGPT 檔案庫";
+        button.hidden = Boolean(attempt);
+        button.addEventListener("click", () => { if (current(version) && libraryRows[index] === row) return saveSegmentToLibrary(index, !attempt); });
+        outputs[attempt].setAttribute("role", "status"); outputs[attempt].setAttribute("aria-live", "polite");
+      });
+      item.append(label, buttons[0], outputs[0], buttons[1], outputs[1]);
+    }
+    row.label.textContent = `${libraryName(segment)} · ${formatTime(segment.start_seconds)}–${formatTime(segment.end_seconds)} · ${Number.isFinite(segment.size_bytes) ? segment.size_bytes + " bytes" : "大小未知"}`;
+    $("library-list").append(row.item);
+    return row;
+  });
+}
+async function saveSegmentToLibrary(index, library = true) {
+  const segment = data?.segments?.[index], row = libraryRows[index];
+  if (!segment || !row || closed || restoring || libraryBusy.size || librarySending || activeOperation?.error_code === "MEDIA_EXPIRED") return;
+  const output = row.outputs[library ? 0 : 1], version = generation, jobId = data.job_id, started = nowMs();
+  const isCurrent = () => current(version) && data?.job_id === jobId && libraryRows[index] === row;
+  const check = () => { checkCurrent(version); if (!isCurrent()) throw new Error("片段已失效，忽略舊上傳結果。"); };
+  if (library) { row.outputs[1].textContent = ""; row.buttons[1].hidden = true; }
+  libraryBusy.add(index); output.textContent = "下載中…"; updateButtons();
+  try {
+    if (typeof host()?.uploadFile !== "function") throw new Error("此宿主缺少 uploadFile，無法上傳。");
+    const url = safeURL(segment.url);
+    if (!url) throw new Error("此片段沒有有效的媒體網址，請重新取得狀態。");
+    const response = await fetch(url, { credentials: "omit", referrerPolicy: "no-referrer", cache: "no-store" });
+    check();
+    if (!response.ok) throw new Error("下載失敗 HTTP " + response.status);
+    const blob = await response.blob(); check();
+    let sha256 = "不可用";
+    if (typeof crypto !== "undefined" && crypto.subtle) {
+      const bytes = await blob.arrayBuffer(); check();
+      const digest = await crypto.subtle.digest("SHA-256", bytes); check();
+      sha256 = Array.from(new Uint8Array(digest), byte => byte.toString(16).padStart(2, "0")).join("");
+    }
+    const filename = libraryName(segment), file = new File([blob], filename, { type: "video/mp4" });
+    output.textContent = "上傳中…";
+    const result = await host().uploadFile(file, library ? { library: true } : undefined); check();
+    const fileId = typeof result === "string" ? result : result?.fileId;
+    if (typeof fileId !== "string" || !fileId.trim() || /https?:|sig=|expires=/i.test(fileId)) throw new Error("uploadFile 未回傳 fileId：回傳型別 " + typeof result + "，欄位 " + Object.keys(result || {}).join(","));
+    let hasDownloadUrl = false, downloadError = "";
+    if (typeof host()?.getFileDownloadUrl === "function") {
+      try { hasDownloadUrl = Boolean((await host().getFileDownloadUrl({ fileId }))?.downloadUrl); }
+      catch (error) { downloadError = "\ngetFileDownloadUrl 失敗：" + libraryError(error); }
+      check();
+    }
+    const ms = Math.round(nowMs() - started), mismatch = Number.isFinite(segment.size_bytes) && segment.size_bytes !== blob.size;
+    libraryResults.delete(index); libraryResults.set(index, { fileId, filename, size: blob.size, ms, sha256, library, hasDownloadUrl });
+    output.textContent = `fileId：${fileId}\n大小：${blob.size} bytes${mismatch ? "（與分段資料大小不符）" : ""}\n耗時：${ms} ms\nlibrary:${library}\n下載網址：${hasDownloadUrl ? "已取得" : "未取得"}\nSHA-256：${sha256}${downloadError}\n尚未確認檔案庫介面或模型可讀取。`;
+  } catch (error) {
+    if (isCurrent()) {
+      output.textContent = libraryError(error) + "\n未自動重送；再按一次可能產生重複檔案。";
+      if (/Failed to fetch|Load failed/i.test(error?.message || "")) output.textContent += "\n可能是簽章過期（24 小時）或網路／CORS 問題，請按「重新取得狀態」換新網址。";
+      if (library) row.buttons[1].hidden = false;
+    }
+  } finally { if (isCurrent()) { libraryBusy.delete(index); updateButtons(); } }
+}
+async function askAboutLibraryFile() {
+  const result = [...libraryResults.values()].at(-1);
+  if (!result || librarySending || libraryBusy.size || restoring || closed) return;
+  const version = generation, epoch = libraryEpoch;
+  librarySending = true; updateButtons();
+  const previous = libraryModel;
+  try {
+    libraryModel = { fileId: result.fileId, filename: result.filename, size: result.size };
+    try { await saveState(true); } catch (error) { if (current(version) && epoch === libraryEpoch) libraryModel = previous; throw error; }
+    checkCurrent(version);
+    if (epoch !== libraryEpoch) return;
+    const prompt = `這是 #59 實驗。我剛按下按鈕上傳影片片段 ${result.filename}（fileId=${result.fileId}，${result.size} bytes，library:${result.library}）；尚未確認已進 ChatGPT 檔案庫。請不要呼叫任何工具。若能讀取這個檔案，回答它的 SHA-256 與第 10 秒的畫面文字；若看不到或讀不到，直接回答「看不到」，不要猜測。`;
+    const acknowledgment = await invoke("ui/message", { role: "user", content: [{ type: "text", text: prompt }] }, host()?.sendFollowUpMessage ? () => host().sendFollowUpMessage({ prompt }) : null, version);
+    checkCurrent(version);
+    if (epoch !== libraryEpoch) return;
+    if (acknowledgment?.isError) throw new Error(errorText(acknowledgment.content?.find(item => item.type === "text")?.text));
+    $("library-message").textContent = "已送出檔案讀取實驗要求；尚未確認模型可讀取。";
+  } catch (error) { if (current(version) && epoch === libraryEpoch) $("library-message").textContent = "檔案實驗要求未確認送達，未自動重送。請先檢查對話。\n" + libraryError(error); }
+  finally { if (current(version) && epoch === libraryEpoch) { librarySending = false; updateButtons(); } }
 }
 function showOperation() {
   $("operation").hidden = !activeOperation;
@@ -247,6 +376,7 @@ function renderPrepared(prepared) {
   if (!prepared?.job_id || !Array.isArray(prepared.segments)) return false;
   const changed = data?.job_id !== prepared.job_id;
   if (changed) {
+    resetLibrary();
     generation++; pollEpoch++; clearTimeout(pollTimer);
     stopDrivePolling(); driveConfigured = true;
     data = prepared; analysisResult = null; activeOperation = null; driveOperation = null; acting = false; driveActing = false; sending = false; uncertainStart = false;
@@ -265,7 +395,9 @@ function renderPrepared(prepared) {
     option.textContent = `${formatTime(segment.start_seconds)}–${formatTime(segment.end_seconds)} · ${segment.filename || "片段 " + (index + 1)}`;
     $("segment").append(option);
   });
+  renderLibrary();
   if (prepared.segments.length) selectSegment(Math.max(0, Math.min(selectedSegment, prepared.segments.length - 1)));
+  else if (changed) saveState();
   updateButtons();
   return changed;
 }
@@ -443,6 +575,7 @@ async function pollOperation(version = generation, epoch = pollEpoch) {
 }
 function clearExpiredMedia(jobId) {
   clearReport();
+  resetLibrary();
   // Keep only the job identity for remount recovery; all previous media and evidence are stale.
   data = { job_id: jobId, segments: [] };
   analysisResult = null; evidenceRows = []; shownCount = 60; pendingSeek = null;
@@ -451,6 +584,7 @@ function clearExpiredMedia(jobId) {
   $("segment-link").hidden = true; $("segment-link").removeAttribute("href");
   $("segment").replaceChildren(); $("findings").hidden = true; $("evidence").replaceChildren();
   $("drive-handoff").hidden = true; $("drive-prompt").value = "";
+  saveState();
 }
 async function restoreJob() {
   const version = generation, id = data?.job_id || saved.jobId;
@@ -645,6 +779,7 @@ function receiveToolResult(value, initial = false) {
     if (activeOperation?.operation === "prepare" && activeOperation.operation_id) supersededPrepares.add(activeOperation.operation_id);
     currentPrepareId = payload.operation_id;
     clearReport();
+    resetLibrary();
     generation++; stopPolling(); stopDrivePolling(); data = null; analysisResult = null; driveOperation = null; acting = false; driveActing = false; sending = false; restoring = false; uncertainStart = false;
     $("title").textContent = "正在準備新影片"; $("summary").textContent = "準備完成後可開始分析。";
     $("media").hidden = true; $("findings").hidden = true; $("drive-handoff").hidden = true; $("drive-prompt").value = ""; status("");
@@ -758,6 +893,7 @@ $("drive").addEventListener("click", () => startOperation("drive"));
 $("copy-handoff").addEventListener("click", copyHandoff);
 $("open-chat").addEventListener("click", openNewChat);
 $("ask").addEventListener("click", askChatGPT);
+$("library-ask").addEventListener("click", askAboutLibraryFile);
 $("cancel").addEventListener("click", () => changeOperation("cancel"));
 $("resume").addEventListener("click", () => changeOperation("resume"));
 $("refresh").addEventListener("click", () => {
@@ -769,6 +905,7 @@ $("player").addEventListener("loadedmetadata", () => { if (pendingSeek !== null)
 $("player").addEventListener("error", () => status("此片段暫時無法播放；可在新分頁開啟，或重新取得工作狀態。證據文字仍可查看。"));
 $("filter").addEventListener("change", () => { shownCount = 60; renderEvidence(); saveState(); });
 $("more").addEventListener("click", () => { shownCount += 60; renderEvidence(); });
+updateButtons();
 ensureBridge().catch(() => {});
 if (typeof ResizeObserver === "function") {
   let lastSize = "";

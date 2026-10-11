@@ -303,7 +303,35 @@ class MCPValidationTests(unittest.TestCase):
         self.assertIn('"ui/message"', mcp_server.WIDGET_HTML)
         self.assertNotIn("queueMicrotask(startAnalysis)", mcp_server.WIDGET_HTML)
         self.assertIn("get_video_job", mcp_server.WIDGET_HTML)
-        self.assertNotIn("uploadFile(", mcp_server.WIDGET_HTML)
+        html = mcp_server.WIDGET_HTML
+        upload_body = html.split("async function saveSegmentToLibrary(", 1)[1].split("async function askAboutLibraryFile(", 1)[0]
+        self.assertEqual(html.count("uploadFile("), 1)
+        self.assertEqual(upload_body.count("uploadFile("), 1)
+        for name in ("renderPrepared", "receiveToolResult", "restoreJob", "autoStartParallel"):
+            body = html.split(f"function {name}(", 1)[1].split("\nfunction ", 1)[0].split("\nasync function ", 1)[0]
+            self.assertNotIn("uploadFile(", body)
+            self.assertNotIn("fetch(", body)
+
+    def test_widget_csp_allows_segment_media_connections(self) -> None:
+        self.assertIn(mcp_server.MEDIA_ORIGIN, mcp_server.UI_META["ui"]["csp"]["connectDomains"])
+        self.assertIn(mcp_server.MEDIA_ORIGIN, mcp_server.UI_META["openai/widgetCSP"]["connect_domains"])
+
+    def test_signed_segment_media_allows_cross_origin_get_and_head(self) -> None:
+        from starlette.applications import Starlette
+        from starlette.routing import Route
+        from starlette.testclient import TestClient
+        from urllib.parse import urlsplit
+
+        path = mcp_server.MCP_JOBS_ROOT / "0123456789ab" / "segments" / "segment_000.mp4"
+        path.parent.mkdir()
+        path.write_bytes(b"fake-mp4")
+        url = urlsplit(mcp_server.media_url("0123456789ab", "segments/segment_000.mp4"))
+        app = Starlette(routes=[Route("/media/{job_id}/{filename:path}", mcp_server.media, methods=["GET", "HEAD"])])
+        with TestClient(app) as client:
+            for method in (client.get, client.head):
+                response = method(url.path + "?" + url.query)
+                self.assertEqual(response.status_code, 200)
+                self.assertEqual(response.headers["access-control-allow-origin"], "*")
 
     def test_drive_tool_exposes_output_schema_and_widget_path(self) -> None:
         tools = asyncio.run(mcp_server.mcp.list_tools())
