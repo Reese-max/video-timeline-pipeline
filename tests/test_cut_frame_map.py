@@ -285,7 +285,12 @@ class FrameMapTests(unittest.TestCase):
                 output = original
                 if temporary:
                     output = root / "output.json"
-                    output.with_name(output.name + ".tmp").symlink_to(original)
+                    try:
+                        output.with_name(output.name + ".tmp").symlink_to(original)
+                    except OSError as exc:
+                        if os.name == "nt" and exc.winerror == 1314:
+                            self.skipTest("Windows account lacks symlink creation privilege")
+                        raise
                 protected = [original, video, spec, companion, export]
                 before = hashes(protected)
                 if command == "map-frames":

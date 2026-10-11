@@ -21,7 +21,9 @@ def terminate_self():
 
 
 def watch_parent():
-    sys.stdin.buffer.read()
+    # Avoid holding BufferedReader's lock during interpreter shutdown.
+    while os.read(sys.stdin.fileno(), 1):
+        pass
     terminate_self()
 
 
