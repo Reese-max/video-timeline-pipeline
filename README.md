@@ -130,6 +130,8 @@ v9 修正 developer MCP 與官方 Drive 的交接邊界：不在原對話送出 
 
 媒體 tunnel worker 現在會驗證 DNS／TLS 後才發佈網址，每 30 秒檢查公開 `/health`；連續三次失敗才重建自己的 cloudflared 子行程。來源服務尚未啟動／故障或公開端 HTTP 429 不會觸發無效的 tunnel 重建。tunnel 不可用時，啟動器忽略舊網址並退回 MCP 原有公開 origin，保留 MCP／Drive 功能，不宣稱原生附件已恢復；現有 MCP 若仍持有不同的媒體網址，啟動器回傳非零，不強制中斷正在處理的影片。網址更換後，仍須受控重載 MCP、重新整理 ChatGPT 動作並 prepare 新 widget，才能更新確切的 CSP 網域；舊 widget 須使用 Drive 交接。回歸檢查（Linux／WSL）：`python3 -m unittest discover -s tests -p test_media_tunnel.py -v`。這不等於外部 ChatGPT 能下載 MP4 的驗收；[Quick Tunnels 官方不提供 SLA，僅供開發測試](https://developers.cloudflare.com/cloudflare-one/networks/connectors/cloudflare-tunnel/do-more-with-tunnels/trycloudflare/)，固定網域部署需另行設定 named tunnel。本次不新增網域或更動公開入口。
 
+Funnel 主機名變更後，ChatGPT 外掛清單可能殘留「Video Timeline Pipeline - Cursor Fixed」（Workspace upload，包著已刪除的 grokbot-2 App）：其選單只有編輯／下載 ZIP／上傳新版本，沒有刪除入口（#60）。該項目未安裝、不會被呼叫（2026-10-08 觀察），只是留在清單上，不影響新連線；保持未安裝即可。請改用新建立的連線，並在重新整理外掛動作後 prepare 新 widget。
+
 v7 修正跨工作狀態：切換 job 時立即替換 model context、清除舊附件 ID，並以工作快照及遞增版本隔離非同步結果（包含 A → B → A）。舊作業回傳或失敗不得覆寫目前 context、送出摘要要求或改寫目前錯誤；待舊呼叫結束後僅啟動最新工作。已送出的上傳可能在遠端完成，但過期結果會被丟棄，不刪除已建立的檔案。Drive 回應的 job_id 必須吻合；資料型交接回應不會當成新影片。回歸測試：`node tests/test_widget_handoff.cjs`。UI URI 按 [官方快取規則](https://developers.openai.com/plugins/build/chatgpt-ui#embed-the-component-in-the-server-response) 升版為 `ui://video-timeline-pipeline/v7.html`。
 
 v8 保留 v7 的工作隔離，下載期限改為涵蓋 HTTP 回應與完整 `blob()` 讀取；內容串流卡住也會在 30 秒中止並走 Drive fallback。UI URI 為 `ui://video-timeline-pipeline/v8.html`。時間軸改讀 FFmpeg `segments.csv` 的實際 muxer 起訖（非 `index × segment_seconds`），並停用負時間戳自動平移，避免編碼延遲造成偏移；manifest 升為 v2，重新 prepare 時會重建舊估算快取。超過 999 的分段使用數字排序，媒體與預覽路由亦接受較長索引。
