@@ -25,7 +25,7 @@ import uuid
 REPOSITORY = "Reese-max/video-timeline-pipeline"
 WORKFLOW = ".github/workflows/cost-timezone.yml"
 RUNTIME_FILES = ("mcp_server.py", "pipeline.py", "job_worker.py", "job_queue.py", "execution_control.py",
-                 "media_retention.py", "media_lifecycle.py", "drive_storage.py", "cost_tracker.py",
+                 "media_retention.py", "media_lifecycle.py", "drive_storage.py", "cost_tracker.py", "analysis_report.py",
                  "scoring.py", "notifications.py", "web/widget.html", "requirements.txt")
 
 
@@ -95,7 +95,7 @@ def github_ci(sha: str) -> dict:
 
 
 def clean_environment(**values) -> dict:
-    permitted = ("PATH", "HOME", "SYSTEMROOT", "WINDIR", "TEMP", "TMP", "LANG", "LC_ALL",
+    permitted = ("PATH", "HOME", "USERNAME", "SYSTEMROOT", "SYSTEMDRIVE", "WINDIR", "TEMP", "TMP", "LANG", "LC_ALL",
                  "SSL_CERT_FILE", "SSL_CERT_DIR", "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY")
     env = {key: os.environ[key] for key in permitted if key in os.environ}
     return {**env, "PYTHONUTF8": "1", "PYTHONDONTWRITEBYTECODE": "1", **values}

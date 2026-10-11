@@ -32,6 +32,17 @@ def archive(files):
 
 
 class LinuxDeployTests(unittest.TestCase):
+    def test_runtime_inventory_matches_server(self):
+        import mcp_server
+        self.assertEqual(set(deploy.RUNTIME_FILES), set(mcp_server.RUNTIME_SHA256))
+
+    def test_clean_environment_preserves_windows_identity_without_secrets(self):
+        with patch.dict(os.environ, {"SYSTEMDRIVE": "C:", "USERNAME": "fixture-user", "GROQ_API_KEY": "fixture"}):
+            environment = deploy.clean_environment()
+        self.assertEqual(environment["SYSTEMDRIVE"], "C:")
+        self.assertEqual(environment["USERNAME"], "fixture-user")
+        self.assertNotIn("GROQ_API_KEY", environment)
+
     def test_ci_exact_main_push_and_latest_attempt_are_required(self):
         run = {"id": 100, "run_attempt": 1, "head_sha": SHA, "head_branch": "main",
                "event": "push", "name": "Video Timeline CI", "path": deploy.WORKFLOW,

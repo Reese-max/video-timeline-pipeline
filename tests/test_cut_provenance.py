@@ -215,7 +215,12 @@ class ProvenanceTests(unittest.TestCase):
         outside = self.root / "outside.json"
         shutil.copyfile(path, outside)
         path.unlink()
-        path.symlink_to(outside)
+        try:
+            path.symlink_to(outside)
+        except OSError as exc:
+            if os.name == "nt" and exc.winerror == 1314:
+                self.skipTest("Windows account lacks symlink creation privilege")
+            raise
         self.assert_build_error("MALFORMED_EVIDENCE")
 
     def test_point_visual_and_summary_cannot_generate_range(self):
