@@ -1071,6 +1071,47 @@ def analysis_quality(result: dict[str, Any]) -> dict[str, Any]:
             "limitation": "僅檢查證據完整性與模型自報信心，不保證語意正確；畫面為抽樣，非逐幀檢視。"}
 
 
+def visual_observations_incomplete(rows: list[dict[str, Any]] | None) -> bool:
+    """Positive evidence that visual evidence is unusable (issue #77).
+
+    The visual stage returning a value is not proof of usable evidence:
+    timestamp-coverage failures come back as a placeholder observation with
+    ``completion_status=incomplete`` / ``finish_reason=timestamp_coverage``.
+    Absent markers (healthy observations) count as usable.
+    """
+    for row in rows or []:
+        if not isinstance(row, dict):
+            return True
+        if row.get("completion_status") not in (None, "complete"):
+            return True
+        if row.get("finish_reason") == "timestamp_coverage":
+            return True
+    return False
+
+
+def transcript_gaps_pending(transcript: dict[str, Any] | None) -> bool:
+    """True while transcript gaps remain or a backfill attempt failed (issue #77)."""
+    transcript = transcript if isinstance(transcript, dict) else {}
+    gap_check = transcript.get("gap_check")
+    remaining = gap_check.get("remaining") if isinstance(gap_check, dict) else []
+    return bool(remaining or transcript.get("backfill_errors"))
+
+
+def stored_analysis_evidence_complete(result: dict[str, Any]) -> bool:
+    """Cache gate: status=complete alone must not reuse degraded evidence (issue #77).
+
+    Pre-fix caches stored timestamp-coverage placeholders and un-backfilled
+    transcript gaps with status=complete; recompute those instead of reusing.
+    Rows without per-frame markers (legacy healthy rows, empty timelines)
+    still hit — only positive evidence of incompleteness bypasses the cache.
+    """
+    frames = [row.get("data") for row in result.get("timeline", []) or []
+              if isinstance(row, dict) and row.get("type") == "visual"]
+    if visual_observations_incomplete(frames):
+        return False
+    return not transcript_gaps_pending(result.get("transcript"))
+
+
 def analysis_cache_signature(video_path: Path, manifest: dict) -> str:
     """Hash actual bytes and all analysis choices; never include credential values."""
     configuration = {
@@ -1132,10 +1173,14 @@ def analyze_prepared_sync(job_id: str) -> dict[str, Any]:
     analysis_dir = job_dir / "analysis" / "runs" / cache_signature
     result_path = job_dir / "analysis" / "result.json"
     cached = pipeline.reuse_artifact(result_path)
+    # Issue #77: status=complete alone must not reuse degraded evidence —
+    # timestamp-coverage placeholders and un-backfilled transcript gaps stored
+    # by earlier versions are recomputed instead of returned.
     if (
         isinstance(cached, dict)
         and cached.get("status") == "complete"
         and cached.get("cache_signature") == cache_signature
+        and stored_analysis_evidence_complete(cached)
     ):
         pipeline.record_cost_cache_hit("pipeline", "analysis", job=job_id, root=MCP_ROOT)
         if result_path.is_file():
@@ -1259,15 +1304,25 @@ def analyze_prepared_sync(job_id: str) -> dict[str, Any]:
             audio_status = "error"
             errors.append(f"音訊：{transcript_box.get('error', '未知錯誤')}")
         observations = visual_box.get("value") or []
-        if "value" in visual_box:
+        if ("value" in visual_box and observations
+                and not visual_observations_incomplete(observations)):
             visual_status = "complete"
+        elif "value" in visual_box:
+            # Issue #77: a returned value with coverage-failure placeholders is
+            # not usable evidence — never report it as complete.
+            visual_status = "error"
+            errors.append("畫面：時間碼覆蓋失敗或部分畫面回應不完整，證據不足。")
         else:
             visual_status = "error"
             errors.append(f"畫面：{visual_box.get('error', '未知錯誤')}")
     else:
         try:
             observations = visual_stage()
-            visual_status = "complete"
+            if observations and not visual_observations_incomplete(observations):
+                visual_status = "complete"
+            else:
+                visual_status = "error"
+                errors.append("畫面：時間碼覆蓋失敗或部分畫面回應不完整，證據不足。")
         except (DeadlineExceeded, ExecutionCancelled):
             raise
         except Exception as error:
@@ -1279,10 +1334,14 @@ def analyze_prepared_sync(job_id: str) -> dict[str, Any]:
     timeline = pipeline.merge_timeline(transcript, observations)
     # ChatGPT produces the final summary from evidence; no duplicate MiniMax summary call.
     summary = {"status": "pending_chatgpt", "reason": "請由 ChatGPT 依 transcript／timeline 整理。"}
+    # Issue #77: un-backfilled transcript gaps must not be stored as complete,
+    # or reruns would return the cache instead of calling the model again.
+    transcript_pending = transcript_gaps_pending(transcript)
     overall = (
         "complete"
         if visual_status == "complete"
         and audio_status in {"complete", "skipped"}
+        and not transcript_pending
         else "partial"
         if timeline
         else "error"
