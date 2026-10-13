@@ -13,7 +13,7 @@ class MediaTunnelTests(unittest.TestCase):
     def test_launcher_rejects_stale_runtime_and_keeps_drive_available(self):
         script = (Path(__file__).resolve().parents[1] / "scripts/start-mcp-supervised.sh").read_text()
         selection = script[script.index('media_base="${MCP_MEDIA_BASE_URL:-}"'):script.index('process_matches()')]
-        guard = script[script.index('if [ -n "${pid}" ]; then'):script.index('printf -v run_script')]
+        guard = script[script.index('if [ -n "${pid}" ]; then'):script.index('command=(/bin/bash')]
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             launcher = root / "media-launcher"
@@ -21,7 +21,7 @@ class MediaTunnelTests(unittest.TestCase):
             launcher.chmod(0o700)
             urlfile = root / "media-url"
             urlfile.write_text("https://dead.trycloudflare.com\n")
-            env = dict(os.environ, MCP_MEDIA_BASE_URL="", media_launcher=str(launcher),
+            env = dict(os.environ, MCP_MEDIA_BASE_URL="", MCP_USE_QUICK_TUNNEL="1", media_launcher=str(launcher),
                        media_url_file=str(urlfile), public_base="https://mcp.example", group="test")
             result = subprocess.run(["bash", "-c", selection + 'printf "%s" "$media_base"'],
                                     env=env, capture_output=True, text=True, timeout=5)
@@ -35,6 +35,27 @@ class MediaTunnelTests(unittest.TestCase):
                 self.assertEqual(result.returncode, expected, result.stderr)
                 if expected:
                     self.assertIn("Running jobs were not interrupted", result.stderr)
+
+    def test_launcher_defaults_to_stable_media_and_preserves_explicit_override(self):
+        script = (Path(__file__).resolve().parents[1] / "scripts/start-mcp-supervised.sh").read_text()
+        selection = script[script.index('media_base="${MCP_MEDIA_BASE_URL:-}"'):script.index('process_matches()')]
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            launcher = root / "media-launcher"
+            marker = root / "called"
+            launcher.write_text('#!/bin/sh\ntouch "$marker"\nexit 1\n')
+            launcher.chmod(0o700)
+            urlfile = root / "media-url"
+            urlfile.write_text("https://rotating.trycloudflare.com\n")
+            for override, expected in (("", "https://mcp.example"), ("https://media.example", "https://media.example")):
+                env = dict(os.environ, MCP_MEDIA_BASE_URL=override, MCP_USE_QUICK_TUNNEL="0",
+                           media_launcher=str(launcher), media_url_file=str(urlfile),
+                           public_base="https://mcp.example", group="test", marker=str(marker))
+                result = subprocess.run(["bash", "-c", selection + 'printf "%s" "$media_base"'],
+                                        env=env, capture_output=True, text=True, timeout=5)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout, expected)
+                self.assertFalse(marker.exists(), "Stable mode must not start or depend on a quick tunnel")
 
     def test_worker_recovers_dns_failure_without_restarting_a_failed_origin(self):
         script = Path(__file__).resolve().parents[1] / "scripts/start-mcp-media-tunnel-supervised.sh"

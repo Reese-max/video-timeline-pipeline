@@ -13,7 +13,156 @@ import drive_storage as drive
 import mcp_server as server
 
 
+class TranscriptGapQualityTests(unittest.TestCase):
+    def setUp(self):
+        self.result = {"status": "complete", "audio_status": "complete", "visual_status": "complete",
+                       "transcript": {"segments": [{"text": "hello"}],
+                                      "gap_check": {"max_gap": 5.0, "remaining": []}, "backfill_errors": []},
+                       "errors": [], "timeline": [{"type": "visual", "data": {
+                           "visual_summary": "A visible sign", "confidence": 0.9}}]}
+
+    def test_remaining_gap_requires_review_with_time_range(self):
+        self.result["transcript"]["gap_check"]["remaining"] = [{"start": 118.0, "end": 150.0}]
+        quality = server.analysis_quality(self.result)
+        self.assertEqual(quality["status"], "evidence_available")
+        self.assertEqual(quality["reasons"], [])
+        self.assertEqual(quality["warnings"], [
+            "逐字稿有超過 5 秒的空白（1:58–2:30），可能是無人說話或音樂，必要時核對原片。"])
+
+    def test_remaining_gaps_show_only_three_ranges(self):
+        self.result["transcript"]["gap_check"]["remaining"] = [
+            {"start": start, "end": start + 10} for start in (60, 120, 180, 240, 300)]
+        quality = server.analysis_quality(self.result)
+        self.assertEqual(quality["status"], "evidence_available")
+        self.assertEqual(quality["reasons"], [])
+        reason = quality["warnings"][0]
+        for interval in ("1:00–1:10", "2:00–2:10", "3:00–3:10"):
+            self.assertIn(interval, reason)
+        self.assertNotIn("4:00", reason)
+        self.assertNotIn("5:00", reason)
+        self.assertEqual(reason.count("–"), 3)
+        self.assertIn("等 5 段", reason)
+
+    def test_backfill_errors_without_remaining_gaps_require_review(self):
+        self.result["transcript"]["backfill_errors"] = [{"error": "Groq 503"}]
+        quality = server.analysis_quality(self.result)
+        self.assertEqual(quality["status"], "needs_review")
+        self.assertEqual(quality["reasons"], ["逐字稿補轉失敗，可能漏字。"])
+        self.assertEqual(quality["warnings"], [])
+
+    def test_remaining_gap_and_backfill_error_share_one_reason(self):
+        self.result["transcript"]["gap_check"]["remaining"] = [{"start": 118, "end": 150}]
+        self.result["transcript"]["backfill_errors"] = [{"error": "Groq 503"}]
+        quality = server.analysis_quality(self.result)
+        self.assertEqual(quality["status"], "needs_review")
+        self.assertEqual(len(quality["reasons"]), 1)
+        self.assertIn("1:58–2:30", quality["reasons"][0])
+        self.assertIn("補轉失敗，可能漏字", quality["reasons"][0])
+        self.assertEqual(quality["warnings"], [])
+
+    def test_empty_gap_metadata_adds_no_reason(self):
+        quality = server.analysis_quality(self.result)
+        self.assertEqual(quality["status"], "evidence_available")
+        self.assertEqual(quality["reasons"], [])
+        self.assertEqual(quality["warnings"], [])
+
+    def test_old_transcript_without_gap_metadata_adds_no_reason(self):
+        del self.result["transcript"]["gap_check"]
+        del self.result["transcript"]["backfill_errors"]
+        quality = server.analysis_quality(self.result)
+        self.assertEqual(quality["status"], "evidence_available")
+        self.assertEqual(quality["reasons"], [])
+        self.assertEqual(quality["warnings"], [])
+
+    def test_invalid_gap_times_are_skipped_without_raising(self):
+        for value in (None, float("nan"), float("inf"), float("-inf"), "118", True):
+            with self.subTest(value=value):
+                self.result["transcript"]["gap_check"]["remaining"] = [
+                    {"start": value, "end": 150}, {"start": 118, "end": value},
+                    {"start": 118, "end": 150}]
+                quality = server.analysis_quality(self.result)
+                self.assertEqual(quality["status"], "evidence_available")
+                self.assertEqual(quality["reasons"], [])
+                self.assertEqual(quality["warnings"][0].count("–"), 1)
+                self.assertIn("1:58–2:30", quality["warnings"][0])
+                self.assertNotIn("等", quality["warnings"][0])
+        self.result["transcript"]["gap_check"]["remaining"] = [{"start": None, "end": float("nan")}]
+        quality = server.analysis_quality(self.result)
+        self.assertEqual(quality["status"], "evidence_available")
+        self.assertEqual(quality["reasons"], [])
+        self.assertNotIn("–", quality["warnings"][0])
+
+
 class ReliabilityTests(unittest.TestCase):
+    def test_unreliable_visual_timestamps_warn_and_count_only_visual(self):
+        good = {"status": "complete", "audio_status": "skipped", "visual_status": "complete",
+                "transcript": {"segments": []}, "timeline": [
+                    {"type": "visual", "data": {"visual_summary": "測試畫面", "confidence": 0.9,
+                                                "timestamp_reliable": False}},
+                    {"type": "visual", "data": {"visual_summary": "舊畫面", "confidence": 0.9}},
+                    {"type": "visual", "data": {"visual_summary": "測試畫面", "confidence": 0.9,
+                                                "timestamp_reliable": False}},
+                    {"type": "speech", "data": {"timestamp_reliable": False}}]}
+        quality = server.analysis_quality(good)
+        self.assertEqual(quality["status"], "evidence_available")
+        self.assertEqual(quality["reasons"], [])
+        self.assertEqual(quality["warnings"], ["2 筆畫面時間碼不可靠，未提供跳轉。"])
+        for row in good["timeline"][:3]:
+            row["data"].pop("timestamp_reliable", None)
+        self.assertEqual(server.analysis_quality(good)["status"], "evidence_available")
+        self.assertEqual(server.analysis_quality(good)["reasons"], [])
+        self.assertEqual(server.analysis_quality(good)["warnings"], [])
+
+    def test_unreliable_timestamps_count_only_usable_visuals(self):
+        for include_usable in (False, True):
+            with self.subTest(include_usable=include_usable):
+                rows = [{"visual_summary": "未完成", "completion_status": "incomplete"},
+                        {"visual_summary": "原始回應", "raw": "unparsed"},
+                        {"visual_summary": "尚未執行 MiniMax 視覺理解。"}, {"visual_summary": ""}]
+                if include_usable:
+                    rows.append({"visual_summary": "可用畫面", "confidence": 0.9})
+                result = {"status": "complete", "audio_status": "skipped", "visual_status": "complete",
+                          "timeline": [{"type": "visual", "data": {**row, "timestamp_reliable": False}}
+                                       for row in rows]}
+                quality = server.analysis_quality(result)
+                self.assertEqual(quality["status"], "needs_review")
+                self.assertEqual(quality["reasons"], ["缺少可用畫面觀察，或部分畫面回應不完整。"])
+                self.assertEqual(quality["warnings"], ["1 筆畫面時間碼不可靠，未提供跳轉。"]
+                                 if include_usable else [])
+
+    def test_warnings_survive_tool_schema_and_allow_summary(self):
+        result = {"status": "complete", "audio_status": "complete", "visual_status": "complete",
+                  "transcript": {"segments": [{"text": "hello"}], "backfill_errors": [],
+                                 "gap_check": {"max_gap": 5, "remaining": [{"start": 118, "end": 150}]}},
+                  "timeline": [{"type": "visual", "data": {"visual_summary": "可用畫面", "confidence": 0.9,
+                                                            "timestamp_reliable": False}}]}
+        response = server.analysis_tool_result(result)
+        quality = response.structuredContent["quality"]
+        self.assertEqual(quality["status"], "evidence_available")
+        self.assertEqual(quality["reasons"], [])
+        self.assertEqual(len(quality["warnings"]), 2)
+        text = response.content[0].text
+        self.assertIn("注意：" + "；".join(quality["warnings"]), text)
+        self.assertNotIn("停止摘要", text)
+        self.assertIn("請根據 transcript／timeline 整理", text)
+        model = server.PreparedVideoAnalysisResult.model_validate(response.structuredContent)
+        self.assertEqual(model.model_dump()["quality"]["warnings"], quality["warnings"])
+        tool = next(item for item in asyncio.run(server.mcp.list_tools()) if item.name == "analyze_prepared_video")
+        schema = tool.outputSchema["$defs"]["AnalysisQuality"]
+        self.assertEqual(schema["properties"]["warnings"]["items"], {"type": "string"})
+        self.assertNotIn("warnings", schema["required"])
+        legacy = {key: value for key, value in quality.items() if key != "warnings"}
+        first = server.AnalysisQuality.model_validate(legacy)
+        first.warnings.append("test")
+        self.assertEqual(server.AnalysisQuality.model_validate(legacy).warnings, [])
+        result["transcript"]["backfill_errors"] = [{"error": "Groq 503"}]
+        response = server.analysis_tool_result(result)
+        self.assertEqual(response.structuredContent["quality"]["status"], "needs_review")
+        self.assertEqual(response.structuredContent["quality"]["warnings"], ["1 筆畫面時間碼不可靠，未提供跳轉。"])
+        self.assertIn("停止摘要", response.content[0].text)
+        self.assertIn("需覆核：", response.content[0].text)
+        self.assertIn("注意：", response.content[0].text)
+
     def test_analysis_quality_requires_usable_evidence_not_just_api_success(self):
         good = {"status": "complete", "audio_status": "complete", "visual_status": "complete",
                 "transcript": {"segments": [{"text": "hello"}]}, "errors": [],
@@ -47,12 +196,13 @@ class ReliabilityTests(unittest.TestCase):
         self.assertEqual(server.analysis_quality(good)["status"], "evidence_available", "Silent video is not failed ASR")
 
     def test_cached_analysis_is_rechecked_for_quality(self):
-        cached = {"status": "complete", "source_fingerprint": "same", "audio_status": "complete",
+        cached = {"status": "complete", "source_fingerprint": "same", "cache_signature": "signature", "audio_status": "complete",
                   "visual_status": "complete", "timeline": [], "transcript": {"segments": []}}
         with (patch.object(server, "prepared_job_dir", return_value=Path("unused")),
               patch.object(server, "read_manifest", return_value={"status": "ready"}),
               patch.object(server.pipeline, "locate_source_video", return_value=Path("unused.mp4")),
               patch.object(server.pipeline, "file_fingerprint", return_value="same"),
+              patch.object(server, "analysis_cache_signature", return_value="signature"),
               patch.object(server.pipeline, "reuse_artifact", return_value=cached)):
             result = server.analyze_prepared_sync("0123456789ab")
         self.assertEqual(result["quality"]["status"], "needs_review")

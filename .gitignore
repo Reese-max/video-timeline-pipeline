@@ -2,6 +2,16 @@
 .env.bak-*
 jobs/
 mcp_jobs/
+.video-state/
+.runtime/
+*.bak-*
+*.sqlite3
+*.sqlite3-*
+.deployment-baseline.json
+.deployment/
+loop-*-tests.txt
+loop-*.tar.gz
+.pytest_cache/
 mcp-server.log
 mcp-server.pid
 mcp-supervisor.lock
@@ -21,3 +31,4 @@ __pycache__/
 cookies/
 cookies.txt
 *.cookies.txt
+secrets/

@@ -1,5 +1,7 @@
 import asyncio
+import ipaddress
 import json
+import socket
 import tempfile
 import unittest
 from pathlib import Path
@@ -10,6 +12,18 @@ import mcp_server
 
 
 class MCPValidationTests(unittest.TestCase):
+    def setUp(self):
+        self.temp_root = tempfile.TemporaryDirectory()
+        root = Path(self.temp_root.name)
+        (root / "mcp_jobs" / "0123456789ab").mkdir(parents=True)
+        self.patchers = [patch.object(mcp_server, "MCP_ROOT", root),
+                         patch.object(mcp_server, "MCP_JOBS_ROOT", root / "mcp_jobs")]
+        for patcher in self.patchers: patcher.start()
+
+    def tearDown(self):
+        for patcher in reversed(self.patchers): patcher.stop()
+        self.temp_root.cleanup()
+
     def test_drive_upload_recovers_502_in_same_session(self) -> None:
         completed = {"id": "file_1", "webViewLink": "https://drive.google.com/file/d/file_1/view"}
         for statuses, ranges, expected_bodies in [
@@ -79,13 +93,130 @@ class MCPValidationTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             mcp_server.validate_source_url("https://user:pass@example.com/video.mp4")
 
+    def test_validate_source_url_facebook_share_accepts_with_fake_ip_and_doh(self) -> None:
+        url = "https://www.facebook.com/share/v/1ExtCtwPgg/?mibextid=wwXIfr"
+        mock_response = MagicMock(status_code=200)
+        with (
+            patch.object(mcp_server.socket, "getaddrinfo", return_value=[(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("198.18.0.1", 443))]),
+            patch.object(mcp_server, "public_dns_addresses", return_value={ipaddress.ip_address("57.145.2.1")}),
+            patch.object(mcp_server.requests, "get", return_value=mock_response),
+        ):
+            self.assertEqual(mcp_server.validate_source_url(url), url)
+
+    def test_validate_source_url_facebook_share_reel_follows_public_redirect(self) -> None:
+        url = "https://www.facebook.com/share/r/1FZQnH1JoV/?mibextid=wwXIfr"
+        hop = MagicMock(status_code=302, headers={"Location": "https://www.facebook.com/reel/1234567890/"})
+        final = MagicMock(status_code=200, headers={})
+        with (
+            patch.object(mcp_server.socket, "getaddrinfo", return_value=[(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("198.18.0.1", 443))]),
+            patch.object(mcp_server, "public_dns_addresses", return_value={ipaddress.ip_address("57.145.2.1")}),
+            patch.object(mcp_server.requests, "get", side_effect=[hop, final]) as get,
+        ):
+            self.assertEqual(mcp_server.validate_source_url(url), url)
+        self.assertEqual(get.call_count, 2)
+        self.assertEqual(get.call_args_list[1].args[0], "https://www.facebook.com/reel/1234567890/")
+
+    def test_validate_source_url_fake_ip_empty_doh_known_vs_unknown_host(self) -> None:
+        fb_url = "https://www.facebook.com/share/v/1ExtCtwPgg/?mibextid=wwXIfr"
+        mock_response = MagicMock(status_code=200)
+        with (
+            patch.object(mcp_server.socket, "getaddrinfo", return_value=[(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("198.18.0.1", 443))]),
+            patch.object(mcp_server, "public_dns_addresses", return_value=set()),
+            patch.object(mcp_server.requests, "get", return_value=mock_response),
+        ):
+            with self.assertRaisesRegex(ValueError, "無法確認"):
+                mcp_server.validate_source_url(fb_url)
+
+        evil_url = "https://evil.example/video.mp4"
+        with (
+            patch.object(mcp_server.socket, "getaddrinfo", return_value=[(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("198.18.0.1", 443))]),
+            patch.object(mcp_server, "public_dns_addresses", return_value=set()),
+        ):
+            with self.assertRaises(ValueError):
+                mcp_server.validate_source_url(evil_url)
+
+    def test_validate_source_url_fake_ip_doh_private_ip_rejected(self) -> None:
+        url = "https://www.facebook.com/share/v/1ExtCtwPgg/?mibextid=wwXIfr"
+        with (
+            patch.object(mcp_server.socket, "getaddrinfo", return_value=[(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("198.18.0.1", 443))]),
+            patch.object(mcp_server, "public_dns_addresses", return_value={ipaddress.ip_address("10.0.0.5")}),
+        ):
+            with self.assertRaises(ValueError):
+                mcp_server.validate_source_url(url)
+
+    def test_validate_source_url_ip_literals_rejected(self) -> None:
+        urls = [
+            "http://127.0.0.1/",
+            "http://169.254.169.254/latest/meta-data/",
+            "http://100.100.100.100/",
+            "http://198.18.0.1/",
+            "http://[::1]/",
+        ]
+        for url in urls:
+            with self.subTest(url=url):
+                with self.assertRaises(ValueError):
+                    mcp_server.validate_source_url(url)
+
+    def test_validate_source_url_resolving_to_link_local_rejected(self) -> None:
+        url = "https://metadata.internal.example/video.mp4"
+        with patch.object(
+            mcp_server.socket,
+            "getaddrinfo",
+            return_value=[(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("169.254.169.254", 443))],
+        ):
+            with self.assertRaises(ValueError):
+                mcp_server.validate_source_url(url)
+
+    def test_validate_source_url_share_redirect_hop_to_link_local_rejected(self) -> None:
+        url = "https://www.facebook.com/share/v/1ExtCtwPgg/?mibextid=wwXIfr"
+        mock_response = MagicMock()
+        mock_response.status_code = 302
+        mock_response.headers = {"Location": "http://169.254.169.254/"}
+        with (
+            patch.object(mcp_server.socket, "getaddrinfo", return_value=[(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("198.18.0.1", 443))]),
+            patch.object(mcp_server, "public_dns_addresses", return_value={ipaddress.ip_address("57.145.2.1")}),
+            patch.object(mcp_server.requests, "get", return_value=mock_response),
+        ):
+            with self.assertRaises(ValueError):
+                mcp_server.validate_source_url(url)
+
+    def test_public_dns_addresses_parsing_and_fallback(self) -> None:
+        bad_response = MagicMock(status_code=500)
+        good_a = MagicMock(status_code=200)
+        good_a.json.return_value = {
+            "Status": 0,
+            "Question": [{"name": "example.com.", "type": 1}],
+            "Answer": [
+                {"name": "example.com", "type": 5, "data": "cname.example.com."},
+                {"name": "cname.example.com", "type": 1, "data": "93.184.216.34"},
+            ],
+        }
+        good_aaaa = MagicMock(status_code=200)
+        good_aaaa.json.return_value = {
+            "Status": 0,
+            "Question": [{"name": "example.com.", "type": 28}],
+            "Answer": [
+                {"name": "example.com", "type": 5, "data": "cname.example.com."},
+                {"name": "cname.example.com", "type": 28, "data": "2606:2800:220:1:248:1893:25c8:1946"},
+            ],
+        }
+        with patch.object(mcp_server.requests, "get", side_effect=[bad_response, good_a, good_aaaa]):
+            addrs = mcp_server.public_dns_addresses("example.com")
+            self.assertEqual(
+                addrs,
+                {
+                    ipaddress.ip_address("93.184.216.34"),
+                    ipaddress.ip_address("2606:2800:220:1:248:1893:25c8:1946"),
+                },
+            )
+
     def test_media_path_rejects_traversal(self) -> None:
         self.assertIsNone(mcp_server.safe_media_path("0123456789ab", "segments/../source.mp4"))
         self.assertIsNone(mcp_server.safe_media_path("not-a-job", "segments/segment_000.mp4"))
 
     def test_media_urls_use_media_base(self) -> None:
         self.assertEqual(
-            mcp_server.media_url("0123456789ab", "segments/segment_000.mp4"),
+            mcp_server.media_url("0123456789ab", "segments/segment_000.mp4").split("?", 1)[0],
             f"{mcp_server.MCP_MEDIA_BASE_URL}/media/0123456789ab/segments/segment_000.mp4",
         )
 
@@ -165,13 +296,42 @@ class MCPValidationTests(unittest.TestCase):
         self.assertIsNotNone(tool.outputSchema)
         self.assertTrue(tool.meta["openai/widgetAccessible"])
         self.assertNotIn("const openai = window.openai", mcp_server.WIDGET_HTML)
-        self.assertIn("const getOpenAI = () => window.openai", mcp_server.WIDGET_HTML)
+        self.assertIn("window.openai", mcp_server.WIDGET_HTML)
         self.assertIn('request("ui/initialize"', mcp_server.WIDGET_HTML)
         self.assertIn("ui/notifications/initialized", mcp_server.WIDGET_HTML)
-        self.assertIn('request("tools/call"', mcp_server.WIDGET_HTML)
-        self.assertIn('request("ui/message"', mcp_server.WIDGET_HTML)
-        self.assertIn("queueMicrotask(startAnalysis)", mcp_server.WIDGET_HTML)
-        self.assertNotIn("uploadFile(", mcp_server.WIDGET_HTML)
+        self.assertIn('"tools/call"', mcp_server.WIDGET_HTML)
+        self.assertIn('"ui/message"', mcp_server.WIDGET_HTML)
+        self.assertNotIn("queueMicrotask(startAnalysis)", mcp_server.WIDGET_HTML)
+        self.assertIn("get_video_job", mcp_server.WIDGET_HTML)
+        html = mcp_server.WIDGET_HTML
+        upload_body = html.split("async function saveSegmentToLibrary(", 1)[1].split("async function askAboutLibraryFile(", 1)[0]
+        self.assertEqual(html.count("uploadFile("), 1)
+        self.assertEqual(upload_body.count("uploadFile("), 1)
+        for name in ("renderPrepared", "receiveToolResult", "restoreJob", "autoStartParallel"):
+            body = html.split(f"function {name}(", 1)[1].split("\nfunction ", 1)[0].split("\nasync function ", 1)[0]
+            self.assertNotIn("uploadFile(", body)
+            self.assertNotIn("fetch(", body)
+
+    def test_widget_csp_allows_segment_media_connections(self) -> None:
+        self.assertIn(mcp_server.MEDIA_ORIGIN, mcp_server.UI_META["ui"]["csp"]["connectDomains"])
+        self.assertIn(mcp_server.MEDIA_ORIGIN, mcp_server.UI_META["openai/widgetCSP"]["connect_domains"])
+
+    def test_signed_segment_media_allows_cross_origin_get_and_head(self) -> None:
+        from starlette.applications import Starlette
+        from starlette.routing import Route
+        from starlette.testclient import TestClient
+        from urllib.parse import urlsplit
+
+        path = mcp_server.MCP_JOBS_ROOT / "0123456789ab" / "segments" / "segment_000.mp4"
+        path.parent.mkdir()
+        path.write_bytes(b"fake-mp4")
+        url = urlsplit(mcp_server.media_url("0123456789ab", "segments/segment_000.mp4"))
+        app = Starlette(routes=[Route("/media/{job_id}/{filename:path}", mcp_server.media, methods=["GET", "HEAD"])])
+        with TestClient(app) as client:
+            for method in (client.get, client.head):
+                response = method(url.path + "?" + url.query)
+                self.assertEqual(response.status_code, 200)
+                self.assertEqual(response.headers["access-control-allow-origin"], "*")
 
     def test_drive_tool_exposes_output_schema_and_widget_path(self) -> None:
         tools = asyncio.run(mcp_server.mcp.list_tools())
@@ -179,7 +339,7 @@ class MCPValidationTests(unittest.TestCase):
         self.assertIsNotNone(tool.outputSchema)
         self.assertTrue(tool.meta["openai/widgetAccessible"])
         self.assertIn("upload_prepared_video_to_drive", mcp_server.WIDGET_HTML)
-        self.assertIn("Google Drive connector", mcp_server.WIDGET_HTML)
+        self.assertIn("Google Drive", mcp_server.WIDGET_HTML)
         self.assertNotIn("analyzeOnServer", mcp_server.WIDGET_HTML)
 
     def test_drive_view_urls_are_metadata_not_materializable_attachments(self) -> None:
@@ -197,7 +357,9 @@ class MCPValidationTests(unittest.TestCase):
         }
         result = mcp_server.drive_tool_result(payload)
         self.assertEqual([item.type for item in result.content], ["text"])
-        self.assertEqual(result.structuredContent, payload)
+        for key, value in payload.items():
+            self.assertEqual(result.structuredContent[key], value)
+        self.assertIn("file_1", result.structuredContent["handoff_text"])
         mcp_server.DriveUploadResult.model_validate(result.structuredContent)
         self.assertIn("download_raw_file=true", result.content[0].text)
         self.assertIn("include_base64=false", result.content[0].text)
@@ -222,6 +384,7 @@ class MCPValidationTests(unittest.TestCase):
             with (
                 patch.object(mcp_server, "prepared_job_dir", return_value=Path(raw_dir)),
                 patch.object(mcp_server, "read_manifest", return_value=manifest),
+                patch.multiple(mcp_server, check_job_capacity=MagicMock(), storage_policy=MagicMock()),
                 patch.object(mcp_server.pipeline, "locate_source_video", return_value=video_path),
                 patch.object(mcp_server.pipeline, "file_fingerprint", return_value="7:1"),
                 patch.object(mcp_server.pipeline, "reuse_artifact", return_value=None),
@@ -234,11 +397,11 @@ class MCPValidationTests(unittest.TestCase):
                     },
                 ),
                 patch.object(mcp_server.pipeline, "minimax_model", return_value="MiniMax-M3"),
+                patch.object(mcp_server.pipeline, "minimax_endpoint", return_value="https://api.minimax.io/v1"),
                 patch.object(mcp_server.pipeline, "minimax_subscription_key", return_value="key"),
-                patch.object(mcp_server.pipeline, "vision_frame_limit", return_value=8),
                 patch.object(
                     mcp_server.pipeline,
-                    "extract_candidates",
+                    "extract_budgeted_candidates",
                     return_value=(
                         [{"timestamp": 0, "path": str(video_path), "ocr_text": ""}],
                         {},
@@ -273,7 +436,7 @@ class MCPValidationTests(unittest.TestCase):
                 patch.object(mcp_server.pipeline, "create_summary") as create_summary_mock,
                 patch.object(mcp_server.pipeline, "file_sha256", return_value="sha"),
                 patch.object(mcp_server.pipeline, "write_json"),
-                patch.dict(mcp_server.os.environ, {"GROQ_API_KEY": "groq"}, clear=False),
+                patch.dict(mcp_server.os.environ, {"GROQ_API_KEY": "groq", "ANALYZE_VISUAL_MODE": "frames"}, clear=False),
             ):
                 result = mcp_server.analyze_prepared_sync("0123456789ab")
 
@@ -284,7 +447,8 @@ class MCPValidationTests(unittest.TestCase):
         self.assertEqual(result["summary"]["status"], "pending_chatgpt")
         self.assertEqual(result["quality"]["status"], "evidence_available")
         create_summary_mock.assert_not_called()
-        self.assertEqual(extract_candidates_mock.call_args.args[3], 0)
+        self.assertEqual(extract_candidates_mock.call_args.kwargs["candidate_budget"], 240)
+        self.assertEqual(extract_candidates_mock.call_args.args[2], 2)
 
     def test_drive_upload_caches_verified_segment_metadata(self) -> None:
         with tempfile.TemporaryDirectory() as raw_dir:
@@ -344,7 +508,7 @@ class MCPValidationTests(unittest.TestCase):
 
     def test_prepare_tool_structured_result_matches_schema(self) -> None:
         manifest = {
-            "job_id": "job-1",
+            "job_id": "0123456789ab",
             "source": {"title": "demo", "url": "https://example.com/video", "duration_seconds": 1.0},
             "duration_seconds": 1.0,
             "segment_seconds": 60,
@@ -370,7 +534,7 @@ class MCPValidationTests(unittest.TestCase):
             )
         self.assertEqual(result.structuredContent["status"], "ready")
         self.assertEqual(result.structuredContent["segments"][0]["filename"], "segment_000.mp4")
-        self.assertIn("analyze_prepared_video", result.content[0].text)
+        self.assertIn("自動同時啟動分析與 Drive 上傳", result.content[0].text)
         self.assertNotIn("先完成檔案交接", result.content[0].text)
 
 

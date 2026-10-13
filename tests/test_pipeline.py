@@ -1,5 +1,8 @@
 import io
 import json
+import os
+import subprocess
+import sys
 import tempfile
 import urllib.error
 import unittest
@@ -7,6 +10,19 @@ from pathlib import Path
 from unittest import mock
 
 import pipeline
+
+
+class SelfTestTests(unittest.TestCase):
+    def test_self_test_passes_on_linux(self) -> None:
+        result = subprocess.run(
+            [sys.executable, "-X", "utf8", "pipeline.py", "--self-test"],
+            capture_output=True,
+            text=True,
+            cwd=Path(__file__).parent.parent,
+            env={**os.environ, "PYTHONPATH": "."},
+        )
+        self.assertEqual(result.returncode, 0, f"self-test failed: {result.stdout}\n{result.stderr}")
+        self.assertIn("self-test: OK", result.stdout)
 
 
 class FrameSelectionTests(unittest.TestCase):
@@ -238,7 +254,7 @@ class FacebookAuthorTests(unittest.TestCase):
         }
         with mock.patch.object(
             pipeline,
-            "post_json",
+            "request_json",
             return_value={"data": {"id": "run-1", "status": "RUNNING"}},
         ) as post, mock.patch.object(pipeline, "get_json", side_effect=fake_get), mock.patch.dict(
             pipeline.os.environ, environment, clear=True
@@ -250,7 +266,10 @@ class FacebookAuthorTests(unittest.TestCase):
         self.assertEqual([item["id"] for item in feed["items"]], ["video-1"])
         self.assertEqual(feed["items"][0]["url"], "https://www.facebook.com/example/videos/123/")
         self.assertEqual(feed["facebook"]["provider"], "apify")
-        run_url, run_headers, run_body = post.call_args.args[:3]
+        run_url, run_headers = post.call_args.args[:2]
+        run_body = post.call_args.kwargs["body"]
+        self.assertEqual(post.call_args.kwargs["method"], "POST")
+        self.assertEqual(post.call_args.kwargs["attempts"], 1)
         self.assertNotIn("test-apify-token", run_url)
         self.assertEqual(run_headers["Authorization"], "Bearer test-apify-token")
         self.assertIn("maxTotalChargeUsd=1.0", run_url)

@@ -32,6 +32,30 @@ class DeliveryResult:
     retry_after_seconds: int | None = None
 
 
+def budget_blocked_error() -> type[RuntimeError]:
+    """Lazy handle on the real guard exception.
+
+    cost_tracker imports notifications, which imports this module; resolving the
+    class at except-time keeps the dependency one-directional and still binds the
+    production exception type (never a re-defined copy).
+    """
+    from cost_tracker import BudgetBlockedError
+
+    return BudgetBlockedError
+
+
+def cost_guard(provider: str, operation: str, **kwargs: Any):
+    """成本守衛（#4）：寄送前預留，被拒絕時完全不會建立連線。"""
+    from cost_tracker import provider_cost_guard
+
+    return provider_cost_guard(provider, operation, **kwargs)
+
+
+def blocked_delivery(reason: str) -> DeliveryResult:
+    """預算拒絕不是暫時性失敗：不排重試、不遞迴產生新告警。"""
+    return DeliveryResult(status="permanent_failure", safe_error=mask_sensitive(f"Budget blocked: {reason}"))
+
+
 def mask_sensitive(text: str) -> str:
     """Mask credentials, tokens, or passwords in error messages."""
     if not text:
@@ -156,12 +180,15 @@ class ResendProvider(BaseProvider):
         )
 
         try:
-            with urllib.request.urlopen(req, timeout=20) as resp:
-                resp_data = json.loads(resp.read().decode("utf-8"))
-                return DeliveryResult(
-                    status="accepted",
-                    provider_message_id=resp_data.get("id"),
-                )
+            with cost_guard("resend", "email.send"):
+                with urllib.request.urlopen(req, timeout=20) as resp:
+                    resp_data = json.loads(resp.read().decode("utf-8"))
+                    return DeliveryResult(
+                        status="accepted",
+                        provider_message_id=resp_data.get("id"),
+                    )
+        except budget_blocked_error() as exc:
+            return blocked_delivery(exc.reason)
         except urllib.error.HTTPError as exc:
             err_body = exc.read().decode("utf-8", errors="ignore")
             # 429: Rate limited
@@ -237,17 +264,20 @@ class SmtpProvider(BaseProvider):
             msg.add_alternative(html_body, subtype="html")
 
         try:
-            context = ssl.create_default_context() if self.use_tls else None
-            with smtplib.SMTP(self.host, self.port, timeout=25) as server:
-                if self.use_tls:
-                    server.starttls(context=context)
-                if self.username and self.password:
-                    server.login(self.username, self.password)
-                server.send_message(msg)
-                return DeliveryResult(
-                    status="accepted",
-                    provider_message_id=msg["Message-ID"],
-                )
+            with cost_guard("smtp", "email.send"):
+                context = ssl.create_default_context() if self.use_tls else None
+                with smtplib.SMTP(self.host, self.port, timeout=25) as server:
+                    if self.use_tls:
+                        server.starttls(context=context)
+                    if self.username and self.password:
+                        server.login(self.username, self.password)
+                    server.send_message(msg)
+                    return DeliveryResult(
+                        status="accepted",
+                        provider_message_id=msg["Message-ID"],
+                    )
+        except budget_blocked_error() as exc:
+            return blocked_delivery(exc.reason)
         except smtplib.SMTPAuthenticationError as exc:
             return DeliveryResult(
                 status="permanent_failure",
@@ -311,9 +341,12 @@ class WebhookProvider(BaseProvider):
         )
 
         try:
-            with urllib.request.urlopen(req, timeout=15) as resp:
-                resp.read(512)
-                return DeliveryResult(status="accepted", provider_message_id=f"hook_{int(time.time())}")
+            with cost_guard("webhook", "webhook.post"):
+                with urllib.request.urlopen(req, timeout=15) as resp:
+                    resp.read(512)
+                    return DeliveryResult(status="accepted", provider_message_id=f"hook_{int(time.time())}")
+        except budget_blocked_error() as exc:
+            return blocked_delivery(exc.reason)
         except urllib.error.HTTPError as exc:
             err_body = exc.read().decode("utf-8", errors="ignore")
             if exc.code == 429:
