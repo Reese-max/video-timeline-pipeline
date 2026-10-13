@@ -1,5 +1,8 @@
 import io
 import json
+import os
+import subprocess
+import sys
 import tempfile
 import urllib.error
 import unittest
@@ -7,6 +10,19 @@ from pathlib import Path
 from unittest import mock
 
 import pipeline
+
+
+class SelfTestTests(unittest.TestCase):
+    def test_self_test_passes_on_linux(self) -> None:
+        result = subprocess.run(
+            [sys.executable, "-X", "utf8", "pipeline.py", "--self-test"],
+            capture_output=True,
+            text=True,
+            cwd=Path(__file__).parent.parent,
+            env={**os.environ, "PYTHONPATH": "."},
+        )
+        self.assertEqual(result.returncode, 0, f"self-test failed: {result.stdout}\n{result.stderr}")
+        self.assertIn("self-test: OK", result.stdout)
 
 
 class FrameSelectionTests(unittest.TestCase):
