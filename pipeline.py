@@ -2737,10 +2737,22 @@ def compress_video_for_minimax_upload(
     # Leave ~10% headroom for container overhead so we stay under the Files API cap.
     total_bits = max(1, int(target_bytes * 8 * 0.90))
     video_bps = max(250_000, int(total_bits / seconds) - audio_bps)
-    video_kbps = max(250, video_bps // 1000)
+    # libx264's bitrate/buffer options use signed 32-bit bit counts. A very
+    # short clip must not turn the upload size target into overflowing rates.
+    video_kbps = min(max(250, video_bps // 1000), (2**31 - 1) // 2000)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     temporary = output_path.with_suffix(output_path.suffix + ".partial")
     temporary.unlink(missing_ok=True)
+    try:
+        return _compress_video_mp4(ffmpeg, video_path, output_path, temporary, seconds, video_kbps, target_bytes)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _compress_video_mp4(
+    ffmpeg: str, video_path: Path, output_path: Path, temporary: Path,
+    seconds: float, video_kbps: int, target_bytes: int,
+) -> Path:
     run_external(
         [
             ffmpeg,
@@ -2772,6 +2784,8 @@ def compress_video_for_minimax_upload(
             "2",
             "-movflags",
             "+faststart",
+            "-f",
+            "mp4",
             str(temporary),
         ],
         timeout=max(120.0, min(3600.0, seconds * 4.0)),
@@ -3358,6 +3372,7 @@ def analyze_video_mp4(
         compressed_path = scratch / "minimax-compressed.mp4"
         compress_error: Exception | None = None
         for target in (MINIMAX_VIDEO_COMPRESS_TARGET_BYTES, MINIMAX_VIDEO_COMPRESS_RETRY_BYTES):
+            compression_finished = False
             try:
                 print(
                     f"· video_mp4 壓縮備援：目標 ≤{target // (1024 * 1024)}MB"
@@ -3369,6 +3384,7 @@ def analyze_video_mp4(
                     target_bytes=target,
                     duration=duration,
                 )
+                compression_finished = True
                 compressed_size = compressed_path.stat().st_size
                 if compressed_size > MINIMAX_VIDEO_FILES_API_LIMIT_BYTES:
                     raise RuntimeError(
@@ -3391,7 +3407,7 @@ def analyze_video_mp4(
                     # Compress succeeded; non-size upload/analyze errors are not a frames fallback.
                     raise
                 return persist(observations, parsed, file_id)
-            except budget_blocked_error():
+            except (DeadlineExceeded, ExecutionCancelled, budget_blocked_error()):
                 raise
             except Exception as error:
                 compress_error = error
@@ -3402,7 +3418,8 @@ def analyze_video_mp4(
                 )
                 still_too_large = is_minimax_video_size_error(error)
                 compress_failed = (
-                    ffmpeg_unavailable
+                    not compression_finished
+                    or ffmpeg_unavailable
                     or "compress produced empty" in message
                     or "ffmpeg compress" in message.lower()
                     or still_too_large
