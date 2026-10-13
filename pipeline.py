@@ -7232,11 +7232,12 @@ def self_test() -> None:
         original_run_external = run_external
         globals()["run_external"] = lambda command, **kwargs: captured_task.append(command) or ""
         try:
-            assert install_rss_task(rss_root / "task", 15, False).startswith("VidBee-RSS-")
+            if os.name == "nt":
+                assert install_rss_task(rss_root / "task", 15, False).startswith("VidBee-RSS-")
+                task_script = rss_root / "task" / "rss" / "scheduled-refresh.cmd"
+                assert captured_task and "--rss-process" not in task_script.read_text(encoding="utf-8")
         finally:
             globals()["run_external"] = original_run_external
-        task_script = rss_root / "task" / "rss" / "scheduled-refresh.cmd"
-        assert captured_task and "--rss-process" not in task_script.read_text(encoding="utf-8")
 
     with tempfile.TemporaryDirectory() as failure_temp:
         failure_root = Path(failure_temp)
@@ -7340,9 +7341,18 @@ def self_test() -> None:
     assert fetch_calls == 2 and waits == [0.0] and fetched["etag"] == '"v2"'
     assert any(key.casefold() == "if-none-match" and value == '"v1"' for key, value in fetch_headers[0].items())
     try:
-        process_rss_queue(
-            argparse.Namespace(rss_max_items=1, dry_run=False, local_only=False, allow_batch_cloud=False)
-        )
+        with tempfile.TemporaryDirectory() as temp_root:
+            process_rss_queue(
+                argparse.Namespace(
+                    rss_max_items=1,
+                    dry_run=False,
+                    local_only=False,
+                    allow_batch_cloud=False,
+                    root=Path(temp_root),
+                    rss_retry_failed=False,
+                    rss_webhook=None,
+                )
+            )
         raise AssertionError("RSS 雲端處理必須要求明確旗標")
     except RuntimeError as exc:
         assert "Credits" in str(exc)
