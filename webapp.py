@@ -250,6 +250,19 @@ class DashboardHandler(BaseHTTPRequestHandler):
         except (BrokenPipeError, ConnectionResetError):
             pass
 
+    def _send_javascript(self, status: int, source: bytes) -> None:
+        self.send_response(status)
+        for key, value in self._security_headers({
+            "Content-Type": "text/javascript; charset=utf-8",
+        }).items():
+            self.send_header(key, value)
+        self.send_header("Content-Length", str(len(source)))
+        self.end_headers()
+        try:
+            self.wfile.write(source)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+
     def _error(self, code: str, safe_message: str, *, status: int | None = None,
                retryable: bool = False) -> None:
         self._send_json(
@@ -499,6 +512,16 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 raise web_services.ServiceError("not_found", "unknown task", http_status=404)
             self._send_json(200, {"schema_version": SCHEMA_VERSION, **task})
             return
+        # Same-origin behavior only; the fixed path remains under web_static.
+        if path == "/dashboard.js":
+            script = Path(__file__).with_name("web_static") / "dashboard.js"
+            try:
+                source = script.read_bytes()
+            except OSError:
+                self._error("not_found", "not found", status=404)
+                return
+            self._send_javascript(200, source)
+            return
         # HTML pages
         if path == "/":
             self._send_html(200, _page_home(self.server))
@@ -612,13 +635,20 @@ _CSS = """
 body{font-family:system-ui,sans-serif;margin:0;background:#0f1115;color:#e8eaed}
 nav{background:#1c1f26;padding:.7rem 1.2rem;display:flex;gap:1rem;flex-wrap:wrap}
 nav a{color:#9ecbff;text-decoration:none}
-main{padding:1.2rem;max-width:1100px;margin:0 auto}
+main{box-sizing:border-box;width:100%;padding:1.2rem;max-width:1100px;margin:0 auto}
+.table-scroll{max-width:100%;overflow-x:auto;-webkit-overflow-scrolling:touch}
 table{border-collapse:collapse;width:100%;margin:1rem 0}
 th,td{padding:.35rem .6rem;border-bottom:1px solid #2c313a;text-align:left;font-size:.9rem}
 .card{background:#1c1f26;border:1px solid #2c313a;border-radius:8px;padding:1rem;margin:.8rem 0}
 .muted{color:#9aa0a6}.err{color:#ff8a80}.ok{color:#80d8a7}
-input,select,button{background:#262a33;color:#e8eaed;border:1px solid #3a3f4a;border-radius:6px;padding:.4rem .6rem}
+input,select,textarea,button{box-sizing:border-box;max-width:100%;background:#262a33;color:#e8eaed;border:1px solid #3a3f4a;border-radius:6px;padding:.4rem .6rem}
+textarea{display:block;width:100%;margin:.4rem 0}
+.search-query{width:min(100%,36rem)}
+.task-status{display:inline-block;border-radius:999px;padding:.12rem .45rem;font-weight:600}
+.task-status-blocked{color:#ffca80;background:#493512}
+.task-status-unknown{color:#ff8a80;background:#4a2525}
 a{color:#9ecbff}
+@media(max-width:640px){nav{gap:.55rem;padding:.7rem}.card{padding:.75rem}main{padding:.65rem}.search-query{width:100%}}
 """
 
 
@@ -641,7 +671,7 @@ def _page(server: DashboardServer, title: str, body: str) -> str:
 <nav><a href="/">總覽</a><a href="/videos">影片庫</a><a href="/search">搜尋</a>
 <a href="/operations">作業</a><a href="/operations/failed">失敗</a><a href="/operations/providers">供應商</a>
 <a href="/digests">摘要</a><a href="/notifications">通知</a><a href="/tasks">工作</a></nav>
-<main>{body}</main></body></html>"""
+<main>{body}</main><script src="/dashboard.js" defer></script></body></html>"""
 
 
 def _state_block(available: bool, label_when_missing: str) -> str:
@@ -723,8 +753,8 @@ def _page_videos(server: DashboardServer, query: dict[str, list[str]]) -> str:
 <input name="author" placeholder="作者" value="{_e(first('author'))}">
 <input name="status" placeholder="狀態" value="{_e(first('status'))}">
 <button>篩選</button></form></div>
-<div class="card"><table><tr><th>標題</th><th>平台</th><th>作者</th><th>發佈</th><th>完成</th><th>長度</th><th>分類</th><th>狀態</th><th>分數</th></tr>
-{rows}</table>{empty}{pager}</div>"""
+<div class="card"><div class="table-scroll"><table><tr><th>標題</th><th>平台</th><th>作者</th><th>發佈</th><th>完成</th><th>長度</th><th>分類</th><th>狀態</th><th>分數</th></tr>
+{rows}</table></div>{empty}{pager}</div>"""
     return _page(server, "影片庫", body)
 
 
@@ -768,10 +798,18 @@ def _page_search(server: DashboardServer, q: str) -> str:
             results_html = f'<div class="card"><p class="err">{_e(exc.code)}：{_e(exc.safe_message)}</p></div>'
     body = f"""
 <div class="card"><form method="get" action="/search">
-<input name="q" value="{_e(q)}" maxlength="200" size="60" placeholder="本機全文搜尋">
+<input class="search-query" name="q" value="{_e(q)}" maxlength="200" size="60" placeholder="本機全文搜尋">
 <button>搜尋</button>
 <p class="muted">GET 搜尋只讀本機索引（external_calls=0）。語意檢索／Ask 會消耗額度，請用 POST /api/search、/api/ask（需 CSRF／授權，進 durable task）。</p>
-</form></div>{results_html}"""
+</form></div>{results_html}
+<div class="card"><h2>Ask</h2>
+<form id="ask-form">
+<label for="ask-question">根據影片資料提問</label>
+<textarea id="ask-question" name="question" maxlength="200" required rows="3" placeholder="輸入問題"></textarea>
+<button type="submit">提交 Ask（可能消耗額度）</button>
+<p class="muted">提交後會排入背景工作。沒有可引用片段時會明確顯示無證據，不會補造答案。</p>
+</form><p id="ask-status" class="muted" aria-live="polite"></p>
+<p id="ask-result" aria-live="polite"></p></div>"""
     return _page(server, "搜尋", body)
 
 
@@ -835,9 +873,22 @@ def _page_digests(server: DashboardServer) -> str:
         f"<td>r{_e(i['revision'])}</td><td>{_e(i['status'])}</td><td>{_e(i['selected_count'])}/{_e(i['candidate_count'])}</td></tr>"
         for i in data.get("items", [])
     )
-    body = f"""<div class="card">{_state_block(data.get('available', False), '尚無摘要紀錄。')}
-<table><tr><th>digest</th><th>類型</th><th>窗口</th><th>版</th><th>狀態</th><th>選入/候選</th></tr>{rows}</table>
-<p class="muted">預覽：POST /api/digest/preview；送出：POST /api/digest/send（需 digest_id+revision+payload_hash）。</p></div>"""
+    body = f"""<div class="card"><h2>建立摘要預覽</h2>
+<form id="digest-preview-form">
+<label for="digest-type">類型</label>
+<select id="digest-type" name="digest_type"><option value="daily">每日</option><option value="weekly">每週</option></select>
+<label for="digest-date">日期（留空使用今天）</label><input id="digest-date" name="date" type="date">
+<button type="submit">產生本機預覽</button></form>
+<p id="digest-status" class="muted" aria-live="polite"></p>
+<section id="digest-preview" hidden aria-live="polite">
+<h3>待確認摘要</h3><p id="digest-window"></p><p id="digest-counts"></p>
+<ul id="digest-items"></ul>
+<label><input id="digest-confirm" type="checkbox"> 我已核對此摘要與日期窗口，並確認排入寄送佇列。</label>
+<button id="digest-send" type="button" disabled>確認排入寄送佇列</button>
+<p class="muted">確認只會排入背景佇列；只有啟動 --serve-worker 後才會處理寄送。</p>
+</section></div>
+<div class="card">{_state_block(data.get('available', False), '尚無摘要紀錄。')}
+<div class="table-scroll"><table><tr><th>digest</th><th>類型</th><th>窗口</th><th>版</th><th>狀態</th><th>選入/候選</th></tr>{rows}</table></div></div>"""
     return _page(server, "摘要", body)
 
 
@@ -854,9 +905,13 @@ def _page_notifications(server: DashboardServer) -> str:
 
 
 def _page_tasks(server: DashboardServer) -> str:
+    def render_status(status: str) -> str:
+        safe_status = status if status in web_tasks.TASK_STATUSES else "unknown"
+        return f'<span class="task-status task-status-{_e(safe_status)}">{_e(status)}</span>'
+
     tasks = web_tasks.list_tasks(server.root, limit=100)
     rows = "".join(
-        f"<tr><td>{_e(t['task_id'][:8])}</td><td>{_e(t['type'])}</td><td>{_e(t['status'])}</td>"
+        f"<tr><td>{_e(t['task_id'][:8])}</td><td>{_e(t['type'])}</td><td>{render_status(t['status'])}</td>"
         f"<td>{_e(t['attempts'])}/{_e(t['max_attempts'])}</td><td>{_e(t['safe_error'])}</td><td>{_e(t['created_at'])}</td></tr>"
         for t in tasks
     )
