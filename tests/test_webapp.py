@@ -277,6 +277,39 @@ class RemoteBindGuardTests(unittest.TestCase):
             server.server_close()
 
 
+class FirstCompletionMetricTests(unittest.TestCase):
+    def test_new_video_windows_ignore_created_at_completed_at_and_manifest_mtime(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            jobs = root / "jobs"
+            jobs.mkdir()
+            today = _iso(datetime.datetime.now(UTC))
+            for job, manifest in (
+                ("created-only", {"status": "completed", "created_at": today}),
+                ("retry-time", {"status": "completed", "completed_at": today}),
+            ):
+                job_dir = jobs / job
+                job_dir.mkdir()
+                manifest_path = job_dir / "manifest.json"
+                manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+                # Rewriting/indexing a manifest today must not make an old or
+                # unregistered job look newly completed.
+                manifest_path.touch()
+
+            stats = web_services.dashboard_stats(root)
+            self.assertEqual(stats["new_videos"]["today"], 0)
+            self.assertEqual(stats["new_videos"]["this_week"], 0)
+
+            eligible_dir = jobs / "stable-eligible"
+            eligible_dir.mkdir()
+            (eligible_dir / "manifest.json").write_text(
+                json.dumps({"status": "completed", "eligible_at": today}), encoding="utf-8"
+            )
+            stats = web_services.dashboard_stats(root)
+            self.assertEqual(stats["new_videos"]["today"], 1)
+            self.assertEqual(stats["new_videos"]["this_week"], 1)
+
+
 class StatsAndLibraryTests(ServerFixture):
     @classmethod
     def make_root(cls) -> Path:

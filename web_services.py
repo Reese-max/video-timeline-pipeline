@@ -183,18 +183,18 @@ def _manifest_for(root: Path, job: str) -> dict[str, Any]:
     return _read_json(job_dir / "manifest.json")
 
 
-def _first_completed_at(manifest: dict[str, Any], job_dir: Path | None) -> tuple[str | None, str]:
-    """Stable completion timestamp — never indexed_at (reindexing is not 'new')."""
-    for field in ("first_completed_at", "completed_at", "eligible_at", "created_at"):
+def _first_completed_at(manifest: dict[str, Any], _job_dir: Path | None = None) -> tuple[str | None, str]:
+    """Return only a persisted first-completion/eligibility timestamp.
+
+    Creation time and filesystem mtime can predate processing or change when
+    artifacts are rewritten, so neither is evidence that a video first
+    completed in a dashboard window. Likewise, ``completed_at`` may describe
+    a later retry; only the stable first-completion fields are suitable here.
+    """
+    for field in ("first_completed_at", "eligible_at"):
         dt = _parse_iso(manifest.get(field))
         if dt:
             return _iso(dt), field
-    if job_dir is not None:
-        manifest_path = job_dir / "manifest.json"
-        try:
-            return _iso(datetime.datetime.fromtimestamp(manifest_path.stat().st_mtime, datetime.timezone.utc)), "mtime"
-        except OSError:
-            pass
     return None, "unknown"
 
 
