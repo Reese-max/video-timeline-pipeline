@@ -391,5 +391,13 @@ VFR terminal 5-tick frame 有獨立實際 canary。Transcript/timeline inputs �
 
 此 mode 驗證**此離線 handoff contract 選到的實際 decoded presentation frames**，
 未驗證 Premiere/Resolve 是否採用同一 stream clock/normalization。所有 receipts
-仍是 `NLE_IMPORT_UNVERIFIED`，人工 timecode→sequence baseline 仍 UNMEASURED；
-不宣稱已完成整個 issue #11 的人工流程／NLE acceptance。
+仍是 `NLE_IMPORT_UNVERIFIED`，人工 timecode→sequence baseline 仍 `UNMEASURED`。
+原 Issue #11 的十項離線研究驗收已完成，研究結論為 **NARROW**：只支持此處
+已驗證的 manual/evidence-selection、CSV／OTIO 與媒體範圍 handoff contract。
+Issue 的第六項驗收明確允許在沒有 NLE 的環境使用 official OTIO parser +
+FFmpeg source-range verification；本研究保留這個限制，不宣稱 Premiere／Resolve
+實際匯入、真人逐字稿或模型準確率已驗證。
+
+若要把研究升為正式 FEATURE，仍須依原 Success Metrics 量測手工抄 timecode→
+sequence 的步驟／時間基線；取得合法 NLE 環境時，再做其 import adapter canary。
+這些後續 promotion／integration 條件不改寫成本次已完成研究的額外關閉門檻。
