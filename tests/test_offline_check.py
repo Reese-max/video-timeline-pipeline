@@ -25,7 +25,8 @@ class OfflineCheckTests(unittest.TestCase):
             self.assertIn("MCP_ROOT", run.call_args.kwargs["env"])
 
         for index, script in ((5, "tests/test_parallel_submission.cjs"),
-                              (6, "tests/test_widget_analysis_report.cjs")):
+                              (6, "tests/test_widget_analysis_report.cjs"),
+                              (7, "tests/test_widget_library_experiment.cjs")):
             with self.subTest(command=script), \
                  patch.object(check_offline.shutil, "which", return_value="available"), \
                  patch.object(check_offline.importlib.util, "find_spec", return_value=True), \
@@ -37,12 +38,12 @@ class OfflineCheckTests(unittest.TestCase):
 
     def test_archive_checks_do_not_inspect_a_parent_checkout(self):
         parent = Path(check_offline.__file__).resolve().parents[2]
-        outcomes = [SimpleNamespace(returncode=0)] * 7 + [SimpleNamespace(returncode=0, stdout=str(parent))]
+        outcomes = [SimpleNamespace(returncode=0)] * 8 + [SimpleNamespace(returncode=0, stdout=str(parent))]
         with patch.object(check_offline.shutil, "which", return_value="available"), \
              patch.object(check_offline.importlib.util, "find_spec", return_value=True), \
              patch.object(check_offline.subprocess, "run", side_effect=outcomes) as run:
             self.assertEqual(check_offline.main(), 0)
-            self.assertEqual(run.call_count, 8)
+            self.assertEqual(run.call_count, 9)
             expected = [
                 ["ffmpeg", "-version"], ["ffprobe", "-version"], ["node", "--version"],
                 [check_offline.sys.executable, "-X", "utf8", "-B", "-m", "unittest",
@@ -50,8 +51,9 @@ class OfflineCheckTests(unittest.TestCase):
                 ["node", "tests/test_widget_handoff.cjs"],
                 ["node", "tests/test_parallel_submission.cjs"],
                 ["node", "tests/test_widget_analysis_report.cjs"],
+                ["node", "tests/test_widget_library_experiment.cjs"],
             ]
-            self.assertEqual([call.args[0] for call in run.call_args_list[:7]], expected)
+            self.assertEqual([call.args[0] for call in run.call_args_list[:8]], expected)
             self.assertTrue(all(call.kwargs["cwd"] == parent / Path(check_offline.__file__).resolve().parents[1].name
                                 for call in run.call_args_list))
             self.assertEqual(run.call_args.args[0], ["git", "rev-parse", "--show-toplevel"])
