@@ -84,6 +84,24 @@ const noLeaks = h => {
 let count = 0, failures = 0;
 async function test(name, run) { try { await run(); count++; console.log('ok ' + count + ' - ' + name); } catch (error) { failures++; console.error('FAIL - ' + name, error); } }
 (async () => {
+  await test('serialized ordinary summary waits for its durable sending receipt', async () => {
+    const h = harness({ snapshot: { prepared: job('first'), analysis: analysis('first') } });
+    await h.flush();
+    const wait = deferred(), save = h.openai.setWidgetState;
+    let pending = false;
+    h.openai.setWidgetState = function(state) {
+      if (Object.values(state.privateContent.followUps).includes('sending')) {
+        pending = true; return wait.promise.then(() => save.call(this, state));
+      }
+      return save.call(this, state);
+    };
+    const asking = h.elements.get('ask').fire('click');
+    await waitUntil(() => pending); await h.flush();
+    try { assert.equal(h.prompts.length, 0); }
+    finally { wait.resolve(); await asking; await h.flush(); }
+    assert.equal(h.prompts.length, 1);
+    assert(h.states.some(state => Object.values(state.privateContent.followUps).includes('sending')));
+  });
   await test('review structured model content attaches an uploaded file without requiring a model hash', async () => {
     const h = harness(); await h.flush(); await uploadClick(h); await h.click('library-ask');
     assert.deepEqual(clone(h.openai.widgetState.modelContent.uploaded_file_ids), ['file-library']);
