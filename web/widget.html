@@ -116,6 +116,7 @@ let driveActing = false, driveConfigured = true, autoStartArmed = false, closed 
 // 同一 job 在此介面生命週期只自動啟動一次；重複 prepare 或失敗後改走手動按鈕（送出冪等由伺服器去重）。
 const autoStartedJobs = new Set();
 let lastPersisted = "";
+let stateWrites = Promise.resolve();
 let evidenceRows = [], shownCount = 60, selectedSegment = 0, pendingSeek = null;
 let currentPrepareId = null;
 const supersededPrepares = new Set();
@@ -125,7 +126,7 @@ let restoredOperationId = saved.operationId || null;
 let persistenceAvailable = typeof host()?.setWidgetState === "function";
 // ponytail: 同時只上傳一個片段；需要並行時再改成逐片段鎖。
 const libraryBusy = new Set(), libraryResults = new Map();
-let libraryRows = [], libraryModel = null, librarySending = false, libraryEpoch = 0;
+let libraryRows = [], libraryModel = null, librarySending = false, libraryEpoch = 0, libraryStateUncertain = false;
 const terminal = new Set(["failed", "cancelled", "expired", "interrupted"]);
 const isPending = value => ["queued", "running"].includes(value?.status);
 const errorText = value => typeof value === "string" ? value : value?.message || "未提供錯誤說明";
@@ -151,7 +152,7 @@ function buildState() {
         operationId: activeOperation?.operation_id || null, followUps: { ...receipts },
         filter: $("filter").value || "all", selectedSegment },
   };
-  if (libraryModel) state.modelContent += "\n檔案庫實驗（未確認模型可讀取）：" + JSON.stringify({ uploaded_file_ids: [libraryModel.fileId], filename: libraryModel.filename, size: libraryModel.size });
+  if (libraryModel) state.modelContent = { description: state.modelContent + "\n檔案庫實驗（未確認模型可讀取）", uploaded_file_ids: [libraryModel.fileId], filename: libraryModel.filename, size: libraryModel.size };
   return state;
 }
 function saveState(experimental = false) {
@@ -163,9 +164,14 @@ function saveState(experimental = false) {
     const state = buildState();
     const serialized = JSON.stringify(state);
     if (serialized === lastPersisted) return;
-    const result = host().setWidgetState(state);
-    if (experimental) return Promise.resolve(result).then(() => { if (serialized === JSON.stringify(buildState())) lastPersisted = serialized; });
-    Promise.resolve(result).catch(() => {});
+    const version = generation, epoch = libraryEpoch;
+    const result = stateWrites.then(() => {
+      if (!current(version) || epoch !== libraryEpoch) return;
+      return host().setWidgetState(state);
+    }).then(() => { if (serialized === JSON.stringify(buildState())) lastPersisted = serialized; });
+    stateWrites = result.catch(() => {});
+    if (experimental) return result;
+    result.catch(() => { if (serialized === lastPersisted) lastPersisted = ""; });
     lastPersisted = serialized;
   } catch (error) { if (experimental) throw error; persistenceAvailable = false; }
   $("persistence").hidden = persistenceAvailable;
@@ -232,7 +238,7 @@ function updateButtons() {
   $("library-experiment").hidden = !data?.segments?.length;
   $("library-caps").textContent = ["uploadFile", "getFileDownloadUrl", "selectFiles", "setWidgetState", "sendFollowUpMessage"].map(name => `${name}：${typeof host()?.[name] === "function" ? "可用" : "缺少"}`).join(" · ");
   for (const row of libraryRows) for (const button of row.buttons) button.disabled = typeof host()?.uploadFile !== "function" || !ready || restoring || closed || libraryBusy.size > 0 || librarySending;
-  $("library-ask").disabled = !ready || restoring || closed || librarySending || libraryBusy.size > 0 || !libraryResults.size;
+  $("library-ask").disabled = !ready || restoring || closed || librarySending || libraryStateUncertain || libraryBusy.size > 0 || !libraryResults.size;
 }
 const redactLibrary = value => String(value).replace(/(?:https?(?::|%3a))?(?:\/\/|%2f%2f|\\\/\\\/)\S+/gi, "[URL]").replace(/(?:sig|expires)(?:=|%3d|\\u003d)[^\s&]+/gi, "[URL]");
 function libraryError(error) {
@@ -245,7 +251,7 @@ const nowMs = () => typeof performance !== "undefined" ? performance.now() : Dat
 const libraryName = segment => String(segment.filename || "segment.mp4").replace(/[^\w.-]/g, "_");
 function resetLibrary() {
   libraryEpoch++;
-  libraryBusy.clear(); libraryResults.clear(); libraryRows = []; libraryModel = null; librarySending = false;
+  libraryBusy.clear(); libraryResults.clear(); libraryRows = []; libraryModel = null; librarySending = false; libraryStateUncertain = false;
   $("library-list").replaceChildren(); $("library-message").textContent = ""; $("library-ask").disabled = true;
   $("library-experiment").hidden = true;
 }
@@ -298,7 +304,7 @@ async function saveSegmentToLibrary(index, library = true) {
     output.textContent = "上傳中…";
     const result = await host().uploadFile(file, library ? { library: true } : undefined); check();
     const fileId = typeof result === "string" ? result : result?.fileId;
-    if (typeof fileId !== "string" || !fileId.trim() || /https?:|sig=|expires=/i.test(fileId)) throw new Error("uploadFile 未回傳 fileId：回傳型別 " + typeof result + "，欄位 " + Object.keys(result || {}).join(","));
+    if (typeof fileId !== "string" || !fileId.trim() || redactLibrary(fileId) !== fileId || /https?:|sig=|expires=/i.test(fileId)) throw new Error("uploadFile 未回傳 fileId：回傳型別 " + typeof result + "，欄位 " + Object.keys(result || {}).join(","));
     let hasDownloadUrl = false, downloadError = "";
     if (typeof host()?.getFileDownloadUrl === "function") {
       try { hasDownloadUrl = Boolean((await host().getFileDownloadUrl({ fileId }))?.downloadUrl); }
@@ -318,22 +324,31 @@ async function saveSegmentToLibrary(index, library = true) {
 }
 async function askAboutLibraryFile() {
   const result = [...libraryResults.values()].at(-1);
-  if (!result || librarySending || libraryBusy.size || restoring || closed) return;
+  if (!result || librarySending || libraryStateUncertain || libraryBusy.size || restoring || closed) return;
   const version = generation, epoch = libraryEpoch;
   librarySending = true; updateButtons();
   const previous = libraryModel;
   try {
     libraryModel = { fileId: result.fileId, filename: result.filename, size: result.size };
-    try { await saveState(true); } catch (error) { if (current(version) && epoch === libraryEpoch) libraryModel = previous; throw error; }
+    try { await saveState(true); }
+    catch (error) {
+      if (current(version) && epoch === libraryEpoch) {
+        libraryModel = previous;
+        lastPersisted = "";
+        try { await saveState(true); }
+        catch { libraryStateUncertain = true; }
+      }
+      throw error;
+    }
     checkCurrent(version);
     if (epoch !== libraryEpoch) return;
-    const prompt = `這是 #59 實驗。我剛按下按鈕上傳影片片段 ${result.filename}（fileId=${result.fileId}，${result.size} bytes，library:${result.library}）；尚未確認已進 ChatGPT 檔案庫。請不要呼叫任何工具。若能讀取這個檔案，回答它的 SHA-256 與第 10 秒的畫面文字；若看不到或讀不到，直接回答「看不到」，不要猜測。`;
+    const prompt = `這是 #59 實驗。我剛按下按鈕上傳影片片段 ${result.filename}（fileId=${result.fileId}，${result.size} bytes，library:${result.library}）；尚未確認已進 ChatGPT 檔案庫。請不要呼叫任何工具。若能讀取這個檔案，回答第 10 秒的畫面文字；若看不到或讀不到，直接回答「看不到」，不要猜測。SHA-256 由小工具在本機計算並另行核對，不要求模型猜測雜湊。`;
     const acknowledgment = await invoke("ui/message", { role: "user", content: [{ type: "text", text: prompt }] }, host()?.sendFollowUpMessage ? () => host().sendFollowUpMessage({ prompt }) : null, version);
     checkCurrent(version);
     if (epoch !== libraryEpoch) return;
     if (acknowledgment?.isError) throw new Error(errorText(acknowledgment.content?.find(item => item.type === "text")?.text));
     $("library-message").textContent = "已送出檔案讀取實驗要求；尚未確認模型可讀取。";
-  } catch (error) { if (current(version) && epoch === libraryEpoch) $("library-message").textContent = "檔案實驗要求未確認送達，未自動重送。請先檢查對話。\n" + libraryError(error); }
+  } catch (error) { if (current(version) && epoch === libraryEpoch) $("library-message").textContent = "檔案實驗要求未確認送達，未自動重送。請先檢查對話。\n" + libraryError(error) + (libraryStateUncertain ? "\n宿主狀態回復未確認，已停用重試；請重新載入並核對檔案狀態。" : ""); }
   finally { if (current(version) && epoch === libraryEpoch) { librarySending = false; updateButtons(); } }
 }
 function showOperation() {

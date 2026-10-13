@@ -84,6 +84,41 @@ const noLeaks = h => {
 let count = 0, failures = 0;
 async function test(name, run) { try { await run(); count++; console.log('ok ' + count + ' - ' + name); } catch (error) { failures++; console.error('FAIL - ' + name, error); } }
 (async () => {
+  await test('review structured model content attaches an uploaded file without requiring a model hash', async () => {
+    const h = harness(); await h.flush(); await uploadClick(h); await h.click('library-ask');
+    assert.deepEqual(clone(h.openai.widgetState.modelContent.uploaded_file_ids), ['file-library']);
+    assert.equal(typeof h.openai.widgetState.modelContent.description, 'string');
+    assert(!h.prompts[0].includes('回答它的 SHA-256'));
+    assert.match(h.prompts[0], /第 10 秒/);
+  });
+  await test('review encoded URL upload responses never become file IDs', async () => {
+    for (const value of ['//media.example/file?sig=SECRET', 'https%3A%2F%2Fmedia.example%2Ffile%3Fsig%3DSECRET', 'https:\\/\\/media.example/file?sig=SECRET']) {
+      const h = harness({ upload: async () => value }); await h.flush(); await uploadClick(h);
+      assert(h.elements.get('library-ask').disabled);
+      noLeaks(h);
+    }
+  });
+  await test('review failed experimental save rolls back concurrent ordinary state writes', async () => {
+    const h = harness(); await h.flush(); await uploadClick(h);
+    let reject, pending = false;
+    const save = h.openai.setWidgetState;
+    h.openai.setWidgetState = function(state) {
+      if (!pending && JSON.stringify(state.modelContent).includes('uploaded_file_ids')) {
+        pending = true; return new Promise((resolve, fail) => { reject = fail; });
+      }
+      return save.call(this, state);
+    };
+    const asking = h.elements.get('library-ask').fire('click');
+    await waitUntil(() => pending);
+    h.elements.get('segment').value = '1'; h.elements.get('segment').fire('change');
+    h.elements.get('filter').value = 'visual'; h.elements.get('filter').fire('change');
+    await h.flush(); reject(new Error('Rejected experimental state'));
+    await asking; await h.flush();
+    assert(!JSON.stringify(h.openai.widgetState.modelContent).includes('uploaded_file_ids'));
+    assert.equal(h.openai.widgetState.privateContent.selectedSegment, 1);
+    assert.equal(h.openai.widgetState.privateContent.filter, 'visual');
+    assert.equal(h.prompts.length, 0);
+  });
   await test('no click means no fetch upload download or prompt, even after refresh', async () => {
     const h = harness(); await h.flush(); await h.click('refresh');
     assert(h.elements.has('library-experiment')); assert.equal(h.elements.get('library-experiment').hidden, false);
@@ -153,22 +188,22 @@ async function test(name, run) { try { await run(); count++; console.log('ok ' +
   await test('ask explicitly saves model IDs through unified state and standard bridge', async () => {
     const h = harness(); await h.flush(); await uploadClick(h); assert.equal(h.prompts.length, 0); await h.click('library-ask'); assert.equal(h.prompts.length, 1);
     assert.match(h.prompts[0], /file-library/); assert.match(h.prompts[0], /看不到/); assert.match(h.prompts[0], /不要呼叫任何工具/);
-    assert.match(h.openai.widgetState.modelContent, /uploaded_file_ids.*file-library/); assert(!JSON.stringify(h.openai.widgetState.privateContent).includes('file-library')); assert.deepEqual(h.fallbackCalls, []);
-    h.elements.get('segment').value = '1'; h.elements.get('segment').fire('change'); assert.match(h.openai.widgetState.modelContent, /uploaded_file_ids.*file-library/); noLeaks(h);
+    assert.match(JSON.stringify(h.openai.widgetState.modelContent), /uploaded_file_ids.*file-library/); assert(!JSON.stringify(h.openai.widgetState.privateContent).includes('file-library')); assert.deepEqual(h.fallbackCalls, []);
+    h.elements.get('segment').value = '1'; h.elements.get('segment').fire('change'); assert.match(JSON.stringify(h.openai.widgetState.modelContent), /uploaded_file_ids.*file-library/); noLeaks(h);
   });
   await test('ask uses host follow-up when standard bridge is unsupported', async () => {
     const h = harness({ bridge: false }); await h.flush(); await uploadClick(h); await h.click('library-ask'); assert.equal(h.prompts.length, 1); assert(h.fallbackCalls.includes('message')); noLeaks(h);
   });
   await test('experimental state rejection preserves normal state saving and does not send', async () => {
     const h = harness(); await h.flush(); await uploadClick(h); const save = h.openai.setWidgetState;
-    h.openai.setWidgetState = function(state) { if (state.modelContent.includes('uploaded_file_ids')) throw new Error('Rejected experimental shape FULL END'); return save.call(this, state); };
+    h.openai.setWidgetState = function(state) { if (JSON.stringify(state.modelContent).includes('uploaded_file_ids')) throw new Error('Rejected experimental shape FULL END'); return save.call(this, state); };
     await h.click('library-ask'); assert.match(visible(h), /Rejected experimental shape FULL END/); assert.equal(h.prompts.length, 0);
-    const before = h.states.length; h.elements.get('segment').value = '1'; h.elements.get('segment').fire('change'); assert.equal(h.states.length, before + 1); assert(!h.openai.widgetState.modelContent.includes('uploaded_file_ids'));
+    const before = h.states.length; h.elements.get('segment').value = '1'; h.elements.get('segment').fire('change'); await h.flush(); assert.equal(h.states.length, before + 1); assert(!JSON.stringify(h.openai.widgetState.modelContent).includes('uploaded_file_ids'));
     assert(h.elements.get('persistence').hidden);
   });
   await test('follow-up ambiguity does not retry and retains error; job switch clears model IDs', async () => {
     const h = harness({ sendError: 'send failed FULL END https://download.example/private?sig=DOWNLOAD' }); await h.flush(); await uploadClick(h); await h.click('library-ask'); assert.equal(h.prompts.length, 1); assert.match(visible(h), /send failed FULL END/); noLeaks(h);
-    h.notifyTool(job('second')); await h.flush(); assert(!h.openai.widgetState.modelContent.includes('file-library'));
+    h.notifyTool(job('second')); await h.flush(); assert(!JSON.stringify(h.openai.widgetState.modelContent).includes('file-library'));
   });
   await test('new preparation resets library state and stale buttons', async () => {
     const wait = deferred(), h = harness({ upload: () => wait.promise }); await h.flush(); const b = buttons(h)[0], first = b.fire('click'); await waitUntil(() => h.uploads.length === 1);
@@ -192,7 +227,7 @@ async function test(name, run) { try { await run(); count++; console.log('ok ' +
       const h = harness(); await h.flush(); await uploadClick(h);
       const save = h.openai.setWidgetState, persisted = vm.runInContext('lastPersisted', h.context), wait = deferred(); let attempts = 0;
       h.openai.setWidgetState = function(state) {
-        if (state.modelContent.includes('uploaded_file_ids')) {
+        if (JSON.stringify(state.modelContent).includes('uploaded_file_ids')) {
           if (++attempts === 1) return Promise.reject(new Error('Async rejection FULL END'));
           return wait.promise.then(() => save.call(this, state));
         }
@@ -200,11 +235,12 @@ async function test(name, run) { try { await run(); count++; console.log('ok ' +
       };
       await h.click('library-ask');
       assert.equal(h.prompts.length, 0); assert.match(visible(h), /Async rejection FULL END/);
-      assert(!h.openai.widgetState.modelContent.includes('uploaded_file_ids'));
+      assert(!JSON.stringify(h.openai.widgetState.modelContent).includes('uploaded_file_ids'));
       assert.equal(vm.runInContext('libraryModel', h.context), null);
       assert.equal(vm.runInContext('lastPersisted', h.context), persisted);
       const before = h.states.length;
       h.elements.get('segment').value = '1'; h.elements.get('segment').fire('change');
+      await h.flush();
       assert.equal(h.states.length, before + 1); assert(h.elements.get('persistence').hidden);
       h.elements.get('segment').value = '0'; h.elements.get('segment').fire('change');
       const retry = h.elements.get('library-ask').fire('click'); await h.flush();
@@ -252,14 +288,14 @@ async function test(name, run) { try { await run(); count++; console.log('ok ' +
       throw new Error('Unexpected ' + name);
     } });
     await h.flush(); await uploadClick(h); await h.click('library-ask');
-    assert.match(h.states.at(-1).modelContent, /uploaded_file_ids/);
+    assert.match(JSON.stringify(h.states.at(-1).modelContent), /uploaded_file_ids/);
     await h.click('analyze'); await h.poll();
     assert(h.elements.get('library-experiment').hidden);
-    assert(!h.states.at(-1).modelContent.includes('uploaded_file_ids'));
+    assert(!JSON.stringify(h.states.at(-1).modelContent).includes('uploaded_file_ids'));
     assert.equal(vm.runInContext('libraryModel', h.context), null);
     h.notifyTool(job('second')); await h.flush();
     h.notifyTool({ ...job('third'), segments: [] }); await h.flush();
-    assert(!h.states.at(-1).modelContent.includes('uploaded_file_ids'));
+    assert(!JSON.stringify(h.states.at(-1).modelContent).includes('uploaded_file_ids'));
     assert.equal(h.states.at(-1).privateContent.jobId, 'third');
   });
   await test('F4 new library attempt clears normal fallback error and button before success', async () => {
