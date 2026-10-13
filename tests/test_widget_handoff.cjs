@@ -67,6 +67,17 @@ function harness({ output = job('first'), saved = {}, snapshot, respond, bridge 
 let count = 0;
 async function test(name, run) { await run(); count++; console.log('ok ' + count + ' - ' + name); }
 (async () => {
+  await test('partial evidence survives remount and permits only explicit analysis retry', async () => {
+    const h = harness({ snapshot: { prepared: job('first'), analysis: analysis('first', true) } });
+    await h.flush();
+    assert.deepEqual(h.calls.map(c => c.name), ['get_prepared_video']);
+    assert.equal(h.elements.get('findings').hidden, false);
+    assert.equal(h.elements.get('analyze').disabled, false);
+    assert.match(h.elements.get('analyze').textContent, /重試/);
+    await h.click('analyze');
+    assert.equal(h.calls.filter(c => c.name === 'analyze_prepared_video').length, 1);
+    assert.equal(h.calls.at(-1).args.background, true);
+  });
   await test('initial load only reads status; standard bridge preferred', async () => {
     const h = harness(); await h.flush(); assert.deepEqual(h.calls.map(c => c.name), ['get_prepared_video']); assert.deepEqual(h.fallbackCalls, []); assert.equal(h.prompts.length, 0); assert.equal(h.elements.get('analyze').disabled, false);
   });

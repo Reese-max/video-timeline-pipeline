@@ -227,6 +227,18 @@ class TranscribeBackfillTest(unittest.TestCase):
             {"text": "這是正常句子", "avg_logprob": -0.3, "compression_ratio": 1.5}, True,
         )
 
+    def test_backfill_keeps_sentence_crossing_both_context_boundaries(self) -> None:
+        self._check_backfill_filter(
+            {"start": 10.0, "end": 50.0, "text": "所有上传的资料都能在这里找到"}, True,
+        )
+
+    def test_backfill_drops_segments_entirely_in_context(self) -> None:
+        for start, end in ((0.0, 14.0), (46.0, 54.0)):
+            with self.subTest(start=start, end=end):
+                self._check_backfill_filter(
+                    {"start": start, "end": end, "text": "只有上下文的正常句子"}, False,
+                )
+
     def test_backfill_accepts_short_contained_text(self) -> None:
         from pipeline import accept_backfill_segment
 
