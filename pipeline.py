@@ -2227,11 +2227,13 @@ def transcribe_all(
                         continue
                     gap_start = round(raw_start + window_start, 3)
                     gap_end = round(raw_end + window_start, 3)
-                    if (
-                        gap_start < gap["start"] - TRANSCRIPT_GAP_TOL
-                        or gap_end > gap["end"] + TRANSCRIPT_GAP_TOL
-                    ):
+                    # Whisper may return one sentence spanning context and the
+                    # missing interval. Retain its overlap instead of dropping
+                    # the whole sentence; context-only responses stay excluded.
+                    if gap_end <= gap["start"] or gap_start >= gap["end"]:
                         continue
+                    gap_start = max(gap_start, gap["start"] - TRANSCRIPT_GAP_TOL)
+                    gap_end = min(gap_end, gap["end"] + TRANSCRIPT_GAP_TOL)
                     gap_item: dict[str, Any] = {
                         "start": gap_start,
                         "end": gap_end,
