@@ -25,9 +25,13 @@ import urllib.parse
 import uuid
 from contextlib import closing
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 JOB_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+JOB_ARTIFACTS = frozenset({
+    "manifest.json", "summary.json", "timeline.json",
+    "transcript.txt", "transcript_verified.txt", "whisper.txt",
+})
 DEFAULT_PAGE_SIZE = 50
 MAX_PAGE_SIZE = 100
 MAX_QUERY_LENGTH = 200
@@ -164,23 +168,83 @@ def _read_json(path: Path) -> dict[str, Any]:
         return {}
 
 
+def _jobs_root(root: Path) -> Path | None:
+    root_dir = Path(root).resolve()
+    jobs_path = root_dir / "jobs"
+    try:
+        jobs_root = jobs_path.resolve()
+        jobs_root.relative_to(root_dir)
+    except (OSError, RuntimeError, ValueError):
+        return None
+    return jobs_root if jobs_root.is_dir() else None
+
+
 def _job_dir(root: Path, job: str) -> Path | None:
     if not JOB_ID_RE.match(job or ""):
         return None
-    jobs_root = (root / "jobs").resolve()
-    candidate = (jobs_root / job).resolve()
+    jobs_root = _jobs_root(root)
+    if jobs_root is None:
+        return None
+    job_path = jobs_root / job
     try:
+        candidate = job_path.resolve()
         candidate.relative_to(jobs_root)
     except ValueError:
         return None
+    except (OSError, RuntimeError):
+        return None
+    # A database job ID must name its own directory; do not let a symlink
+    # alias another job's artifacts, even when both are under jobs/.
+    if candidate != job_path:
+        return None
     return candidate if candidate.is_dir() else None
+
+
+def _job_file(job_dir: Path, name: str) -> Path | None:
+    """Resolve one allowlisted artifact and reject paths escaping its job."""
+    if name not in JOB_ARTIFACTS:
+        return None
+    try:
+        job_root = job_dir.resolve()
+        candidate = (job_root / name).resolve()
+        candidate.relative_to(job_root)
+    except (OSError, RuntimeError, ValueError):
+        return None
+    return candidate if candidate.is_file() else None
+
+
+def _job_json(job_dir: Path, name: str) -> dict[str, Any]:
+    path = _job_file(job_dir, name)
+    return _read_json(path) if path is not None else {}
+
+
+def _iter_indexed_job_ids(root: Path) -> Iterator[str]:
+    """Stream DB-known job IDs without materializing the full library."""
+    with closing(connect_library_ro(root)) as conn:
+        cursor = conn.execute("SELECT DISTINCT job FROM videos ORDER BY job")
+        while True:
+            rows = cursor.fetchmany(500)
+            if not rows:
+                break
+            for row in rows:
+                job = str(row[0] or "")
+                if job:
+                    yield job
+
+
+def _require_indexed_job(root: Path, job: str) -> None:
+    """Require a job ID to come from the read-only library index before disk access."""
+    with closing(connect_library_ro(root)) as conn:
+        exists = conn.execute("SELECT 1 FROM videos WHERE job = ? LIMIT 1", (job,)).fetchone()
+    if exists is None:
+        raise ServiceError("not_found", "unknown job", http_status=404)
 
 
 def _manifest_for(root: Path, job: str) -> dict[str, Any]:
     job_dir = _job_dir(root, job)
     if job_dir is None:
         return {}
-    return _read_json(job_dir / "manifest.json")
+    return _job_json(job_dir, "manifest.json")
 
 
 def _first_completed_at(manifest: dict[str, Any], _job_dir: Path | None = None) -> tuple[str | None, str]:
@@ -259,27 +323,32 @@ def dashboard_stats(root: Path) -> dict[str, Any]:
 
     new_today = 0
     new_week = 0
-    jobs_dir = root / "jobs"
     videos_by_status: dict[str, int] = {}
     index_ok = False
-    if jobs_dir.is_dir():
-        for manifest_path in jobs_dir.glob("*/manifest.json"):
-            manifest = _read_json(manifest_path)
-            if not manifest:
-                continue
-            completed_at, _field = _first_completed_at(manifest, manifest_path.parent)
-            completed_dt = _parse_iso(completed_at)
-            if completed_dt is None:
-                continue
-            if completed_dt >= today_start_local.astimezone(datetime.timezone.utc):
-                new_today += 1
-            if completed_dt >= week_start_local.astimezone(datetime.timezone.utc):
-                new_week += 1
     try:
         with closing(connect_library_ro(root)) as conn:
             index_ok = True
             for row in conn.execute("SELECT status, COUNT(*) AS n FROM videos GROUP BY status"):
                 videos_by_status[str(row["status"] or "unknown")] = int(row["n"])
+
+            # Count first-completions only for job IDs present in library.db.
+            # Stream IDs so a large collection does not require an all-job list.
+            cursor = conn.execute("SELECT DISTINCT job FROM videos ORDER BY job")
+            while rows := cursor.fetchmany(500):
+                for row in rows:
+                    job = str(row[0] or "")
+                    job_dir = _job_dir(root, job)
+                    if job_dir is None:
+                        continue
+                    manifest = _job_json(job_dir, "manifest.json")
+                    completed_at, _field = _first_completed_at(manifest, job_dir)
+                    completed_dt = _parse_iso(completed_at)
+                    if completed_dt is None:
+                        continue
+                    if completed_dt >= today_start_local.astimezone(datetime.timezone.utc):
+                        new_today += 1
+                    if completed_dt >= week_start_local.astimezone(datetime.timezone.utc):
+                        new_week += 1
     except ServiceError:
         index_ok = False
 
@@ -505,12 +574,12 @@ def _manifest_job_filter(
     platform: str,
     date_range: tuple[str, datetime.datetime | None, datetime.datetime | None] | None = None,
 ) -> set[str]:
-    jobs_dir = root / "jobs"
     matched: set[str] = set()
-    if not jobs_dir.is_dir():
-        return matched
-    for manifest_path in jobs_dir.glob("*/manifest.json"):
-        manifest = _read_json(manifest_path)
+    for job in _iter_indexed_job_ids(root):
+        job_dir = _job_dir(root, job)
+        if job_dir is None:
+            continue
+        manifest = _job_json(job_dir, "manifest.json")
         if not manifest:
             continue
         if author:
@@ -524,7 +593,7 @@ def _manifest_job_filter(
         if date_range:
             field, date_from, date_to = date_range
             if field == "first_completed_at":
-                value_s, _f = _first_completed_at(manifest, manifest_path.parent)
+                value_s, _f = _first_completed_at(manifest, job_dir)
                 value_dt = _parse_iso(value_s)
             else:
                 value_dt = _parse_iso(_published_at(manifest))
@@ -534,7 +603,7 @@ def _manifest_job_filter(
                 continue
             if date_to and value_dt > date_to:
                 continue
-        matched.add(manifest_path.parent.name)
+        matched.add(job)
     return matched
 
 
@@ -547,13 +616,14 @@ def get_video_detail(
 ) -> dict[str, Any]:
     if not JOB_ID_RE.match(job or ""):
         raise ServiceError("invalid_param", "invalid job id", http_status=400)
+    _require_indexed_job(root, job)
     job_dir = _job_dir(root, job)
     if job_dir is None:
         raise ServiceError("not_found", "unknown job", http_status=404)
 
-    manifest = _read_json(job_dir / "manifest.json")
-    summary = _read_json(job_dir / "summary.json")
-    timeline = _read_json(job_dir / "timeline.json")
+    manifest = _job_json(job_dir, "manifest.json")
+    summary = _job_json(job_dir, "summary.json")
+    timeline = _job_json(job_dir, "timeline.json")
     entries = timeline.get("entries") or timeline.get("chapters") or []
     total_entries = len(entries)
     timeline_limit = max(1, min(int(timeline_limit), 500))
@@ -562,8 +632,8 @@ def get_video_detail(
 
     transcript: dict[str, Any] = {"available": False}
     for name in ("transcript.txt", "transcript_verified.txt", "whisper.txt"):
-        candidate = job_dir / name
-        if candidate.is_file():
+        candidate = _job_file(job_dir, name)
+        if candidate is not None:
             transcript = {"available": True, "artifact": name, "size_bytes": candidate.stat().st_size}
             break
 
@@ -657,12 +727,13 @@ def get_transcript_window(root: Path, job: str, *, offset: int = 0, limit: int =
     """Windowed transcript read — large transcripts never load fully into RAM (W2/W10)."""
     if not JOB_ID_RE.match(job or ""):
         raise ServiceError("invalid_param", "invalid job id", http_status=400)
+    _require_indexed_job(root, job)
     job_dir = _job_dir(root, job)
     if job_dir is None:
         raise ServiceError("not_found", "unknown job", http_status=404)
     for name in ("transcript.txt", "transcript_verified.txt", "whisper.txt"):
-        candidate = job_dir / name
-        if candidate.is_file():
+        candidate = _job_file(job_dir, name)
+        if candidate is not None:
             limit = max(1, min(int(limit), 200_000))
             with candidate.open("r", encoding="utf-8", errors="replace") as handle:
                 handle.seek(max(0, int(offset)))

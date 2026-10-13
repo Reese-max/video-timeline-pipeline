@@ -90,6 +90,19 @@ def _build_index(root: Path) -> None:
         conn.close()
 
 
+def _index_one_job(root: Path, job: str) -> None:
+    conn = pipeline.index_connection(root)
+    try:
+        conn.execute(
+            "INSERT OR IGNORE INTO videos (job, title, source, status, duration, indexed_at, categories)"
+            " VALUES (?, ?, ?, 'completed', 1.0, '2026-01-01T00:00:00Z', '[]')",
+            (job, job, "https://example.com/video"),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
 def _write_rss_state(root: Path, items: list[dict]) -> None:
     rss = root / "rss"
     rss.mkdir(exist_ok=True)
@@ -277,6 +290,82 @@ class RemoteBindGuardTests(unittest.TestCase):
             server.server_close()
 
 
+class ArtifactSymlinkBoundaryTests(unittest.TestCase):
+    def test_detail_and_transcript_do_not_follow_symlinks_outside_job(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            jobs = root / "jobs"
+            job_dir = jobs / "job-1"
+            job_dir.mkdir(parents=True)
+            private_summary = root / "private-summary.json"
+            private_summary.write_text(json.dumps({"brief": "PRIVATE SUMMARY"}), encoding="utf-8")
+            private_timeline = root / "private-timeline.json"
+            private_timeline.write_text(
+                json.dumps({"entries": [{"label": "PRIVATE TIMELINE"}]}), encoding="utf-8"
+            )
+            private_transcript = root / ".env"
+            private_transcript.write_text("API_KEY=PRIVATE TRANSCRIPT\n", encoding="utf-8")
+            (job_dir / "manifest.json").write_text(
+                json.dumps({"status": "completed", "source": {"title": "job-1"}}), encoding="utf-8"
+            )
+            for name, target in (
+                ("summary.json", private_summary),
+                ("timeline.json", private_timeline),
+                ("transcript.txt", private_transcript),
+            ):
+                try:
+                    (job_dir / name).symlink_to(target)
+                except (OSError, NotImplementedError) as exc:
+                    self.skipTest(f"symlink creation unavailable: {exc}")
+            _index_one_job(root, "job-1")
+
+            detail = web_services.get_video_detail(root, "job-1")
+            self.assertIsNone(detail["summary"]["brief"])
+            self.assertEqual(detail["timeline"]["total"], 0)
+            self.assertFalse(detail["transcript"]["available"])
+            with self.assertRaises(web_services.ServiceError):
+                web_services.get_transcript_window(root, "job-1")
+
+    def test_artifact_directory_must_be_indexed_job(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            job_dir = root / "jobs" / "unindexed-job"
+            job_dir.mkdir(parents=True)
+            (job_dir / "manifest.json").write_text(
+                json.dumps({"status": "completed", "source": {"title": "private"}}), encoding="utf-8"
+            )
+            (job_dir / "transcript.txt").write_text("private transcript", encoding="utf-8")
+            _index_one_job(root, "different-indexed-job")
+            with self.assertRaisesRegex(web_services.ServiceError, "unknown job"):
+                web_services.get_video_detail(root, "unindexed-job")
+            with self.assertRaisesRegex(web_services.ServiceError, "unknown job"):
+                web_services.get_transcript_window(root, "unindexed-job")
+
+    def test_job_directory_symlink_cannot_alias_another_job(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            jobs = root / "jobs"
+            (jobs / "real-job").mkdir(parents=True)
+            try:
+                (jobs / "job-alias").symlink_to(jobs / "real-job", target_is_directory=True)
+            except (OSError, NotImplementedError) as exc:
+                self.skipTest(f"symlink creation unavailable: {exc}")
+            self.assertIsNone(web_services._job_dir(root, "job-alias"))
+
+    def test_jobs_root_symlink_cannot_escape_dashboard_root(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "library-root"
+            outside_jobs = Path(tmp) / "outside-jobs"
+            root.mkdir()
+            outside_jobs.mkdir()
+            try:
+                (root / "jobs").symlink_to(outside_jobs, target_is_directory=True)
+            except (OSError, NotImplementedError) as exc:
+                self.skipTest(f"symlink creation unavailable: {exc}")
+            self.assertIsNone(web_services._jobs_root(root))
+            self.assertIsNone(web_services._job_dir(root, "job-1"))
+
+
 class FirstCompletionMetricTests(unittest.TestCase):
     def test_new_video_windows_ignore_created_at_completed_at_and_manifest_mtime(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -295,6 +384,7 @@ class FirstCompletionMetricTests(unittest.TestCase):
                 # Rewriting/indexing a manifest today must not make an old or
                 # unregistered job look newly completed.
                 manifest_path.touch()
+                _index_one_job(root, job)
 
             stats = web_services.dashboard_stats(root)
             self.assertEqual(stats["new_videos"]["today"], 0)
@@ -305,6 +395,7 @@ class FirstCompletionMetricTests(unittest.TestCase):
             (eligible_dir / "manifest.json").write_text(
                 json.dumps({"status": "completed", "eligible_at": today}), encoding="utf-8"
             )
+            _index_one_job(root, "stable-eligible")
             stats = web_services.dashboard_stats(root)
             self.assertEqual(stats["new_videos"]["today"], 1)
             self.assertEqual(stats["new_videos"]["this_week"], 1)
