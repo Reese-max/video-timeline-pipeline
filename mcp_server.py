@@ -1157,6 +1157,10 @@ def cached_analysis(job_id: str, manifest: dict, video_path: Path | None = None)
     video_path = video_path or pipeline.locate_source_video(job_dir)
     cached = pipeline.reuse_artifact(job_dir / "analysis" / "result.json")
     if isinstance(cached, dict) and cached.get("cache_signature") == analysis_cache_signature(video_path, manifest):
+        # Old complete caches can contain incomplete evidence. Do not restore
+        # them as a finished analysis that disables the widget's retry action.
+        if cached.get("status") == "complete" and not stored_analysis_evidence_complete(cached):
+            return None
         return refreshed_analysis(cached)
     return None
 

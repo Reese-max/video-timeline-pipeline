@@ -140,6 +140,7 @@ class AnalysisCacheRegressionTests(unittest.TestCase):
             result_path = self.job_dir / "analysis" / "result.json"
             result_path.parent.mkdir(parents=True, exist_ok=True)
             result_path.write_text(json.dumps(legacy), encoding="utf-8")
+            self.assertIsNone(mcp_server.cached_analysis(JOB_ID, self.manifest, self.source))
         first = mcp_server.analyze_prepared_sync(JOB_ID)
         stored = json.loads((self.job_dir / "analysis" / "result.json")
                             .read_text(encoding="utf-8"))
@@ -164,6 +165,14 @@ class AnalysisCacheRegressionTests(unittest.TestCase):
         self.assertEqual(first["quality"]["status"], "needs_review")
         self.assertNotEqual(stored["status"], "complete")
         # The second call must reach Groq again instead of returning cache.
+        self.assertEqual(transcribe_mock.call_count, 2)
+        self.assertNotEqual(second["status"], "complete")
+
+    def test_remaining_gap_without_backfill_error_requires_explicit_retry(self):
+        transcript = {**GAPPED_TRANSCRIPT, "backfill_errors": []}
+        first, stored, second, _, transcribe_mock = self._run_twice([GOOD_OBSERVATION], transcript)
+        self.assertNotEqual(stored["status"], "complete")
+        self.assertEqual(first["quality"]["status"], "needs_review")
         self.assertEqual(transcribe_mock.call_count, 2)
         self.assertNotEqual(second["status"], "complete")
 

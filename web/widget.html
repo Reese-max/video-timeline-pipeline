@@ -191,8 +191,8 @@ async function callTool(name, args, version) {
 function updateButtons() {
   const busy = acting || restoring || uncertainStart || isPending(activeOperation), ready = Boolean(data?.segments?.length) && activeOperation?.error_code !== "MEDIA_EXPIRED";
   const drivePending = driveActing || isPending(driveOperation);
-  $("analyze").disabled = !ready || busy || Boolean(analysisResult);
-  $("analyze").textContent = analysisResult ? "分析結果已載入" : "開始分析";
+  $("analyze").disabled = !ready || busy || analysisResult?.status === "complete";
+  $("analyze").textContent = analysisResult?.status === "complete" ? "分析結果已載入" : analysisResult ? "重試未完成分析" : "開始分析";
   $("drive").disabled = !ready || busy || drivePending;
   const receipt = receipts[followUpKey()];
   $("ask").disabled = !analysisResult || busy || sending || receipt === "sent";
@@ -558,7 +558,7 @@ async function autoStartParallel(version) {
 }
 async function startOperation(kind) {
   if (!data || acting || driveActing || restoring || uncertainStart || activeOperation?.error_code === "MEDIA_EXPIRED") return;
-  if (kind === "analyze" && (isPending(activeOperation) || analysisResult)) return;
+  if (kind === "analyze" && (isPending(activeOperation) || analysisResult?.status === "complete")) return;
   if (kind === "drive" && (isPending(driveOperation) || driveOperation?.error_code === "MEDIA_EXPIRED")) return;
   const version = generation;
   if (kind === "drive") driveActing = true; else acting = true;
