@@ -2303,15 +2303,18 @@ def like_pattern(query: str) -> str:
 
 
 def category_filter(category: str) -> tuple[str, tuple[Any, ...]]:
-    """categories 是 JSON 陣列：LIKE 打在整段 JSON 文字上，會誤匹配
-    JSON 語法（引號、逗號）與 category 字串裡的 %／_ 萬用字元。
-    改成 json_each 逐元素比對，並轉義 LIKE 萬用字元。"""
+    """Match one complete string label from the videos' categories JSON array.
+
+    Substring matching makes a filter such as ``資安`` include unrelated labels
+    like ``資安風險``. Comparing JSON elements directly also keeps punctuation
+    such as ``%`` and ``_`` literal without building a LIKE pattern.
+    """
     if not category:
         return "", ()
-    escaped = category.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
     return (
-        " AND EXISTS (SELECT 1 FROM json_each(videos.categories) AS jc WHERE jc.value LIKE ? ESCAPE '\\')",
-        (f"%{escaped}%",),
+        " AND EXISTS (SELECT 1 FROM json_each(videos.categories) AS jc "
+        "WHERE jc.type = 'text' AND jc.value = ?)",
+        (category,),
     )
 
 
@@ -2844,7 +2847,7 @@ def list_videos(root: Path, category: str = "") -> int:
         except json.JSONDecodeError:
             cats = ["未分類"]
         for name in cats:
-            if category and category not in name:
+            if category and category != name:
                 continue
             grouped.setdefault(name, []).append((title, source, duration))
 
@@ -5597,7 +5600,11 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--list", action="store_true", help="列出所有影片（可搭配 --category 篩選）")
     parser.add_argument("--show", help="依標題關鍵字顯示某支影片的摘要與章節")
-    parser.add_argument("--category", default="", help="限定分類；可搭配 --list 或 --search")
+    parser.add_argument(
+        "--category",
+        default="",
+        help="依完整分類標籤篩選；可搭配 --list、--search 或 --ask",
+    )
     parser.add_argument("--categorize", action="store_true", help="產生固定分類並歸類所有影片（讓 --digest 用程式碼分群）")
     parser.add_argument("--audit", action="store_true", help="健檢知識庫：找出壞掉的摘要、落後的索引與向量")
     parser.add_argument("--refresh", action="store_true", help="忽略既有的逐字稿／視覺／摘要，全部重新呼叫 API")
