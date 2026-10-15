@@ -1523,10 +1523,20 @@ def multipart_body(
 # 實測 85 分鐘直播（開頭近 20 分鐘無人聲）：幻覺段 no_speech_prob 全是 0.701，
 # 688 個正常段最高只有 0.414，0.6 完美分離、零誤殺。
 NO_SPEECH_PROB_LIMIT = 0.6
+# 但 Groq 對整個請求只回一個 no_speech_prob（同請求所有段落同值），配樂下的
+# 清楚旁白會到 0.93–0.98：job 714b23bfc9c0 的 360–480 秒整段 85 句被誤刪，
+# 那些段落 avg_logprob 約 -0.08。比照 Whisper 原生規則，no_speech 高「且」
+# 解碼信心低才當靜默；缺 avg_logprob 時維持舊行為。
+CONFIDENT_SPEECH_LOGPROB = -0.3
 
 
-def is_silence(no_speech: Any) -> bool:
-    return isinstance(no_speech, (int, float)) and not isinstance(no_speech, bool) and no_speech > NO_SPEECH_PROB_LIMIT
+def is_silence(no_speech: Any, avg_logprob: Any = None) -> bool:
+    def number(value: Any) -> bool:
+        return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+    if not number(no_speech) or no_speech <= NO_SPEECH_PROB_LIMIT:
+        return False
+    return not (number(avg_logprob) and avg_logprob >= CONFIDENT_SPEECH_LOGPROB)
 
 
 # Whisper 切段逐字稿斷層回填（issue #55）：job 16fae7864ca8 的第二段音訊
@@ -2114,7 +2124,7 @@ def transcribe_all(
             raw_segments = [{"start": 0, "end": chunk_duration, "text": result["text"]}]
         for segment in raw_segments:
             text = str(segment.get("text", "")).strip()
-            if not text or is_silence(segment.get("no_speech_prob")):
+            if not text or is_silence(segment.get("no_speech_prob"), segment.get("avg_logprob")):
                 continue
             item = {
                 "start": round(float(segment.get("start", 0)) + offset, 3),
@@ -2216,7 +2226,7 @@ def transcribe_all(
                     if not isinstance(gap_segment, dict):
                         continue  # 供應商／快取回應混入非段落元素：跳過，不整批作廢
                     gap_text = str(gap_segment.get("text", "")).strip()
-                    if not gap_text or is_silence(gap_segment.get("no_speech_prob")):
+                    if not gap_text or is_silence(gap_segment.get("no_speech_prob"), gap_segment.get("avg_logprob")):
                         continue
                     try:
                         raw_start = float(gap_segment.get("start", 0))
@@ -2417,7 +2427,7 @@ def transcribe_local(
         detected = getattr(info, "language", None) or detected
         for segment in result:
             text = (segment.text or "").strip()
-            if not text or is_silence(getattr(segment, "no_speech_prob", None)):
+            if not text or is_silence(getattr(segment, "no_speech_prob", None), getattr(segment, "avg_logprob", None)):
                 continue
             segments.append(
                 {
@@ -3355,11 +3365,25 @@ def analyze_video_mp4(
             fallback_reason=detail,
         )
 
+    def finish(observations: list[dict[str, Any]], parsed: dict[str, Any] | None, file_id: str | None) -> list[dict[str, Any]]:
+        # A truncated whole-video answer (finish_reason=length) leaves zero visual
+        # evidence; long videos hit the output cap routinely, so sample frames instead.
+        # Other incomplete outcomes (e.g. timestamp_coverage) stay fail-closed.
+        truncated = any(
+            isinstance(item, dict)
+            and item.get("completion_status") == "incomplete"
+            and item.get("finish_reason") == "length"
+            for item in observations
+        )
+        if not truncated or not allow_frames_fallback:
+            return persist(observations, parsed, file_id)
+        return frames_or_raise("video_mp4 response truncated (finish_reason=length)")
+
     try:
         if strategy == "direct":
+            core_result = None
             try:
-                observations, parsed, file_id = run_core(video_path, analysis_method="minimax_video")
-                return persist(observations, parsed, file_id)
+                core_result = run_core(video_path, analysis_method="minimax_video")
             except budget_blocked_error():
                 raise
             except Exception as error:
@@ -3367,10 +3391,13 @@ def analyze_video_mp4(
                     raise
                 failure_reasons.append(str(error))
                 print(f"! MiniMax video_mp4 上傳因大小／上限失敗，改試壓縮：{error}")
+            if core_result is not None:
+                return finish(*core_result)
 
         # compress_first (oversized source) or retry after size reject
         compressed_path = scratch / "minimax-compressed.mp4"
         compress_error: Exception | None = None
+        compressed_result = None
         for target in (MINIMAX_VIDEO_COMPRESS_TARGET_BYTES, MINIMAX_VIDEO_COMPRESS_RETRY_BYTES):
             compression_finished = False
             try:
@@ -3406,7 +3433,8 @@ def analyze_video_mp4(
                         raise
                     # Compress succeeded; non-size upload/analyze errors are not a frames fallback.
                     raise
-                return persist(observations, parsed, file_id)
+                compressed_result = (observations, parsed, file_id)
+                break
             except (DeadlineExceeded, ExecutionCancelled, budget_blocked_error()):
                 raise
             except Exception as error:
@@ -3430,6 +3458,8 @@ def analyze_video_mp4(
                         break
                     continue
                 raise
+        if compressed_result is not None:
+            return finish(*compressed_result)
 
         reason = (
             f"source {source_size} bytes requires fallback; compress failed"
@@ -7392,6 +7422,9 @@ def self_test() -> None:
     assert is_silence(0.701) and is_silence(0.61)
     assert not is_silence(0.414) and not is_silence(0.028) and not is_silence(0.0)
     assert not is_silence(None) and not is_silence("0.9") and not is_silence(True)
+    # Groq 請求層級 no_speech 偏高但解碼很有把握＝配樂下的真旁白，不刪
+    assert not is_silence(0.926, -0.076) and not is_silence(0.98, -0.3)
+    assert is_silence(0.701, -0.5) and is_silence(0.95, None) and is_silence(0.95, True)
 
     assert retry_delay(urllib.error.HTTPError("u", 429, "", {"Retry-After": "7"}, None), 2.0) == 7.0
     assert retry_delay(urllib.error.HTTPError("u", 429, "", {"Retry-After": "999"}, None), 2.0) == 120.0
