@@ -108,5 +108,37 @@ class VideoMp4OutputCeilingTests(unittest.TestCase):
         self.assertEqual(pipeline.video_mp4_fps_for_duration(1.0, None), 1.0)
 
 
+class LongRequestBudgetTests(unittest.TestCase):
+    def test_post_json_budget_covers_requested_timeout(self) -> None:
+        seen: list[float] = []
+
+        class Stop(Exception):
+            pass
+
+        def fake_budget(label, default_seconds, env_name):
+            seen.append(default_seconds)
+            raise Stop()
+
+        with mock.patch.object(pipeline, "OperationBudget", side_effect=fake_budget):
+            with self.assertRaises(Stop):
+                pipeline.post_json("https://example.invalid", {}, b"{}", 3600)
+            with self.assertRaises(Stop):
+                pipeline.post_json("https://example.invalid", {}, b"{}", 180)
+        self.assertEqual(seen, [3600, 900])
+
+    def test_mcp_cache_signature_tracks_output_ceiling(self) -> None:
+        import mcp_server
+
+        root = Path(tempfile.mkdtemp(prefix="sig-"))
+        video = root / "clip.mp4"
+        video.write_bytes(b"fake")
+        env = {"MINIMAX_MODEL": "MiniMax-M3", "MINIMAX_BASE_URL": "https://api.minimax.io/v1"}
+        with mock.patch.dict(os.environ, {**env, "ANALYZE_VIDEO_MAX_TOKENS": "65536"}):
+            low = mcp_server.analysis_cache_signature(video, {"segment_seconds": 120})
+        with mock.patch.dict(os.environ, {**env, "ANALYZE_VIDEO_MAX_TOKENS": "524288"}):
+            high = mcp_server.analysis_cache_signature(video, {"segment_seconds": 120})
+        self.assertNotEqual(low, high)
+
+
 if __name__ == "__main__":
     unittest.main()

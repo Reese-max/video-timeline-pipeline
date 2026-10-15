@@ -1722,7 +1722,9 @@ def request_json(
 ) -> dict[str, Any]:
     if attempts < 1 or timeout <= 0:
         raise ValueError("attempts and timeout must be positive")
-    budget = OperationBudget("API request", 900, "VIDEO_API_TIMEOUT_SECONDS")
+    # A caller asking for a longer single request (whole-video MiniMax) must not be
+    # silently cut to the 900s default; VIDEO_API_TIMEOUT_SECONDS and the job deadline still win.
+    budget = OperationBudget("API request", max(900, timeout), "VIDEO_API_TIMEOUT_SECONDS")
     headers = {"User-Agent": USER_AGENT, **headers}
     delay = 2.0
     for attempt in range(1, attempts + 1):
@@ -3332,6 +3334,7 @@ def analyze_video_mp4(
                 "prompt": prompt,
                 "fps": fps_value,
                 "detail": detail_value,
+                "max_completion_tokens": max_completion_tokens,
                 "video_sha256": file_sha256(video_path),
             },
             ensure_ascii=False,
