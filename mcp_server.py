@@ -1131,6 +1131,7 @@ def analysis_cache_signature(video_path: Path, manifest: dict) -> str:
         "visual_mode": pipeline.visual_mode(),
         "video_fps": float(os.getenv("ANALYZE_VIDEO_FPS", "1") or 1),
         "video_detail": os.getenv("ANALYZE_VIDEO_DETAIL", "default").strip().lower() or "default",
+        "video_max_tokens": pipeline.video_mp4_max_completion_tokens(),
     }
     return hashlib.sha256(json.dumps(configuration, sort_keys=True).encode()).hexdigest()
 
@@ -1218,7 +1219,9 @@ def analyze_prepared_sync(job_id: str) -> dict[str, Any]:
             report_progress("upload", 20, "上傳整支影片給 MiniMax 直接理解")
             sampling_stats.update({
                 "mode": "video_mp4",
-                "fps": float(os.getenv("ANALYZE_VIDEO_FPS", "1") or 1),
+                "fps": pipeline.video_mp4_fps_for_duration(
+                    max(0.2, min(5.0, float(os.getenv("ANALYZE_VIDEO_FPS", "1") or 1))), duration),
+                "max_completion_tokens": pipeline.video_mp4_max_completion_tokens(),
                 "detail": os.getenv("ANALYZE_VIDEO_DETAIL", "default").strip().lower() or "default",
                 "source_bytes": video_path.stat().st_size,
             })
