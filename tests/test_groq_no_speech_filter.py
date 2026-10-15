@@ -13,6 +13,11 @@ class GroqNoSpeechFilterTests(unittest.TestCase):
         self.assertTrue(pipeline.is_silence(0.701, -0.5))
         self.assertTrue(pipeline.is_silence(0.701, -1.2))
 
+    def test_confident_known_hallucination_is_still_silence(self):
+        self.assertTrue(pipeline.is_silence(0.95, -0.05, "Thank you."))
+        self.assertTrue(pipeline.is_silence(0.95, -0.05, "谢谢观看"))
+        self.assertFalse(pipeline.is_silence(0.3, -0.05, "Thank you."))  # below limit: untouched
+
     def test_missing_logprob_keeps_legacy_threshold(self):
         self.assertTrue(pipeline.is_silence(0.701))
         self.assertTrue(pipeline.is_silence(0.95, None))

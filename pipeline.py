@@ -1530,12 +1530,20 @@ NO_SPEECH_PROB_LIMIT = 0.6
 CONFIDENT_SPEECH_LOGPROB = -0.3
 
 
-def is_silence(no_speech: Any, avg_logprob: Any = None) -> bool:
+def is_hallucination_text(text: str) -> bool:
+    normalized = re.sub(r"[\W_]+", "", str(text).lower())
+    return bool(re.fullmatch(r"(?:thankyou|thanksforwatching|you|pleasesubscribe|"
+                             r"字幕由amaraorg社区提供|请不吝点赞订阅转发打赏支持明镜与点点栏目|谢谢观看)+", normalized))
+
+
+def is_silence(no_speech: Any, avg_logprob: Any = None, text: str = "") -> bool:
     def number(value: Any) -> bool:
         return isinstance(value, (int, float)) and not isinstance(value, bool)
 
     if not number(no_speech) or no_speech <= NO_SPEECH_PROB_LIMIT:
         return False
+    if is_hallucination_text(text):
+        return True
     return not (number(avg_logprob) and avg_logprob >= CONFIDENT_SPEECH_LOGPROB)
 
 
@@ -1555,8 +1563,7 @@ def accept_backfill_segment(
 ) -> bool:
     """補轉合併時排除幻覺、低信心與鄰近重複文字，亦適用舊快取。"""
     normalized = re.sub(r"[\W_]+", "", segment["text"].lower())
-    if re.fullmatch(r"(?:thankyou|thanksforwatching|you|pleasesubscribe|"
-                    r"字幕由amaraorg社区提供|请不吝点赞订阅转发打赏支持明镜与点点栏目|谢谢观看)+", normalized):
+    if is_hallucination_text(segment["text"]):
         return False
     for field, threshold in (("avg_logprob", -1.0), ("compression_ratio", 2.4)):
         value = segment.get(field)
@@ -2124,7 +2131,7 @@ def transcribe_all(
             raw_segments = [{"start": 0, "end": chunk_duration, "text": result["text"]}]
         for segment in raw_segments:
             text = str(segment.get("text", "")).strip()
-            if not text or is_silence(segment.get("no_speech_prob"), segment.get("avg_logprob")):
+            if not text or is_silence(segment.get("no_speech_prob"), segment.get("avg_logprob"), text):
                 continue
             item = {
                 "start": round(float(segment.get("start", 0)) + offset, 3),
@@ -2226,7 +2233,7 @@ def transcribe_all(
                     if not isinstance(gap_segment, dict):
                         continue  # 供應商／快取回應混入非段落元素：跳過，不整批作廢
                     gap_text = str(gap_segment.get("text", "")).strip()
-                    if not gap_text or is_silence(gap_segment.get("no_speech_prob"), gap_segment.get("avg_logprob")):
+                    if not gap_text or is_silence(gap_segment.get("no_speech_prob"), gap_segment.get("avg_logprob"), gap_text):
                         continue
                     try:
                         raw_start = float(gap_segment.get("start", 0))
@@ -2427,7 +2434,7 @@ def transcribe_local(
         detected = getattr(info, "language", None) or detected
         for segment in result:
             text = (segment.text or "").strip()
-            if not text or is_silence(getattr(segment, "no_speech_prob", None), getattr(segment, "avg_logprob", None)):
+            if not text or is_silence(getattr(segment, "no_speech_prob", None), getattr(segment, "avg_logprob", None), text):
                 continue
             segments.append(
                 {
