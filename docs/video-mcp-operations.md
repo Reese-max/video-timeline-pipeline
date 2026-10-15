@@ -41,6 +41,14 @@ obey `VIDEO_PROCESS_TIMEOUT_SECONDS` (3600) and `VIDEO_API_TIMEOUT_SECONDS` (900
 bounded by the remaining job deadline. These time limits do not guarantee that
 an already accepted remote API request is unbilled or cancelled remotely.
 
+Whole-video MiniMax analysis (`ANALYZE_VISUAL_MODE=video_mp4`, the default) always
+sends `max_completion_tokens` (`ANALYZE_VIDEO_MAX_TOKENS`, default and ceiling
+524288); without it MiniMax applies a small server default and long videos end
+with `finish_reason=length`. The call waits up to `ANALYZE_VIDEO_TIMEOUT_SECONDS`
+(3600), still bounded by `VIDEO_API_TIMEOUT_SECONDS` and the job deadline, so long
+videos need those raised too. Long videos lower `fps` automatically so frame tokens
+stay under ~800k of the 1M context (floor 0.2 fps).
+
 ## Sampling and cache correctness
 
 The MCP visual stage uses at most 240 low-resolution probes across the full

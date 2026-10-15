@@ -2541,9 +2541,11 @@ def minimax_chat(
     *,
     thinking: str | None = None,
     operation: str = "chat.completions",
+    max_completion_tokens: int | None = None,
 ) -> str:
-    # 預設不設上限：MiniMax-M3 是 reasoning 模型，<think> 會先吃掉配額，
-    # 給定的預算常常在真正的答案輸出前就用完，回傳半截 JSON。
+    # 預設不帶 max_tokens：小預算常在答案輸出前就被 <think> 吃完。
+    # 但完全不帶時 MiniMax 會套用很小的伺服器預設輸出上限，長答案（整片影片分析）
+    # 必須明確給 max_completion_tokens（M3 上限 524288；max_tokens 已被官方標為棄用）。
     payload: dict[str, Any] = {
         "model": model,
         "messages": messages,
@@ -2554,6 +2556,8 @@ def minimax_chat(
         payload["thinking"] = {"type": thinking}
     if max_tokens:
         payload["max_tokens"] = max_tokens
+    if max_completion_tokens:
+        payload["max_completion_tokens"] = max_completion_tokens
     started = time.monotonic()
     # 粗估輸入 token：送出前必須先拿到預算上限，不能等回應才知道花多少。
     prompt_units = len(json.dumps(messages, ensure_ascii=False)) // 4
@@ -2562,7 +2566,7 @@ def minimax_chat(
         operation,
         model=model,
         request_units=prompt_units,
-        response_units=int(max_tokens or 0),
+        response_units=int(max_completion_tokens or max_tokens or 0),
     ):
         raw = post_json(
             minimax_endpoint(),
@@ -2680,6 +2684,32 @@ def minimax_base_url() -> str:
 MINIMAX_VIDEO_FILES_API_LIMIT_BYTES = 512 * 1024 * 1024
 MINIMAX_VIDEO_COMPRESS_TARGET_BYTES = 450 * 1024 * 1024  # mid of 400–480MB target band
 MINIMAX_VIDEO_COMPRESS_RETRY_BYTES = 350 * 1024 * 1024
+# MiniMax-M3 output ceiling; omitting the field falls back to a small server default
+# that truncated a 9-minute video (finish_reason=length).
+MINIMAX_VIDEO_MAX_COMPLETION_TOKENS = 524288
+# 1M context minus headroom for the prompt and reasoning.
+MINIMAX_VIDEO_CONTEXT_TOKEN_BUDGET = 800_000
+# Measured: 552s at fps=1, detail=default -> 95,839 prompt tokens (~174/frame).
+MINIMAX_VIDEO_TOKENS_PER_FRAME = 175
+
+
+def video_mp4_max_completion_tokens() -> int:
+    raw = os.getenv("ANALYZE_VIDEO_MAX_TOKENS", "").strip()
+    value = int(raw) if raw else MINIMAX_VIDEO_MAX_COMPLETION_TOKENS
+    return max(1, min(MINIMAX_VIDEO_MAX_COMPLETION_TOKENS, value))
+
+
+def video_mp4_timeout_seconds() -> int:
+    raw = os.getenv("ANALYZE_VIDEO_TIMEOUT_SECONDS", "").strip()
+    return max(60, int(raw) if raw else 3600)
+
+
+def video_mp4_fps_for_duration(fps: float, duration: float | None) -> float:
+    """Lower fps for long videos so the frame tokens stay inside the context window."""
+    if duration is None or duration <= 0:
+        return fps
+    ceiling = MINIMAX_VIDEO_CONTEXT_TOKEN_BUDGET / (MINIMAX_VIDEO_TOKENS_PER_FRAME * duration)
+    return max(0.2, min(fps, math.floor(ceiling * 1000) / 1000))
 
 
 def choose_video_mp4_upload_strategy(
@@ -3027,6 +3057,7 @@ def _analyze_video_mp4_core(
     source_video: Path,
     extra_meta: dict[str, Any] | None = None,
     duration_hint: float | None = None,
+    max_completion_tokens: int | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, Any] | None, str | None]:
     """Upload once, then chat (one repair retry on compressed timestamps).
 
@@ -3059,6 +3090,7 @@ def _analyze_video_mp4_core(
                 api_key,
                 model,
                 timeout=timeout,
+                max_completion_tokens=max_completion_tokens,
             )
             parsed = parse_json_object(response)
         except MiniMaxIncompleteError as error:
@@ -3250,7 +3282,7 @@ def analyze_video_mp4(
     cache_dir: Path | None = None,
     fps: float | None = None,
     detail: str | None = None,
-    timeout: int = 600,
+    timeout: int | None = None,
     work_dir: Path | None = None,
     frames_workers: int = 4,
     max_frames: int | None = None,
@@ -3266,14 +3298,17 @@ def analyze_video_mp4(
     if cache_dir is not None:
         cache_dir.mkdir(parents=True, exist_ok=True)
     fps_value = float(os.getenv("ANALYZE_VIDEO_FPS", "1") if fps is None else fps)
-    fps_value = max(0.2, min(5.0, fps_value))
+    fps_value = video_mp4_fps_for_duration(max(0.2, min(5.0, fps_value)), duration)
+    timeout = video_mp4_timeout_seconds() if timeout is None else timeout
+    max_completion_tokens = video_mp4_max_completion_tokens()
     detail_value = (detail or os.getenv("ANALYZE_VIDEO_DETAIL", "default")).strip().lower()
     if detail_value not in {"low", "default", "high"}:
         raise RuntimeError("ANALYZE_VIDEO_DETAIL 只能是 low、default 或 high。")
     prompt = (
         "請完整觀看這支影片，只輸出 JSON object，不要 Markdown。"
         "欄位必須包含 events（陣列）與 overall_summary（字串）。"
-        "events 依時間順序列出關鍵畫面／情節（片長短可 3–8 筆，較長可到 20 筆）；"
+        "events 依時間順序列出關鍵畫面／情節：每次畫面、場景、字幕或投影片明顯改變都要列一筆，"
+        "相鄰兩筆間隔不超過 30 秒，不設筆數上限；"
         "每筆必須含 timestamp（秒）、screen_type、visible_text（字串陣列）、"
         "visual_summary、important_details（字串陣列）、confidence（0 到 1）。"
         "timestamp 一律是從 0 起算的原片秒數（純數字；不要 MM:SS、毫秒、幀數或 0–10 的相對分數）。"
@@ -3338,6 +3373,7 @@ def analyze_video_mp4(
             source_video=video_path,
             extra_meta=extra_meta,
             duration_hint=duration,
+            max_completion_tokens=max_completion_tokens,
         )
 
     def persist(observations: list[dict[str, Any]], parsed: dict[str, Any] | None, file_id: str | None) -> list[dict[str, Any]]:
