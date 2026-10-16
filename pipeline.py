@@ -4,6 +4,7 @@ import argparse
 import array
 import concurrent.futures
 import contextlib
+from contextvars import ContextVar
 import csv
 import ctypes
 import datetime
@@ -11,6 +12,7 @@ import difflib
 from decimal import Decimal, InvalidOperation, ROUND_CEILING
 import email.utils
 import hashlib
+import heapq
 import http.cookiejar
 import importlib.util
 import io
@@ -1546,6 +1548,19 @@ class ApiRequestError(RuntimeError):
         self.retry_after = retry_after
 
 
+_DURABLE_TRANSPORT: ContextVar[Callable[[], bool] | None] = ContextVar("durable_transport", default=None)
+
+
+@contextlib.contextmanager
+def durable_transport_scope(before_request: Callable[[], bool]):
+    """Durable workers fence each POST and never replay an uncertain submission."""
+    token = _DURABLE_TRANSPORT.set(before_request)
+    try:
+        yield
+    finally:
+        _DURABLE_TRANSPORT.reset(token)
+
+
 def request_json(
     url: str,
     headers: dict[str, str],
@@ -1561,12 +1576,15 @@ def request_json(
     # silently cut to the 900s default; VIDEO_API_TIMEOUT_SECONDS and the job deadline still win.
     budget = OperationBudget("API request", max(900, timeout), "VIDEO_API_TIMEOUT_SECONDS")
     headers = {"User-Agent": USER_AGENT, **headers}
+    durable_post = method.upper() == "POST" and _DURABLE_TRANSPORT.get() is not None
     delay = 2.0
     for attempt in range(1, attempts + 1):
         request = urllib.request.Request(url, data=body, headers=headers, method=method)
         try:
             from cost_tracker import classify_error, is_retryable, provider_transport_attempt
 
+            if durable_post and not _DURABLE_TRANSPORT.get()():
+                raise ExecutionCancelled("Durable task cancelled or lease expired")
             with provider_transport_attempt():
                 try:
                     with urllib.request.urlopen(request, timeout=budget.remaining(timeout)) as response:
@@ -1584,12 +1602,15 @@ def request_json(
                     raise ApiRequestError(
                         f"API HTTP {exc.code}（{public_url(url)}）：{detail[:1200]}",
                         status_code=exc.code, response_body=detail, retry_after=retry_delay(exc, delay),
+                        provider_outcome_unknown=durable_post and (exc.code == 408 or exc.code >= 500),
                     ) from exc
                 except (urllib.error.URLError, TimeoutError) as exc:
                     reason = getattr(exc, "reason", None) or type(exc).__name__
                     raise ApiRequestError(f"API 網路錯誤：{reason}", provider_outcome_unknown=True) from exc
             break
         except ApiRequestError as exc:
+            if durable_post and exc.provider_outcome_unknown:
+                raise
             category = classify_error(exc, exc.status_code, exc.response_body)
             if exc.status_code in RETRY_STATUS and is_retryable(category) and attempt < attempts:
                 wait = exc.retry_after if exc.retry_after is not None else delay
@@ -1607,8 +1628,8 @@ def request_json(
         result = json.loads(raw.decode("utf-8"))
         budget.check()
         return result
-    except json.JSONDecodeError as exc:
-        raise ApiRequestError(f"API 回應不是 JSON：{raw[:500]!r}") from exc
+    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+        raise ApiRequestError(f"API 回應不是 JSON：{raw[:500]!r}", provider_outcome_unknown=True) from exc
 
 
 def post_json(url: str, headers: dict[str, str], body: bytes, timeout: int = 180) -> dict[str, Any]:
@@ -4047,6 +4068,9 @@ def index_connection(root: Path) -> sqlite3.Connection:
         connection.execute("DELETE FROM index_state")
         connection.execute(f"PRAGMA user_version = {LIBRARY_SCHEMA_VERSION}")
         connection.commit()
+    connection.execute("""CREATE TABLE IF NOT EXISTS video_catalog (
+        job TEXT PRIMARY KEY, platform TEXT, author TEXT, published_at TEXT, first_completed_at TEXT
+    )""")
     return connection
 
 
@@ -4069,8 +4093,25 @@ def index_job(connection: sqlite3.Connection, job_dir: Path) -> int:
         connection.execute("DELETE FROM events WHERE job = ?", (job,))
         connection.execute("DELETE FROM videos WHERE job = ?", (job,))
         connection.execute("DELETE FROM index_state WHERE job = ?", (job,))
+        connection.execute("DELETE FROM video_catalog WHERE job = ?", (job,))
         return 0
     source = manifest.get("source") or {}
+    host = urllib.parse.urlsplit(str(source.get("url") or "")).hostname or ""
+    platform = next((name for name, domains in {
+        "youtube": ("youtube.com", "youtu.be"), "facebook": ("facebook.com", "fb.watch"),
+        "instagram": ("instagram.com",), "threads": ("threads.com", "threads.net"),
+    }.items() if any(host == domain or host.endswith("." + domain) for domain in domains)), None)
+    completed = (manifest.get("first_completed_at") or manifest.get("eligible_at") or manifest.get("completed_at"))
+    if manifest.get("status") != "completed":
+        completed = None
+    connection.execute("""INSERT INTO video_catalog VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT(job) DO UPDATE SET platform=excluded.platform, author=excluded.author,
+        published_at=excluded.published_at,
+        first_completed_at=COALESCE(video_catalog.first_completed_at, excluded.first_completed_at)
+        WHERE video_catalog.platform IS NOT excluded.platform OR video_catalog.author IS NOT excluded.author
+        OR video_catalog.published_at IS NOT excluded.published_at
+        OR (video_catalog.first_completed_at IS NULL AND excluded.first_completed_at IS NOT NULL)""",
+        (job, platform, source.get("author") or source.get("uploader"), source.get("published_at"), completed))
     timeline_path = job_dir / "timeline.json"
     summary_path = job_dir / "summary.json"
     signature = text_hash(
@@ -4202,16 +4243,98 @@ def like_pattern(query: str) -> str:
     return f"%{escaped}%"
 
 
-def search_index(root: Path, query: str, limit: int, category: str = "") -> list[dict[str, Any]]:
+def library_read_connection(root: Path) -> sqlite3.Connection:
+    """Open an existing compatible index without schema changes or model loading."""
+    path = (root / "library.db").resolve()
+    if not path.is_file() or path.parent != root.resolve():
+        raise RuntimeError("migration_required")
+    connection = sqlite3.connect(path.as_uri() + "?mode=ro", uri=True, timeout=2)
+    try:
+        expected = {"videos": {"job", "title", "source", "status", "duration", "categories"},
+                    "events": {"job", "timestamp", "kind", "text"},
+                    "video_catalog": {"job", "platform", "author", "published_at", "first_completed_at"}}
+        if (connection.execute("PRAGMA user_version").fetchone()[0] != LIBRARY_SCHEMA_VERSION
+                or any(not columns <= {r[1] for r in connection.execute(f"PRAGMA table_info({table})")}
+                       for table, columns in expected.items())):
+            raise RuntimeError("migration_required")
+        connection.execute("PRAGMA query_only=ON")
+        return connection
+    except Exception:
+        connection.close()
+        raise
+
+
+def library_filter_sql(filters: dict[str, str] | None = None, *, events: bool = False) -> tuple[str, list[Any]]:
+    """The CLI and Dashboard share exact categories and parameterized filters."""
+    if filters is not None and not isinstance(filters, dict):
+        raise ValueError("Invalid filters")
+    filters = {k: v for k, v in (filters or {}).items() if v not in (None, "")}
+    allowed = {"category", "platform", "author", "job", "kind", "status", "date_field", "date_from", "date_to", "timezone"}
+    if set(filters) - allowed or any(not isinstance(v, str) or len(v) > 200 for v in filters.values()):
+        raise ValueError("Invalid filters")
+    clauses, values = [], []
+    for field in ("platform", "author", "job", "status", "kind"):
+        if field not in filters:
+            continue
+        if field == "kind" and not events:
+            clauses.append("EXISTS (SELECT 1 FROM events e WHERE e.job=videos.job AND e.kind=?)")
+        else:
+            column = {"platform": "c.platform", "author": "c.author", "kind": "events.kind"}.get(field, "videos." + field)
+            clauses.append(column + "=?")
+        values.append(filters[field])
+    if "category" in filters:
+        clauses.append("EXISTS (SELECT 1 FROM json_each(CASE WHEN json_valid(videos.categories) THEN videos.categories ELSE '[]' END) WHERE value=?)")
+        values.append(filters["category"])
+    date_field = filters.get("date_field", "first_completed_at")
+    if date_field not in {"first_completed_at", "published_at"}:
+        raise ValueError("Invalid date field")
+    from zoneinfo import ZoneInfo
+    try:
+        timezone = ZoneInfo(filters.get("timezone", "Asia/Taipei"))
+    except (ValueError, KeyError) as exc:
+        raise ValueError("Invalid timezone") from exc
+    for key, operator in (("date_from", ">="), ("date_to", "<")):
+        if key in filters:
+            date = datetime.date.fromisoformat(filters[key])
+            if key == "date_to":
+                date += datetime.timedelta(days=1)
+            value = datetime.datetime.combine(date, datetime.time(), timezone).isoformat()
+            clauses.append(f"julianday(c.{date_field}){operator}julianday(?)")
+            values.append(value)
+    if filters.get("date_from", "") > filters.get("date_to", "9999-12-31"):
+        raise ValueError("Invalid date range")
+    return " AND ".join(clauses) or "1=1", values
+
+
+def query_videos(root: Path, *, filters: dict[str, str] | None = None, page: int = 1,
+                 page_size: int = 50, sort: str = "title", readonly: bool = False) -> dict[str, Any]:
+    columns = {"title": "videos.title", "duration": "videos.duration", "first_completed_at": "c.first_completed_at",
+               "published_at": "c.published_at"}
+    if sort not in columns or not 1 <= page_size <= 100 or not 1 <= page <= 100000:
+        raise ValueError("Invalid pagination or sort")
+    where, params = library_filter_sql(filters)
+    with contextlib.closing(library_read_connection(root) if readonly else index_connection(root)) as connection:
+        connection.row_factory = sqlite3.Row
+        base = "FROM videos LEFT JOIN video_catalog c ON c.job=videos.job WHERE " + where
+        total = connection.execute("SELECT count(*) " + base, params).fetchone()[0]
+        rows = connection.execute("SELECT videos.*, c.platform, c.author, c.published_at, c.first_completed_at " + base +
+                                  f" ORDER BY {columns[sort]}, videos.job LIMIT ? OFFSET ?",
+                                  [*params, page_size, (page - 1) * page_size]).fetchall()
+    return {"items": [dict(r) for r in rows], "total": total, "page": page, "page_size": page_size}
+
+
+def search_index(root: Path, query: str, limit: int, category: str = "", *, readonly: bool = False,
+                 filters: dict[str, str] | None = None, offset: int = 0) -> list[dict[str, Any]]:
     db_path = root / "library.db"
     if not db_path.is_file():
         raise RuntimeError(f"索引不存在：{db_path}；先執行 `--index`。")
 
-    if not query.strip():
+    if not query.strip() or len(query) > 500 or not 1 <= limit <= 100 or not 0 <= offset <= 10000000:
         raise RuntimeError("搜尋字串不可為空。")
 
-    # categories 存成 JSON 陣列，用 LIKE 比對就夠——分類名是固定清單，不會誤匹配
-    category_clause = " AND videos.categories LIKE ?" if category else ""
+    # CLI 與 Web 共用 JSON 類別精確比對及參數化條件。
+    where_filter, filter_params = library_filter_sql({**(filters or {}), **({"category": category} if category else {})}, events=True)
+    category_clause = " AND " + where_filter
     scan = len(query) < 3
     if scan:
         # ponytail: trigram 索引窗口是 3 字元，「AI」「影片」這種兩字詞 MATCH 一定落空，
@@ -4227,28 +4350,28 @@ def search_index(root: Path, query: str, limit: int, category: str = "") -> list
         )
         snippet_column = "events.text"
         # 參數順序必須跟 SQL 中出現的順序一致：WHERE → 分類 → ORDER BY → LIMIT
-        category_params: tuple[Any, ...] = (f"%{category}%",) if category else ()
+        category_params: tuple[Any, ...] = tuple(filter_params)
         params: tuple[Any, ...] = (like_pattern(query),) + category_params + (query.lower(), limit)
     else:
         # 整段當 phrase 查，否則使用者輸入的 - 或 " 會被當成 FTS5 運算子而語法錯誤。
         where = "events.text MATCH ?"
         order = "rank"
         snippet_column = f"snippet(events, 3, '《', '》', ' … ', {SNIPPET_WIDTH})"
-        category_params = (f"%{category}%",) if category else ()
+        category_params = tuple(filter_params)
         params = ('"' + query.replace('"', '""') + '"',) + category_params + (limit,)
 
-    connection = index_connection(root)
+    connection = library_read_connection(root) if readonly else index_connection(root)
     try:
         cursor = connection.execute(
             f"""
             SELECT videos.title, videos.source, events.job, events.timestamp,
                    events.kind, {snippet_column}, events.text
-            FROM events JOIN videos ON videos.job = events.job
+            FROM events JOIN videos ON videos.job = events.job LEFT JOIN video_catalog c ON c.job=videos.job
             WHERE {where}{category_clause}
             ORDER BY {order}
-            LIMIT ?
+            LIMIT ? OFFSET ?
             """,
-            params,
+            (*params, offset),
         )
         return [
             {
@@ -4390,49 +4513,38 @@ def semantic_search(
     limit: int,
     backend: str = "openrouter",
     threshold: float | None = None,
+    *, readonly: bool = False, filters: dict[str, str] | None = None,
 ) -> list[dict[str, Any]]:
     db_path = root / "library.db"
     if not db_path.is_file():
         raise RuntimeError(f"索引不存在：{db_path}；先執行 `--index`。")
-    query_vector = embed_texts([query], api_key, model, backend)[0]
-    connection = index_connection(root)
+    if not query.strip() or len(query) > 500 or not 1 <= limit <= 100:
+        raise ValueError("Invalid search input")
+    where, params = library_filter_sql(filters, events=True)
+    connection = library_read_connection(root) if readonly else index_connection(root)
     try:
+        query_vector = embed_texts([query], api_key, model, backend)[0]
         # 向量以文字 hash 為鍵，SQLite 沒有內建 sha256，所以在 Python 端對應
-        stored = dict(connection.execute("SELECT text_hash, vector FROM vectors WHERE model = ?", (model,)))
-        rows = [
-            (title, source, job, timestamp, kind, text, stored[text_hash(text)])
-            for title, source, job, timestamp, kind, text in connection.execute(
+        connection.create_function("text_hash", 1, text_hash, deterministic=True)
+        rows = connection.execute(
                 """
                 SELECT videos.title, videos.source, events.job, events.timestamp,
-                       events.kind, events.text
+                       events.kind, events.text, vectors.vector
                 FROM events JOIN videos ON videos.job = events.job
-                """
-            )
-            if text_hash(text) in stored
-        ]
+                LEFT JOIN video_catalog c ON c.job=videos.job
+                JOIN vectors ON vectors.text_hash=text_hash(events.text) AND vectors.model=?
+                WHERE """ + where, [model, *params])
+        # ponytail: O(n) vector scan, O(Top-K) RAM; use sqlite-vec if this scan becomes the bottleneck.
+        scored = heapq.nlargest(limit, (
+            {"title": row[0], "source": row[1], "job": row[2], "timestamp": row[3],
+             "kind": row[4], "text": row[5], "snippet": row[5][:120],
+             "score": cosine(query_vector, unpack_vector(row[6])), "mode": "semantic"}
+            for row in rows), key=lambda item: item["score"])
     finally:
         connection.close()
-    if not rows:
+    if not scored:
         raise RuntimeError(f"索引裡沒有 {model} 的向量；先執行 `--embed`。")
     # ponytail: 純 Python 全掃描。幾千個向量是毫秒級；真的大到會慢再換 sqlite-vec。
-    scored = sorted(
-        (
-            {
-                "title": row[0],
-                "source": row[1],
-                "job": row[2],
-                "timestamp": row[3],
-                "kind": row[4],
-                "text": row[5],
-                "snippet": row[5][:120],
-                "score": cosine(query_vector, unpack_vector(row[6])),
-                "mode": "semantic",
-            }
-            for row in rows
-        ),
-        key=lambda item: item["score"],
-        reverse=True,
-    )
     # 沒有下限的話每次都回傳整個索引，末幾筆只是「最不像的那些」，不是命中。
     if not scored:
         return []
@@ -4474,8 +4586,11 @@ def answer_question(
     embed_key: str = "",
     embed_model: str = "",
     embed_backend: str = "",
+    *, evidence: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
-    if embed_backend:
+    if evidence is not None:
+        keywords, hits = [question], evidence[:limit]
+    elif embed_backend:
         # 有向量就直接拿問句比對語意，不必先抽關鍵詞——少一次呼叫，命中也更準。
         keywords = ["（語意檢索）"]
         hits = semantic_search(root, question, embed_key, embed_model, limit, embed_backend)
@@ -4735,8 +4850,9 @@ def list_videos(root: Path, category: str = "") -> int:
         raise RuntimeError(f"索引不存在：{db_path}；先執行 `--index`。")
     connection = index_connection(root)
     try:
+        where, params = library_filter_sql({"category": category})
         rows = connection.execute(
-            "SELECT title, source, duration, categories FROM videos ORDER BY duration DESC"
+            "SELECT title, source, duration, categories FROM videos LEFT JOIN video_catalog c ON c.job=videos.job WHERE " + where + " ORDER BY duration DESC", params
         ).fetchall()
     finally:
         connection.close()
@@ -4748,7 +4864,7 @@ def list_videos(root: Path, category: str = "") -> int:
         except json.JSONDecodeError:
             cats = ["未分類"]
         for name in cats:
-            if category and category not in name:
+            if category and category != name:
                 continue
             grouped.setdefault(name, []).append((title, source, duration))
 
@@ -6169,14 +6285,27 @@ def update_rss_subscription(
     return subscription
 
 
-def requeue_rss_item(root: Path, item_id: str) -> dict[str, Any]:
+def validate_rss_retry(item: dict[str, Any] | None) -> None:
+    """Strict Dashboard adapter: keep the original cooldown and dead-letter budget."""
+    if not item or item.get("status") != "failed" or int(item.get("attempts", 0)) >= RSS_MAX_ATTEMPTS:
+        raise ValueError("Only known failed RSS items within the retry budget can be retried")
+    cooldown = item.get("next_retry_at")
+    if cooldown and (not feed_timestamp(cooldown) or feed_timestamp(cooldown) > time.time()):
+        raise ValueError("RSS retry is cooling down")
+
+
+def requeue_rss_item(root: Path, item_id: str, *, preserve_retry_budget: bool = False) -> dict[str, Any]:
     state = load_rss_state(root)
     item = next((entry for entry in state["items"] if entry.get("id") == item_id), None)
     if item is None:
         raise RuntimeError(f"找不到 RSS 項目：{item_id}")
+    if preserve_retry_budget:
+        validate_rss_retry(item)
     if item.get("status") not in {"failed", "dead-letter", "processing"}:
         raise RuntimeError(f"RSS 項目 {item_id} 不是可重排的失敗狀態。")
-    item.update({"status": "queued", "attempts": 0, "last_error": "", "next_retry_at": ""})
+    item.update({"status": "queued", "last_error": ""})
+    if not preserve_retry_budget:
+        item.update(attempts=0, next_retry_at="")
     item.pop("processing_started_at", None)
     save_rss_state(root, state)
     return item
@@ -7597,6 +7726,16 @@ def self_test() -> None:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="影片語音＋畫面時間軸摘要管線")
+    dashboard = parser.add_mutually_exclusive_group()
+    dashboard.add_argument("--serve", action="store_true", help="啟動選用的本機唯讀 Dashboard；不啟動 worker")
+    dashboard.add_argument("--web-init", action="store_true", help="明確建立 Dashboard 索引／任務 schema；不執行外部工作")
+    dashboard.add_argument("--web-worker", action="store_true", help="處理一筆持久化 Dashboard 任務後離開")
+    parser.add_argument("--host", default="127.0.0.1")
+    parser.add_argument("--port", type=int, default=8080)
+    parser.add_argument("--web-writes", action="store_true", help="允許已授權的 POST 排程；需要 WEB_TOKEN")
+    parser.add_argument("--allow-remote", action="store_true")
+    parser.add_argument("--web-origin", help="遠端 HTTPS 反向代理的完整 origin")
+    parser.add_argument("--web-trusted-proxy", help="唯一可信的反向代理 IP；不採信轉送 header")
     parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     source = parser.add_mutually_exclusive_group()
     source.add_argument("--url", help="YouTube／Facebook／Instagram／Threads 等支援的影片 URL")
@@ -7986,7 +8125,7 @@ def run_pipeline(args: argparse.Namespace) -> Path:
         manifest["open_notebook"] = {**previous_sync, "source_id": previous_source_id}  # 這次沒同步也不能弄丟
     # 後處理階段（--categorize）寫進 manifest 的欄位，也要跟著保留：
     # manifest 每次重建，重跑一次批次就會把分類全部沖掉，下次 --categorize 又得整批重來。
-    for preserved in ("categories", "level"):
+    for preserved in ("categories", "level", "first_completed_at", "eligible_at"):
         if previous.get(preserved):
             manifest[preserved] = previous[preserved]
     # Preserve an existing completed manifest until its source byte binding
@@ -8319,6 +8458,9 @@ def run_pipeline(args: argparse.Namespace) -> Path:
         manifest["artifacts"]["source"] = artifact_path(job_dir / "source.json", root)
         if not args.no_video:
             assert_analysis_source(video_path, manifest["source_sha256"])
+        if manifest.get("status") == "completed":
+            manifest.setdefault("first_completed_at", manifest.get("eligible_at") or rss_now())
+            manifest.setdefault("eligible_at", manifest["first_completed_at"])
         write_json(manifest_path, manifest)
         connection = index_connection(root)
         try:
@@ -8347,6 +8489,27 @@ def main() -> int:
     args = parse_args()
     # 成本守衛要綁到這次執行的專案根目錄，否則 strict 模式會拒絕所有付費傳輸。
     bind_cost_root(args.root.resolve())
+    if args.serve or args.web_init or args.web_worker:
+        try:
+            if args.web_init or args.web_worker:
+                import web_services
+                if args.web_init:
+                    web_services.initialize(args.root.resolve())
+                    print("Dashboard schema ready; no worker started.")
+                else:
+                    result = web_services.run_worker_once(args.root.resolve())
+                    print(json.dumps(result or {"status": "idle"}, ensure_ascii=False))
+            else:
+                from webapp import serve
+                serve(args.root.resolve(), host=args.host, port=args.port, enable_writes=args.web_writes,
+                      allow_remote=args.allow_remote, public_origin=args.web_origin, trusted_proxy=args.web_trusted_proxy)
+            return 0
+        except ImportError:
+            print("Dashboard dependencies unavailable; install requirements-web.txt", file=sys.stderr)
+            return 1
+        except (RuntimeError, ValueError, OSError, sqlite3.Error):
+            print("Dashboard unavailable; check bind/auth settings and run --web-init explicitly if migration is required.", file=sys.stderr)
+            return 1
     if args.self_test:
         self_test()
         return 0
@@ -8447,7 +8610,7 @@ def main() -> int:
         try:
             if args.list:
                 total = list_videos(root, args.category)
-                print(f"\n共 {total} 支" + (f"（分類含「{args.category}」）" if args.category else ""))
+                print(f"\n共 {total} 支" + (f"（分類「{args.category}」）" if args.category else ""))
             if args.show:
                 if not show_video(root, args.show):
                     return 1

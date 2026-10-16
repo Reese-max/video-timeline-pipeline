@@ -34,9 +34,17 @@ def bind_cost_root(root: Path) -> None:
     set_cost_root(root)
 
 
-def get_operations_db(root: Path) -> sqlite3.Connection:
+def get_operations_db(root: Path, *, readonly: bool = False) -> sqlite3.Connection:
     """Connect to operations.db and ensure schema migrations are applied."""
     db_path = root / "operations.db"
+    if readonly:
+        path = db_path.resolve()
+        if not path.is_file() or path.parent != root.resolve():
+            raise RuntimeError("migration_required")
+        conn = sqlite3.connect(path.as_uri() + "?mode=ro", uri=True, timeout=2)
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA query_only=ON")
+        return conn
     conn = sqlite3.connect(db_path, timeout=30.0)
     conn.row_factory = sqlite3.Row
     try:
@@ -207,6 +215,7 @@ def claim_pending_deliveries(
     worker_id: str,
     lease_seconds: int = 60,
     limit: int = 10,
+    delivery_id: str | None = None,
 ) -> list[sqlite3.Row]:
     """Atomically claim pending or retry_wait deliveries within a short transaction."""
     now_iso = _utc_now_iso()
@@ -215,6 +224,7 @@ def claim_pending_deliveries(
 
     with conn:
         cur = conn.cursor()
+        conn.execute("BEGIN IMMEDIATE")
         cur.execute(
             """
             SELECT d.delivery_id, d.event_id, d.channel, d.recipient_id, d.provider,
@@ -225,9 +235,10 @@ def claim_pending_deliveries(
             WHERE d.status IN ('pending', 'retry_wait')
               AND (d.next_attempt_at IS NULL OR d.next_attempt_at <= ?)
               AND (d.lease_expires_at IS NULL OR d.lease_expires_at <= ?)
+              AND (? IS NULL OR d.delivery_id = ?)
             LIMIT ?
             """,
-            (now_iso, now_iso, limit),
+            (now_iso, now_iso, delivery_id, delivery_id, limit),
         )
         rows = cur.fetchall()
         if not rows:
@@ -349,6 +360,47 @@ def update_delivery_status(
 
 
 # ── CLI Actions ─────────────────────────────────────────────────────────────
+
+
+def send_frozen_digest(root: Path, draft: dict[str, Any], *, provider: BaseProvider | None = None, before_send=None) -> dict[str, Any]:
+    """Worker-only dispatch of a confirmed immutable draft using the existing outbox."""
+    bind_cost_root(root)
+    payload = draft["payload"]
+    if not payload["selected_items"]:
+        return {"status": "skipped", "reason": "empty_window"}
+    active = provider or get_configured_provider(draft["provider"])
+    text, html = render_digest_email(payload)
+    frozen = {"subject": f"【影片知識庫】{payload['window_label']}", "text_body": text, "html_body": html}
+    identity = f"web-digest:{draft['digest_id']}:{draft['revision']}:{draft['payload_hash']}"
+    with closing(get_operations_db(root)) as conn:
+        event_id = record_event(conn, f"digest.{draft['digest_type']}", None, None, str(draft["revision"]),
+                                {**payload, "_web_frozen_email": frozen}, identity)
+        delivery_id = enqueue_delivery(conn, event_id, "email", draft["recipient"], draft["provider"], draft["payload_hash"], identity)
+        claimed = claim_pending_deliveries(conn, f"web-{os.getpid()}", limit=1, delivery_id=delivery_id)
+        if not claimed:
+            row = conn.execute("SELECT status FROM notification_deliveries WHERE delivery_id=?", (delivery_id,)).fetchone()
+            return {"status": row[0] if row[0] in {"accepted", "unknown", "dead"} else "unknown", "delivery_id": delivery_id}
+        target = claimed[0]
+        started = _utc_now_iso()
+        if before_send is not None and not before_send():
+            with conn:
+                conn.execute("UPDATE notification_deliveries SET status='cancelled',lease_token=NULL,lease_expires_at=NULL WHERE delivery_id=? AND lease_token=?",
+                             (delivery_id, target["lease_token"]))
+            return {"status": "cancelled", "delivery_id": delivery_id}
+        try:
+            frozen = json.loads(target["payload_json"])["_web_frozen_email"]
+            outcome = active.send(recipient=target["recipient_id"], **frozen,
+                idempotency_key=target["provider_idempotency_key"])
+        except Exception:
+            outcome = DeliveryResult(status="unknown", safe_error="reconcile_remote_before_retry")
+        update_delivery_status(conn, delivery_id, target["lease_token"], outcome, int(target["attempt_count"]) + 1, started)
+        with conn:
+            conn.execute("UPDATE web_digest_drafts SET status=? WHERE digest_id=? AND revision=?",
+                         (outcome.status, draft["digest_id"], draft["revision"]))
+        blocked = bool(outcome.safe_error and outcome.safe_error.startswith("Budget blocked:"))
+        return {"status": "blocked" if blocked else outcome.status, "delivery_id": delivery_id,
+                "remote_operation_id": outcome.provider_message_id,
+                "selected_count": payload["selected_count"], "deferred_count": payload["deferred_count"]}
 
 
 def run_digest_preview(
@@ -581,7 +633,6 @@ def run_notification_retry(root: Path, provider: BaseProvider | None = None) -> 
     """Retry deliveries that are in retry_wait status."""
     bind_cost_root(root)
     with closing(get_operations_db(root)) as conn:
-        active_provider = provider or get_configured_provider()
         worker_id = f"retry_worker_{os.getpid()}"
 
         claimed = claim_pending_deliveries(conn, worker_id=worker_id, limit=20)
@@ -593,15 +644,21 @@ def run_notification_retry(root: Path, provider: BaseProvider | None = None) -> 
             started = _utc_now_iso()
             # Parse payload
             try:
+                frozen = None
                 payload = json.loads(item["payload_json"])
-                subject = f"【重試通知】{item['event_type']}"
-                text_body = json.dumps(payload, ensure_ascii=False, indent=2)
-                html_body = None
+                frozen = payload.get("_web_frozen_email")
+                if frozen:
+                    subject, text_body, html_body = (frozen[key] for key in ("subject", "text_body", "html_body"))
+                else:
+                    subject = f"【重試通知】{item['event_type']}"
+                    text_body = json.dumps(payload, ensure_ascii=False, indent=2)
+                    html_body = None
             except Exception:
                 subject = f"【重試通知】{item['event_type']}"
                 text_body = "無法解碼 payload"
                 html_body = None
 
+            active_provider = provider or (get_configured_provider(item["provider"]) if frozen else get_configured_provider())
             result = active_provider.send(
                 recipient=item["recipient_id"],
                 subject=subject,

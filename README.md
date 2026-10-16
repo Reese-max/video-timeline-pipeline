@@ -72,6 +72,32 @@ python pipeline.py --video 'D:\path\to\video.mp4' --dry-run --slide-extractor st
 
 `--dry-run` 不會下載、不會上傳、不會呼叫雲端 API，但會用本機 `ffprobe`／`ffmpeg` 產生音訊片段與候選截圖。輸出在 `jobs\<12字元雜湊>\`。
 
+## 本機 Dashboard（選用，#6）
+
+不需要 Node 前端建置；一般 CLI 不需安裝 Web 套件。使用既有資料目錄時，先停止該目錄的寫入工作、備份 `library.db`／`operations.db`，再明確初始化：
+
+```powershell
+python -m pip install -r requirements-web.txt
+python pipeline.py --root 'C:\Data\VideoLibrary' --web-init
+python pipeline.py --root 'C:\Data\VideoLibrary' --serve
+```
+
+開啟 `http://127.0.0.1:8080`。預設唯讀，只查本機索引、原 RSS 狀態及成本帳本；啟動不建立／升級資料庫、不啟動 worker、不下載模型、不分析影片或寄信。不相容索引顯示 `migration_required`。頁面提供今日／本週覆蓋、影片與證據分頁、全文搜尋、成本、工作與摘要。
+
+需要明確排程語意搜尋、Ask、RSS 重排或凍結摘要寄送時，在目前 shell 設定私人 `WEB_TOKEN`（至少 32 字元）及所需 provider／收件者環境變數，再啟動：
+
+```powershell
+python pipeline.py --root 'C:\Data\VideoLibrary' --serve --web-writes
+# 另一個已設定相同 provider 環境變數的 shell：每次只領取一筆後離開。
+python pipeline.py --root 'C:\Data\VideoLibrary' --web-worker
+```
+
+於頁面的「操作授權」輸入自己的權杖；關頁後清除，瀏覽器不持久儲存它。Web 模式只讀取目前程序的環境變數，不自動載入資料目錄的 `.env`。排入成功回傳 202／task ID，必須另行執行 worker；輪詢或重整頁面不執行工作。未知傳輸不自動重送，取消只停止後續步驟，不保證退費。摘要先本機預覽，再確認 `digest_id + revision + payload_hash`；接受僅代表「供應商已接受」。
+
+遠端需同時指定 `--allow-remote`、有效 `WEB_TOKEN`、`--web-origin https://...` 與 `--web-trusted-proxy <確切IP>`，並由管理者設定可信 TLS 反向代理及防火牆。缺少任何條件即拒絕啟動，不能直接開放未加密服務。
+
+[完整操作與驗收](docs/dashboard.md) 包含 API 限制、既有佇列語意、故障恢復、合成資料效能及尚未驗證範圍。
+
 ## ChatGPT 網頁 MCP 影片摘要
 
 `mcp_server.py` 是 ChatGPT Apps/MCP 入口：公開影片 URL → 既有下載器 → FFmpeg 分段 → Groq 語音辨識／MiniMax 整支影片畫面分析 → ChatGPT 根據工具證據整理時間軸。v14 widget 在準備完成後自動同時啟動伺服器分析（A）與 Drive 上傳（B，已設定時），兩者互不等待；再由「交給 ChatGPT 整理」送出整理要求；重新開啟不會自動重跑或重送。CLI 的 MiniMax 摘要流程不變；MCP 不另呼叫 MiniMax 產生摘要。影片放在 Git 忽略的 `mcp_jobs\`，工作佇列及簽章金鑰在私有 `.video-state/`。

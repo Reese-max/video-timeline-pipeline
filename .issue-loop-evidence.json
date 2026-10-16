@@ -1,0 +1,12 @@
+{
+  "repo": "Reese-max/video-timeline-pipeline",
+  "issue": 6,
+  "base_sha": "42d225936ba704cf70b93cac7bdf84da85ac86b8",
+  "red_proof": "Before implementation: python -X utf8 -B -m unittest discover -s tests -p test_webapp.py -v exited 1: ImportError: Failed to import test module: test_webapp; ModuleNotFoundError: No module named 'web_services'; Ran 1 test in 0.000s; FAILED (errors=1). Subsequent behavioral red checks before their fixes: test_uncertain_post_is_one_transport_and_stays_unknown: AssertionError: 2 != 1; test_frozen_digest_retry_preserves_wire_content_and_provider: Expected get_configured_provider('fake'), Actual get_configured_provider(); test_rss_cooldown_is_rechecked_after_waiting_in_the_task_queue: AssertionError: 'succeeded' != 'blocked'. Browser regression red: node tests/test_dashboard_ui.cjs exited 1 with AssertionError [ERR_ASSERTION]: Got unwanted rejection. Actual message: Cannot set properties of null (setting 'disabled').",
+  "test_command": "python -X utf8 -B -m unittest discover -s tests -p \"test_*.py\" -v && node tests/test_widget_handoff.cjs && node tests/test_parallel_submission.cjs && node tests/test_widget_analysis_report.cjs && node tests/test_widget_library_experiment.cjs && node tests/test_dashboard_ui.cjs && git diff --check",
+  "test_exit": 0,
+  "tests_passed": 725,
+  "tests_failed": 0,
+  "summary": "實作 W0–W11 的選用本機優先 Dashboard，重用既有搜尋、評分、成本、RSS 與 Digest service，提供共用精確篩選、安全唯讀查詢及有界證據頁。加入 SQLite durable tasks、授權與預算界線、lease fencing、取消與 unknown 防重播，以及凍結摘要確認和內容不變的寄送重試。Git Bash 完整驗證 exit 0：651 個 Python 測試方法中 630 完整通過、2 個部分子案例略過、19 個整項略過，另有 95 個 Node 檢查通過，tests_passed 計完整通過的 630+95；真實 Chromium 操作、320/360px 窄畫面及 1k/10k 合成資料效能驗證也通過。",
+  "not_done": "未 push、未建立 PR、未部署遠端服務，沒有使用真實付費 API 或寄送真實郵件；未驗證實體手機、真實 TLS/proxy、供應商 delivery/bounce 或自動 reconciliation。Windows 平台共 25 次略過事件（19 個整項、涉及 2 個方法的 6 個子案例），包括 symlink 權限及既有 POSIX 專屬檢查；尚無跨平台 CI 收據。此機 Git Bash 經 scripts/check_offline.py 二次啟動 Python 時有兩項既有 CreateProcess WinError 87，根因未定位；evidence 的命令直接執行相同完整 Python/Node 套件且已通過。專案沒有既有 coverage ratchet、CRAP 或 mutation gate，本次未導入。"
+}
