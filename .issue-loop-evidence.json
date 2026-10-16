@@ -1,0 +1,12 @@
+{
+  "repo": "Reese-max/video-timeline-pipeline",
+  "issue": 56,
+  "base_sha": "42d225936ba704cf70b93cac7bdf84da85ac86b8",
+  "red_proof": "Before implementation: python -X utf8 -B -m unittest discover -s tests -p test_video_event_gap_fill.py -v (exit 1)\nFAIL: test_gap_fill_checks_its_own_compressed_timestamps_before_caching (test_video_event_gap_fill.VideoGapFillCallTests.test_gap_fill_checks_its_own_compressed_timestamps_before_caching)\n  self.assertIs(row[\"timestamp_reliable\"], False)\nAssertionError: True is not False\nRan 13 tests in 0.269s\nFAILED (failures=1)\nBefore cache invalidation: the same suite exited 1 with FAIL: test_visual_json_from_before_gap_filling_is_not_reused (AssertionError: True is not false) and FAIL: test_cache_from_before_gap_timestamp_checks_is_not_reused (AssertionError: Tuples differ: (0, 0) != (1, 2)); Ran 14 tests in 0.277s; FAILED (failures=2).",
+  "test_command": "python -X utf8 -B -m unittest discover -s tests -p test_video_event_gap_fill.py -v && python -X utf8 -B -m unittest discover -s tests -p 'test_video_timestamp*.py' -v",
+  "test_exit": 0,
+  "tests_passed": 43,
+  "tests_failed": 0,
+  "summary": "Reused the existing per-response source-time validator for gap-fill responses before merging so compressed timestamps are marked unreliable without rescaling or diluting first-answer warnings. A shared validation revision invalidates both raw MP4 and aggregate CLI caches; new cache readback preserves unreliable flags. The exact evidence command passed 43 relevant tests; the full offline checker separately passed 599 Python tests with 24 skips and 94 Node controls, and Windows synchronization fixtures passed 30 checks. Controlled 166.6-second fixtures cover this regression and existing range/coverage rules, but the original issue's real-model screenshot alignment acceptance remains unverified.",
+  "not_done": "No real MiniMax call or original 166.6-second video/screenshot comparison was performed, so the <=5-second alignment requirement remains unverified and issue #56 is not ready for closure. No push, PR, merge, deployment, issue closure, or modification to another branch was performed. The repository has no configured lint, coverage ratchet, CRAP, or mutation gate."
+}
