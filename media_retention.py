@@ -202,6 +202,8 @@ def cleanup(jobs_root: Path, *, apply: bool = False, now: float | None = None) -
                 for path in paths:
                     if (reason == "eligible_drive_backed" and path.parent == job and path.name.startswith("source.")
                             and not drive_backup_still_verified(job)):
+                        audit.update(status="stopped_drive_changed", completed_at=time.time())
+                        pipeline.write_json(job / AUDIT, audit)
                         raise RuntimeError("Google Drive 備份在清理途中變動；保留原片。")
                     old, current = snapshots[path], path.lstat()
                     if (path.is_symlink() or not path.resolve().is_relative_to(root)

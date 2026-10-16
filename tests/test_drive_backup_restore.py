@@ -291,6 +291,10 @@ class DriveBackedCleanupTests(unittest.TestCase):
             self.assertEqual(report["deleted_files"], 2)  # segment and preview only
             self.assertEqual(len(report["errors"]), 1)
             self.assertTrue((job / "source.mp4").exists())
+            audit = json.loads((job / retention.AUDIT).read_text(encoding="utf-8"))
+            self.assertEqual(audit["status"], "stopped_drive_changed")
+            self.assertEqual(sorted(Path(name).as_posix() for name in audit["deleted_files"]),
+                             ["previews/preview_000.jpg", "segments/segment_000.mp4"])
 
 
 if __name__ == "__main__":

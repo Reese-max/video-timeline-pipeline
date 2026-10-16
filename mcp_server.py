@@ -714,6 +714,8 @@ def ensure_local_media(job_dir: Path, manifest: dict) -> Path | None:
         current = None
     if current is not None and pipeline.file_fingerprint(current) != (manifest.get("source") or {}).get("fingerprint"):
         return None  # A newer, never-backed-up source; the old backup must not replace it.
+    for stale in [*job_dir.glob("*.drive-restore.part"), *(job_dir / "segments").glob("*.drive-restore.part")]:
+        stale.unlink(missing_ok=True)  # Leftovers of an interrupted restore; not counted twice below.
     missing = state["source_file"]["size_bytes"] if current is None else 0
     missing += sum(row["size_bytes"] for row in state["local_segments"]
                    if _file_missing(job_dir / "segments" / row["filename"]))

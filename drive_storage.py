@@ -540,11 +540,12 @@ def verify_remote_backup(state: dict) -> bool:
         return (_matches_file(remote, file_id, local, folder_id, mime_type)
                 and capabilities.get("canDownload") is not False)
 
-    source = state["source_file"]
-    if not usable(_get_file(token, source["file_id"]), source["file_id"], source, source["mime_type"]):
+    if not all(usable(_get_file(token, saved["file_id"]), saved["file_id"], row)
+               for row, saved in zip(state["local_segments"], state["files"])):
         return False
-    return all(usable(_get_file(token, saved["file_id"]), saved["file_id"], row)
-               for row, saved in zip(state["local_segments"], state["files"]))
+    # Source last: keep the gap between this check and deleting the local source short.
+    source = state["source_file"]
+    return usable(_get_file(token, source["file_id"]), source["file_id"], source, source["mime_type"])
 
 
 def _download_file(token: str, file_id: str, destination: Path, size: int, digest: str,
