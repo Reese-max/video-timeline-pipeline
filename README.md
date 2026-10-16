@@ -633,7 +633,7 @@ OPEN_NOTEBOOK_PASSWORD=不要提交到版本控制
 | 供應商 | 操作 | 預留時機 |
 |---|---|---|
 | Groq | `audio.transcriptions` | 每個音訊片段送出前（命中本機快取時不預留、不產生新費用） |
-| MiniMax | `vision.analyze_images`、`summarize.*`、`query.keywords`、`query.answer`、`digest.report`、`library.classify` | 每次送出前，同一則 `finish_reason` 重試會各自入帳 |
+| MiniMax | `chat.completions`（整支影片畫面分析）、`summarize.*`、`query.keywords`、`query.answer`、`digest.report`、`library.classify` | 每次送出前，同一則 `finish_reason` 重試會各自入帳 |
 | MiniMax | `files.upload` | 每次 upload attempt 送出前；bytes 是請求單位，未知價格記為 unknown，strict 模式拒絕送出 |
 | OpenRouter | `embeddings` | 每個 batch 送出前（向量已存在時不送出、不預留） |
 | Meta Graph | `graph.query` | 每次分頁請求 |

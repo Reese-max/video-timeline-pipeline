@@ -418,7 +418,7 @@ class PipelineSourceBindingTests(unittest.TestCase):
                  mock.patch.object(pipeline, "minimax_endpoint", return_value="offline"), \
                  mock.patch.object(pipeline, "minimax_model", return_value="offline"), \
                  mock.patch.object(pipeline, "transcribe_all", side_effect=AssertionError("paid ASR")) as asr, \
-                 mock.patch.object(pipeline, "analyze_images", side_effect=AssertionError("paid vision")) as vision, \
+                 mock.patch.object(pipeline, "analyze_video_mp4", side_effect=AssertionError("paid vision")) as vision, \
                  mock.patch.object(pipeline, "create_summary", side_effect=AssertionError("paid summary")) as summary, \
                  mock.patch.object(pipeline, "request_json", side_effect=AssertionError("provider call")) as transport, \
                  mock.patch("urllib.request.urlopen", side_effect=AssertionError("network")) as network:
