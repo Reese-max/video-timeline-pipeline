@@ -1,0 +1,12 @@
+{
+  "repo": "Reese-max/video-timeline-pipeline",
+  "issue": 55,
+  "base_sha": "42d225936ba704cf70b93cac7bdf84da85ac86b8",
+  "red_proof": "Before implementation: python -X utf8 -B -m unittest discover -s tests -p 'test_transcript_gap_schema_regression.py' -v exited 1.\nFAIL: test_untimed_backfill_cannot_hide_issue55_gap (test_transcript_gap_schema_regression.TranscriptGapSchemaRegressionTests.test_untimed_backfill_cannot_hide_issue55_gap) (response={'text': 'context without timing'})\nAssertionError: Lists differ: [] != [{'start': 120.0, 'end': 149.6}]\nRan 7 tests in 0.468s\nFAILED (failures=6)",
+  "test_command": "python -X utf8 -B -m unittest discover -s tests -p 'test_transcript*.py' -v",
+  "test_exit": 0,
+  "tests_passed": 34,
+  "tests_failed": 0,
+  "summary": "Removed fabricated time spans from Groq gap-backfill ingestion so text-only responses and segments missing start or end cannot falsely clear the 120.0-149.6 second gap. Regression coverage increased from 32 to 34 tests, exercising malformed provider responses and cached replies while retaining valid timed speech and existing recovery/filtering behavior. The evidence test command was rerun successfully through Git Bash, and the full offline check exited 0 (Python: Ran 623 tests, OK with 24 skip entries; Node: 44/2/16/32 passed). The 5-second gap and subtitle-content acceptance criteria remain verified only with controlled provider responses, not the original media.",
+  "not_done": "The original 166.6-second media and original-job provider responses are absent from this worktree, so actual 0-166 second continuity and the 2:00-2:28 subtitles remain unverified and issue #55 must remain open. Windows/POSIX and symlink limitations account for the full suite's 24 skip entries; Linux CI was not run. No configured lint, coverage-ratchet, CRAP, or mutation gates were found or added. No paid provider calls, Drive/host acceptance, push, PR, deployment, or changes to another repository branch were performed."
+}

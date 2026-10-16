@@ -2058,14 +2058,7 @@ def transcribe_all(
                     }
                 )
                 gap_segments = backfill_result.get("segments") or []
-                if not gap_segments and backfill_result.get("text"):
-                    gap_segments = [
-                        {
-                            "start": 0,
-                            "end": window_end - window_start,
-                            "text": backfill_result["text"],
-                        }
-                    ]
+                # Untimed context cannot prove that speech inside the gap was recovered.
                 for gap_segment in gap_segments:
                     if not isinstance(gap_segment, dict):
                         continue  # 供應商／快取回應混入非段落元素：跳過，不整批作廢
@@ -2073,8 +2066,8 @@ def transcribe_all(
                     if not gap_text or is_silence(gap_segment.get("no_speech_prob"), gap_segment.get("avg_logprob"), gap_text):
                         continue
                     try:
-                        raw_start = float(gap_segment.get("start", 0))
-                        raw_end = float(gap_segment.get("end", window_end - window_start))
+                        raw_start = float(gap_segment.get("start"))
+                        raw_end = float(gap_segment.get("end"))
                     except (TypeError, ValueError):
                         continue  # 壞了一個段落的時間戳：跳過，不整批作廢
                     if not (math.isfinite(raw_start) and math.isfinite(raw_end) and 0 <= raw_start < raw_end):

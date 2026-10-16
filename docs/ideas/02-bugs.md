@@ -24,6 +24,7 @@
 - **原因（main 程式註解的結論）：** 切段邊界剛好在 120 秒（`segment_seconds=120`）；硬切點撞上半句話時，Whisper 解碼器整個 30 秒視窗交白卷，屬模型側行為，放寬 `no_speech_prob` 過濾救不回來（還會召回幻覺）。main 的處置是合併後偵測 >5 秒的內部斷層，帶前後 15 秒上下文補轉。
 - **驗收：** 0–166 秒之間，逐字稿不能有超過 5 秒的空白（片頭片尾除外）。上表的字幕內容要出現在逐字稿裡。
 - **main 現況：** 驗收門檻即 `TRANSCRIPT_MAX_GAP = 5.0`，狀態看 `transcript.gap_check.remaining`（空陣列＝無斷層）；補轉失敗會讓品質判定改為 needs_review，殘留斷層則只列為提醒（warnings）。尚未用真實影片驗證。
+- **補轉資料驗證（#55）：** 補轉段落必須具備有效的 `start`／`end`；只有文字、缺少任一時間戳的回應（含舊快取）不再被推定覆蓋整段斷層。無效段落會略過，有效段落仍可合併；未補齊的範圍保留於 `gap_check.remaining`。離線回歸指令：`python -X utf8 -B -m unittest discover -s tests -p 'test_transcript*.py' -v`；原始 166.6 秒影片與 2:00–2:28 字幕內容仍待實測。
 
 ## 2. MiniMax 畫面證據的時間碼壓縮了
 
