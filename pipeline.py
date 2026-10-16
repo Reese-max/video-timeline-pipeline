@@ -2786,6 +2786,103 @@ def _parse_video_mp4_events(parsed: dict[str, Any]) -> list[dict[str, Any]]:
     return observations
 
 
+VIDEO_EVENT_FIELD_RULES = (
+    "每筆必須含 timestamp（秒）、screen_type、visible_text（字串陣列）、"
+    "visual_summary、important_details（字串陣列）、confidence（0 到 1）。"
+    "timestamp 一律是從 0 起算的原片秒數（純數字；不要 MM:SS、毫秒、幀數或 0–10 的相對分數）。"
+    "描述文字一律用繁體中文，畫面上的原文照抄不要翻譯。"
+    "若看不清楚，保留空陣列並降低 confidence。"
+)
+# Prompt contract for whole-video answers: no stretch of the video may go this long without an event.
+VIDEO_EVENT_MAX_GAP_SECONDS = 30.0
+# A gap-fill event this close to one already listed describes the same screen.
+VIDEO_EVENT_DUPLICATE_SECONDS = 1.0
+
+
+def gap_checked_video_config(config: Any) -> bool:
+    """CLI visual.json written before gap filling must be analysed again, not reused."""
+    return isinstance(config, dict) and config.get("visual_event_gap_seconds") == VIDEO_EVENT_MAX_GAP_SECONDS
+
+
+def video_event_gaps(
+    observations: list[dict[str, Any]],
+    duration: float | None,
+    max_gap: float = VIDEO_EVENT_MAX_GAP_SECONDS,
+) -> list[tuple[float, float]]:
+    """Spans longer than max_gap with no visual event, measured from 0 to the end of the video."""
+    if duration is None or not math.isfinite(duration) or duration <= 0:
+        return []
+    stamps = sorted(max(0.0, min(float(row["timestamp"]), duration)) for row in observations)
+    edges = [0.0, *stamps, float(duration)]
+    return [(start, end) for start, end in zip(edges, edges[1:]) if end - start > max_gap]
+
+
+def _fill_video_event_gaps(
+    observations: list[dict[str, Any]],
+    *,
+    file_id: str,
+    api_key: str,
+    model: str,
+    fps_value: float,
+    detail_value: str,
+    timeout: int,
+    duration: float | None,
+    max_completion_tokens: int | None,
+) -> list[dict[str, Any]]:
+    """Ask once more about the spans the first answer skipped; keep the first answer if that fails."""
+    gaps = video_event_gaps(observations, duration)
+    if not gaps:
+        return observations
+    windows = "、".join(f"{start:.1f}–{end:.1f} 秒" for start, end in gaps)
+    prompt = (
+        "請完整觀看這支影片，只輸出 JSON object，不要 Markdown。欄位必須包含 events（陣列）。"
+        f"先前的分析在這些時段沒有任何畫面事件：{windows}。"
+        "請只針對這些時段重新仔細觀看，列出時段內每次畫面、場景、字幕或投影片的改變；"
+        f"畫面沒有改變也要每 {VIDEO_EVENT_MAX_GAP_SECONDS:.0f} 秒內至少列一筆，不要輸出這些時段以外的事件。"
+        + VIDEO_EVENT_FIELD_RULES
+    )
+    try:
+        response = minimax_chat(
+            [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": prompt},
+                        {
+                            "type": "video_url",
+                            "video_url": {"url": f"mm_file://{file_id}", "detail": detail_value, "fps": fps_value},
+                        },
+                    ],
+                }
+            ],
+            api_key,
+            model,
+            timeout=max(1, timeout // 2),  # optional extra pass: keep the whole job inside its deadline
+            max_completion_tokens=max_completion_tokens,
+        )
+        found = _parse_video_mp4_events(parse_json_object(response))
+    except (DeadlineExceeded, ExecutionCancelled):
+        raise  # The job was stopped; its partial work must not be saved as complete.
+    except budget_blocked_error():
+        raise
+    except Exception as error:  # The first answer is still complete evidence on its own.
+        print(f"! 畫面事件補漏失敗，保留第一次結果：{error}")
+        return observations
+    taken = [float(row["timestamp"]) for row in observations]
+    added: list[dict[str, Any]] = []
+    for row in found:
+        stamp = row["timestamp"]
+        if any(start < stamp < end for start, end in gaps) and all(
+            abs(stamp - other) >= VIDEO_EVENT_DUPLICATE_SECONDS for other in taken
+        ):
+            taken.append(stamp)
+            added.append(row)
+    print(f"· 畫面事件補漏：{len(gaps)} 段超過 {VIDEO_EVENT_MAX_GAP_SECONDS:.0f} 秒的空檔，新增 {len(added)} 筆")
+    if not added:
+        return observations
+    return sorted([*observations, *added], key=lambda row: row["timestamp"])
+
+
 # Frame sampling was removed; only whole-video MiniMax answers count as visual evidence.
 WHOLE_VIDEO_ANALYSIS_METHODS = frozenset({"minimax_video", "minimax_video_compressed"})
 
@@ -2942,6 +3039,7 @@ def _analyze_video_mp4_core(
         )
         return incomplete, parsed if isinstance(parsed, dict) else None, file_id
 
+    from_events = bool(observations)
     if not observations:
         overall = parsed.get("overall_summary")
         if isinstance(overall, str) and overall.strip():
@@ -2999,6 +3097,19 @@ def _analyze_video_mp4_core(
                 observation["timestamp_reliable"] = False
                 if not observation.get("timestamp_issue"):
                     observation["timestamp_issue"] = "時間碼疑似被壓縮，需覆核原片"
+    if from_events:
+        # After the first answer's own checks, so added events never dilute its warnings.
+        observations = _fill_video_event_gaps(
+            observations,
+            file_id=file_id,
+            api_key=api_key,
+            model=model,
+            fps_value=fps_value,
+            detail_value=detail_value,
+            timeout=timeout,
+            duration=duration_hint,
+            max_completion_tokens=max_completion_tokens,
+        )
 
     _stamp_video_observations(
         observations,
@@ -3044,11 +3155,7 @@ def analyze_video_mp4(
         "欄位必須包含 events（陣列）與 overall_summary（字串）。"
         "events 依時間順序列出關鍵畫面／情節：每次畫面、場景、字幕或投影片明顯改變都要列一筆，"
         "相鄰兩筆間隔不超過 30 秒，不設筆數上限；"
-        "每筆必須含 timestamp（秒）、screen_type、visible_text（字串陣列）、"
-        "visual_summary、important_details（字串陣列）、confidence（0 到 1）。"
-        "timestamp 一律是從 0 起算的原片秒數（純數字；不要 MM:SS、毫秒、幀數或 0–10 的相對分數）。"
-        "描述文字一律用繁體中文，畫面上的原文照抄不要翻譯。"
-        "若看不清楚，保留空陣列並降低 confidence。"
+        + VIDEO_EVENT_FIELD_RULES
     )
     if duration is not None and duration > 0:
         prompt += (
@@ -3061,8 +3168,9 @@ def analyze_video_mp4(
     if cache_dir is not None:
         material = json.dumps(
             {
-                "version": 1,
+                "version": 2,
                 "mode": "video_mp4",
+                "max_event_gap_seconds": VIDEO_EVENT_MAX_GAP_SECONDS,
                 "model": model,
                 "prompt": prompt,
                 "fps": fps_value,
@@ -7864,6 +7972,7 @@ def run_pipeline(args: argparse.Namespace) -> Path:
             **artifact_config,
             "workers": min(max(args.workers, 1), 4),
             "vision_workers": min(max(args.vision_workers, 1), 8),
+            "visual_event_gap_seconds": VIDEO_EVENT_MAX_GAP_SECONDS,
             "language": language,
             "groq_model": args.groq_model,
             "word_timestamps": args.word_timestamps,
@@ -8067,6 +8176,7 @@ def run_pipeline(args: argparse.Namespace) -> Path:
                     reuse_artifact(job_dir / "visual.json")
                     if reuse_cloud
                     and previous_mode == "video_mp4"
+                    and gap_checked_video_config(previous.get("config"))
                     and previous.get("models", {}).get("visual") == model
                     and previous.get("source", {}).get("resolved_video")
                     == artifact_path(video_path, root)
