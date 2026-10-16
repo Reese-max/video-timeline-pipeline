@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- PR #40 自我審查修正：每個實際傳輸重試各自預留與入帳，Apify／Notebook 建立請求不自動重送；Notebook 替換與 CLI 通知先套用預算。預留查核以寫入交易序列化，未結清風險跨日保留並透過新增的帳本關聯欄位避免重複計算；保留舊資料。修復 Apify JSON 落盤、MiniMax 回傳 token 用量、Bright Data 未確定回應與尚未送出之本機失敗記帳，以及內建自測、Windows 測試環境與 SQLite 連線清理。
 - Instagram 盤點先載入專案／root 環境設定並驗證正整數結果上限與正數逾時；stderr 在提交前顯示有效上限。非物件採集回應保留未確定回執與成本預留，不以重送恢復；離線 HTTP／檔案／SQLite 回歸不代表真實供應商計費驗收。
 - Bright Data Instagram 作者盤點需要 finite 結果預算；未提供 `--instagram-max-items` 時需設定 `BRIGHTDATA_INSTAGRAM_MAX_ITEMS`，避免 `--allow-batch-cloud` 搭配無上限的供應商請求。
 - 整合既有背景佇列、簽名媒體網址與抽樣更新；停用整工作目錄刪除，清理與同步／背景操作共用鎖，保護佇列失敗、使用中及分享租約，保留新式分析路徑的文字結果與回執。

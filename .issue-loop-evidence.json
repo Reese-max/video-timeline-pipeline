@@ -1,0 +1,16 @@
+{
+  "repo": "Reese-max/video-timeline-pipeline",
+  "issue": 40,
+  "base_sha": "8faff45ffe165e0d67628cc35fd05acd1ed07b6d",
+  "red_proof": "Before production fixes, python -X utf8 -m unittest discover -s tests -p test_pr40_review.py -v exited 1: Ran 13 tests; FAILED (failures=15, errors=2), including subtests. Concrete failures: 4 Apify creation POSTs instead of 1; concurrent reservations both approved; multiple physical retries recorded as one attempt; Notebook DELETE before budget denial; notification CLI ignored project/root hard-stop settings; strict whitespace/sub-micro caps bypassed; unknown risk counted twice or disappeared after midnight; malformed quota response settled uncertain work; local marker failure retained cloud cost; MiniMax returned tokens ignored; Decimal JSON serialization TypeError. Baseline full suite at the admitted head also exited 1 (239 tests; failures=13, errors=6, skipped=11) because clear=True fixtures removed Windows identity. Subsequent regression runs exposed SQLite WinError 32 before connection-close fixes, and built-in self-test AttributeError for a missing root before validation-order correction. Post-fix review additionally captured separate exit-1 regressions for the self-test stub rejecting cost= and higher returned usage being lost from unresolved risk; both were fixed to green. Logs were captured locally; all regression transport calls were mocked.",
+  "test_command": "python -X utf8 -m unittest discover -s tests -q && node tests/test_widget_handoff.cjs && python -m py_compile pipeline.py cost_tracker.py tests/test_pr40_review.py && git diff --check",
+  "test_exit": 0,
+  "tests_passed": 274,
+  "tests_failed": 0,
+  "summary": "Reviewed PR #40 against linked issue #8 and integrated guard contract #4, then fixed 14 concrete defects with regression evidence. Final validation ran under Git Bash: Python 255 total, 244 passed and 11 skipped; widget 30 passed; compile and diff checks passed. Sixteen focused review tests cover the regressions, legacy ledger preservation, offline self-test, and strict zero-dispatch behavior. No dependencies added, no provider calls, and no push.",
+  "not_done": [
+    "Live Bright Data/Apify limit enforcement and billing canaries NOT_RUN; offline tests do not establish provider billing acceptance.",
+    "Historical unknown usage rows without reservation_id are preserved and cannot be automatically paired; manual reconciliation remains necessary.",
+    "No push, merge, deployment, branch changes, or GitHub issue/PR mutations."
+  ]
+}

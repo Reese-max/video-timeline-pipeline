@@ -252,15 +252,16 @@ class GuardAccountingTests(unittest.TestCase):
     def test_timeout_keeps_reservation_outstanding_as_unknown(self) -> None:
         with patch.object(pipeline.time, "sleep", lambda *_: None), patch.object(
             urllib.request, "urlopen", side_effect=TimeoutError("read timed out")
-        ):
+        ) as transport:
             with self.assertRaises(RuntimeError):
                 pipeline.minimax_chat([{"role": "user", "content": "hi"}], "mm-key", "MiniMax-M3")
 
         usage = rows(self.root, "usage_costs")
-        self.assertEqual(len(usage), 1)
-        self.assertEqual(usage[0]["status"], "unknown")
-        # An unproven attempt keeps its risk: the reservation must stay outstanding.
-        self.assertEqual(rows(self.root, "budget_reservations")[0]["status"], "reserved")
+        self.assertEqual(transport.call_count, 4)
+        self.assertEqual([row["status"] for row in usage], ["unknown"] * transport.call_count)
+        # Every unproven attempt keeps its own risk outstanding.
+        self.assertEqual([row["status"] for row in rows(self.root, "budget_reservations")],
+                         ["reserved"] * transport.call_count)
 
     def test_remote_operation_id_is_kept_for_reconciliation(self) -> None:
         snapshot = "s_abc123"

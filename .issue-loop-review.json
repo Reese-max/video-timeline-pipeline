@@ -1,0 +1,22 @@
+{
+  "pr": 40,
+  "head": "8faff45ffe165e0d67628cc35fd05acd1ed07b6d",
+  "findings": [
+    {"severity":"med","file":"pipeline.py","line":4392,"issue":"Apify discovery returns Decimal in max_total_charge_usd; successful paid results fail JSON persistence."},
+    {"severity":"high","file":"pipeline.py","line":4332,"issue":"The guard wraps automatic transport retries: multiple billable POSTs share one reservation, including Apify Actor creation after a lost response."},
+    {"severity":"high","file":"pipeline.py","line":3017,"issue":"Open Notebook replacement deletes the existing source before the budget guard can refuse the replacement."},
+    {"severity":"high","file":"pipeline.py","line":7386,"issue":"Notification CLI commands return before loading project/root .env, silently ignoring configured hard-stop budgets."},
+    {"severity":"high","file":"cost_tracker.py","line":455,"issue":"New live guard calls a reservation check whose SELECTs run before a write transaction; concurrent workers can both spend the same remaining budget."},
+    {"severity":"high","file":"cost_tracker.py","line":209,"issue":"Strict-mode parsing disagrees on surrounding whitespace, and positive sub-micro-dollar caps truncate to zero and disable enforcement."},
+    {"severity":"med","file":"cost_tracker.py","line":498,"issue":"Unknown attempts are counted in both usage and outstanding reservations, incorrectly rejecting work that still fits the budget."},
+    {"severity":"high","file":"cost_tracker.py","line":497,"issue":"Unusable Bright Data responses containing words such as quota are treated as known failures and settle reservations despite having no usable snapshot ID."},
+    {"severity":"med","file":"pipeline.py","line":4656,"issue":"A local submission-marker write failure before any transport leaves a permanent unknown charge and outstanding reservation."},
+    {"severity":"med","file":"pipeline.py","line":2255,"issue":"MiniMax successful responses are recorded before consuming provider usage; default calls report zero output tokens despite returned usage."},
+    {"severity":"med","file":"tests/test_instagram_budget_recovery.py","line":42,"issue":"New clear=True test environments remove USERNAME, breaking real Windows private-directory ACL checks; the full suite fails before exercising recovery."},
+    {"severity":"high","file":"cost_tracker.py","line":239,"issue":"Outstanding reservations disappear from the live guard's risk calculation at a period boundary even though unknown remote work remains unresolved."},
+    {"severity":"med","file":"tests/test_instagram_budget_recovery.py","line":155,"issue":"The SQLite connection context commits but does not close the handle, so Windows recovery tests fail during TemporaryDirectory cleanup with WinError 32."},
+    {"severity":"med","file":"pipeline.py","line":5517,"issue":"RSS queue root binding now precedes cloud-permission validation; the built-in offline self-test's rejection fixture has no root and raises AttributeError instead of exercising the authorization refusal."}
+  ],
+  "fixed": true,
+  "summary": "Found and locally fixed 14 actionable defects in retry accounting, atomic budget enforcement, recovery/persistence, side-effect ordering, CLI configuration, and Windows/self-test verification. Failing regressions were captured before fixes; final Git Bash validation passed 244 Python tests and 30 widget scenarios, with 11 Python tests skipped. No push or live paid-provider calls were performed; provider billing and historical unlinked unknown reservations still require external/manual reconciliation."
+}

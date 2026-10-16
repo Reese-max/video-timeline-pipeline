@@ -594,19 +594,19 @@ OPEN_NOTEBOOK_PASSWORD=不要提交到版本控制
 
 ## 成本守衛（#4）
 
-所有已啟用的對外傳輸都經過同一道守衛：送出前先在 `operations.db` 原子預留金額，送出後入帳並結清預留。CLI、背景排程、MCP 工具與內建重試都走同一條路徑，不存在只寫在文件、實際沒接上的開關。
+所有已啟用的對外傳輸都經過同一道守衛：每個實際傳輸嘗試（含重試）送出前先在 `operations.db` 原子預留金額，取得確定結果後入帳並結清預留。CLI、背景排程與 MCP 工具共用守衛；CLI 通知指令也先載入專案與所選 `--root` 的 `.env`。
 
 已接入的傳輸：
 
 | 供應商 | 操作 | 預留時機 |
 |---|---|---|
 | Groq | `audio.transcriptions` | 每個音訊片段送出前（命中本機快取時不預留、不產生新費用） |
-| MiniMax | `vision.analyze_images`、`summarize.*`、`query.keywords`、`query.answer`、`digest.report`、`library.classify` | 每次送出前，同一則 `finish_reason` 重試會各自入帳 |
+| MiniMax | `vision.analyze_images`、`summarize.*`、`query.keywords`、`query.answer`、`digest.report`、`library.classify` | 每次送出前；傳輸與 `finish_reason` 重試各自入帳，回應中的有效 token 用量更新估算 |
 | OpenRouter | `embeddings` | 每個 batch 送出前（向量已存在時不送出、不預留） |
 | Meta Graph | `graph.query` | 每次分頁請求 |
-| Apify | `actor.run.start` | 一次 Actor 工作只預留一次，金額以供應商端 `APIFY_MAX_TOTAL_CHARGE_USD` 封頂；後續 poll／dataset 讀取屬同一筆遠端工作，不重複計完整 Actor 費用 |
+| Apify | `actor.run.start` | 每次建立工作前，以供應商端 `APIFY_MAX_TOTAL_CHARGE_USD` 封頂；建立請求不自動重送，後續 poll／dataset 讀取屬同一筆遠端工作 |
 | Bright Data | `datasets.trigger` | 寫入 `.submitted` 回執前；被拒絕時不會留下「送出狀態不明」的標記 |
-| Open Notebook | `sources.sync` | 建立 source 前 |
+| Open Notebook | `sources.sync` | 替換時刪除舊 source 前；建立請求不自動重送 |
 | RSS 通知 Webhook | `notify` | 每次通知前 |
 | Email（Resend／SMTP／Webhook） | `email.send`、`webhook.post` | 每次寄送前，被拒絕時回 `permanent_failure`（不重試、不遞迴告警） |
 
@@ -622,6 +622,7 @@ COST_TIMEZONE=Asia/Taipei
 * `BUDGET_HARD_STOP=true` **且** `DAILY_BUDGET_USD>0`：嚴格模式。`已花費 + 未結清預留 + 本次上限` 超過每日上限時，傳輸在開連線前就被拒絕（`Budget blocked:`），並記一筆 `blocked_budget`。
 * 嚴格模式下成本帳本不可寫（唯讀、損壞、磁碟滿）一律 fail-closed，不會因為記帳失敗就放行付費請求。
 * 超時、連線中斷或結果不明的 attempt 記為 `unknown` 且**不結清**預留，避免遠端仍在跑的工作看起來免費；之後要用 `provider_operation_id`（Apify run、Bright Data snapshot）對帳。
+* 未結清預留跨日仍保留風險，已觀察用量高於原始估計時會提高預留；新紀錄透過 `reservation_id` 避免同一 attempt 的用量與預留重複計算。舊帳本會保留資料並新增關聯欄位；既有未關聯的 unknown 紀錄仍需人工對帳。Bright Data 在本機提交標記寫入失敗、尚未送出時記為零費用並結清預留。
 * 沒有開嚴格模式時，守衛是諮詢性的：帳本寫不進去（唯讀、磁碟滿、被鎖住）只會印一行 `!` 警告並照常送出，但該 attempt 的預留會留在 `reserved`，不會因為沒記到帳就當成沒花錢。要「記不到就不准花」，請開 `BUDGET_HARD_STOP=true` 並設定 `DAILY_BUDGET_USD`。
 * 目前沒有自動釋出／對帳 `reserved` 預留的工具；unknown attempt 的遠端工作要人工用 `provider_operation_id` 對帳（規劃中的統一對帳屬 #7 範圍）。
 
@@ -634,3 +635,5 @@ python pipeline.py --provider-health
 報表只讀本機 `operations.db`，不會為了查成本再發任何付費請求；「本程式、指定帳戶範圍、截至 as_of」不等於供應商帳單。`unknown` 不會被當成 0。
 
 **邊界**：本地守衛只能攔截「這個程式送出去的新請求」。供應商晚計費、同一帳戶被其他工具共用、無法取消的遠端工作，與沒有可驗證價格的操作，都不在這個保證裡；要真正的零超支，仍需要供應商端的額度控制。
+
+離線守衛回歸：`python -X utf8 -m unittest discover -s tests -p test_pr40_review.py -q`。涵蓋併發預留、跨日風險、每次重試入帳、替換前拒絕、舊帳本遷移與內建自測；未呼叫真實付費供應商。

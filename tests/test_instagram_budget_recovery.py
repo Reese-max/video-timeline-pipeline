@@ -39,7 +39,10 @@ class InstagramBudgetRecoveryTests(unittest.TestCase):
         import cost_tracker
         with contextlib.ExitStack() as stack:
             root = Path(stack.enter_context(tempfile.TemporaryDirectory()))
-            stack.enter_context(patch.dict(os.environ, {"BRIGHTDATA_API_TOKEN": TOKEN, "BRIGHTDATA_RUN_TIMEOUT_SECONDS": "60"}, clear=True))
+            stack.enter_context(patch.dict(os.environ, {
+                **{key: os.environ[key] for key in ("USERNAME", "PATH", "SYSTEMROOT") if key in os.environ},
+                "BRIGHTDATA_API_TOKEN": TOKEN, "BRIGHTDATA_RUN_TIMEOUT_SECONDS": "60",
+            }, clear=True))
             stack.enter_context(cost_tracker.cost_root_scope(None))
             self.patcher = Patches(stack)
             self.patcher.setattr(pipeline.time, "sleep", lambda seconds: None)
@@ -152,7 +155,7 @@ class InstagramBudgetRecoveryTests(unittest.TestCase):
                         else:
                             with self.assertRaisesRegex(RuntimeError, '禁止重送'):
                                 pipeline.fetch_instagram_author('testauthor', max_items=3, allow_paid=True, root=root)
-                    with sqlite3.connect(root / 'operations.db') as db:
+                    with contextlib.closing(sqlite3.connect(root / 'operations.db')) as db:
                         status, cost_status, operation = db.execute('SELECT status,cost_status,operation FROM usage_costs').fetchone()
                         reservation = db.execute('SELECT status FROM budget_reservations').fetchone()[0]
                     self.assertTrue(operation == 'datasets.trigger' and cost_status == 'estimated')

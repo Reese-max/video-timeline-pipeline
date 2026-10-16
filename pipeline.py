@@ -1556,6 +1556,7 @@ class ApiRequestError(RuntimeError):
         super().__init__(message)
         self.status_code = status_code
         self.response_body = response_body
+        self.outcome_unknown = status_code is None
 
 
 def request_json(
@@ -1566,6 +1567,7 @@ def request_json(
     body: bytes | None = None,
     timeout: int,
     attempts: int = 4,
+    cost: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     if attempts < 1 or timeout <= 0:
         raise ValueError("attempts and timeout must be positive")
@@ -1575,50 +1577,71 @@ def request_json(
     for attempt in range(1, attempts + 1):
         request = urllib.request.Request(url, data=body, headers=headers, method=method)
         try:
-            with urllib.request.urlopen(request, timeout=budget.remaining(timeout)) as response:
-                raw = read_response(response, budget, read_timeout=timeout)
-            break
-        except urllib.error.HTTPError as exc:
-            try:
-                detail = read_response(exc, budget, 4096, read_timeout=timeout).decode("utf-8", errors="replace")
-            finally:
-                exc.close()
-            secrets = {value for key, value in headers.items() if key.lower() in {"authorization", "x-api-key", "api-key"}}
-            secrets.update(value.split(" ", 1)[-1] for value in list(secrets))
-            detail = redact_values(detail, secrets)
-            if exc.code in RETRY_STATUS and attempt < attempts:
-                wait = retry_delay(exc, delay)
-                print(f"! API HTTP {exc.code}，{wait:.0f} 秒後重試（{attempt}/{attempts - 1}）")
-                budget.sleep(wait)
-                delay *= 2
-                continue
-            # 帶上 URL：base_url 被環境變數改掉時，光看「404 page not found」查不出原因。
-            raise ApiRequestError(
-                f"API HTTP {exc.code}（{public_url(url)}）：{detail[:1200]}", status_code=exc.code, response_body=detail
-            ) from exc
-        # TimeoutError 不是 URLError 的子類，只接 URLError 會讓讀取逾時完全跳過重試
-        except (urllib.error.URLError, TimeoutError) as exc:
-            reason = getattr(exc, "reason", None) or type(exc).__name__
-            if attempt < attempts:
-                print(f"! API 網路錯誤（{reason}），{delay:.0f} 秒後重試（{attempt}/{attempts - 1}）")
-                budget.sleep(delay)
-                delay *= 2
-                continue
-            raise ApiRequestError(f"API 網路錯誤：{reason}") from exc
-    try:
-        result = json.loads(raw.decode("utf-8"))
-        budget.check()
-        return result
-    except json.JSONDecodeError as exc:
-        raise ApiRequestError(f"API 回應不是 JSON：{raw[:500]!r}") from exc
+            timeout_remaining = budget.remaining(timeout)
+            # Each physical retry owns a fresh reservation; prior unknown work stays outstanding.
+            with cost_guard(**cost) if cost else contextlib.nullcontext() as outcome:
+                try:
+                    with urllib.request.urlopen(request, timeout=timeout_remaining) as response:
+                        raw = read_response(response, budget, read_timeout=timeout)
+                except urllib.error.HTTPError as exc:
+                    try:
+                        detail = read_response(exc, budget, 4096, read_timeout=timeout).decode("utf-8", errors="replace")
+                    finally:
+                        exc.close()
+                    secrets = {value for key, value in headers.items() if key.lower() in {"authorization", "x-api-key", "api-key"}}
+                    secrets.update(value.split(" ", 1)[-1] for value in list(secrets))
+                    detail = redact_values(detail, secrets)
+                    raise ApiRequestError(
+                        f"API HTTP {exc.code}（{public_url(url)}）：{detail[:1200]}", status_code=exc.code, response_body=detail
+                    ) from exc
+                except (urllib.error.URLError, TimeoutError) as exc:
+                    reason = getattr(exc, "reason", None) or type(exc).__name__
+                    raise ApiRequestError(f"API 網路錯誤：{reason}") from exc
+                try:
+                    result = json.loads(raw.decode("utf-8"))
+                except json.JSONDecodeError as exc:
+                    raise ApiRequestError(f"API 回應不是 JSON：{raw[:500]!r}") from exc
+                if cost and cost["provider"] in {"minimax", "openrouter"} and isinstance(result, dict):
+                    usage = result.get("usage")
+                    if isinstance(usage, dict):
+                        for key, field in (("prompt_tokens", "request_units"), ("completion_tokens", "response_units")):
+                            value = usage.get(key)
+                            if type(value) is int and value >= 0:
+                                setattr(outcome, field, value)
+                        from cost_tracker import estimate_operation_cost_micro_usd
+                        outcome.estimated_micro_usd = estimate_operation_cost_micro_usd(
+                            cost["provider"], cost.get("model"), outcome.request_units, outcome.response_units
+                        )
+                budget.check()
+                return result
+        except ApiRequestError as exc:
+            cause = exc.__cause__
+            if attempt == attempts:
+                raise
+            if isinstance(cause, urllib.error.HTTPError):
+                if exc.status_code not in RETRY_STATUS:
+                    raise
+                wait = retry_delay(cause, delay)
+                print(f"! API HTTP {exc.status_code}，{wait:.0f} 秒後重試（{attempt}/{attempts - 1}）")
+            elif isinstance(cause, (urllib.error.URLError, TimeoutError)):
+                wait = delay
+                reason = getattr(cause, "reason", None) or type(cause).__name__
+                print(f"! API 網路錯誤（{reason}），{wait:.0f} 秒後重試（{attempt}/{attempts - 1}）")
+            else:
+                raise
+            budget.sleep(wait)
+            delay *= 2
 
 
-def post_json(url: str, headers: dict[str, str], body: bytes, timeout: int = 180) -> dict[str, Any]:
-    return request_json(url, headers, method="POST", body=body, timeout=timeout)
+def post_json(
+    url: str, headers: dict[str, str], body: bytes, timeout: int = 180,
+    *, cost: dict[str, Any] | None = None, attempts: int = 4,
+) -> dict[str, Any]:
+    return request_json(url, headers, method="POST", body=body, timeout=timeout, attempts=attempts, cost=cost)
 
 
-def get_json(url: str, headers: dict[str, str]) -> dict[str, Any]:
-    return request_json(url, headers, method="GET", timeout=30)
+def get_json(url: str, headers: dict[str, str], *, cost: dict[str, Any] | None = None) -> dict[str, Any]:
+    return request_json(url, headers, method="GET", timeout=30, cost=cost)
 
 
 RSS_MAX_BYTES = 5 * 1024 * 1024
@@ -1873,15 +1896,16 @@ def groq_transcribe(
     if language and language != "auto":
         fields["language"] = language
     body, boundary = multipart_body(fields, "file", audio_path)
-    with cost_guard("groq", "audio.transcriptions", model=model, request_units=audio_path.stat().st_size // 1000):
-        return post_json(
-            "https://api.groq.com/openai/v1/audio/transcriptions",
-            {
-                "Authorization": f"Bearer {api_key}",
-                "Content-Type": f"multipart/form-data; boundary={boundary}",
-            },
-            body,
-        )
+    return post_json(
+        "https://api.groq.com/openai/v1/audio/transcriptions",
+        {
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": f"multipart/form-data; boundary={boundary}",
+        },
+        body,
+        cost={"provider": "groq", "operation": "audio.transcriptions", "model": model,
+              "request_units": audio_path.stat().st_size // 1000},
+    )
 
 
 def transcribe_all(
@@ -2252,19 +2276,14 @@ def minimax_chat(
     started = time.monotonic()
     # 粗估輸入 token：送出前必須先拿到預算上限，不能等回應才知道花多少。
     prompt_units = len(json.dumps(messages, ensure_ascii=False)) // 4
-    with cost_guard(
-        "minimax",
-        operation,
-        model=model,
-        request_units=prompt_units,
-        response_units=int(max_tokens or 0),
-    ):
-        raw = post_json(
-            minimax_endpoint(),
-            {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
-            json.dumps(payload, ensure_ascii=False).encode("utf-8"),
-            timeout,
-        )
+    raw = post_json(
+        minimax_endpoint(),
+        {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+        json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+        timeout,
+        cost={"provider": "minimax", "operation": operation, "model": model,
+              "request_units": prompt_units, "response_units": int(max_tokens or 0)},
+    )
     choices = raw.get("choices") or []
     if not choices:
         raise RuntimeError(f"MiniMax 回應缺少 choices：{raw}")
@@ -2991,31 +3010,26 @@ def open_notebook_sync(
     sources_url = base_url + "/" + sources_path.strip("/")
     auth_headers = {"Authorization": f"Bearer {password}", "X-Password": password}
 
-    replaced = False
-    if replace_source_id:
-        # 重跑同一支影片時先撤掉上次的條目，否則 notebook 會積出一排同名 source。
-        try:
-            request_json(
-                f"{base_url}/api/sources/{replace_source_id}",
-                auth_headers,
-                method="DELETE",
-                timeout=30,
-            )
-            replaced = True
-        except RuntimeError as exc:
-            # 使用者可能已經在 UI 手動刪掉了，那不是錯誤。
-            if "HTTP 404" not in str(exc):
-                raise
-
     fields = {"type": "upload", "notebook_id": notebook_id, "async_processing": "true"}
     if title:
         # 不傳的話 Open Notebook 拿檔名當標題，整個 notebook 會是一排 knowledge.md
         fields["title"] = title
     body, boundary = multipart_body(fields, "file", knowledge_path)
     headers = {**auth_headers, "Content-Type": f"multipart/form-data; boundary={boundary}"}
-    # 只有建立 source 會讓對外服務開始處理；後面的 command poll 屬同一筆工作。
+    replaced = False
+    # Permission must precede replacement side effects; polling belongs to the same work.
     with cost_guard("open_notebook", "sources.sync") as guard_outcome:
-        response = post_json(sources_url, headers, body)
+        if replace_source_id:
+            try:
+                request_json(
+                    f"{base_url}/api/sources/{replace_source_id}",
+                    auth_headers, method="DELETE", timeout=30,
+                )
+                replaced = True
+            except RuntimeError as exc:
+                if "HTTP 404" not in str(exc):
+                    raise
+        response = post_json(sources_url, headers, body, attempts=1)
         source_id = response.get("id") or ""
         if source_id:
             guard_outcome.provider_operation_id = str(source_id)
@@ -3361,12 +3375,12 @@ def embed_texts(texts: list[str], api_key: str, model: str, backend: str = "open
 def embed_texts_openrouter(texts: list[str], api_key: str, model: str) -> list[list[float]]:
     """OpenRouter 的 embeddings 端點。模型清單查不到它、文件也沒寫，但實測可用。"""
     prompt_units = sum(len(text) for text in texts) // 4
-    with cost_guard("openrouter", "embeddings", model=model, request_units=prompt_units):
-        response = post_json(
-            os.getenv("EMBED_BASE_URL", "https://openrouter.ai/api/v1").rstrip("/") + "/embeddings",
-            {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
-            json.dumps({"model": model, "input": texts}, ensure_ascii=False).encode("utf-8"),
-        )
+    response = post_json(
+        os.getenv("EMBED_BASE_URL", "https://openrouter.ai/api/v1").rstrip("/") + "/embeddings",
+        {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+        json.dumps({"model": model, "input": texts}, ensure_ascii=False).encode("utf-8"),
+        cost={"provider": "openrouter", "operation": "embeddings", "model": model, "request_units": prompt_units},
+    )
     items = response.get("data") or []
     if len(items) != len(texts):
         raise RuntimeError(f"embedding 回傳數量不符：送 {len(texts)} 筆、收 {len(items)} 筆")
@@ -4171,8 +4185,8 @@ def facebook_graph_version() -> str:
 def facebook_graph_payload(url: str, token: str) -> dict[str, Any]:
     try:
         # 每頁分頁都是一次外部請求：逐次經過同一個守衛，不因分頁而漏記。
-        with cost_guard("meta", "graph.query"):
-            payload = get_json(url, {"Authorization": f"Bearer {token}"})
+        payload = get_json(url, {"Authorization": f"Bearer {token}"},
+                           cost={"provider": "meta", "operation": "graph.query"})
     except budget_blocked_error():
         raise
     except RuntimeError as exc:
@@ -4329,7 +4343,7 @@ def fetch_facebook_author_apify(author: str, since: str) -> dict[str, Any]:
             estimated_micro_usd=max_charge_micro,
             provider_enforced_upper_bound_micro_usd=max_charge_micro,
         ) as guard_outcome:
-            payload = post_json(run_url, headers, json.dumps(actor_input).encode("utf-8"), timeout=70)
+            payload = post_json(run_url, headers, json.dumps(actor_input).encode("utf-8"), timeout=70, attempts=1)
             run = payload.get("data") if isinstance(payload, dict) else None
             if not isinstance(run, dict) or not run.get("id"):
                 raise RuntimeError("Apify 啟動回應缺少 run ID。")
@@ -4389,7 +4403,7 @@ def fetch_facebook_author_apify(author: str, since: str) -> dict[str, Any]:
             "raw_count": len(raw_items),
             "results_limit": results_limit,
             "results_limit_reached": len(raw_items) >= results_limit,
-            "max_total_charge_usd": max_charge,
+            "max_total_charge_usd": float(max_charge),
             "usage_total_usd": run.get("usageTotalUsd"),
             "charged_event_counts": run.get("chargedEventCounts") or {},
             "status_message": str(run.get("statusMessage") or "")[:500],
@@ -4628,6 +4642,7 @@ class SubmissionUncertainError(RuntimeError):
         super().__init__(message)
         self.status_code = status_code
         self.response_body = response_body
+        self.outcome_unknown = status_code is None
 
 
 def submit_brightdata_once(folder: Path, url: str, headers: dict[str, str], body: bytes) -> str:
@@ -4654,6 +4669,7 @@ def submit_brightdata_once(folder: Path, url: str, headers: dict[str, str], body
         # 「送出狀態不明」的回執擋住後續對帳。
         try:
             with cost_guard("brightdata", "datasets.trigger") as guard_outcome:
+                guard_outcome.sent = False
                 # ponytail: uncertain submissions stay blocked; provider-side reconciliation is manual.
                 try:
                     with marker_path.open("x", encoding="utf-8") as marker:
@@ -4662,6 +4678,7 @@ def submit_brightdata_once(folder: Path, url: str, headers: dict[str, str], body
                         os.fsync(marker.fileno())
                 except FileExistsError:
                     raise RuntimeError(f"上次送出狀態不明，禁止再次計費採集；請核對 {folder} 與 Bright Data。") from None
+                guard_outcome.sent = True
                 try:
                     receipt["response"] = request_json(url, headers, method="POST", body=body, timeout=60, attempts=1)
                 except Exception as exc:
@@ -5514,7 +5531,6 @@ def send_rss_notification(webhook: str, event: str, item: dict[str, Any]) -> Non
 
 
 def process_rss_queue(args: argparse.Namespace) -> dict[str, int]:
-    bind_cost_root(args.root.resolve())
     if args.rss_max_items <= 0:
         raise ValueError("--rss-max-items 必須大於 0。")
     if not (args.dry_run or args.local_only or args.allow_batch_cloud):
@@ -5523,6 +5539,7 @@ def process_rss_queue(args: argparse.Namespace) -> dict[str, int]:
             "確認主控台額度與支出控制後，明確加上 --allow-batch-cloud。"
         )
     root = args.root.resolve()
+    bind_cost_root(root)
     state = load_rss_state(root)
     recovered = recover_stale_rss_items(state)
     eligible = {"queued"}
@@ -5907,7 +5924,7 @@ def self_test() -> None:
     original_post_json = post_json
     original_minimax_endpoint = minimax_endpoint
 
-    def capture_minimax_payload(url: str, headers: dict[str, str], body: bytes, timeout: int) -> dict[str, Any]:
+    def capture_minimax_payload(url: str, headers: dict[str, str], body: bytes, timeout: int, **_kwargs: Any) -> dict[str, Any]:
         captured_payload.update(json.loads(body.decode("utf-8")))
         return {"choices": [{"message": {"content": "{}"}, "finish_reason": "stop"}]}
 
@@ -7372,6 +7389,10 @@ def run_pipeline(args: argparse.Namespace) -> Path:
 
 def main() -> int:
     args = parse_args()
+    project_env = Path(__file__).resolve().parent / ".env"
+    load_dotenv(project_env)
+    if (args.root.resolve() / ".env").resolve() != project_env.resolve():
+        load_dotenv(args.root.resolve() / ".env")
     # 成本守衛要綁到這次執行的專案根目錄，否則 strict 模式會拒絕所有付費傳輸。
     bind_cost_root(args.root.resolve())
     if args.self_test:

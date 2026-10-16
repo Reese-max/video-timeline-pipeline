@@ -119,6 +119,7 @@ def _init_cost_schema(conn: sqlite3.Connection) -> None:
                 status TEXT NOT NULL,
                 safe_error TEXT,
                 provider_request_id TEXT,
+                reservation_id TEXT,
                 billing_basis TEXT,
                 pricing_version TEXT DEFAULT '1',
                 estimated_micro_usd INTEGER DEFAULT 0,
@@ -146,6 +147,9 @@ def _init_cost_schema(conn: sqlite3.Connection) -> None:
             CREATE INDEX IF NOT EXISTS ix_budget_period ON budget_reservations(period_id, status);
             """
         )
+        conn.execute("BEGIN IMMEDIATE")
+        if "reservation_id" not in {row[1] for row in conn.execute("PRAGMA table_info(usage_costs)")}:
+            conn.execute("ALTER TABLE usage_costs ADD COLUMN reservation_id TEXT")
 
 
 def _utc_now_iso() -> str:
@@ -206,7 +210,7 @@ def check_and_reserve_budget(
 
     Returns: (allowed, reservation_id, reason)
     """
-    hard_stop = os.getenv("BUDGET_HARD_STOP", "false").lower() in ("true", "1", "yes")
+    hard_stop = os.getenv("BUDGET_HARD_STOP", "false").strip().lower() in ("true", "1", "yes")
     daily_budget_usd = _daily_budget_usd()
     daily_budget_micro = int(daily_budget_usd * 1_000_000)
 
@@ -216,13 +220,19 @@ def check_and_reserve_budget(
         period_id = _current_period_id("daily")
 
         with conn:
+            conn.execute("BEGIN IMMEDIATE")
             cur = conn.cursor()
             # Sum settled actual/estimated costs for today
             cur.execute(
                 """
                 SELECT COALESCE(SUM(estimated_micro_usd), 0)
-                FROM usage_costs
+                FROM usage_costs AS usage
                 WHERE account_scope = ? AND created_at LIKE ? AND status != 'blocked_budget'
+                  AND NOT EXISTS (
+                      SELECT 1 FROM budget_reservations AS reservation
+                      WHERE reservation.reservation_id = usage.reservation_id
+                        AND reservation.status = 'reserved'
+                  )
                 """,
                 (account_scope, f"{period_id}%"),
             )
@@ -233,15 +243,15 @@ def check_and_reserve_budget(
                 """
                 SELECT COALESCE(SUM(max_micro_usd), 0)
                 FROM budget_reservations
-                WHERE account_scope = ? AND period_id = ? AND status = 'reserved'
+                WHERE account_scope = ? AND status = 'reserved'
                 """,
-                (account_scope, period_id),
+                (account_scope,),
             )
             outstanding_micro = int(cur.fetchone()[0])
 
             total_projected = settled_micro + outstanding_micro + estimated_micro_usd
 
-            if hard_stop and daily_budget_micro > 0 and total_projected > daily_budget_micro:
+            if hard_stop and daily_budget_usd > 0 and total_projected > daily_budget_micro:
                 reason = (
                     f"Budget blocked: projected ({total_projected / 1_000_000:.3f} USD) "
                     f"exceeds daily limit ({daily_budget_usd:.2f} USD)"
@@ -353,6 +363,9 @@ class GuardOutcome:
     enforced: bool = False
     estimated_micro_usd: int = 0
     provider_operation_id: str | None = None
+    request_units: int = 0
+    response_units: int = 0
+    sent: bool = True
 
 
 def _record_guard_attempt(
@@ -386,6 +399,7 @@ def _record_guard_attempt(
             provider_request_id=outcome.provider_operation_id,
             reservation_id=outcome.reservation_id,
             estimated_micro_usd=outcome.estimated_micro_usd,
+            actual_micro_usd=0 if not outcome.sent else None,
             account_scope=account_scope,
             settle_reservation=settle_reservation,
         )
@@ -481,12 +495,14 @@ def provider_cost_guard(
         reservation_id=reservation_id,
         enforced=True,
         estimated_micro_usd=bound,
+        request_units=request_units,
+        response_units=response_units,
     )
     started = time.monotonic()
     try:
         yield outcome
     except BaseException as exc:
-        status_code = getattr(exc, "status_code", None)
+        status_code = getattr(exc, "status_code", getattr(exc, "code", None))
         category = classify_error(
             exc,
             status_code if isinstance(status_code, int) else None,
@@ -494,7 +510,11 @@ def provider_cost_guard(
         )
         # An unproven outcome (timeout, dropped connection, unknown) keeps its
         # reserved risk: settling it would let an unreconciled remote job look free.
-        unresolved = category in ("timeout", "network", "unknown")
+        unresolved = outcome.sent and (
+            getattr(exc, "outcome_unknown", False) or category in ("timeout", "network", "unknown")
+        )
+        if not outcome.sent:
+            outcome.estimated_micro_usd = 0
         _record_guard_attempt(
             target,
             outcome,
@@ -516,8 +536,8 @@ def provider_cost_guard(
         model=model,
         status="succeeded",
         safe_error=None,
-        request_units=request_units,
-        response_units=response_units,
+        request_units=outcome.request_units,
+        response_units=outcome.response_units,
         latency_ms=(time.monotonic() - started) * 1000.0,
         account_scope=account_scope,
         job=job,
@@ -575,9 +595,9 @@ def record_usage(
                 INSERT INTO usage_costs (
                     cost_id, library_id, job, analysis_revision, provider, model, operation,
                     request_units, response_units, started_at, finished_at, latency_ms,
-                    cache_hit, status, safe_error, provider_request_id,
+                    cache_hit, status, safe_error, provider_request_id, reservation_id,
                     estimated_micro_usd, actual_micro_usd, cost_status, account_scope, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     cost_id,
@@ -596,6 +616,7 @@ def record_usage(
                     status,
                     safe_error,
                     provider_request_id,
+                    reservation_id,
                     estimated_micro,
                     actual_micro_usd,
                     cost_status,
@@ -613,6 +634,13 @@ def record_usage(
                     WHERE reservation_id = ?
                     """,
                     (now_iso, reservation_id),
+                )
+            elif reservation_id:
+                # Newly observed usage can increase risk even when the operation times out.
+                conn.execute(
+                    "UPDATE budget_reservations SET max_micro_usd = MAX(max_micro_usd, ?) "
+                    "WHERE reservation_id = ? AND status = 'reserved'",
+                    (estimated_micro, reservation_id),
                 )
 
         return cost_id

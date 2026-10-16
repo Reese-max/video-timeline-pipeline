@@ -171,7 +171,7 @@ class FacebookAuthorTests(unittest.TestCase):
         )
         calls: list[tuple[str, dict[str, str]]] = []
 
-        def fake_get(url: str, headers: dict[str, str]) -> dict:
+        def fake_get(url: str, headers: dict[str, str], **_kwargs) -> dict:
             calls.append((url, headers))
             return next(responses)
 
@@ -343,6 +343,7 @@ class InstagramAuthorTests(unittest.TestCase):
     def test_brightdata_discovery_uses_env_var_when_max_items_not_supplied(self) -> None:
         with tempfile.TemporaryDirectory() as root, \
              mock.patch.dict(pipeline.os.environ, {
+                 **{key: pipeline.os.environ[key] for key in ("USERNAME", "PATH", "SYSTEMROOT") if key in pipeline.os.environ},
                  "BRIGHTDATA_API_TOKEN": "test-token",
                  "BRIGHTDATA_INSTAGRAM_MAX_ITEMS": "15",
                  "BRIGHTDATA_RUN_TIMEOUT_SECONDS": "60",
@@ -355,6 +356,7 @@ class InstagramAuthorTests(unittest.TestCase):
     def test_brightdata_discovery_prints_bound_before_triggering(self) -> None:
         with tempfile.TemporaryDirectory() as root, \
              mock.patch.dict(pipeline.os.environ, {
+                 **{key: pipeline.os.environ[key] for key in ("USERNAME", "PATH", "SYSTEMROOT") if key in pipeline.os.environ},
                  "BRIGHTDATA_API_TOKEN": "test-token",
                  "BRIGHTDATA_INSTAGRAM_MAX_ITEMS": "10",
                  "BRIGHTDATA_RUN_TIMEOUT_SECONDS": "60",
