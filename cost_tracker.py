@@ -27,6 +27,7 @@ from pathlib import Path
 from typing import Any, Iterator, Literal
 
 from notifications import get_operations_db
+from operations import foundation_status, open_readonly
 
 CostStatus = Literal["actual", "estimated", "confirmed_included", "unknown", "zero_local"]
 UsageStatus = Literal["reserved", "sent", "succeeded", "failed", "unknown", "blocked_budget", "cache_hit"]
@@ -97,69 +98,10 @@ def is_retryable(category: ErrorTaxonomy) -> bool:
 
 
 def _init_cost_schema(conn: sqlite3.Connection) -> None:
-    """Idempotently initialize usage and budget tables in operations.db."""
-    with conn:
-        conn.executescript(
-            """
-            CREATE TABLE IF NOT EXISTS usage_costs (
-                cost_id TEXT PRIMARY KEY,
-                logical_operation_id TEXT,
-                library_id TEXT,
-                job TEXT,
-                analysis_revision TEXT,
-                provider TEXT NOT NULL,
-                account_scope TEXT DEFAULT 'default',
-                model TEXT,
-                operation TEXT NOT NULL,
-                attempt_no INTEGER DEFAULT 1,
-                request_units INTEGER DEFAULT 0,
-                response_units INTEGER DEFAULT 0,
-                started_at TEXT NOT NULL,
-                finished_at TEXT,
-                latency_ms REAL,
-                cache_hit INTEGER DEFAULT 0,
-                status TEXT NOT NULL,
-                safe_error TEXT,
-                provider_request_id TEXT,
-                billing_basis TEXT,
-                pricing_version TEXT DEFAULT '1',
-                estimated_micro_usd INTEGER DEFAULT 0,
-                actual_micro_usd INTEGER,
-                cost_status TEXT NOT NULL,
-                reservation_id TEXT,
-                created_at TEXT NOT NULL
-            );
+    """Compatibility entry point; the shared registry owns all migrations."""
+    from operations import ensure_foundation_schema
 
-            CREATE TABLE IF NOT EXISTS budget_reservations (
-                reservation_id TEXT PRIMARY KEY,
-                operation_id TEXT NOT NULL,
-                account_scope TEXT DEFAULT 'default',
-                period_id TEXT NOT NULL,
-                max_micro_usd INTEGER NOT NULL,
-                status TEXT NOT NULL,
-                lease_token TEXT,
-                sent_at TEXT,
-                provider_operation_id TEXT,
-                settled_at TEXT,
-                created_at TEXT NOT NULL
-            );
-
-            CREATE INDEX IF NOT EXISTS ix_costs_job ON usage_costs(job, provider);
-            CREATE INDEX IF NOT EXISTS ix_costs_period ON usage_costs(created_at, provider);
-            -- Outstanding reservations are selected by the configured period
-            -- window, so they are indexed by the same columns the filter uses.
-            -- period_id is kept as a stored audit label (reporting, dedup key)
-            -- but is no longer a predicate, so ix_budget_period is not created.
-            CREATE INDEX IF NOT EXISTS ix_budget_reserved_window
-                ON budget_reservations(account_scope, created_at, status);
-            """
-        )
-        # Older operations.db files predate the attempt/reservation link. Keep
-        # their rows intact; only new records receive an explicit link.
-        conn.execute("BEGIN IMMEDIATE")
-        columns = {row[1] for row in conn.execute("PRAGMA table_info(usage_costs)")}
-        if "reservation_id" not in columns:
-            conn.execute("ALTER TABLE usage_costs ADD COLUMN reservation_id TEXT")
+    ensure_foundation_schema(conn)
 
 
 def _utc_now_iso() -> str:
@@ -782,8 +724,10 @@ def get_cost_report(root: Path, period_type: str = "daily") -> dict[str, Any]:
     """Compile read-only financial and token usage report."""
     period_id, period_start_utc, period_end_utc, tz_key = _current_period(period_type)
 
-    with closing(get_operations_db(root)) as conn:
-        _init_cost_schema(conn)
+    conn = open_readonly(root)
+    if conn is None:
+        return foundation_status(root)
+    with closing(conn):
 
         cur = conn.cursor()
         cur.execute(
@@ -837,8 +781,10 @@ def get_budget_status(root: Path) -> dict[str, Any]:
     daily_budget_micro = int(daily_budget * 1_000_000)
     hard_stop = _hard_stop_enabled()
 
-    with closing(get_operations_db(root)) as conn:
-        _init_cost_schema(conn)
+    conn = open_readonly(root)
+    if conn is None:
+        return foundation_status(root)
+    with closing(conn):
 
         with conn:
             # Both balance reads share one snapshot, including a concurrent
@@ -874,8 +820,10 @@ def get_budget_status(root: Path) -> dict[str, Any]:
 
 def get_provider_health(root: Path) -> dict[str, Any]:
     """Inspect provider error rates and latency stats."""
-    with closing(get_operations_db(root)) as conn:
-        _init_cost_schema(conn)
+    conn = open_readonly(root)
+    if conn is None:
+        return foundation_status(root)
+    with closing(conn):
 
         cur = conn.cursor()
         cur.execute(
@@ -906,10 +854,12 @@ def get_provider_health(root: Path) -> dict[str, Any]:
         return {"providers": health}
 
 
-def get_failed_list(root: Path) -> list[dict[str, Any]]:
+def get_failed_list(root: Path) -> list[dict[str, Any]] | dict[str, Any]:
     """Return recent failed operations and their safe errors."""
-    with closing(get_operations_db(root)) as conn:
-        _init_cost_schema(conn)
+    conn = open_readonly(root)
+    if conn is None:
+        return foundation_status(root)
+    with closing(conn):
 
         cur = conn.cursor()
         cur.execute(

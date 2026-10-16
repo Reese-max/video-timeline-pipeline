@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- #7 F0.1／F0.2：統一 operations migration registry、持久 library UUID、內容版本與完成事件原子登記；新增零外部呼叫的 `--ops-reconcile`，歷史補登保留未知時間且不寄送。成本／評分讀取不再隱式建表，Digest 依內容版本與帳本資格選取，完成 hook 排除本機預覽與不完整產物。新增離線回歸及 [路線圖與驗收邊界](docs/ROADMAP.md)。
+
 - 新增 #59：v14 widget 提供可收合的 ChatGPT 檔案庫實驗，每個分段須明確點擊才 fetch／uploadFile；一般上傳亦須另行點擊。顯示上傳資訊、SHA-256 與完整遮蔽網址的錯誤；隔離連點、換 job 及實驗狀態保存失敗，模型讀取要求走既有訊息橋接與統一保存。新增獨立 Node 測試並納入離線檢查，固定既有 CSP／成功媒體 CORS 前提；檔案庫與模型可讀性仍需真實 ChatGPT 驗證。已知限制：上傳卡住時需重新載入介面。
 
 - 補強 #58：v14 widget 在 A 分析完成後自動讀取報告，明示摘要提交前尚未上傳；提交摘要後以 1–10 秒退避輪詢報告工作，驗證完成後顯示「A 已完成」並啟用合併複製。失敗保留完整錯誤，換 job／關閉停止輪詢。合併指令採 §4.3 原文，以「合併：」開頭並保留 file_id／SHA-256／未獨立驗證聲明；README 說明 paired worker 與 caller_submitted 上傳條件。UI URI 同步升為 `ui://video-timeline-pipeline/v14-<媒體網址 hash>.html`。

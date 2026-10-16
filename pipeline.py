@@ -4101,7 +4101,7 @@ def index_job(connection: sqlite3.Connection, job_dir: Path) -> int:
     # 向量以文字 hash 為鍵，不隨 events 重建而失效，所以這裡只清片段
     connection.execute("DELETE FROM events WHERE job = ?", (job,))
     connection.execute(
-        "INSERT OR REPLACE INTO videos VALUES (?, ?, ?, ?, ?, ?, ?)",
+        "INSERT OR REPLACE INTO videos (job, title, source, status, duration, indexed_at, categories) VALUES (?, ?, ?, ?, ?, ?, ?)",
         (
             job,
             source.get("title") or "",
@@ -7775,6 +7775,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--category", default="", help="限定分類；可搭配 --list 或 --search")
     parser.add_argument("--categorize", action="store_true", help="產生固定分類並歸類所有影片（讓 --digest 用程式碼分群）")
     parser.add_argument("--audit", action="store_true", help="健檢知識庫：找出壞掉的摘要、落後的索引與向量")
+    parser.add_argument("--ops-reconcile", action="store_true", help="本機補登已完成的分析版本與事件；歷史內容不寄送")
     parser.add_argument("--refresh", action="store_true", help="忽略既有的逐字稿／視覺／摘要，全部重新呼叫 API")
     parser.add_argument(
         "--digest-preview",
@@ -7986,16 +7987,31 @@ def run_pipeline(args: argparse.Namespace) -> Path:
         manifest["open_notebook"] = {**previous_sync, "source_id": previous_source_id}  # 這次沒同步也不能弄丟
     # 後處理階段（--categorize）寫進 manifest 的欄位，也要跟著保留：
     # manifest 每次重建，重跑一次批次就會把分類全部沖掉，下次 --categorize 又得整批重來。
-    for preserved in ("categories", "level"):
+    for preserved in ("categories", "level", "library_id", "analysis_revision", "eligible_at"):
         if previous.get(preserved):
             manifest[preserved] = previous[preserved]
     # Preserve an existing completed manifest until its source byte binding
     # passes. A refused retry must not erase the cache authority and thereby
     # make the next retry silently regenerate paid evidence.
     manifest_started = False
+    previous_revision = None
+
+    def preserve_previous_completion() -> None:
+        nonlocal previous_revision
+        if previous.get("status") == "completed" and not (args.dry_run or args.local_only):
+            from notifications import record_pipeline_completed_event
+            from operations import completion_snapshot
+
+            try:
+                previous_revision, _ = completion_snapshot(root, job_dir, previous)
+            except (OSError, ValueError, TypeError, AttributeError):
+                return
+            record_pipeline_completed_event(root, job_dir, previous, backfill=True)
+
     try:
         captions_only: dict[str, Any] | None = None
         if args.no_video:
+            preserve_previous_completion()
             write_json(manifest_path, manifest)
             manifest_started = True
             # 只抓字幕：不下載影片、不切音訊、不抽幀。標題與時長改由 info.json 提供。
@@ -8035,6 +8051,7 @@ def run_pipeline(args: argparse.Namespace) -> Path:
                 video_path, previous, reuse_cloud=reuse_cloud,
                 local_only=args.dry_run or args.local_only,
             )
+            preserve_previous_completion()
             write_json(manifest_path, manifest)
             manifest_started = True
 
@@ -8328,8 +8345,11 @@ def run_pipeline(args: argparse.Namespace) -> Path:
             connection.close()
         try:
             from notifications import record_pipeline_completed_event
+            from operations import completion_snapshot
 
-            record_pipeline_completed_event(root, job_dir, manifest)
+            # A failed initial backfill must not make unchanged history eligible.
+            unchanged = previous_revision is not None and completion_snapshot(root, job_dir, manifest)[0] == previous_revision
+            record_pipeline_completed_event(root, job_dir, manifest, backfill=unchanged)
         except Exception:
             pass
         return manifest_path
@@ -8349,6 +8369,11 @@ def main() -> int:
     bind_cost_root(args.root.resolve())
     if args.self_test:
         self_test()
+        return 0
+    if getattr(args, "ops_reconcile", False):
+        from operations import reconcile_processed_revisions
+
+        print(json.dumps(reconcile_processed_revisions(args.root.resolve()), ensure_ascii=False, indent=2))
         return 0
     if getattr(args, "digest_preview", None):
         from notifications import run_digest_preview

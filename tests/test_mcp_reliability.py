@@ -334,8 +334,8 @@ class ReliabilityTests(unittest.TestCase):
                 notifications.get_operations_db(Path("unused"))
         connection.close.assert_called_once()
         connection.reset_mock()
-        with (patch.object(cost_tracker, "get_operations_db", return_value=connection),
-              patch.object(cost_tracker, "_init_cost_schema", side_effect=RuntimeError("schema"))):
+        with (patch.object(cost_tracker, "open_readonly", return_value=connection),
+              patch.object(connection, "cursor", side_effect=RuntimeError("schema"))):
             with self.assertRaisesRegex(RuntimeError, "schema"):
                 cost_tracker.get_cost_report(Path("unused"))
         connection.close.assert_called_once()

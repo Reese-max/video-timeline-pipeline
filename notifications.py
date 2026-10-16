@@ -15,7 +15,7 @@ import json
 import os
 import sqlite3
 import uuid
-from contextlib import closing
+from contextlib import closing, nullcontext
 from pathlib import Path
 from typing import Any
 
@@ -48,90 +48,10 @@ def get_operations_db(root: Path) -> sqlite3.Connection:
 
 
 def _init_operations_schema(conn: sqlite3.Connection) -> None:
-    """Idempotently initialize tables for notifications and digest runs."""
-    with conn:
-        conn.executescript(
-            """
-            CREATE TABLE IF NOT EXISTS notification_events (
-                event_id TEXT PRIMARY KEY,
-                event_type TEXT NOT NULL,
-                library_id TEXT,
-                job TEXT,
-                analysis_revision TEXT,
-                payload_version TEXT DEFAULT '1',
-                payload_json TEXT NOT NULL,
-                created_at TEXT NOT NULL,
-                dedup_key TEXT UNIQUE NOT NULL
-            );
+    """Compatibility entry point; the shared registry owns all migrations."""
+    from operations import ensure_foundation_schema
 
-            CREATE TABLE IF NOT EXISTS notification_deliveries (
-                delivery_id TEXT PRIMARY KEY,
-                event_id TEXT NOT NULL,
-                channel TEXT NOT NULL,
-                recipient_id TEXT NOT NULL,
-                provider TEXT NOT NULL,
-                status TEXT NOT NULL,
-                payload_hash TEXT NOT NULL,
-                provider_idempotency_key TEXT,
-                provider_message_id TEXT,
-                attempt_count INTEGER DEFAULT 0,
-                lease_owner TEXT,
-                lease_token TEXT,
-                lease_expires_at TEXT,
-                next_attempt_at TEXT,
-                safe_error TEXT,
-                submitted_at TEXT,
-                accepted_at TEXT,
-                created_at TEXT NOT NULL,
-                FOREIGN KEY(event_id) REFERENCES notification_events(event_id)
-            );
-
-            CREATE TABLE IF NOT EXISTS delivery_attempts (
-                attempt_id TEXT PRIMARY KEY,
-                delivery_id TEXT NOT NULL,
-                attempt_no INTEGER NOT NULL,
-                request_id TEXT,
-                started_at TEXT NOT NULL,
-                finished_at TEXT,
-                outcome TEXT NOT NULL,
-                safe_error TEXT,
-                FOREIGN KEY(delivery_id) REFERENCES notification_deliveries(delivery_id)
-            );
-
-            CREATE TABLE IF NOT EXISTS digest_runs (
-                digest_id TEXT PRIMARY KEY,
-                schedule_id TEXT NOT NULL,
-                type TEXT NOT NULL,
-                window_start TEXT NOT NULL,
-                window_end TEXT NOT NULL,
-                timezone TEXT NOT NULL,
-                recipient_id TEXT NOT NULL,
-                revision INTEGER DEFAULT 1,
-                selection_snapshot TEXT NOT NULL,
-                rendered_payload_hash TEXT NOT NULL,
-                status TEXT NOT NULL,
-                candidate_count INTEGER DEFAULT 0,
-                selected_count INTEGER DEFAULT 0,
-                deferred_count INTEGER DEFAULT 0,
-                created_at TEXT NOT NULL
-            );
-
-            CREATE TABLE IF NOT EXISTS digest_items (
-                digest_id TEXT NOT NULL,
-                job TEXT NOT NULL,
-                analysis_revision TEXT,
-                rank INTEGER NOT NULL,
-                reason TEXT,
-                disposition TEXT NOT NULL,
-                PRIMARY KEY(digest_id, job),
-                FOREIGN KEY(digest_id) REFERENCES digest_runs(digest_id)
-            );
-
-            CREATE UNIQUE INDEX IF NOT EXISTS uq_deliveries ON notification_deliveries(event_id, channel, recipient_id);
-            CREATE UNIQUE INDEX IF NOT EXISTS uq_digest_runs ON digest_runs(schedule_id, type, window_start, window_end, recipient_id, revision);
-            CREATE INDEX IF NOT EXISTS ix_deliveries_status ON notification_deliveries(status, next_attempt_at);
-            """
-        )
+    ensure_foundation_schema(conn)
 
 
 def _utc_now_iso() -> str:
@@ -147,25 +67,19 @@ def record_event(
     payload: dict[str, Any],
     dedup_key: str,
 ) -> str:
-    """Record an outbox event idempotently. Returns event_id."""
-    cur = conn.cursor()
-    cur.execute("SELECT event_id FROM notification_events WHERE dedup_key = ?", (dedup_key,))
-    existing = cur.fetchone()
-    if existing:
-        return str(existing["event_id"])
-
-    event_id = str(uuid.uuid4())
+    """Record once, participating in the caller's transaction when present."""
+    event_id = str(uuid.uuid5(uuid.NAMESPACE_URL, dedup_key))
     payload_json = json.dumps(payload, ensure_ascii=False, sort_keys=True)
-    with conn:
+    with nullcontext() if conn.in_transaction else conn:
         conn.execute(
             """
             INSERT INTO notification_events (
                 event_id, event_type, library_id, job, analysis_revision, payload_json, created_at, dedup_key
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(dedup_key) DO NOTHING
             """,
             (event_id, event_type, library_id, job, analysis_revision, payload_json, _utc_now_iso(), dedup_key),
         )
-    return event_id
+    return str(conn.execute("SELECT event_id FROM notification_events WHERE dedup_key=?", (dedup_key,)).fetchone()[0])
 
 
 def enqueue_delivery(
@@ -196,10 +110,13 @@ def enqueue_delivery(
                 delivery_id, event_id, channel, recipient_id, provider, status,
                 payload_hash, provider_idempotency_key, created_at
             ) VALUES (?, ?, ?, ?, ?, 'pending', ?, ?, ?)
+            ON CONFLICT(event_id, channel, recipient_id) DO NOTHING
             """,
             (delivery_id, event_id, channel, recipient_id, provider, payload_hash, idemp_key, _utc_now_iso()),
         )
-    return delivery_id
+    return str(conn.execute(
+        "SELECT delivery_id FROM notification_deliveries WHERE event_id=? AND channel=? AND recipient_id=?",
+        (event_id, channel, recipient_id)).fetchone()[0])
 
 
 def claim_pending_deliveries(
@@ -207,6 +124,7 @@ def claim_pending_deliveries(
     worker_id: str,
     lease_seconds: int = 60,
     limit: int = 10,
+    delivery_id: str | None = None,
 ) -> list[sqlite3.Row]:
     """Atomically claim pending or retry_wait deliveries within a short transaction."""
     now_iso = _utc_now_iso()
@@ -214,6 +132,7 @@ def claim_pending_deliveries(
     lease_token = str(uuid.uuid4())
 
     with conn:
+        conn.execute("BEGIN IMMEDIATE")
         cur = conn.cursor()
         cur.execute(
             """
@@ -225,9 +144,10 @@ def claim_pending_deliveries(
             WHERE d.status IN ('pending', 'retry_wait')
               AND (d.next_attempt_at IS NULL OR d.next_attempt_at <= ?)
               AND (d.lease_expires_at IS NULL OR d.lease_expires_at <= ?)
+              AND (? IS NULL OR d.delivery_id = ?)
             LIMIT ?
             """,
-            (now_iso, now_iso, limit),
+            (now_iso, now_iso, delivery_id, delivery_id, limit),
         )
         rows = cur.fetchall()
         if not rows:
@@ -624,16 +544,21 @@ def run_notification_retry(root: Path, provider: BaseProvider | None = None) -> 
         return {"claimed": len(claimed), "retried": retried_count, "accepted": accepted_count}
 
 
-def record_pipeline_completed_event(root: Path, job_dir: Path, manifest: dict[str, Any]) -> str | None:
-    """Invoked when a video pipeline run completes: records event and triggers delivery if configured."""
+def record_pipeline_completed_event(root: Path, job_dir: Path, manifest: dict[str, Any], *, backfill: bool = False) -> str | None:
+    """Atomically register verified content and its outbox event before dispatch."""
+    from operations import completion_snapshot, get_or_create_library_id, register_processed_revision
+
+    if not isinstance(manifest, dict) or manifest.get("status") != "completed":
+        return None
     try:
+        revision, artifact_hashes = completion_snapshot(root, job_dir, manifest)
         with closing(get_operations_db(root)) as conn:
             job = job_dir.name
+            library_id = get_or_create_library_id(conn)
             source = manifest.get("source", {})
             title = source.get("title", job)
             url = source.get("url", "")
-            revision = manifest.get("analysis_revision", "1")
-            dedup_key = f"video.completed:{job}:{revision}"
+            dedup_key = f"video.completed:{library_id}:{job}:{revision}"
 
             event_payload = {
                 "job": job,
@@ -643,19 +568,26 @@ def record_pipeline_completed_event(root: Path, job_dir: Path, manifest: dict[st
                 "created_at": _utc_now_iso(),
             }
 
-            event_id = record_event(
-                conn,
-                event_type="video.completed",
-                library_id=manifest.get("library_id"),
-                job=job,
-                analysis_revision=revision,
-                payload=event_payload,
-                dedup_key=dedup_key,
-            )
+            now = None if backfill else _utc_now_iso()
+            with conn:
+                conn.execute("BEGIN IMMEDIATE")
+                row, created = register_processed_revision(
+                    conn, library_id=library_id, job=job, analysis_revision=revision,
+                    artifact_hashes=artifact_hashes, first_completed_at=now, eligible_at=now, backfill=backfill)
+                event_id = record_event(
+                    conn, event_type="video.completed", library_id=library_id, job=job,
+                    analysis_revision=revision, payload=event_payload, dedup_key=dedup_key)
+
+            # Files and SQLite are separate stores: the registry remains authoritative
+            # if the process stops between commit and this optional manifest projection.
+            manifest.update(library_id=library_id, analysis_revision=revision, eligible_at=row["eligible_at"])
+            if created:
+                from pipeline import write_json
+                write_json(job_dir / "manifest.json", manifest)
 
             # If Webhook or high priority notification is active, enqueue delivery
             webhook_url = os.getenv("DISCORD_WEBHOOK_URL") or os.getenv("RSS_NOTIFY_WEBHOOK")
-            if webhook_url:
+            if webhook_url and not backfill and row["eligible_at"] is not None:
                 delivery_id = enqueue_delivery(
                     conn,
                     event_id=event_id,
@@ -665,7 +597,7 @@ def record_pipeline_completed_event(root: Path, job_dir: Path, manifest: dict[st
                     payload_hash=hashlib.sha256(dedup_key.encode()).hexdigest(),
                 )
                 # Dispatch immediately
-                claimed = claim_pending_deliveries(conn, worker_id=f"pipeline_{os.getpid()}", limit=1)
+                claimed = claim_pending_deliveries(conn, worker_id=f"pipeline_{os.getpid()}", limit=1, delivery_id=delivery_id)
                 if claimed:
                     target = claimed[0]
                     text, html_msg = render_event_email("video.completed", event_payload)
