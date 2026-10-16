@@ -2790,6 +2790,15 @@ def _parse_video_mp4_events(parsed: dict[str, Any]) -> list[dict[str, Any]]:
 WHOLE_VIDEO_ANALYSIS_METHODS = frozenset({"minimax_video", "minimax_video_compressed"})
 
 
+def whole_video_observation(data: Any) -> bool:
+    """True only for evidence MiniMax produced by reading the whole video (never sampled frames)."""
+    return isinstance(data, dict) and data.get("analysis_method") in WHOLE_VIDEO_ANALYSIS_METHODS
+
+
+class VideoMp4UnavailableError(RuntimeError):
+    """The video could not be handed to MiniMax even after compression; there is no frame fallback."""
+
+
 def reusable_video_artifact(observations: Any) -> bool:
     """MP4 caches require per-event validation; frame-sampled results are never reused."""
     return isinstance(observations, list) and bool(observations) and all(
@@ -3206,7 +3215,7 @@ def analyze_video_mp4(
         )
         if failure_reasons:
             reason += " | prior: " + " ; ".join(failure_reasons)
-        raise RuntimeError(f"video_mp4 無法交給 MiniMax 直接讀取（抽幀備援已移除）：{reason}")
+        raise VideoMp4UnavailableError(f"video_mp4 無法交給 MiniMax 直接讀取（抽幀備援已移除）：{reason}")
     finally:
         if owned_temp is not None:
             owned_temp.cleanup()
@@ -3948,7 +3957,7 @@ def index_job(connection: sqlite3.Connection, job_dir: Path) -> int:
     signature = text_hash(
         json.dumps(
             {
-                "version": 2,
+                "version": 3,
                 "source": {
                     "title": source.get("title"),
                     "url": source.get("url"),
@@ -4003,6 +4012,8 @@ def index_job(connection: sqlite3.Connection, job_dir: Path) -> int:
                 text = str(event.get("text", "")).strip()
             else:
                 data = event.get("data")
+                if event.get("type") == "visual" and not whole_video_observation(data):
+                    continue  # frame-sampled evidence (removed mode) must not feed search or Q&A
                 if not visual_time_reliable(data):
                     timestamp = None
                 if isinstance(data, dict):
@@ -7568,7 +7579,7 @@ def parse_args() -> argparse.Namespace:
         "--vision-workers",
         type=int,
         default=8,
-        help="MiniMax 畫面分析併發數，預設／最多 8",
+        help="已無作用：抽幀畫面分析已移除，畫面一律由 MiniMax 讀整支影片；保留參數只為相容舊指令",
     )
     parser.add_argument("--language", default=None, help="逐字稿語言；auto 交給 Whisper 自動偵測")
     parser.add_argument(
@@ -8052,14 +8063,36 @@ def run_pipeline(args: argparse.Namespace) -> Path:
                     print("· 重用既有整支影片視覺觀察")
                     return cached
                 print("· MiniMax 直接讀取 mp4（CLI）")
-                return analyze_video_mp4(
-                    video_path,
-                    minimax_subscription_key(),
-                    model,
-                    duration=duration_seconds,
-                    cache_dir=None if args.refresh else job_dir / "vision-video-cache",
-                    work_dir=job_dir / "vision-video-work",
-                )
+                try:
+                    return analyze_video_mp4(
+                        video_path,
+                        minimax_subscription_key(),
+                        model,
+                        duration=duration_seconds,
+                        cache_dir=None if args.refresh else job_dir / "vision-video-cache",
+                        work_dir=job_dir / "vision-video-work",
+                    )
+                except VideoMp4UnavailableError as error:
+                    # Without a frame fallback the visual stage fails alone; the
+                    # transcript from the parallel stage must still be written.
+                    print(f"! 畫面分析未完成：{error}")
+                    return _stamp_video_observations(
+                        [
+                            {
+                                "timestamp": 0.0,
+                                "screen_type": "影片",
+                                "visible_text": [],
+                                "visual_summary": VISUAL_NOT_ANALYZED,
+                                "important_details": [],
+                                "confidence": None,
+                                "completion_status": "incomplete",
+                                "finish_reason": "video_unavailable",
+                                "error": str(error)[:500],
+                            }
+                        ],
+                        analysis_method="minimax_video",
+                        source_video=video_path,
+                    )
 
             cloud_started = time.monotonic()
             (transcript, transcript_raw), observations = run_parallel_stages(

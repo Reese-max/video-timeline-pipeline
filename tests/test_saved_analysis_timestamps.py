@@ -45,16 +45,36 @@ class SavedAnalysisTimestampTests(unittest.TestCase):
                 self.assertEqual(saved, before)
                 self.assertEqual(payload["result"], before)
 
-    def test_validated_video_and_measured_frame_times_remain_usable(self):
-        for method, validated in (("minimax_video", True), ("minimax_video_fallback_frames", None)):
-            result = self.evidence(40)
-            data = result["timeline"][0]["data"]
-            data["analysis_method"] = method
-            if validated is not None:
-                data["timestamp_reliable"] = validated
-            refreshed = server.analysis_tool_result(result).structuredContent
-            self.assertEqual(refreshed["timeline"][0]["timestamp"], 40)
-            self.assertEqual(refreshed["quality"]["warnings"], [])
+    def test_validated_video_time_remains_usable(self):
+        result = self.evidence(40)
+        result["timeline"][0]["data"]["timestamp_reliable"] = True
+        refreshed = server.analysis_tool_result(result).structuredContent
+        self.assertEqual(refreshed["timeline"][0]["timestamp"], 40)
+        self.assertEqual(refreshed["quality"]["warnings"], [])
+        self.assertEqual(refreshed["status"], "complete")
+
+    def test_saved_frame_sampled_rows_are_dropped_and_reopened(self):
+        for method in ("minimax_video_fallback_frames", "minimax", "local_uniformity_check", None):
+            with self.subTest(method=method):
+                result = self.evidence(40)
+                data = result["timeline"][0]["data"]
+                if method is None:
+                    del data["analysis_method"]
+                else:
+                    data["analysis_method"] = method
+                before = copy.deepcopy(result)
+                payload = {"status": "completed", "result_kind": "analysis", "result": result}
+                with patch.object(server, "get_queue") as queue:
+                    queue.return_value.get.return_value = payload
+                    polled = asyncio.run(server.get_video_job("a" * 32))["result"]
+                direct = server.analysis_tool_result(result).structuredContent
+                for refreshed in (polled, direct):
+                    self.assertEqual(refreshed["timeline"], [])
+                    self.assertEqual(refreshed["status"], "partial")
+                    self.assertEqual(refreshed["visual_status"], "error")
+                    self.assertTrue(any("抽幀" in error for error in refreshed["errors"]))
+                    self.assertNotEqual(refreshed["quality"]["status"], "evidence_available")
+                self.assertEqual(result, before)
 
     def test_retention_keeps_warning_or_unvalidated_timestamp_media(self):
         for reason in ("out_of_range", "legacy", "warning", "unreliable"):

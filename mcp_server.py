@@ -1138,6 +1138,20 @@ def analysis_cache_signature(video_path: Path, manifest: dict) -> str:
 def refreshed_analysis(result: dict[str, Any]) -> dict[str, Any]:
     """Read-time safety only: preserve stored evidence and never trigger paid work."""
     result = copy.deepcopy(result)
+    timeline = result.get("timeline")
+    if isinstance(timeline, list):
+        kept = [row for row in timeline if not (
+            isinstance(row, dict) and row.get("type") == "visual"
+            and not pipeline.whole_video_observation(row.get("data")))]
+        if len(kept) != len(timeline):
+            # Frame sampling was removed: old frame-derived rows are dropped and the
+            # result is reopened so the widget offers a fresh whole-video analysis.
+            result["timeline"] = kept
+            result["visual_status"] = "error"
+            if result.get("status") == "complete":
+                result["status"] = "partial"
+            errors = result.get("errors") if isinstance(result.get("errors"), list) else []
+            result["errors"] = [*errors, "舊版抽幀畫面結果已停用，請重新分析讓 MiniMax 讀取整支影片。"]
     for row in result.get("timeline", []):
         if row.get("type") != "visual":
             continue

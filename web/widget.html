@@ -424,7 +424,7 @@ function renderEvidence() {
     const item = document.createElement("li"), time = document.createElement(canSeek ? "button" : "span");
     time.textContent = formatTime(row.timestamp) + (row.end !== null ? "–" + formatTime(row.end) : "") + (row.timestamp_reliable === false ? "（時間碼不可靠）" : "");
     if (canSeek) { time.type = "button"; time.setAttribute("aria-label", `核對原片 ${time.textContent}`); time.addEventListener("click", () => seekEvidence(row.timestamp)); }
-    const badge = document.createElement("span"); badge.className = "badge"; badge.textContent = row.type === "speech" ? "逐字稿" : "畫面觀察（抽樣）";
+    const badge = document.createElement("span"); badge.className = "badge"; badge.textContent = row.type === "speech" ? "逐字稿" : "畫面觀察";
     item.append(time, badge);
     const text = document.createElement("p"); text.textContent = row.text || "此筆沒有可顯示的內容。"; item.append(text);
     if (row.detail) { const detail = document.createElement("p"); detail.className = "muted"; detail.textContent = row.detail; item.append(detail); }
