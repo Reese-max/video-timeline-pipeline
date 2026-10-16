@@ -27,6 +27,7 @@ class DrivePrimaryTests(unittest.TestCase):
             (self.job / name).unlink()
         for patcher in (patch.object(server, "MCP_JOBS_ROOT", self.root),
                         patch.object(server, "report_progress"),
+                        patch.object(server, "check_job_capacity"),
                         patch.object(server, "require_disk_space")):
             patcher.start()
             self.addCleanup(patcher.stop)
@@ -52,6 +53,20 @@ class DrivePrimaryTests(unittest.TestCase):
         self.assertEqual(path, self.job / "source.mp4")
         self.assertEqual(pipeline.file_fingerprint(path), self.manifest["source"]["fingerprint"])
 
+    def test_a_newer_local_source_is_never_replaced_by_the_backup(self):
+        (self.job / "source.mp4").write_bytes(b"newer source from the URL")
+        with patch.object(drive_storage, "restore_prepared_media") as restore:
+            self.assertIsNone(server.ensure_local_media(self.job, self.manifest))
+        restore.assert_not_called()
+        self.assertEqual((self.job / "source.mp4").read_bytes(), b"newer source from the URL")
+
+    def test_drive_job_refuses_a_backup_drive_no_longer_holds(self):
+        with patch.object(drive_storage, "verify_remote_backup", return_value=False), \
+             patch.object(drive_storage, "upload_prepared_segments") as upload:
+            with self.assertRaises(RuntimeError):
+                server.upload_prepared_drive_sync(JOB)
+        upload.assert_not_called()
+
     def test_without_complete_backup_nothing_is_downloaded(self):
         legacy = {k: v for k, v in self.state.items() if k != "source_file"}
         pipeline.write_json(self.job / "drive-manifest.json", legacy)
@@ -74,7 +89,8 @@ class DrivePrimaryTests(unittest.TestCase):
         self.assertEqual(manifest, self.manifest)
 
     def test_drive_job_for_cleaned_media_reports_the_existing_backup(self):
-        with patch.object(drive_storage, "upload_prepared_segments") as upload:
+        with patch.object(drive_storage, "verify_remote_backup", return_value=True), \
+             patch.object(drive_storage, "upload_prepared_segments") as upload:
             result = server.upload_prepared_drive_sync(JOB)
         upload.assert_not_called()
         self.assertEqual(result["source_file"]["file_id"], "src_1")

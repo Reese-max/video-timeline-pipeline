@@ -29,6 +29,21 @@ MEDIA = re.compile(
     r"analysis/(?:runs/[a-f0-9]{64}/)?audio/audio_\d+\.mp3|"
     r"analysis/runs/[a-f0-9]{64}/vision-video-work/minimax-compressed\.mp4)", re.I)
 AUDIT = "media-retention.json"
+# Media rebuilt from the source (previews, analysis frames/audio, compression output).
+DERIVED = re.compile(
+    r"(?:previews/preview_\d+\.jpg|"
+    r"analysis/(?:runs/[a-f0-9]{64}/)?(?:frames|budgeted-frames)/frame_\d+\.jpg|"
+    r"analysis/(?:runs/[a-f0-9]{64}/)?audio/audio_\d+\.mp3|"
+    r"analysis/runs/[a-f0-9]{64}/vision-video-work/minimax-compressed\.mp4)", re.I)
+
+
+def drive_backup_still_verified(job: Path) -> bool:
+    """Re-check Drive right before the last local copy of the source goes."""
+    try:
+        state = json.loads((job / "drive-manifest.json").read_text(encoding="utf-8"))
+        return bool(drive_storage.verify_remote_backup(state))
+    except Exception:
+        return False
 
 
 def drive_backed_grace_seconds() -> int:
@@ -51,7 +66,9 @@ def drive_backed_media(job: Path, files: list[Path], now: float) -> tuple[list[P
         marker = StoragePolicy._marker(job)
         if not marker:
             return [], "unmanaged"
-        if now < float(marker.get("link_until") or 0):
+        # Links issued before link_until existed were only recorded in protected_until.
+        link_guard = marker["protected_until"] if marker.get("link_until") is None else marker["link_until"]
+        if now < float(link_guard):
             return [], "retained_or_live_share"
         if now - max(marker["managed_at"], marker["last_used_at"]) < drive_backed_grace_seconds():
             return [], "younger_than_retention"
@@ -72,6 +89,11 @@ def drive_backed_media(job: Path, files: list[Path], now: float) -> tuple[list[P
             source = job / state["source_file"]["file_name"]
         if not drive_storage.local_matches_backup(job, state):
             return [], "source_changed"
+        backed_up = drive_storage.backup_relative_paths(state)
+        for path in files:
+            relative = path.relative_to(job).as_posix()
+            if MEDIA.fullmatch(relative) and relative not in backed_up and not DERIVED.fullmatch(relative):
+                return [], "unbacked_media"  # e.g. a newer source the backup never saw
         try:
             verified = drive_storage.verify_remote_backup(state)
         except Exception:  # Unknown Drive state never authorizes a deletion.
@@ -178,6 +200,9 @@ def cleanup(jobs_root: Path, *, apply: bool = False, now: float | None = None) -
                          "planned_files": [str(p.relative_to(job)) for p in paths], "deleted_files": []}
                 pipeline.write_json(job / AUDIT, audit)
                 for path in paths:
+                    if (reason == "eligible_drive_backed" and path.parent == job and path.name.startswith("source.")
+                            and not drive_backup_still_verified(job)):
+                        raise RuntimeError("Google Drive 備份在清理途中變動；保留原片。")
                     old, current = snapshots[path], path.lstat()
                     if (path.is_symlink() or not path.resolve().is_relative_to(root)
                             or (old.st_dev, old.st_ino, old.st_size, old.st_mtime_ns)

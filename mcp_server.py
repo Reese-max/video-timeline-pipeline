@@ -708,9 +708,18 @@ def ensure_local_media(job_dir: Path, manifest: dict) -> Path | None:
     state = drive_backup_state(job_dir, manifest)
     if state is None:
         return None
+    try:
+        current = pipeline.locate_source_video(job_dir)
+    except RuntimeError:
+        current = None
+    if current is not None and pipeline.file_fingerprint(current) != (manifest.get("source") or {}).get("fingerprint"):
+        return None  # A newer, never-backed-up source; the old backup must not replace it.
+    missing = state["source_file"]["size_bytes"] if current is None else 0
+    missing += sum(row["size_bytes"] for row in state["local_segments"]
+                   if _file_missing(job_dir / "segments" / row["filename"]))
     report_progress("restore", 8, "從 Google Drive 取回影片")
-    require_disk_space(state["source_file"]["size_bytes"]
-                       + sum(row["size_bytes"] for row in state["local_segments"]))
+    check_job_capacity(str(manifest.get("job_id") or job_dir.name), missing)
+    require_disk_space(missing)
     drive_storage.restore_prepared_media(job_dir, state)
     for item in manifest.get("segments") or []:
         preview = item.get("preview_filename")
@@ -1964,7 +1973,10 @@ def upload_prepared_drive_sync(job_id: str) -> dict:
     source = manifest.get("source") or {}
     backup = drive_backup_state(job_dir, manifest) if prepared_media_path(job_dir, manifest) is None else None
     if backup is not None:
-        result = backup  # Local media was cleaned after a complete, verified backup.
+        # Local media was cleaned after a complete backup; report it only if Drive still holds it.
+        if not drive_storage.verify_remote_backup(backup):
+            raise RuntimeError("Google Drive 備份已被刪除、移動或無法下載，且本機影片已清理；請用原網址重新準備。")
+        result = backup
     else:
         try:
             source_path = pipeline.locate_source_video(job_dir)

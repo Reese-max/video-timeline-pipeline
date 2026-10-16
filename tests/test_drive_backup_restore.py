@@ -98,10 +98,28 @@ class RestoreTests(unittest.TestCase):
             with patch.object(drive_storage, "_access_token", return_value="token"), \
                  patch.object(drive_storage.urllib.request, "urlopen", side_effect=fake_urlopen):
                 restored = drive_storage.restore_prepared_media(job, state)
-            self.assertEqual(sorted(restored), ["segment_000.mp4", "source.mp4"])
-            self.assertEqual(sorted(requested), ["seg_1", "src_1"])
+            self.assertEqual(restored, ["segment_000.mp4", "source.mp4"])
+            self.assertEqual(requested, ["seg_1", "src_1"])  # source last completes the media set
             self.assertEqual(pipeline.file_fingerprint(job / "source.mp4"), manifest["source"]["fingerprint"])
             self.assertEqual((job / "segments" / "segment_000.mp4").read_bytes(), payloads["seg_1"])
+
+    def test_restore_never_overwrites_a_different_local_file(self):
+        with tempfile.TemporaryDirectory() as raw:
+            job, _, state = build_job(Path(raw) / "mcp_jobs", now=10**9)
+            payloads = {"src_1": (job / "source.mp4").read_bytes(),
+                        "seg_1": (job / "segments" / "segment_000.mp4").read_bytes()}
+            (job / "segments" / "segment_000.mp4").unlink()
+            (job / "source.mp4").write_bytes(b"newer source that was never backed up")
+
+            def backup_bytes(request, timeout=0):  # Drive returns the genuine backup bytes
+                return io.BytesIO(payloads[request.full_url.split("/files/")[1].split("?")[0]])
+
+            with patch.object(drive_storage, "_access_token", return_value="token"), \
+                 patch.object(drive_storage.urllib.request, "urlopen", side_effect=backup_bytes) as urlopen:
+                with self.assertRaises(RuntimeError):
+                    drive_storage.restore_prepared_media(job, state)
+            self.assertEqual((job / "source.mp4").read_bytes(), b"newer source that was never backed up")
+            self.assertNotIn("src_1", [call.args[0].full_url for call in urlopen.call_args_list])
 
     def test_corrupt_download_is_rejected_without_leaving_a_partial_file(self):
         with tempfile.TemporaryDirectory() as raw:
@@ -240,9 +258,39 @@ class DriveBackedCleanupTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw).resolve() / "mcp_jobs"
             build_job(root, now=self.now)
+            policy = StoragePolicy(root, 10**12, 10**12, 7 * 86400, 0)
+            policy.protect_until(JOB, self.now - 60, link=True)  # links issued since the upgrade expired
             # analyze/drive submissions protect for days; the queue itself is checked separately.
-            StoragePolicy(root, 10**12, 10**12, 7 * 86400, 0).protect_until(JOB, self.now + 8 * 86400)
+            policy.protect_until(JOB, self.now + 8 * 86400)
             self.assertEqual(self.run_cleanup(root)["drive_backed_jobs"], 1)
+
+    def test_links_from_before_the_upgrade_still_protect_media(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw).resolve() / "mcp_jobs"
+            build_job(root, now=self.now)
+            StoragePolicy(root, 10**12, 10**12, 7 * 86400, 0).protect_until(JOB, self.now + 600)
+            report = self.run_cleanup(root, apply=True)
+            self.assertEqual(report["skipped"].get("retained_or_live_share"), 1)
+
+    def test_media_the_backup_never_saw_is_not_deleted(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw).resolve() / "mcp_jobs"
+            job, _, _ = build_job(root, now=self.now)
+            (job / "source.webm").write_bytes(b"newer download in another container")
+            report = self.run_cleanup(root, apply=True)
+            self.assertEqual(report["deleted_files"], 0)
+            self.assertEqual(report["skipped"].get("unbacked_media"), 1)
+            self.assertTrue((job / "source.webm").exists())
+
+    def test_backup_changing_mid_cleanup_keeps_the_source(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw).resolve() / "mcp_jobs"
+            job, _, _ = build_job(root, now=self.now)
+            with patch.object(drive_storage, "verify_remote_backup", side_effect=[True, False]):
+                report = retention.cleanup(root, apply=True, now=self.now)
+            self.assertEqual(report["deleted_files"], 2)  # segment and preview only
+            self.assertEqual(len(report["errors"]), 1)
+            self.assertTrue((job / "source.mp4").exists())
 
 
 if __name__ == "__main__":
