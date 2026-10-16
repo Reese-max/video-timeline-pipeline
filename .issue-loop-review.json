@@ -1,0 +1,38 @@
+{
+  "pr": 14,
+  "head": "efda1320e968df01bbd7ead8be4a3831b44806f2",
+  "findings": [
+    {
+      "severity": "med",
+      "file": "pipeline.py",
+      "line": 3510,
+      "issue": "fixed: The shared budget gate accepted True, positive floats, NaN and Infinity from persisted subscription state, allowing invalid provider-work limits to reach the paid trigger. It now requires a positive integer, excluding bool, before any provider request; the regression also asserts zero outbound calls."
+    },
+    {
+      "severity": "med",
+      "file": "pipeline.py",
+      "line": 3547,
+      "issue": "fixed: The paid snapshot trigger inherited four automatic POST attempts from request_json. A lost acknowledgement could create multiple billable snapshots despite the displayed per-snapshot limit. This trigger now uses attempts=1, with a transport-level timeout regression; other callers retain their existing retry policy."
+    },
+    {
+      "severity": "low",
+      "file": "pipeline.py",
+      "line": 5501,
+      "issue": "fixed: CLI help advertised an unlimited default for --instagram-max-items, contradicting the mandatory finite budget and README. It now describes the required positive integer and its reuse for subscription refresh, with a CLI-help regression."
+    },
+    {
+      "severity": "med",
+      "file": "pipeline.py",
+      "line": 3871,
+      "issue": "needs-human: Existing Instagram subscriptions with instagram_max_items=null now fail every refresh, but --rss-update cannot set a budget and re-adding the author is rejected as a duplicate. A non-destructive budget-update or migration contract must be chosen; do not invent a spend allowance or remove existing queue/history."
+    },
+    {
+      "severity": "med",
+      "file": "pipeline.py",
+      "line": 3567,
+      "issue": "needs-human: Issue #8 requires retries of a known in-progress snapshot to reuse it. The snapshot ID is only returned after successful polling/download, with no durable checkpoint or resume input; retrying after a poll error submits another paid trigger. Choose an explicit resume/new-run contract before changing this public behavior."
+    }
+  ],
+  "fixed": true,
+  "summary": "Fixed invalid budget types, automatic resubmission of the paid snapshot trigger, and stale CLI help; three regression tests went red to green, and all 10 pipeline tests pass under Git Bash with pre-trigger, token-free notice assertions. Needs-human: choose a non-destructive budget-update path for legacy subscriptions and an explicit known-snapshot resume/new-run contract. The full suite still has the same eight Windows SQLite cleanup failures reproduced at the PR merge base (33 pass, 8 fail after fixes); no push or live Bright Data calls were made."
+}

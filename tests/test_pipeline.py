@@ -1,3 +1,4 @@
+import io
 import tempfile
 import unittest
 from pathlib import Path
@@ -198,11 +199,21 @@ class InstagramAuthorTests(unittest.TestCase):
             "BRIGHTDATA_API_TOKEN": "test-brightdata-token",
             "BRIGHTDATA_RUN_TIMEOUT_SECONDS": "60",
         }
+        notice = io.StringIO()
+
+        def fake_post(*args, **kwargs):
+            self.assertIn("num_of_posts=20", notice.getvalue())
+            self.assertIn("計費", notice.getvalue())
+            self.assertNotIn("test-brightdata-token", notice.getvalue())
+            return {"snapshot_id": "s_test"}
+
         with mock.patch.object(
-            pipeline, "post_json", return_value={"snapshot_id": "s_test"}
+            pipeline, "post_json", side_effect=fake_post
         ) as post, mock.patch.object(
             pipeline, "get_json", side_effect=fake_get
-        ), mock.patch.dict(pipeline.os.environ, environment, clear=True):
+        ), mock.patch.dict(pipeline.os.environ, environment, clear=True), mock.patch.object(
+            pipeline.sys, "stderr", notice
+        ):
             feed = pipeline.fetch_instagram_author(
                 "https://www.instagram.com/example/",
                 "2025-01-01",
@@ -257,6 +268,42 @@ class InstagramAuthorTests(unittest.TestCase):
                         allow_paid=True,
                     )
         self.assertEqual(calls, [], "預算閘失敗前不得有任何 Bright Data 請求")
+
+    def test_brightdata_discovery_rejects_non_integer_budgets(self) -> None:
+        environment = {"BRIGHTDATA_API_TOKEN": "test-brightdata-token"}
+        with mock.patch.dict(pipeline.os.environ, environment, clear=True), mock.patch.object(
+            pipeline, "post_json", return_value={"snapshot_id": "s_test"}
+        ) as post, mock.patch.object(
+            pipeline, "get_json", side_effect=lambda url, headers: {"status": "ready"} if "/progress/" in url else []
+        ) as get:
+            for bad in (True, False, 1.5, 2.0, float("nan"), float("inf"), float("-inf"), "3", [], {}):
+                with self.assertRaisesRegex(ValueError, "instagram-max-items", msg=repr(bad)):
+                    pipeline.fetch_instagram_author("example", max_items=bad, allow_paid=True)
+            post.assert_not_called()
+            get.assert_not_called()
+
+    def test_brightdata_trigger_is_not_automatically_retried(self) -> None:
+        with mock.patch.dict(
+            pipeline.os.environ, {"BRIGHTDATA_API_TOKEN": "test-brightdata-token"}, clear=True
+        ), mock.patch.object(
+            pipeline.urllib.request, "urlopen", side_effect=TimeoutError("lost acknowledgement")
+        ) as transport, mock.patch.object(pipeline.time, "sleep"):
+            with self.assertRaisesRegex(RuntimeError, "API 網路錯誤"):
+                pipeline.fetch_instagram_author("example", max_items=3, allow_paid=True)
+            self.assertEqual(transport.call_count, 1, "A billable trigger must never be automatically resubmitted")
+
+    def test_instagram_budget_help_describes_required_bound(self) -> None:
+        output = io.StringIO()
+        with mock.patch.object(pipeline.sys, "argv", ["pipeline.py", "--help"]), mock.patch.object(
+            pipeline.sys, "stdout", output
+        ):
+            with self.assertRaises(SystemExit) as exited:
+                pipeline.parse_args()
+        self.assertEqual(exited.exception.code, 0)
+        budget_help = output.getvalue().rsplit("--instagram-max-items", 1)[1].split("--instagram-discover-only", 1)[0]
+        self.assertIn("必填", budget_help)
+        self.assertIn("正整數", budget_help)
+        self.assertNotIn("預設不設上限", budget_help)
 
 
 if __name__ == "__main__":

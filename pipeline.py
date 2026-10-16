@@ -785,8 +785,10 @@ def request_json(
         raise RuntimeError(f"API 回應不是 JSON：{raw[:500]!r}") from exc
 
 
-def post_json(url: str, headers: dict[str, str], body: bytes, timeout: int = 180) -> dict[str, Any]:
-    return request_json(url, headers, method="POST", body=body, timeout=timeout)
+def post_json(
+    url: str, headers: dict[str, str], body: bytes, timeout: int = 180, *, attempts: int = 4
+) -> dict[str, Any]:
+    return request_json(url, headers, method="POST", body=body, timeout=timeout, attempts=attempts)
 
 
 def get_json(url: str, headers: dict[str, str]) -> dict[str, Any]:
@@ -3507,7 +3509,7 @@ def fetch_instagram_author(
     if not allow_paid:
         raise RuntimeError("Bright Data 可能計費；確認帳戶額度後加上 --allow-batch-cloud。")
     # fail-closed 預算閘：opt-in 不代表無上限；--instagram-since 是本機日期過濾，不構成成本上限
-    if max_items is None:
+    if type(max_items) is not int or max_items <= 0:
         raise ValueError(
             "Bright Data 付費盤點必須帶有限結果預算：請以 --instagram-max-items <正整數> 設定上限"
             "（--instagram-since 僅為本機日期過濾，不構成成本上限）。"
@@ -3519,8 +3521,8 @@ def fetch_instagram_author(
         timeout_seconds = int(os.getenv("BRIGHTDATA_RUN_TIMEOUT_SECONDS", "1800"))
     except ValueError as exc:
         raise ValueError("BRIGHTDATA_RUN_TIMEOUT_SECONDS 必須是整數。") from exc
-    if timeout_seconds <= 0 or max_items <= 0:
-        raise ValueError("Bright Data timeout 與 --instagram-max-items 必須大於 0。")
+    if timeout_seconds <= 0:
+        raise ValueError("Bright Data timeout 必須大於 0。")
     # 觸發前先印出有效上限（不印 token）——讓 operator 在計費前看到實際工作量界線
     print(f"Bright Data Instagram 盤點上限：num_of_posts={max_items}（每筆結果可能計費）", file=sys.stderr)
 
@@ -3549,6 +3551,7 @@ def fetch_instagram_author(
             headers,
             json.dumps({"input": [discovery_input]}).encode("utf-8"),
             timeout=60,
+            attempts=1,  # 建立 snapshot 非冪等；回應遺失時不可重送計費請求。
         )
         snapshot_id = str(payload.get("snapshot_id") or "") if isinstance(payload, dict) else ""
         if not re.fullmatch(r"s_[A-Za-z0-9_-]+", snapshot_id):
@@ -5498,7 +5501,7 @@ def parse_args() -> argparse.Namespace:
         "--instagram-max-items",
         type=int,
         default=None,
-        help="手動限制本次發現的近期 Reels 數；預設不設上限",
+        help="Bright Data 付費盤點必填的正整數結果上限；訂閱刷新沿用此值",
     )
     rss.add_argument(
         "--instagram-discover-only",

@@ -157,6 +157,8 @@ python pipeline.py --rss-process --rss-max-items 4 --allow-batch-cloud
 
 盤點快照保存在 Git 忽略且受 ACL 保護的 `rss\instagram-<雜湊>-latest.json`，包含原始 Bright Data 結果與 snapshot provenance。刷新時會把已見 Post ID 傳入 `posts_to_not_include`，本機佇列仍以穩定 ID 去重。Bright Data 的 Reel discovery 目前不支援伺服器端日期篩選；若某筆沒有 `date_posted`，工具會保留並在快照及盤點訊息標示「無法驗證回溯範圍」，不會假裝近一年盤點完整。私人／登入限定內容不處理，平台可見性與供應商回傳仍可能造成缺漏。請參考 [Instagram Scraper API](https://docs.brightdata.com/datasets/scrapers/instagram/introduction)、[Reel discovery](https://docs.brightdata.com/api-reference/scrapers/social-media-apis/instagram-reels-discover-by-url) 與 [非同步 snapshot 流程](https://docs.brightdata.com/api-reference/rest-api/scraper/asynchronous-requests)。
 
+建立付費 snapshot 的 POST 僅送出一次，不會在逾時或 HTTP 錯誤後自動重送；狀態查詢與結果下載仍可重試。目前尚無 snapshot 恢復指令，中斷後重新執行會建立另一個付費 snapshot，請先確認遠端工作。訂閱刷新沿用建立時的 `--instagram-max-items`；舊訂閱若未儲存上限會被拒絕，且目前 `--rss-update` 尚不能補設此欄位。
+
 單篇公開 Reel／影片貼文不需要先建立作者訂閱，可直接走既有入口：
 
 ```powershell

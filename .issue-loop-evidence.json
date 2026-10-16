@@ -1,0 +1,12 @@
+{
+  "repo": "Reese-max/video-timeline-pipeline",
+  "issue": 14,
+  "base_sha": "efda1320e968df01bbd7ead8be4a3831b44806f2",
+  "red_proof": "Before implementation, Git Bash ran python -m pytest -q tests/test_pipeline.py --tb=short against the reviewed production code at efda1320e968df01bbd7ead8be4a3831b44806f2 with the new tests: exit 1. FAILED tests/test_pipeline.py::InstagramAuthorTests::test_brightdata_discovery_rejects_non_integer_budgets: AssertionError: ValueError not raised : True. FAILED tests/test_pipeline.py::InstagramAuthorTests::test_brightdata_trigger_is_not_automatically_retried: AssertionError: 4 != 1 : A billable trigger must never be automatically resubmitted. FAILED tests/test_pipeline.py::InstagramAuthorTests::test_instagram_budget_help_describes_required_bound. Result: 3 failed, 7 passed in 0.34s.",
+  "test_command": "python -m pytest -q tests/test_pipeline.py",
+  "test_exit": 0,
+  "tests_passed": 10,
+  "tests_failed": 0,
+  "summary": "The shared Bright Data budget gate now rejects bool, non-integer and non-finite values before any provider call, while accepted requests still include num_of_posts. The paid snapshot creation POST uses the existing request helper with attempts=1, preventing automatic duplicate submission after a lost acknowledgement, and CLI help now describes the required positive bound. Three regression tests were red before the fix and all 10 pipeline tests are green; the existing allowed-request test also verifies the budget notice is present before triggering and contains no token. README documents retry behavior and the two unresolved recovery/migration limitations.",
+  "not_done": "needs-human: Existing subscriptions with instagram_max_items=null still require an explicit non-destructive budget-update/migration contract; no spend default was invented and no subscription/queue data was changed. needs-human: Persisting and resuming a known in-progress snapshot requires an explicit resume/new-run interface; disabling implicit POST retries does not implement that acceptance criterion. Full-suite command python -m pytest -q --tb=no exits 1 with 33 passed and 8 failed; the exact same eight Windows SQLite temporary-file cleanup failures were reproduced on merge-base dc421fef263ccc5b7321910304a9fa910c1a5c5d (29 passed, 8 failed) and on the unmodified PR head (30 passed, 8 failed). Provider budget enforcement was verified with mocks, not live paid requests. No push, PR modification, other-branch modification, deployment or paid provider call was performed."
+}
