@@ -626,6 +626,22 @@ OPEN_NOTEBOOK_PASSWORD=不要提交到版本控制
 
 兩個前提：`manifest.json` 不能刪（那是唯一的對應記錄），以及若你在 Open Notebook 介面手動刪過該條目，這次同步會刪不到（404 會被忽略）而新增一份。手動刪掉的孤兒條目只能自己在介面清。
 
+## 共用操作帳本與路線圖（#7）
+
+`operations.py` 統一管理 `operations.db` 的版本化 migration、通知、成本與評分資料表；原有資料原地升級，不依附可重建的 `library.db`。每個資料集保存一個 `library_id` UUID，搬移完整資料根目錄時保留；新的空資料集會取得另一個 ID。請勿同時在備份副本啟動寄送 worker。
+
+CLI 的完整分析通過本機產物檢查後，以分析內容、來源 SHA-256 與模型版本產生 `analysis_revision`，並在同一 SQLite 交易寫入 `processed_revisions` 與完成事件。分類、索引時間、執行時間、快取命中數與絕對媒體路徑不會產生新版本；相同內容重跑保留首次資格時間。實際內容或模型版本改變才產生新版本。`dry-run`、`local-only`、不完整或缺漏產物不登記完成、不從完成 hook 寄送。
+
+```bash
+python pipeline.py --root /path/to/library --ops-reconcile
+```
+
+這是明確寫入本機帳本的補登命令，只掃描 `jobs/*/manifest.json`，不重跑分析、不呼叫供應商、不寄送。舊內容的首次完成時間未知時維持 `NULL`，標為 `backfill`，預設不進日／週 Digest；不以 manifest 的 `created_at` 或檔案時間假造完成時間。已有登記的相同版本保持不變。這個命令優先於其他功能命令（`--self-test` 除外），建議單獨執行。
+
+成本／預算／供應商／失敗清單與評分解釋／報告改用 SQLite `mode=ro`：缺少帳本回 `{"status":"unavailable"}`，舊版或不相容 schema 回 `{"status":"migration_required"}`，不在查詢時建立或升級 DB。資料可讀時維持既有輸出格式；首次有明確寫入操作時才套用 migration。Digest 依實際內容版本核對帳本資格；尚無帳本的舊資料只保留明確 `eligible_at` 相容入口，沒有資格時間就跳過。
+
+檔案、兩個 DB 與 RSS JSON 沒有共同交易；manifest 的身分欄位只是投影，補登與 Digest 仍以帳本及現有產物為準。備份／回復停寄、部署副本鎖、通知送出前 attempt 落盤及未知請求人工對帳仍是待完成的 release gates。完整交付順序、驗收對照與尚未實作項目見 [路線圖](docs/ROADMAP.md)。
+
 ## 成本守衛（#4）
 
 下列已啟用的傳輸入口經過同一道守衛：送出前先在 `operations.db` 原子預留金額，送出後入帳；結果不明時保留預留。CLI、背景排程與 MCP 綁定同一個成本帳本。部分 HTTP helper 的內建重試目前仍合併記在一次邏輯呼叫內，尚未逐次入帳；這些缺乏可驗證費用上限的操作在 strict 模式會拒絕送出。

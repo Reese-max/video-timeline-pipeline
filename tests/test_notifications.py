@@ -310,9 +310,14 @@ class PipelineCompletionEventTests(unittest.TestCase):
             job_dir = root / "jobs" / "test_job_1"
             job_dir.mkdir(parents=True)
             manifest = {
+                "status": "completed",
                 "source": {"title": "Completed Video", "url": "https://example.com/v1"},
-                "analysis_revision": "1",
+                "artifacts": {name: str((job_dir / f"{name}.json").relative_to(root))
+                              for name in ("transcript", "timeline", "summary")},
             }
+            pipeline.write_json(job_dir / "transcript.json", {"segments": []})
+            pipeline.write_json(job_dir / "timeline.json", [])
+            pipeline.write_json(job_dir / "summary.json", {"brief": "Completed Video"})
 
             fake_webhook = email_providers.FakeProvider(mode="accepted")
             with mock.patch("notifications.get_configured_provider", return_value=fake_webhook), \

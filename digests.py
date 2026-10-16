@@ -12,6 +12,8 @@ from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
 
+from operations import completion_snapshot, load_eligibility_index
+
 
 def parse_iso_datetime(value: str | None) -> datetime.datetime | None:
     """Parse ISO datetime string with robust timezone support."""
@@ -79,6 +81,10 @@ def collect_digest_candidates(
     if not jobs_dir.is_dir():
         return []
 
+    eligibility = load_eligibility_index(root)
+    if eligibility is None:
+        return []  # A present but unreadable/old ledger cannot authorize history.
+
     candidates: list[dict[str, Any]] = []
 
     for job_path in jobs_dir.iterdir():
@@ -100,16 +106,20 @@ def collect_digest_candidates(
             continue
 
         # Check eligibility timestamp
-        eligible_str = (
-            manifest.get("eligible_at")
-            or manifest.get("created_at")
-            or manifest.get("processing", {}).get("created_at")
-        )
+        revision = manifest.get("analysis_revision", "1")
+        if (root / "operations.db").exists():
+            try:
+                revision, _ = completion_snapshot(root, job_path, manifest)
+            except (OSError, ValueError, TypeError, AttributeError):
+                continue
+            eligible_str = eligibility.get((job_path.name, revision))
+        else:
+            # Explicit legacy eligibility is preserved; created_at and filesystem
+            # mtime are not evidence of a first completion.
+            eligible_str = manifest.get("eligible_at")
         eligible_dt = parse_iso_datetime(eligible_str)
         if not eligible_dt:
-            # Fallback to filesystem mtime
-            mtime = manifest_file.stat().st_mtime
-            eligible_dt = datetime.datetime.fromtimestamp(mtime, tz=datetime.timezone.utc)
+            continue
 
         if window_start_utc <= eligible_dt < window_end_utc:
             source = manifest.get("source", {})
@@ -131,7 +141,7 @@ def collect_digest_candidates(
                 "terms": summary.get("terms", []),
                 "chapters": chapters,
                 "eligible_at": eligible_dt.isoformat(),
-                "analysis_revision": manifest.get("analysis_revision", "1"),
+                "analysis_revision": revision,
             }
             candidates.append(item)
 

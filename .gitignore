@@ -22,6 +22,7 @@ batches/
 rss/
 canary/
 library.db
+library.db-*
 operations.db
 operations.db-*
 digest_preview_*.md
