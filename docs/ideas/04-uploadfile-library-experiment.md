@@ -1,6 +1,6 @@
 # 04｜實驗：用 `window.openai.uploadFile` 把影片存進 ChatGPT 檔案庫
 
-> 狀態（2026-10-11）：未實測。main 的小工具沒有 `uploadFile`。這個實驗必須做在小工具端（本檔 §3），不是伺服器端的 MCP 工具：`window.openai.uploadFile` 是 ChatGPT 宿主提供給小工具的用戶端 API。
+> 狀態（2026-10-16）：小工具端按鈕與離線契約測試已實作，真實 ChatGPT 檔案庫及模型讀取仍未實測。`window.openai.uploadFile` 是 ChatGPT 宿主提供給小工具的用戶端 API。
 
 ## 1. 目的
 
@@ -19,30 +19,21 @@
 
 **推論：** 最可能的用法是「小工具把 MP4 存進檔案庫 → 使用者在對話裡從檔案庫把影片附加進來 → ChatGPT 讀取」。模型應該不會自動看到小工具上傳的檔案。
 
-## 3. 測試按鈕（加進現有的 Video Timeline 小工具）
+## 3. 測試按鈕（現有 Video Timeline 小工具）
 
-```js
-async function saveSegmentToLibrary(segmentUrl, fileName) {
-  if (!window.openai?.uploadFile) throw new Error('此環境沒有 uploadFile');
-  const t0 = performance.now();
-  const res = await fetch(segmentUrl);          // 小工具的 CSP 允許連線網域要包含伺服器網址
-  if (!res.ok) throw new Error('下載失敗 ' + res.status);
-  const blob = await res.blob();
-  const file = new File([blob], fileName, { type: 'video/mp4' });
-  let r;
-  try {
-    r = await window.openai.uploadFile(file, { library: true });
-  } catch (e) {
-    // library 不可用時，退回一般上傳再試一次，兩次的錯誤都要記錄
-    console.warn('library 上傳失敗：', e);
-    r = await window.openai.uploadFile(file);
-  }
-  const fileId = r?.fileId ?? r;                // 回傳格式文件沒寫清楚，兩種都處理
-  let downloadUrl = null;
-  try { downloadUrl = (await window.openai.getFileDownloadUrl({ fileId }))?.downloadUrl ?? null; } catch (_) {}
-  return { fileId, size: blob.size, ms: Math.round(performance.now() - t0), hasDownloadUrl: !!downloadUrl };
-}
-```
+實作集中在 [web/widget.html](../../web/widget.html) 的 `saveSegmentToLibrary` 與 `askAboutLibraryFile`。[官方 Reference](https://developers.openai.com/plugins/reference#file-apis) 確認 `uploadFile(file, { library: true })` 及 `getFileDownloadUrl({ fileId })` 的介面；檔案庫依帳號提供，API 回傳成功不代表模型已讀取。
+
+| 驗收要求 | 實作／證據 |
+|---|---|
+| 每個片段明確點擊後才上傳 | 每列「存到 ChatGPT 檔案庫」按鈕；能力偵測及離線無點擊測試 |
+| 成功／錯誤診斷 | fileId、實際下載大小、耗時、SHA-256、下載網址是否可用；錯誤保留說明並遮蔽簽章網址 |
+| library 不可用時的備援 | 額外點擊「改用一般上傳」，保留兩次結果；刻意不採原提案的自動重送，避免不明結果造成重複檔案 |
+| 同對話讀取實驗 | 另按「請模型讀這個檔案」，先保存 `modelContent.uploaded_file_ids`，再送出 MCP Apps 訊息；宿主不支援標準 bridge 時使用 `sendFollowUpMessage` |
+| 指定時間點 | 按上傳時的片段起訖換算原片 0:30、1:05、2:10；0–120 秒片段問第 30／65 秒，120 秒起的片段問第 10 秒；不把標準答案或預期雜湊送給模型 |
+| 其他片段及重新整理 | 僅選落在片段內的時間點；沒有指定點時選片段內最多第 10 秒的時間，範圍未知則明說；重新整理不改變已上傳片段的時間依據 |
+| 真實檔案庫／模型可讀取 | **未驗證**；離線測試不等於檔案庫出現、上傳後 bytes 相同或模型實際解碼 |
+
+`node tests/test_widget_library_experiment.cjs` 執行實際 widget script 與假的宿主／MP4 bytes；涵蓋 SHA-256、時間換算、備援、錯誤遮蔽及狀態競態，不呼叫 Drive 或付費模型。完整實測清單見 [widget_manual_checks.md](../../tests/widget_manual_checks.md#59-chatgpt-檔案庫實驗)。
 
 **要求：**
 - 每個片段一個按鈕；成功時在畫面上顯示 `fileId`、大小、耗時，失敗時顯示完整錯誤訊息（不要吞掉）。
@@ -67,11 +58,11 @@ async function saveSegmentToLibrary(segmentUrl, fileName) {
 - 想在 Claude 的雲端環境另架測試伺服器，但環境的安全政策不允許開對外通道。
 - Chrome 擴充功能連線失敗，沒辦法操作 ChatGPT。
 
-**下一步：** Grok Bot 部署測試按鈕之後，把 Chrome 擴充功能連上，由 Claude 跑第 4 節的驗證。
+本次 worker 僅修改及測試工作樹，未部署或操作真實 ChatGPT 工作階段。部署由 driver 處理後，依第 4 節驗證並分別記錄檔案庫與模型讀取結果。
 
 ## 來源
 
 - <https://developers.openai.com/plugins/changelog>
-- <https://developers.openai.com/apps-sdk/reference>
+- <https://developers.openai.com/plugins/reference>
 - <https://community.openai.com/t/window-openai-uploadfile-and-setwidgetstate-and-imageids/1372230>
 - <https://community.openai.com/t/please-make-window-openai-uploadfile-file-support-csv-type/1370003>
