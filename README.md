@@ -582,6 +582,25 @@ OpenRouter 的 `/embeddings` 與 `/rerank` 端點在模型清單裡查不到、�
 
 `--ask --semantic` 會直接拿問句比對語意，跳過「先抽關鍵詞」那一步：少一次 API 呼叫，命中也更準。
 
+## Web Dashboard（本機唯讀為主）
+
+```powershell
+python pipeline.py --serve                                # http://127.0.0.1:8080
+python pipeline.py --serve --serve-host 127.0.0.1 --serve-port 8080
+python pipeline.py --serve-worker        # 另開程序：執行已排入的持久化工作
+python pipeline.py --serve-worker-once   # 只處理目前已到期的工作後結束
+```
+
+Dashboard 只用 Python 標準函式庫（`webapp.py`＋`web_services.py`＋`web_tasks.py`），不裝 FastAPI/Jinja2 也能跑；沒有它既有 CLI 完全不受影響。啟動時不會開 worker、排程、下載模型、分析影片或寄信。
+
+**安全基線（啟動即生效，不是事後補）**：預設只綁 loopback；Host allowlist 擋 DNS rebinding；POST 一律要 `Origin` 檢查＋`X-CSRF-Token`（token 由啟動程序產生，寫在頁面 `<meta>` 與 `GET /api/health`）；錯誤只回 `code/safe_message/retryable/request_id`，不外洩絕對路徑、stack trace 或憑證；HTML 全數 escape、來源連結限 http(s) scheme；請求 body ≤64KB、POST 每 IP 每分鐘 60 次；所有 SQL 參數化、排序欄位走 allowlist、分頁預設 50／上限 100、查詢長度上限 200。讀取走 `mode=ro` 連線，不使用會 CREATE/DROP 的 `index_connection()`——索引不存在回 `index_unavailable`、schema 不相容回 `migration_required`，不會偷建表。
+
+**費用界線**：`GET /api/search` 只查本機 FTS（回應帶 `external_calls: 0`）。語意檢索用 `POST /api/search`（`mode=semantic`）、問答用 `POST /api/ask`——先過 `check_and_reserve_budget` 預算閘，通過才排入 `operations.db` 的 `operation_tasks`，回 `202 + task_id`；`GET /api/tasks/{id}` 輪詢進度、永不啟動新工作。重試／寄信等副作用同理：`POST /api/jobs/{item}/retry`（`processing` 中的項目回 `409 unknown_state`，不能一鍵當新工作重建）、`POST /api/digest/preview`（純本機組裝，回 `digest_id+revision+payload_hash`）、`POST /api/digest/send`（三者必須與預覽一致，不一致回 `409 stale_preview`；重複送 `Idempotency-Key` 去重）。
+
+**唯讀頁面**：`/`（今日/本週新片依 `eligible_at`、狀態計數、成本/評分摘要——缺資料顯示 unavailable 不補 0）、`/videos`、`/videos/{job}`（分頁時間軸與逐字稿視窗）、`/operations`、`/operations/failed`、`/operations/providers`、`/digests`、`/notifications`、`/tasks`。對應 JSON API 在 `/api/*`，路由表見 issue #6 W9。
+
+**非 loopback** 必須三個條件同時成立才會啟動：`--serve-allow-remote`、授權 token（`WEB_AUTH_TOKEN` 或 `--serve-auth-token`）、`--serve-trusted-proxy`（聲明有可信 TLS 反向代理／私有通道）；此模式下所有請求都要 `Authorization: Bearer`，缺一拒絕綁定。反向代理的網域要另外加進 Host allowlist（`--serve-allowed-host dashboard.internal`，或 `WEB_ALLOWED_HOSTS` 逗號分隔），否則非 loopback 綁定只有 loopback 與綁定位址本身可用。
+
 ## Open Notebook 知識庫
 
 > **選用，預設不啟用。** 開源自架的 Open Notebook（不是 Google NotebookLM），要另外用 Docker 跑起來。本專案的資料庫是上面那個 `library.db` 單檔，查詢用 `--search` 就夠；只有想要筆記介面與 RAG 問答時才需要這一節。以下步驟經實測可用，但沒跑這套服務完全不影響管線。

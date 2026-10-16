@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- 新增本機 Web Dashboard（`pipeline.py --serve`）：唯讀為主的影片情報介面——總覽統計（依 `eligible_at` 的新片計數、RSS 狀態、成本/評分摘要，缺資料顯示 unavailable）、影片庫分頁與證據詳情、本機 FTS 搜尋、operations/失敗/供應商監控、摘要與通知歷史。純標準函式庫實作，既有 CLI 不受影響。
+- 副作用一律走 `operations.db` 的 `operation_tasks` 持久化佇列（`--serve-worker` 執行）：語意搜尋、Ask、RSS 重排、摘要寄送經預算閘與 idempotency 去重後回 202+task_id；claim/lease/fencing、heartbeat、retry backoff、cancel 與 crash recovery（遠端已送出的標 unknown 不盲目重做）。
+- Dashboard 安全基線：loopback 預設、Host allowlist、Origin/CSRF 檢查、錯誤遮罩、HTML autoescape、URL scheme allowlist、body/rate/分頁/排序/查詢長度上限、讀取走唯讀連線且不做 schema 遷移；非 loopback 需 allow-remote＋token＋trusted-proxy 三者齊備並強制 Bearer。
+
 - 新增 #59：v14 widget 提供可收合的 ChatGPT 檔案庫實驗，每個分段須明確點擊才 fetch／uploadFile；一般上傳亦須另行點擊。顯示上傳資訊、SHA-256 與完整遮蔽網址的錯誤；隔離連點、換 job 及實驗狀態保存失敗，模型讀取要求走既有訊息橋接與統一保存。新增獨立 Node 測試並納入離線檢查，固定既有 CSP／成功媒體 CORS 前提；檔案庫與模型可讀性仍需真實 ChatGPT 驗證。已知限制：上傳卡住時需重新載入介面。
 
 - 補強 #58：v14 widget 在 A 分析完成後自動讀取報告，明示摘要提交前尚未上傳；提交摘要後以 1–10 秒退避輪詢報告工作，驗證完成後顯示「A 已完成」並啟用合併複製。失敗保留完整錯誤，換 job／關閉停止輪詢。合併指令採 §4.3 原文，以「合併：」開頭並保留 file_id／SHA-256／未獨立驗證聲明；README 說明 paired worker 與 caller_submitted 上傳條件。UI URI 同步升為 `ui://video-timeline-pipeline/v14-<媒體網址 hash>.html`。

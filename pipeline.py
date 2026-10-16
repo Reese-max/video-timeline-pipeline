@@ -4094,7 +4094,19 @@ def like_pattern(query: str) -> str:
     return f"%{escaped}%"
 
 
-def search_index(root: Path, query: str, limit: int, category: str = "") -> list[dict[str, Any]]:
+def search_index(
+    root: Path,
+    query: str,
+    limit: int,
+    category: str = "",
+    connection: sqlite3.Connection | None = None,
+) -> list[dict[str, Any]]:
+    """Keyword/FTS search over library.db.
+
+    ``connection`` lets callers inject an existing (e.g. read-only)
+    connection — the web dashboard uses this so GET search never opens a
+    writable DB handle nor runs index_connection's schema-migration path.
+    """
     db_path = root / "library.db"
     if not db_path.is_file():
         raise RuntimeError(f"索引不存在：{db_path}；先執行 `--index`。")
@@ -4129,7 +4141,9 @@ def search_index(root: Path, query: str, limit: int, category: str = "") -> list
         category_params = (f"%{category}%",) if category else ()
         params = ('"' + query.replace('"', '""') + '"',) + category_params + (limit,)
 
-    connection = index_connection(root)
+    owns_connection = connection is None
+    if owns_connection:
+        connection = index_connection(root)
     try:
         cursor = connection.execute(
             f"""
@@ -4156,7 +4170,8 @@ def search_index(root: Path, query: str, limit: int, category: str = "") -> list
             for row in cursor
         ]
     finally:
-        connection.close()
+        if owns_connection:
+            connection.close()
 
 
 _LOCAL_EMBEDDERS: dict[str, Any] = {}
@@ -7691,6 +7706,33 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--budget-status", action="store_true", help="檢視目前已用預算與配額上限狀態")
     parser.add_argument("--provider-health", action="store_true", help="檢查各供應商成功率與延遲統計")
     parser.add_argument("--failed-list", action="store_true", help="列出近期失敗或遭預算阻斷的操作紀錄")
+    web = parser.add_argument_group("Web Dashboard")
+    web.add_argument("--serve", action="store_true", help="啟動本機唯讀為主的 Web Dashboard（預設僅 loopback）")
+    web.add_argument("--serve-host", default="127.0.0.1", help="Dashboard 綁定位址；預設 127.0.0.1")
+    web.add_argument("--serve-port", type=int, default=8080, help="Dashboard 埠號；預設 8080")
+    web.add_argument(
+        "--serve-allow-remote",
+        action="store_true",
+        help="允許非 loopback 綁定；仍須 WEB_AUTH_TOKEN/--serve-auth-token 與 --serve-trusted-proxy",
+    )
+    web.add_argument(
+        "--serve-trusted-proxy",
+        action="store_true",
+        help="聲明 Dashboard 位於可信 TLS 反向代理或私有安全通道之後",
+    )
+    web.add_argument(
+        "--serve-auth-token",
+        default=None,
+        help="Dashboard 授權 token；也可用 WEB_AUTH_TOKEN 環境變數",
+    )
+    web.add_argument(
+        "--serve-allowed-host",
+        action="append",
+        default=None,
+        help="額外允許的 Host（遠端網域等）；可重複，也可用 WEB_ALLOWED_HOSTS 逗號分隔",
+    )
+    web.add_argument("--serve-worker", action="store_true", help="執行 Dashboard 持久化工作佇列的 worker")
+    web.add_argument("--serve-worker-once", action="store_true", help="worker 只處理目前已到期的工作後結束")
     parser.add_argument("--self-test", action="store_true")
     return parser.parse_args()
 
@@ -8240,6 +8282,38 @@ def main() -> int:
     if args.self_test:
         self_test()
         return 0
+    if getattr(args, "serve", False) or getattr(args, "serve_worker", False) or getattr(args, "serve_worker_once", False):
+        # Dashboard 只讀既有產物與佇列狀態；不啟動排程、下載模型或寄信。
+        root = args.root.resolve()
+        load_dotenv(Path(__file__).resolve().parent / ".env")
+        if (root / ".env").resolve() != (Path(__file__).resolve().parent / ".env").resolve():
+            load_dotenv(root / ".env")
+        try:
+            if getattr(args, "serve", False):
+                import webapp
+
+                extra_hosts = list(args.serve_allowed_host or [])
+                env_hosts = os.getenv("WEB_ALLOWED_HOSTS", "")
+                extra_hosts.extend(h.strip() for h in env_hosts.split(",") if h.strip())
+                return webapp.serve(
+                    root,
+                    host=args.serve_host,
+                    port=args.serve_port,
+                    auth_token=args.serve_auth_token or os.getenv("WEB_AUTH_TOKEN", "") or None,
+                    allow_remote=bool(args.serve_allow_remote),
+                    trusted_proxy=bool(args.serve_trusted_proxy),
+                    extra_allowed_hosts=extra_hosts,
+                )
+            import web_tasks
+
+            try:
+                web_tasks.run_worker(root, once=bool(args.serve_worker_once) and not args.serve_worker)
+            except KeyboardInterrupt:
+                pass
+            return 0
+        except (ValueError, RuntimeError, OSError) as exc:
+            print(f"Dashboard ERROR: {exc}", file=sys.stderr)
+            return 1
     if getattr(args, "digest_preview", None):
         from notifications import run_digest_preview
 
