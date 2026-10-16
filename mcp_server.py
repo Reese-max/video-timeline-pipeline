@@ -592,7 +592,7 @@ def segment_bounds(
 def media_url(job_id: str, relative_name: str) -> str:
     expires = int(time.time()) + MCP_MEDIA_TTL
     signature = media_signer().sign(job_id, relative_name, expires)
-    storage_policy().protect_until(job_id, expires)
+    storage_policy().protect_until(job_id, expires, link=True)
     return f"{MCP_MEDIA_BASE_URL}/media/{job_id}/{relative_name}?expires={expires}&sig={signature}"
 
 
@@ -678,6 +678,70 @@ def prepared_media_path(job_dir: Path, manifest: dict) -> Path | None:
         if preview:
             files.append(job_dir / "previews" / str(preview))
     return None if any(_file_missing(path) for path in files) else video_path
+
+
+MEDIA_EXPIRED_MESSAGE = "影片已過保留期限，請重新準備。"
+MEDIA_ARCHIVED_MESSAGE = "本機影片已清理，Google Drive 保有完整備份；重新準備或分析時會自動取回。"
+
+
+def drive_backup_state(job_dir: Path, manifest: dict | None) -> dict | None:
+    """Drive state that can restore the whole prepared media set, else None."""
+    if not isinstance(manifest, dict):
+        return None
+    try:
+        state = json.loads((job_dir / "drive-manifest.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    source = manifest.get("source") or {}
+    if (not isinstance(state, dict) or str(state.get("job_id") or "") != str(manifest.get("job_id") or "")
+            or not drive_storage.backup_complete(state, list(manifest.get("segments") or []),
+                                                 str(source.get("fingerprint") or ""))):
+        return None
+    return state
+
+
+def ensure_local_media(job_dir: Path, manifest: dict) -> Path | None:
+    """Prepared source path, downloading cleaned media back from its Drive backup when needed."""
+    video_path = prepared_media_path(job_dir, manifest)
+    if video_path is not None:
+        return video_path
+    state = drive_backup_state(job_dir, manifest)
+    if state is None:
+        return None
+    try:
+        current = pipeline.locate_source_video(job_dir)
+    except RuntimeError:
+        current = None
+    if current is not None and pipeline.file_fingerprint(current) != (manifest.get("source") or {}).get("fingerprint"):
+        return None  # A newer, never-backed-up source; the old backup must not replace it.
+    for stale in [*job_dir.glob("*.drive-restore.part"), *(job_dir / "segments").glob("*.drive-restore.part")]:
+        stale.unlink(missing_ok=True)  # Leftovers of an interrupted restore; not counted twice below.
+    missing = state["source_file"]["size_bytes"] if current is None else 0
+    missing += sum(row["size_bytes"] for row in state["local_segments"]
+                   if _file_missing(job_dir / "segments" / row["filename"]))
+    report_progress("restore", 8, "從 Google Drive 取回影片")
+    check_job_capacity(str(manifest.get("job_id") or job_dir.name), missing)
+    require_disk_space(missing)
+    drive_storage.restore_prepared_media(job_dir, state)
+    for item in manifest.get("segments") or []:
+        preview = item.get("preview_filename")
+        if preview and _file_missing(job_dir / "previews" / str(preview)):
+            extract_preview(job_dir / "segments" / str(item.get("filename", "")), job_dir / "previews" / str(preview))
+    return prepared_media_path(job_dir, manifest)
+
+
+def restore_before_download(job_dir: Path) -> Path | None:
+    """Prefer the verified Drive copy over downloading the source URL again."""
+    manifest = read_manifest(job_dir)
+    if not manifest:
+        return None
+    try:
+        return ensure_local_media(job_dir, manifest)
+    except (DeadlineExceeded, ExecutionCancelled):
+        raise
+    except Exception as error:
+        print(f"! Google Drive 取回失敗，改從來源網址重新下載：{error}")
+        return None
 
 
 def split_video(video_path: Path, segment_dir: Path, segment_seconds: int) -> list[tuple[Path, float, float]]:
@@ -798,6 +862,8 @@ def prepare_video_sync(url: str, segment_seconds: int, max_segments: int | None)
     try:
         video_path = pipeline.locate_source_video(job_dir)
     except RuntimeError:
+        video_path = restore_before_download(job_dir)
+    if video_path is None:
         check_job_capacity(job_id, MCP_MAX_SOURCE_BYTES)
         require_disk_space(MCP_MAX_SOURCE_BYTES)
         report_progress("download", 10, "下載來源影片")
@@ -819,6 +885,10 @@ def prepare_video_sync(url: str, segment_seconds: int, max_segments: int | None)
     duration = pipeline.video_duration(probe)
     segment_bounds(duration, segment_seconds, max_segments)
     existing = read_manifest(job_dir)
+    if existing and not manifest_is_ready(existing, video_path, segment_seconds, max_segments):
+        # Retention removes segments before the source; refill them from Drive
+        # instead of re-splitting into bytes that no longer match the backup.
+        restore_before_download(job_dir)
     if existing and manifest_is_ready(existing, video_path, segment_seconds, max_segments):
         return existing
 
@@ -1185,7 +1255,12 @@ def analyze_prepared_sync(job_id: str) -> dict[str, Any]:
     manifest = read_manifest(job_dir)
     if not manifest:
         raise RuntimeError("影片尚未準備完成，請先呼叫 prepare_video_for_chatgpt。")
-    video_path = pipeline.locate_source_video(job_dir)
+    try:
+        video_path = pipeline.locate_source_video(job_dir)
+    except RuntimeError:
+        video_path = ensure_local_media(job_dir, manifest)
+        if video_path is None:
+            raise RuntimeError(MEDIA_EXPIRED_MESSAGE) from None
     source_fingerprint = pipeline.file_fingerprint(video_path)
     cache_signature = analysis_cache_signature(video_path, manifest)
     analysis_dir = job_dir / "analysis" / "runs" / cache_signature
@@ -1678,7 +1753,14 @@ async def analyze_prepared_video(
         if background:
             prepared_job_dir(job_id)
             storage_policy().protect_until(job_id, time.time() + MCP_JOB_TIMEOUT * 65 + 3600)
-            return operation_tool_result(get_queue().submit("analyze", {"job_id": job_id}, job_id))
+            operation = get_queue().submit("analyze", {"job_id": job_id}, job_id)
+            if drive_storage.configured():
+                # Drive is the long-term copy of the media; do not depend on the widget to start it.
+                try:
+                    get_queue().submit("drive", {"job_id": job_id}, job_id)
+                except Exception as error:
+                    print(f"! 自動排入 Google Drive 備份失敗（分析照常進行）：{error}")
+            return operation_tool_result(operation)
         result = await asyncio.to_thread(run_job, analyze_prepared_sync, job_id)
     except Exception as error:
         return analysis_tool_error_result(error)
@@ -1870,7 +1952,7 @@ def upload_analysis_report_sync(job_id: str, report_sha256: str, analysis_sha256
     manifest = read_manifest(job_dir, strict=True)
     if not isinstance(manifest, dict):
         raise ValueError("Prepared manifest is unavailable")
-    source = prepared_media_path(job_dir, manifest)
+    source = ensure_local_media(job_dir, manifest)
     if source is None:
         raise ValueError("Prepared source expired before report upload")
     analysis = cached_analysis(job_id, manifest, source)
@@ -1891,9 +1973,21 @@ def upload_prepared_drive_sync(job_id: str) -> dict:
     if not manifest:
         raise RuntimeError("影片尚未準備完成，請先呼叫 prepare_video_for_chatgpt。")
     source = manifest.get("source") or {}
-    result = drive_storage.upload_prepared_segments(
-        job_dir, job_id, str(source.get("title") or job_id),
-        str(source.get("fingerprint") or ""), list(manifest.get("segments") or []))
+    backup = drive_backup_state(job_dir, manifest) if prepared_media_path(job_dir, manifest) is None else None
+    if backup is not None:
+        # Local media was cleaned after a complete backup; report it only if Drive still holds it.
+        if not drive_storage.verify_remote_backup(backup):
+            raise RuntimeError("Google Drive 備份已被刪除、移動或無法下載，且本機影片已清理；請用原網址重新準備。")
+        result = backup
+    else:
+        try:
+            source_path = pipeline.locate_source_video(job_dir)
+        except RuntimeError:
+            source_path = None
+        result = drive_storage.upload_prepared_segments(
+            job_dir, job_id, str(source.get("title") or job_id),
+            str(source.get("fingerprint") or ""), list(manifest.get("segments") or []),
+            source_path=source_path)
     if isinstance(result, dict) and result.get("status") == "drive_ready":
         state = completed_drive_state(job_dir, manifest)
         if state and state.get("handoff_text"):
@@ -1914,7 +2008,8 @@ def refreshed_operation(operation_id: str) -> dict:
         if not manifest:
             raise ValueError("missing or invalid manifest")
         if prepared_media_path(job_dir, manifest) is None:
-            return {**payload, "status": "expired", "error_code": "MEDIA_EXPIRED", "error": "影片已過保留期限，請重新準備。", "result": None}
+            message = MEDIA_ARCHIVED_MESSAGE if drive_backup_state(job_dir, manifest) else MEDIA_EXPIRED_MESSAGE
+            return {**payload, "status": "expired", "error_code": "MEDIA_EXPIRED", "error": message, "result": None}
         payload["result"] = tool_payload(manifest)
     elif payload.get("status") == "completed" and payload.get("result_kind") == "analysis":
         payload = {**payload, "result": refreshed_analysis(payload["result"])}
@@ -1965,8 +2060,10 @@ async def get_prepared_video(job_id: str) -> dict[str, Any]:
             # Retention keeps manifest/analysis records but deletes the prepared media.
             if latest.get("status") == "completed":
                 operations["latest_operation"] = refreshed_operation(latest["operation_id"])
+            archived = drive_backup_state(job_dir, manifest) is not None
             return {"status": "expired", "error_code": "MEDIA_EXPIRED", "job_id": job_id,
-                    "error": "影片已過保留期限，請重新準備。", "prepared": None, "analysis": None,
+                    "error": MEDIA_ARCHIVED_MESSAGE if archived else MEDIA_EXPIRED_MESSAGE,
+                    "drive_backup": archived, "prepared": None, "analysis": None,
                     "analysis_invalidated": False, **operations}
         analysis = cached_analysis(job_id, manifest, video_path)
         invalidated = latest.get("status") == "completed" and latest.get("result_kind") == "analysis" and analysis is None

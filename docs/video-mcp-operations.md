@@ -97,6 +97,30 @@ covered without removing their evidence caches. Each affected job retains its
 `media-retention.json` receipt. Deleted media cannot be recovered locally; expired
 links require downloading the source again. No paid API is called by cleanup.
 
+### Drive-primary media
+
+When Drive is configured, Drive is the long-term copy. The Drive job uploads the
+whole source video next to the segments and verifies both by size and SHA-256
+(`drive-manifest.json` `source_file`). Submitting a background analysis also queues
+the Drive job, so the backup does not depend on the widget.
+
+A job with a complete, verified backup is cleaned by `media_retention.py` instead
+of waiting seven days, once all of these hold: an analysis result exists for the
+same source fingerprint (any status — Drive restores the source for re-analysis),
+no playback link is still valid (`link_until`, at most `MCP_MEDIA_TTL_SECONDS`),
+the job was not prepared or analyzed within `MCP_DRIVE_BACKED_GRACE_SECONDS`
+(default 3600), every local copy still matches its backup, and Drive confirms each
+file is untrashed with the same bytes in the job folder. Any doubt keeps the media.
+Run the timer hourly so cleanup follows analysis closely; the command loads `.env`
+for the Drive credentials.
+
+Cleaned media comes back automatically: preparing the same URL, analyzing, or
+uploading the report downloads the source and segments from Drive, verifies
+size/SHA-256, restores the source mtime so the prepared fingerprint and analysis
+cache still match, and regenerates previews. Without a complete backup the old
+path applies (download the source URL again). `get_prepared_video` reports
+`MEDIA_EXPIRED` with `drive_backup: true` while media is archived on Drive.
+
 Health reports `runtime_sha256`, `writer_busy` and the retention policy for rollout
 verification; healthy status alone is not proof of successful cleanup.
 
