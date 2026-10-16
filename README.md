@@ -506,6 +506,8 @@ python pipeline.py --search '時間軸'   # 命中 N 筆（索引）
 
 `library.db` 可直接用任何 SQLite 工具開；`videos` 表一支影片一列，`events` 表是全文索引。
 
+`--category` 依完整分類標籤精確比對，可搭配 `--list`、`--search` 或 `--ask`，也適用於 `--semantic`。語意模式已有該模型的向量而分類沒有命中時，搜尋回傳零筆，問答回傳找不到相關片段；整庫缺少該模型的向量時仍須先執行 `--embed`。
+
 ## 問答與總覽
 
 兩者都需要 `MINIMAX_SUBSCRIPTION_KEY`，不需要額外服務。
