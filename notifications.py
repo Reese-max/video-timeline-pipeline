@@ -553,8 +553,12 @@ def record_pipeline_completed_event(root: Path, job_dir: Path, manifest: dict[st
             title = source.get("title", job)
             url = source.get("url", "")
             library_id = operations.get_or_create_library_id(conn)
-            artifact_hashes = operations.hash_job_artifacts(root, manifest)
-            # F0.2: the revision is derived from the actual artifact bytes, so
+            artifact_hashes = (
+                operations.verified_artifact_hashes(root, manifest)
+                if manifest.get("status") == "completed"
+                else operations.hash_job_artifacts(root, manifest)
+            )
+            # F0.2: the revision is derived from canonical analysis content, so
             # a rerun of identical content keeps the same identity instead of
             # becoming a newly notifiable video.
             revision = operations.compute_analysis_revision(manifest, artifact_hashes)
@@ -621,14 +625,13 @@ def record_pipeline_completed_event(root: Path, job_dir: Path, manifest: dict[st
                     dirty = True
             manifest_file = job_dir / "manifest.json"
             if dirty and manifest_file.is_file():
-                manifest_file.write_text(
-                    json.dumps(manifest, ensure_ascii=False, indent=2),
-                    encoding="utf-8",
-                )
+                from pipeline import write_json
+
+                write_json(manifest_file, manifest)
 
             # If Webhook or high priority notification is active, enqueue delivery
             webhook_url = os.getenv("DISCORD_WEBHOOK_URL") or os.getenv("RSS_NOTIFY_WEBHOOK")
-            if webhook_url:
+            if webhook_url and (manifest.get("status") != "completed" or eligible_at is not None):
                 delivery_id = enqueue_delivery(
                     conn,
                     event_id=event_id,

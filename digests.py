@@ -84,8 +84,7 @@ def collect_digest_candidates(
     # F0.2: when the completion registry exists it is the eligibility
     # authority. A registered revision with eligible_at NULL is reconciled
     # historical content and is not sent by default; jobs with no registry
-    # row (or whose manifest revision was never registered) fall back to
-    # manifest fields for backward compatibility — reconciliation
+    # row fall back to manifest fields for backward compatibility — reconciliation
     # (--ops-reconcile) closes that gap. An unreadable registry fails closed:
     # better an empty digest than sending on guesswork.
     eligibility = operations.load_eligibility_index(root)
@@ -113,18 +112,20 @@ def collect_digest_candidates(
             continue
 
         # Check eligibility timestamp
+        revision = manifest.get("analysis_revision", "1")
         entry = eligibility.get(job_path.name)
         if entry is not None:
-            revision = manifest.get("analysis_revision")
-            if revision is None:
-                registered_at = entry["latest"]
-            elif str(revision) in entry["revisions"]:
-                registered_at = entry["revisions"][str(revision)]
-            else:
-                # The manifest's content was never registered — treat as
-                # unregistered and use the manifest fallback below.
-                entry = None
-        if entry is not None:
+            # Recover the exact content identity when a DB commit preceded
+            # manifest writeback, or a stale manifest survived a rerun.
+            try:
+                revision = operations.compute_analysis_revision(
+                    manifest, operations.hash_job_artifacts(root, manifest)
+                )
+            except (OSError, ValueError):
+                continue
+            # A known job's changed content needs its own completion record;
+            # neither NULL eligibility nor an unknown revision may use mtime.
+            registered_at = entry["revisions"].get(str(revision))
             if not registered_at:
                 continue
             eligible_dt = parse_iso_datetime(registered_at)
@@ -162,7 +163,7 @@ def collect_digest_candidates(
                 "terms": summary.get("terms", []),
                 "chapters": chapters,
                 "eligible_at": eligible_dt.isoformat(),
-                "analysis_revision": manifest.get("analysis_revision", "1"),
+                "analysis_revision": str(revision),
             }
             candidates.append(item)
 

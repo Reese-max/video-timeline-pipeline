@@ -1,0 +1,68 @@
+{
+  "pr": 34,
+  "head": "f7528d76c7aa59d28005753776ed52157c93513c",
+  "findings": [
+    {
+      "severity": "high",
+      "file": "operations.py",
+      "line": 302,
+      "issue": "Revision hashes include transcript cache statistics, raw request timing and absolute visual paths, so identical cached or relocated analysis creates a new completion event."
+    },
+    {
+      "severity": "high",
+      "file": "operations.py",
+      "line": 520,
+      "issue": "Reconciliation trusts a recorded revision and eligible_at even when the current artifact content no longer matches that revision."
+    },
+    {
+      "severity": "med",
+      "file": "operations.py",
+      "line": 531,
+      "issue": "Reconciliation registers completion without its deterministic outbox event; additionally a pipeline rerun can notify a backfilled revision whose eligible_at is NULL."
+    },
+    {
+      "severity": "high",
+      "file": "notifications.py",
+      "line": 624,
+      "issue": "Completion metadata overwrites manifest.json directly; an interrupted write truncates the existing manifest after the database commits."
+    },
+    {
+      "severity": "med",
+      "file": "operations.py",
+      "line": 400,
+      "issue": "Read-only connection creation occurs outside error handling in both readers, so open failures escape instead of reporting unavailable or failing closed."
+    },
+    {
+      "severity": "med",
+      "file": "operations.py",
+      "line": 410,
+      "issue": "Readiness checks neither the required migration version nor the v2 tables and reports an incomplete v1 database as ready."
+    },
+    {
+      "severity": "med",
+      "file": "operations.py",
+      "line": 514,
+      "issue": "A non-object manifest, invalid artifacts mapping or unreadable artifact aborts the entire reconciliation sweep instead of skipping the bad job."
+    },
+    {
+      "severity": "high",
+      "file": "notifications.py",
+      "line": 576,
+      "issue": "A completed status alone is trusted: absent, unreadable or out-of-root analysis artifacts can be registered as verified completion."
+    },
+    {
+      "severity": "med",
+      "file": "digests.py",
+      "line": 165,
+      "issue": "Digest can emit legacy revision 1 after a DB commit precedes manifest identity writeback; a known job with an unregistered manifest revision can also bypass registry eligibility via created_at/mtime fallback."
+    },
+    {
+      "severity": "med",
+      "file": "notifications.py",
+      "line": 561,
+      "issue": "needs-human: pre-upgrade video.completed:<job>:1 and earlier hash-format events are not associated with the new canonical content identity; rerunning unchanged historical content can create another event. Historical metadata cannot establish whether a new hash represents the same analysis, so a migration/notification policy is required."
+    }
+  ],
+  "fixed": true,
+  "summary": "Fixed nine correctness and data-safety findings with 12 regression tests, including stable content identity, verified atomic completion recovery, historical no-send eligibility, safe manifest writes and read-only readiness. Git Bash verification passed: 166 Python tests (164 passed, 2 platform skips), 21 widget scenarios and git diff --check. needs-human: choose a migration/dedup policy for pre-upgrade revision-1 and earlier hash-format outbox events; their historical records cannot prove content equivalence, and no push, deployment or real provider send occurred."
+}

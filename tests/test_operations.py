@@ -34,6 +34,10 @@ def _ops():
 def _write_job(root: Path, job: str, manifest: dict, summary: dict | None = None) -> Path:
     job_dir = root / "jobs" / job
     job_dir.mkdir(parents=True, exist_ok=True)
+    if summary is not None and isinstance(manifest, dict):
+        artifacts = manifest.setdefault("artifacts", {})
+        if isinstance(artifacts, dict):
+            artifacts.setdefault("summary", f"jobs/{job}/summary.json")
     (job_dir / "manifest.json").write_text(
         json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8"
     )
@@ -601,10 +605,9 @@ class ReconcileBackfillTests(unittest.TestCase):
         ops = _ops()
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            # The completion hook writes analysis_revision and eligible_at as
-            # a pair — both present means the timestamp belongs to this
-            # content and is safe to trust.
-            _write_job(
+            # The recorded identity must match the actual content before
+            # its paired completion timestamp can be trusted.
+            job_dir = _write_job(
                 root,
                 "job_b",
                 {
@@ -616,6 +619,11 @@ class ReconcileBackfillTests(unittest.TestCase):
                 },
                 {"brief": "b"},
             )
+            manifest = json.loads((job_dir / "manifest.json").read_text(encoding="utf-8"))
+            manifest["analysis_revision"] = ops.compute_analysis_revision(
+                manifest, ops.hash_job_artifacts(root, manifest)
+            )
+            _write_job(root, "job_b", manifest)
             ops.reconcile_processed_revisions(root)
             conn = notifications.get_operations_db(root)
             try:
@@ -746,3 +754,217 @@ class DigestEligibilityTests(unittest.TestCase):
                 for c in digests.collect_digest_candidates(root, start, end)
             ]
             self.assertIn("plain_job", jobs)
+
+
+class SelfReviewRegressionTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        self.manifest = {
+            "schema_version": 1,
+            "status": "completed",
+            "source": {"title": "Demo"},
+            "artifacts": {"summary": "jobs/demo/summary.json"},
+        }
+        self.job = _write_job(self.root, "demo", self.manifest, {"brief": "same content"})
+        env = mock.patch.dict("os.environ", {"DISCORD_WEBHOOK_URL": "", "RSS_NOTIFY_WEBHOOK": ""})
+        env.start()
+        self.addCleanup(env.stop)
+
+    def _revision(self) -> str:
+        ops = _ops()
+        return ops.compute_analysis_revision(
+            self.manifest, ops.hash_job_artifacts(self.root, self.manifest)
+        )
+
+    def test_cached_transcription_keeps_completion_identity(self) -> None:
+        import pipeline
+
+        audio = self.job / "audio.wav"
+        audio.write_bytes(b"synthetic audio")
+        chunks = [{"index": 0, "path": str(audio), "sha256": "fake", "source_start": 0, "source_end": 1}]
+        self.manifest["artifacts"].update({
+            "transcript": "jobs/demo/transcript.json",
+            "transcript_raw": "jobs/demo/transcript.raw.json",
+        })
+        event_ids = []
+        response = {"language": "en", "segments": [{"start": 0, "end": 1, "text": "hello"}]}
+        with mock.patch("pipeline.groq_transcribe", return_value=response) as provider:
+            for _ in range(2):
+                transcript, raw = pipeline.transcribe_all(
+                    chunks, "synthetic", "test-model", "en", 1, self.job / "cache"
+                )
+                pipeline.write_json(self.job / "transcript.json", transcript)
+                pipeline.write_json(self.job / "transcript.raw.json", raw)
+                event_ids.append(notifications.record_pipeline_completed_event(self.root, self.job, self.manifest))
+        self.assertEqual(provider.call_count, 1)
+        self.assertIsNotNone(event_ids[0])
+        self.assertEqual(event_ids[0], event_ids[1])
+
+    def test_visual_paths_do_not_change_revision_but_content_does(self) -> None:
+        import pipeline
+
+        self.manifest["artifacts"].update({"visual": "jobs/demo/visual.json", "timeline": "jobs/demo/timeline.json"})
+        observation = {"timestamp": 1, "source_image": "C:/old-root/frame.jpg", "visual_summary": "same screen"}
+        revisions = []
+        for path, text in (("C:/old-root/frame.jpg", "same screen"), ("D:/new-root/frame.jpg", "same screen"), ("D:/new-root/frame.jpg", "new screen")):
+            observation.update(source_image=path, visual_summary=text)
+            pipeline.write_json(self.job / "visual.json", [observation])
+            pipeline.write_json(self.job / "timeline.json", pipeline.merge_timeline({}, [observation]))
+            revisions.append(self._revision())
+        self.assertEqual(revisions[0], revisions[1])
+        self.assertNotEqual(revisions[1], revisions[2])
+
+    def test_reconciliation_recomputes_stale_revision_without_backdating(self) -> None:
+        ops = _ops()
+        self.manifest.update(analysis_revision=self._revision(), eligible_at="2020-01-01T00:00:00Z")
+        (self.job / "summary.json").write_text('{"brief":"changed content"}', encoding="utf-8")
+        _write_job(self.root, "demo", self.manifest)
+        ops.reconcile_processed_revisions(self.root)
+        conn = notifications.get_operations_db(self.root)
+        try:
+            row = conn.execute("SELECT * FROM processed_revisions").fetchone()
+            self.assertEqual(row["analysis_revision"], self._revision())
+            self.assertIsNone(row["eligible_at"])
+            self.assertIsNone(row["first_completed_at"])
+        finally:
+            conn.close()
+
+    def test_reconciliation_recovers_event_atomically_and_idempotently(self) -> None:
+        ops = _ops()
+        with mock.patch("notifications._insert_event", side_effect=sqlite3.OperationalError("outbox failed")):
+            with self.assertRaises(sqlite3.Error):
+                ops.reconcile_processed_revisions(self.root)
+        conn = notifications.get_operations_db(self.root)
+        try:
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM processed_revisions").fetchone()[0], 0)
+        finally:
+            conn.close()
+        self.assertEqual(ops.reconcile_processed_revisions(self.root)["registered"], 1)
+        self.assertEqual(ops.reconcile_processed_revisions(self.root)["registered"], 0)
+        conn = notifications.get_operations_db(self.root)
+        try:
+            row = conn.execute("SELECT * FROM processed_revisions").fetchone()
+            event = conn.execute("SELECT * FROM notification_events").fetchall()
+            self.assertEqual(len(event), 1)
+            self.assertEqual(event[0]["analysis_revision"], row["analysis_revision"])
+            self.assertEqual(event[0]["library_id"], row["library_id"])
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM notification_deliveries").fetchone()[0], 0)
+            self.assertIsNone(row["eligible_at"])
+        finally:
+            conn.close()
+
+    def test_interrupted_manifest_write_preserves_existing_file(self) -> None:
+        original = (self.job / "manifest.json").read_bytes()
+        write_text = Path.write_text
+
+        def fail_during_write(path, content, *args, **kwargs):
+            write_text(path, "{", *args, **kwargs)
+            raise OSError("synthetic disk full")
+
+        with mock.patch.object(Path, "write_text", fail_during_write):
+            result = notifications.record_pipeline_completed_event(self.root, self.job, self.manifest)
+        self.assertIsNone(result)
+        self.assertEqual((self.job / "manifest.json").read_bytes(), original)
+
+    def test_readonly_open_errors_report_unavailable_and_fail_closed(self) -> None:
+        ops = _ops()
+        notifications.get_operations_db(self.root).close()
+        with mock.patch("operations.sqlite3.connect", side_effect=sqlite3.OperationalError("cannot open")):
+            self.assertEqual(ops.foundation_status(self.root)["status"], "unavailable")
+            self.assertIsNone(ops.load_eligibility_index(self.root))
+            now = datetime.datetime.now(datetime.timezone.utc)
+            self.assertEqual(digests.collect_digest_candidates(self.root, now - datetime.timedelta(days=1), now), [])
+
+    def test_v1_schema_is_migration_required_without_writes(self) -> None:
+        ops = _ops()
+        conn = sqlite3.connect(self.root / "operations.db")
+        conn.execute(ops._BOOTSTRAP_DDL)
+        ops.apply_migrations(conn, ops.MIGRATIONS[:1])
+        conn.close()
+        before = (self.root / "operations.db").read_bytes()
+        self.assertEqual(ops.foundation_status(self.root)["status"], "migration_required")
+        self.assertEqual((self.root / "operations.db").read_bytes(), before)
+
+    def test_bad_manifest_or_unreadable_artifact_does_not_abort_sweep(self) -> None:
+        ops = _ops()
+        for bad in ([], None, {"status": "completed", "artifacts": ["invalid"]}, {"status": "completed", "artifacts": {"summary": "jobs/a_bad/summary.json"}}):
+            with self.subTest(manifest=bad), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                _write_job(root, "a_bad", bad, {"brief": "unreadable"})
+                good = {"status": "completed", "artifacts": {"summary": "jobs/z_good/summary.json"}}
+                _write_job(root, "z_good", good, {"brief": "good"})
+                original_open = Path.open
+
+                def unreadable(path, *args, **kwargs):
+                    if path.parent.name == "a_bad" and path.name == "summary.json":
+                        raise PermissionError("unreadable artifact")
+                    return original_open(path, *args, **kwargs)
+
+                with mock.patch.object(Path, "open", unreadable):
+                    result = ops.reconcile_processed_revisions(root)
+                self.assertEqual(result, {"scanned": 2, "registered": 1, "skipped": 1})
+
+    def test_completed_requires_available_analysis_artifacts(self) -> None:
+        for artifacts in ({}, {"summary": "missing.json"}, {"summary": "jobs/demo/summary.json", "transcript": "missing.json"}):
+            with self.subTest(artifacts=artifacts), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                manifest = {"status": "completed", "artifacts": artifacts}
+                job = _write_job(root, "demo", manifest)
+                if "transcript" in artifacts:
+                    (job / "summary.json").write_text('{"brief":"valid summary"}', encoding="utf-8")
+                self.assertIsNone(notifications.record_pipeline_completed_event(root, job, manifest))
+                result = _ops().reconcile_processed_revisions(root)
+                self.assertEqual(result["registered"], 0)
+                conn = notifications.get_operations_db(root)
+                try:
+                    self.assertEqual(conn.execute("SELECT COUNT(*) FROM processed_revisions").fetchone()[0], 0)
+                    self.assertEqual(conn.execute("SELECT COUNT(*) FROM notification_events").fetchone()[0], 0)
+                finally:
+                    conn.close()
+
+    def test_digest_recovers_content_identity_after_missing_manifest_writeback(self) -> None:
+        self.assertIsNotNone(notifications.record_pipeline_completed_event(self.root, self.job, self.manifest))
+        revision = self.manifest["analysis_revision"]
+        eligible = datetime.datetime.fromisoformat(self.manifest["eligible_at"])
+        # A later, different revision must not supply this content's time.
+        conn = notifications.get_operations_db(self.root)
+        try:
+            with conn:
+                _ops().register_processed_revision(
+                    conn, library_id=self.manifest["library_id"], job="demo",
+                    analysis_revision="other-revision", artifact_hashes={},
+                    first_completed_at="2100-01-01T00:00:00+00:00",
+                    eligible_at="2100-01-01T00:00:00+00:00", backfill=False, status="completed",
+                )
+        finally:
+            conn.close()
+        self.manifest.pop("analysis_revision")
+        self.manifest.pop("eligible_at")
+        _write_job(self.root, "demo", self.manifest)
+        candidates = digests.collect_digest_candidates(self.root, eligible - datetime.timedelta(hours=1), eligible + datetime.timedelta(hours=1))
+        self.assertEqual(len(candidates), 1)
+        self.assertEqual(candidates[0]["analysis_revision"], revision)
+        self.assertEqual(datetime.datetime.fromisoformat(candidates[0]["eligible_at"]), eligible)
+
+    def test_reconciled_history_is_not_notified_on_pipeline_rerun(self) -> None:
+        import email_providers
+
+        _ops().reconcile_processed_revisions(self.root)
+        provider = email_providers.FakeProvider(mode="accepted")
+        with mock.patch.dict("os.environ", {"DISCORD_WEBHOOK_URL": "https://example.com/webhook"}), mock.patch("notifications.get_configured_provider", return_value=provider):
+            notifications.record_pipeline_completed_event(self.root, self.job, self.manifest)
+        self.assertEqual(provider.history, [])
+
+    def test_known_history_with_unregistered_content_stays_ineligible(self) -> None:
+        _ops().reconcile_processed_revisions(self.root)
+        (self.job / "summary.json").write_text('{"brief":"not registered yet"}', encoding="utf-8")
+        now = datetime.datetime.now(datetime.timezone.utc)
+        for revision in (None, "unregistered-revision"):
+            with self.subTest(revision=revision):
+                if revision is not None:
+                    self.manifest["analysis_revision"] = revision
+                _write_job(self.root, "demo", self.manifest)
+                candidates = digests.collect_digest_candidates(self.root, now - datetime.timedelta(hours=1), now + datetime.timedelta(hours=1))
+                self.assertEqual(candidates, [])

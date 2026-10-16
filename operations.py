@@ -10,7 +10,7 @@ Shared primitives every feature work package builds on:
   ``library_meta``, reused across restarts and preserved when the root is
   moved or copied), plus the ``processed_revisions`` completion registry.
 
-``analysis_revision`` is derived from the actual artifact bytes — index
+``analysis_revision`` is derived from canonical analysis content — index
 times, run times and absolute root paths never enter the hash, so rerunning
 identical content yields the identical revision and never becomes a newly
 notifiable video.
@@ -31,7 +31,7 @@ from typing import Any
 
 FOUNDATION_SCHEMA_VERSION = 2
 
-# Analysis artifacts whose bytes define the revision. Rendered outputs
+# Analysis artifacts recorded by the registry. Rendered outputs
 # (notes.md, knowledge.md, *.srt) and bookkeeping (source.json,
 # manifest.json) are excluded on purpose: they are regenerated from content
 # or change every run without meaning new analysis.
@@ -44,7 +44,8 @@ CONTENT_ARTIFACTS = (
     "steipete_slides",
 )
 
-REVISION_FORMAT = "f0-analysis-revision-1"
+REVISION_ARTIFACTS = ("transcript", "visual", "timeline", "summary")
+REVISION_FORMAT = "f0-analysis-revision-2"
 
 _BOOTSTRAP_DDL = """
 CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -278,13 +279,16 @@ def _sha256_file(path: Path) -> str:
 
 
 def hash_job_artifacts(root: Path, manifest: dict[str, Any]) -> dict[str, str]:
-    """Content hashes of the analysis artifacts named in the manifest.
+    """Content fingerprints of the analysis artifacts named in the manifest.
 
-    Only CONTENT_ARTIFACTS entries are hashed and only file bytes count —
-    paths and mtimes are provenance, never identity. Missing files are
-    skipped so partial jobs hash deterministically.
+    Revision artifacts use canonical JSON without cache counters or local
+    image paths. Raw provider/extractor artifacts retain byte checksums for
+    provenance but do not define the revision. Missing files are skipped
+    here; verified completion requires all declared artifacts below.
     """
-    artifacts = manifest.get("artifacts") or {}
+    artifacts = manifest.get("artifacts", {})
+    if not isinstance(artifacts, dict):
+        raise ValueError("artifacts must be an object")
     hashes: dict[str, str] = {}
     for name in CONTENT_ARTIFACTS:
         value = artifacts.get(name)
@@ -299,18 +303,50 @@ def hash_job_artifacts(root: Path, manifest: dict[str, Any]) -> dict[str, str]:
         if not resolved.is_relative_to(root.resolve()):
             continue
         if resolved.is_file():
-            hashes[name] = _sha256_file(resolved)
+            if name not in REVISION_ARTIFACTS:
+                hashes[name] = _sha256_file(resolved)
+                continue
+            content = json.loads(resolved.read_text(encoding="utf-8"))
+            expected_type = dict if name in {"transcript", "summary"} else list
+            if not isinstance(content, expected_type):
+                raise ValueError(f"invalid {name} artifact")
+            if isinstance(content, list) and any(not isinstance(item, dict) for item in content):
+                raise ValueError(f"invalid {name} item")
+            if name == "transcript":
+                content.pop("cache", None)
+            elif name == "visual":
+                content = [{k: v for k, v in item.items() if k != "source_image"} for item in content]
+            elif name == "timeline":
+                for event in content:
+                    if event.get("type") == "visual" and isinstance(event.get("data"), dict):
+                        event["data"].pop("source_image", None)
+            material = json.dumps(content, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+            hashes[name] = hashlib.sha256(material.encode("utf-8")).hexdigest()
+    return hashes
+
+
+def verified_artifact_hashes(root: Path, manifest: dict[str, Any]) -> dict[str, str]:
+    """Reject missing/out-of-root artifacts and unusable completed summaries."""
+    hashes = hash_job_artifacts(root, manifest)
+    artifacts = manifest.get("artifacts", {})
+    expected = {name for name in CONTENT_ARTIFACTS if artifacts.get(name) is not None}
+    if "summary" not in hashes or expected != hashes.keys():
+        raise ValueError("completed analysis artifacts are missing or outside the root")
+    summary_path = root / artifacts["summary"]
+    summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    if not summary or summary.get("status") == "skipped":
+        raise ValueError("completed summary is empty or skipped")
     return hashes
 
 
 def compute_analysis_revision(
     manifest: dict[str, Any], artifact_hashes: dict[str, str]
 ) -> str:
-    """Deterministic revision id derived from actual analysis content."""
+    """Deterministic revision id; raw request/extractor metadata is provenance."""
     material = {
         "format": REVISION_FORMAT,
         "schema_version": manifest.get("schema_version"),
-        "artifacts": {k: artifact_hashes[k] for k in sorted(artifact_hashes)},
+        "artifacts": {k: artifact_hashes[k] for k in sorted(artifact_hashes) if k in REVISION_ARTIFACTS},
     }
     return hashlib.sha256(
         json.dumps(material, ensure_ascii=False, sort_keys=True).encode("utf-8")
@@ -397,17 +433,22 @@ def foundation_status(root: Path) -> dict[str, Any]:
     A corrupt or unreadable store reports ``unavailable`` rather than
     raising — read paths never fail closed onto write paths.
     """
-    conn = open_readonly(root)
-    if conn is None:
-        return {"status": "unavailable", "library_id": None, "schema_version": None}
+    conn = None
     try:
+        conn = open_readonly(root)
+        if conn is None:
+            return {"status": "unavailable", "library_id": None, "schema_version": None}
         tables = {
             row[0]
             for row in conn.execute(
                 "SELECT name FROM sqlite_master WHERE type='table'"
             )
         }
-        required = {"schema_migrations", "library_meta", "processed_revisions"}
+        required = {
+            "schema_migrations", "library_meta", "processed_revisions",
+            "notification_events", "notification_deliveries", "delivery_attempts",
+            "digest_runs", "digest_items",
+        }
         if not required.issubset(tables):
             return {
                 "status": "migration_required",
@@ -415,6 +456,8 @@ def foundation_status(root: Path) -> dict[str, Any]:
                 "schema_version": None,
             }
         version = conn.execute("SELECT MAX(version) FROM schema_migrations").fetchone()
+        if int(version[0] or 0) < FOUNDATION_SCHEMA_VERSION:
+            return {"status": "migration_required", "library_id": None, "schema_version": int(version[0] or 0)}
         library = conn.execute(
             "SELECT value FROM library_meta WHERE key = 'library_id'"
         ).fetchone()
@@ -423,7 +466,7 @@ def foundation_status(root: Path) -> dict[str, Any]:
             "library_id": library[0] if library else None,
             "schema_version": int(version[0] or 0),
         }
-    except sqlite3.Error as exc:
+    except (sqlite3.Error, OSError) as exc:
         return {
             "status": "unavailable",
             "library_id": None,
@@ -431,7 +474,8 @@ def foundation_status(root: Path) -> dict[str, Any]:
             "error": str(exc),
         }
     finally:
-        conn.close()
+        if conn is not None:
+            conn.close()
 
 
 def load_eligibility_index(root: Path) -> dict[str, dict[str, Any]] | None:
@@ -448,10 +492,11 @@ def load_eligibility_index(root: Path) -> dict[str, dict[str, Any]] | None:
     present-but-None eligible_at means "registered, not eligible" — callers
     must not substitute a fabricated timestamp (F0.2: 預設不寄歷史內容).
     """
-    conn = open_readonly(root)
-    if conn is None:
-        return {}
+    conn = None
     try:
+        conn = open_readonly(root)
+        if conn is None:
+            return {}
         rows = conn.execute(
             """
             SELECT job, analysis_revision, eligible_at,
@@ -459,10 +504,11 @@ def load_eligibility_index(root: Path) -> dict[str, dict[str, Any]] | None:
             FROM processed_revisions
             """
         ).fetchall()
-    except sqlite3.Error:
+    except (sqlite3.Error, OSError):
         return None
     finally:
-        conn.close()
+        if conn is not None:
+            conn.close()
 
     index: dict[str, dict[str, Any]] = {}
     for row in rows:
@@ -495,7 +541,7 @@ def reconcile_processed_revisions(root: Path) -> dict[str, int]:
     if not root.is_dir():
         return {"scanned": 0, "registered": 0, "skipped": 0}
 
-    from notifications import get_operations_db
+    from notifications import _insert_event, get_operations_db
 
     scanned = registered = skipped = 0
     with closing(get_operations_db(root)) as conn:
@@ -508,25 +554,21 @@ def reconcile_processed_revisions(root: Path) -> dict[str, int]:
             scanned += 1
             try:
                 manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-            except (OSError, json.JSONDecodeError):
+                if not isinstance(manifest, dict) or manifest.get("status") != "completed":
+                    skipped += 1
+                    continue
+                artifact_hashes = verified_artifact_hashes(root, manifest)
+                source = manifest.get("source", {})
+                if not isinstance(source, dict):
+                    raise ValueError("source must be an object")
+            except (OSError, ValueError):
                 skipped += 1
                 continue
-            if manifest.get("status") != "completed":
-                skipped += 1
-                continue
-            artifact_hashes = hash_job_artifacts(root, manifest)
-            # The recorded revision is the completion-time identity; only
-            # manifests that predate revision tracking get a computed one.
+            revision = compute_analysis_revision(manifest, artifact_hashes)
             recorded_revision = manifest.get("analysis_revision")
-            revision = recorded_revision or compute_analysis_revision(
-                manifest, artifact_hashes
-            )
-            # eligible_at is only trustworthy when the completion hook wrote
-            # it — it always writes the field together with analysis_revision.
-            # A bare eligible_at may belong to different content; backfilled
-            # rows then keep NULL rather than fabricating a completion time.
+            # Trust a completion timestamp only when it belongs to these bytes.
             first_completed = (
-                manifest.get("eligible_at") if recorded_revision else None
+                manifest.get("eligible_at") if recorded_revision == revision else None
             )
             with conn:
                 _, created = register_processed_revision(
@@ -539,6 +581,13 @@ def reconcile_processed_revisions(root: Path) -> dict[str, int]:
                     eligible_at=first_completed,
                     backfill=True,
                     status="completed",
+                )
+                job = manifest_path.parent.name
+                _insert_event(
+                    conn, "video.completed", library_id, job, revision,
+                    {"job": job, "title": source.get("title", job), "url": source.get("url", ""),
+                     "analysis_revision": revision, "created_at": _utc_now_iso(), "backfill": True},
+                    f"video.completed:{job}:{revision}",
                 )
             if created:
                 registered += 1

@@ -445,13 +445,17 @@ python pipeline.py --search '時間軸'   # 命中 N 筆（索引）
 
 `library.db` 是可重建的搜尋投影；寄送紀錄、成本、評分與完成登記放進 Git 忽略的 `operations.db`，不綁會被 DROP/REPLACE 的搜尋表。基礎結構由 `operations.py` 提供：
 
-- `schema_migrations`：唯一版本化 migration registry；每個 migration 在單一交易內套用，中途失敗不留半套 schema。
+- `schema_migrations`：共用版本化 migration registry，目前納管 F0、通知與摘要資料表；每個 migration 在單一交易內套用，中途失敗不留半套 schema。既有成本／評分 schema 與舊讀取路徑尚待遷移。
 - `library_meta`：每個資料庫集合的 `library_id` UUID——產生一次後跨重啟保留，搬移或複製 root 不會換新；要另一個獨立資料集需明確初始化。
-- `processed_revisions`：完成登記表。`analysis_revision` 由分析產物內容雜湊得出（不含 `indexed_at`、執行時間或絕對路徑），重跑相同內容仍是同一 revision，不會變成新的可通知影片；內容真的改變才是新 revision。verified completed 產物登記與 outbox 事件在同一個 operations.db 交易內提交。
+- `processed_revisions`：完成登記表。`analysis_revision` 使用 `f0-analysis-revision-2`，由 transcript／visual／timeline／summary 的正規化 JSON 雜湊得出，排除逐字稿快取計數、畫面本機路徑與 JSON 排版；原始 provider 回應及 steipete 輸出保留檔案雜湊供追溯，不參與 revision。重跑相同分析內容仍是同一 revision，內容改變才是新 revision。登記前確認摘要非空、未略過，且所有宣告的分析產物均可讀並位於 root 內；完成登記與 outbox 事件在同一個 operations.db 交易內提交。
 - 讀取契約：`open_readonly()`／`foundation_status()` 以 `mode=ro` 開啟、不跑 DDL；未初始化回 `unavailable`、缺表回 `migration_required`，不隱式建庫。
 - `eligible_at`：完成時寫進 manifest 與登記表；digest 候選以登記表為準，補掃到的歷史內容（`backfill=1`、`eligible_at` 為 NULL）預設不寄。
 
-漏登記由 reconciliation 補掃：`python pipeline.py --ops-reconcile` 掃描 `jobs/*/manifest.json`，把已完成但未登記的影片補進 `processed_revisions`；無可靠首次完成時間時不假造，標記 `backfill=1` 且 `eligible_at` 留空。
+已登記 job 的內容必須命中自己的 revision 與非空資格時間才可入選 digest，不能改用 manifest 建立時間或檔案 mtime；相容回退僅適用於完全未登記的 job。
+
+漏登記由 reconciliation 補掃：`python pipeline.py --ops-reconcile` 掃描 `jobs/*/manifest.json`，在同一交易補齊 `processed_revisions` 與去重 outbox 事件，不建立寄送工作；單一損壞 manifest 或不可讀產物計入 `skipped` 後繼續。每次重新核對實際內容，只有 manifest 的 revision 與目前內容相符才沿用其完成時間；否則標記 `backfill=1` 且 `eligible_at` 留空，重跑相同歷史內容也不通知。完成 hook 的 manifest 回寫使用暫存檔替換；若資料庫先提交而回寫未完成，digest 可從產物還原登記身分與資格時間。
+
+既有 `video.completed:<job>:1` 事件及先前 revision 格式的遷移政策尚待人工決定：舊帳本沒有足夠內容證據可安全對應新雜湊，不能宣稱跨格式升級後已保證不重複通知。正式啟用前須完成此項對帳與政策決策；本 PR 未部署或啟用寄送。
 
 ## 問答與總覽
 

@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- PR #34 自審：修正 revision 雜湊誤含快取／耗時／本機路徑、補掃的內容身分與 outbox 原子恢復、壞資料隔離、完成產物檢查、manifest 安全回寫及 digest 身分恢復；補齊唯讀開啟失敗與 migration v2 就緒判斷。舊 revision 事件的升級去重政策仍需人工決定，未部署或寄送。
 - F0 共用基礎（#7 Roadmap）：`operations.db` 新增版本化 `schema_migrations` registry、每集合穩定的 `library_id`、以及 `processed_revisions` 完成登記表；`analysis_revision` 改由分析產物內容雜湊，重跑相同內容不變成新的可通知影片。完成登記與 outbox 事件於同一交易提交；`--ops-reconcile` 補掃漏登記並標記 `backfill=1`（`eligible_at` 留空、預設不寄歷史內容）；讀取介面 `operations.open_readonly()`／`foundation_status()` 以 `mode=ro` 開啟且未初始化時回 `unavailable`／`migration_required`，不隱式建庫。
 - MiniMax 僅接受完整的 `finish_reason=stop`；截斷或欄位不完整的畫面觀察保留未完成狀態，不寫入可重用快取。逐張與整批視覺快取均檢查 schema，知識檔與 manifest 明確標示視覺完成狀態；以假回應驗證，真實 MiniMax 尚待實測。
 - 2026-09-24：統一 Bright Data 單篇與 IG 作者採集的單次提交／持久回執；未知回應禁止重送，已知 snapshot 可續跑，作者下一輪以成功落盤的 snapshot 推進。基於 `703e649`，本批尚未推送或部署；離線驗證 `python -X utf8 -m unittest discover -s tests -q`：116 項、114 通過／2 項平台略過；`node tests/test_widget_handoff.cjs`：21 項通過；`git diff --check` 通過，皆 exit 0。下一驗收為審閱、推送與部署後的非新增計費 smoke test；不沿用先前部署的線上驗收。
