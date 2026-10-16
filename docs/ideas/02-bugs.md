@@ -45,6 +45,22 @@
 - **驗收：** 畫面證據的 timestamp 要分布在 0–166 秒，和截圖對照的誤差不超過 5 秒。
 - **main 現況：** 提示詞要求原片秒數並覆蓋全片；峰值不足時沿用已上傳檔案重問一次，仍不足就標未完成、不寫快取；逐筆 `timestamp_reliable`：超出片長或 ≥80% 擠在前 10% 的事件標為不可靠，widget 顯示「（時間碼不可靠）」且不給跳轉；不做 rescale。尚未驗證：與截圖誤差 ≤5 秒。
 
+**2026-10-16 本機回歸修補（#56）：** 補問畫面空檔的回應也必須逐次執行既有時間碼檢查，再合併事件；否則正常的首輪事件會掩蓋補問回應中集中在 1–6 秒的時間碼。修補保留原始時間與不可靠標記，不做比例換算；單支影片快取與 CLI `visual.json` 的驗證版本同步失效，MCP 快取沿用既有程式雜湊失效機制。
+
+| 驗收項目 | 本次證據 | 結果 |
+|---|---|---|
+| 畫面時間碼使用原片秒數，異常分布不作可靠跳轉 | 首輪與補問分別檢查；壓縮補問事件保留原值並標不可靠，正常事件不受影響 | 離線回歸通過 |
+| 不沿用未檢查補問時間碼的快取 | 舊 MP4 快取版本與 CLI 設定被拒，新快取保留不可靠標記且可重用 | 離線回歸通過 |
+| 原始 166.6 秒影片、真實 MiniMax 回應與逐筆截圖誤差 ≤5 秒 | 本次未執行真實模型／媒體驗收，離線 provider 回應不能證明對齊 | **未驗證，#56 仍待驗收** |
+
+重跑本次相關測試（Git Bash）：
+
+```bash
+python -X utf8 -B -m unittest discover -s tests -p test_video_event_gap_fill.py -v && python -X utf8 -B -m unittest discover -s tests -p 'test_video_timestamp*.py' -v
+```
+
+本次相關測試由 41 項增加至 43 項，43 項全數通過（exit 0）。完整檢查 `.venv/Scripts/python.exe -X utf8 -B scripts/check_offline.py` 為 Python 599 通過、24 略過，Node 94 項通過（exit 0）；`pwsh -NoProfile -NonInteractive -File tests/test_windows_sync.ps1` 另有 30 項通過（exit 0）。`git diff --check` 通過；專案未配置 lint、coverage ratchet、CRAP 或 mutation gate。
+
 ## 3. 小錯誤（不一定要修，合併時要注意）
 
 - **Whisper 錯字**（畫面字幕是對的）：

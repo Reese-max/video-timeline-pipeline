@@ -36,8 +36,13 @@ class CliVisualReuseTests(unittest.TestCase):
     def test_visual_json_from_before_gap_filling_is_not_reused(self):
         self.assertFalse(pipeline.gap_checked_video_config({"visual_mode": "video_mp4"}))
         self.assertFalse(pipeline.gap_checked_video_config(None))
+        gap_config = {"visual_mode": "video_mp4",
+                      "visual_event_gap_seconds": pipeline.VIDEO_EVENT_MAX_GAP_SECONDS}
+        self.assertFalse(pipeline.gap_checked_video_config(gap_config))
+        self.assertFalse(pipeline.gap_checked_video_config(
+            {**gap_config, "visual_timestamp_validation_version": 2}))
         self.assertTrue(pipeline.gap_checked_video_config(
-            {"visual_mode": "video_mp4", "visual_event_gap_seconds": pipeline.VIDEO_EVENT_MAX_GAP_SECONDS}))
+            {**gap_config, "visual_timestamp_validation_version": 3}))
 
 
 class VideoGapFillCallTests(unittest.TestCase):
@@ -82,6 +87,25 @@ class VideoGapFillCallTests(unittest.TestCase):
             self.assertIn("壓縮", by_stamp[stamp]["timestamp_issue"])
         self.assertIs(by_stamp[50]["timestamp_reliable"], True)
 
+    def test_gap_fill_checks_its_own_compressed_timestamps_before_caching(self):
+        cache = self.root / "cache"
+        compressed = [1, 2, 3, 4, 5, 6]
+        rows, chat, upload = self.run_mp4(
+            [answer(40, 90, 137), answer(*compressed)], 166.6, cache_dir=cache)
+        self.assertEqual((upload.call_count, chat.call_count), (1, 2))
+        self.assertEqual([row["timestamp"] for row in rows], [*compressed, 40, 90, 137])
+        for row in rows:
+            if row["timestamp"] in compressed:
+                self.assertIs(row["timestamp_reliable"], False)
+                self.assertIn("壓縮", row["timestamp_issue"])
+                self.assertEqual(row["timestamp_original"], row["timestamp"])
+                self.assertFalse(pipeline.visual_time_reliable(row))
+            else:
+                self.assertIs(row["timestamp_reliable"], True)
+        cached, chat, upload = self.run_mp4([], 166.6, cache_dir=cache)
+        self.assertEqual((upload.call_count, chat.call_count), (0, 0))
+        self.assertEqual(cached, rows)
+
     def test_summary_only_answer_is_not_gap_filled(self):
         rows, chat, _ = self.run_mp4([json.dumps({"events": [], "overall_summary": "摘要"})], 120)
         self.assertEqual(chat.call_count, 1)
@@ -124,6 +148,14 @@ class VideoGapFillCallTests(unittest.TestCase):
         again, chat, upload = self.run_mp4([], 120, cache_dir=cache)
         self.assertEqual((upload.call_count, chat.call_count), (0, 0))
         self.assertEqual([row["timestamp"] for row in again], [0, 50, 100])
+
+    def test_cache_from_before_gap_timestamp_checks_is_not_reused(self):
+        cache = self.root / "cache"
+        with mock.patch.object(pipeline, "VIDEO_TIMESTAMP_VALIDATION_VERSION", 2, create=True):
+            self.run_mp4([answer(0, 100), answer(50)], 120, cache_dir=cache)
+        rows, chat, upload = self.run_mp4([answer(0, 100), answer(50)], 120, cache_dir=cache)
+        self.assertEqual((upload.call_count, chat.call_count), (1, 2))
+        self.assertEqual([row["timestamp"] for row in rows], [0, 50, 100])
 
 
 if __name__ == "__main__":
