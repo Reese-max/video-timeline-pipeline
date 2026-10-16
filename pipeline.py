@@ -7434,8 +7434,10 @@ def self_test() -> None:
             fake_job / "timeline.json",
             [
                 {"timestamp": 3.0, "type": "speech", "text": "這段說明時間軸合併的做法"},
-                {"timestamp": 5.0, "type": "visual", "data": {"visual_summary": "終端機畫面"}},
-                {"timestamp": 7.0, "type": "visual", "data": {"visual_summary": "合併前後對照，合併結果如圖"}},
+                {"timestamp": 5.0, "type": "visual", "data": {"visual_summary": "終端機畫面",
+                                                              "analysis_method": "minimax_video", "timestamp_reliable": True}},
+                {"timestamp": 7.0, "type": "visual", "data": {"visual_summary": "合併前後對照，合併結果如圖",
+                                                              "analysis_method": "minimax_video", "timestamp_reliable": True}},
             ],
         )
         assert build_index(index_root)[1:] == (1, 4)

@@ -40,6 +40,7 @@ INCOMPLETE_OBSERVATION = {
     "finish_reason": "timestamp_coverage",
     "max_observed_timestamp": 6.9,
     "duration_seconds": DURATION,
+    "analysis_method": "minimax_video",
 }
 
 GOOD_OBSERVATION = {
@@ -50,6 +51,8 @@ GOOD_OBSERVATION = {
     "important_details": [],
     "confidence": 0.9,
     "completion_status": "complete",
+    "analysis_method": "minimax_video",
+    "timestamp_reliable": True,
 }
 
 CLEAN_TRANSCRIPT = {
