@@ -29,6 +29,7 @@ def main() -> int:
             ["node", "tests/test_parallel_submission.cjs"],
             ["node", "tests/test_widget_analysis_report.cjs"],
             ["node", "tests/test_widget_library_experiment.cjs"],
+            ["node", "tests/test_dashboard_ui.cjs"],
         ):
             result = subprocess.run(command, cwd=root, env=env)
             if result.returncode:
