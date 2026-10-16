@@ -505,6 +505,8 @@ python pipeline.py --digest
 
 每個片段都有完整 SHA-256 的 `occurrence_id`，綁定 `library_id`、job、`analysis_revision`、類型、真實起訖（未知保持 NULL）、時間種類、文字雜湊、chunker 版本與有證據的原始 segment IDs。同一份來源及分析重建索引時 ID 不變；來源 URL／位元組版本、實際模型與分析參數、原始 timeline／summary 或明示 analysis revision 改變時，引用屬於新版本。`library-id.json` 是持久資料，搬移、備份與衍生資料庫重建時須保留；連同此檔複製的資料庫仍代表同一邏輯 library，獨立建立的 library 則有不同身分。搜尋與引用輸出保留上述來源欄位；沒有原始 segment ID 時輸出空陣列，不捏造。Ask 的模型回應須為 `{"claims":[{"support_kind":"source_quote","block_index":1,"quote":"完整原始片段文字"}]}`。原文須完整一致，不接受截去日期或否定詞的摘錄，也不接受跨越合併片段邊界的引文；非法編號、改寫、額外文字或模型提供的來源 URL 會使整份回答拒絕。無法核對時回傳 `insufficient_evidence=true`、空 `claims`，並保留檢索 evidence；合法的舊格式引用可保留供查閱，但舊格式主張不會發布。
 
+索引對同一份 artifact bytes 計算 revision 並解析原文，避免並行更新時引用版本與內容錯配。原始 IDs 同時讀取管線的 speech `source`／visual `data`，數字 ID 以字串保留。非法、負數或非有限的起點視為未知；非法或早於起點的終點不構成範圍，保留已知起點，不猜測時間。
+
 成功的 `claims` 由程式綁定原始 occurrence IDs，標記 `quote_verified=true`；`support_validation=exact_source_quote` 僅代表引文與已提供原文一致。逐字稿、視覺模型觀察與衍生摘要會分別標示來源類型。`semantic_support_verified` 一律仍是 `false`：尚未驗證片段是否回答問題、影片說法是否正確或舊價格是否適用於現在。跨片綜合、模型推論與當前外部事實仍拒絕生成；issue #5 的人工 golden evaluation 與完整語意支持驗證尚未完成。片段指令仍為不可信資料，核對失敗不會自動增加修復或驗證模型呼叫。
 
 Ask 以 UTF-8 byte 數保守估算 token，計入指令、問題、標題、時間範圍與 512 token 的回答預留；這是 context 規劃，並未限制供應商實際輸出長度。合併相鄰片段會保留全部來源 ID，合併後超出預算則維持分段；省略數與原因見 `packing`，只有命中多支影片時才限制單片占比。
@@ -594,6 +596,8 @@ python pipeline.py --search '合併' --hybrid --rerank --explain --json
 ```
 
 篩選旗標（`--search`／`--ask` 共用）：`--kind speech,visual`、`--job`、`--platform`、`--author`、`--since/--until`（欄位由 `--date-field` 選 `published_at`／`first_completed_at`／`indexed_at`，預設 `published_at`）、`--include-unknown-dates`。套用日期篩選時，日期未知的影片預設排除並提示筆數；JSON 搜尋與 Ask 檢索資訊包含 `unknown_dates_excluded` 與 `date_field`。發布日不拿索引日冒充，完成日不拿建立日代替。分類是 JSON 精確比對，「資安」不會誤命中「資安新聞」。platform／author／published_at 由 manifest（含 RSS 發布日）與 yt-dlp `source.info.json` 可追溯回填，沒有證據就是 NULL。
+
+新工作首次成功完成時記錄 `first_completed_at`，重跑保留原值；既有已完成工作若沒有日期證據仍為未知。Hybrid 各路候選數至少等於要求的 limit；Ask 降級後先取得關鍵詞候選，再對實際送入 context 的候選執行一次可選 rerank，回報相應筆數。`--json` 與索引／向量前置操作合用時，進度送往 stderr，stdout 保留檢索或回答 JSON。
 
 `--rerank` 是可選的 provider 重排（預設關閉，需 `OPENROUTER_API_KEY`，一般供應商失效時保留原排序；成本守衛拒絕時會停止，不自動降級或改呼叫其他供應商）。`--explain` 顯示每筆命中與 Ask 引用的 RRF／各路名次，只讀已存資料、不額外呼叫模型。`--json` 輸出完整結構（含 `occurrence_id`、`rank_detail`）；`retrieval_mode` 固定為機器可讀 token（`fts`／`semantic`／`hybrid`），人類可讀的檢索描述放在 `mode_label`。`--min-similarity` 同時約束 `--semantic` 與 `--hybrid` 的向量腿。`--search-limit`／`--ask-limit` 必須 ≥ 1；`--ask` 需要非空白問題。
 

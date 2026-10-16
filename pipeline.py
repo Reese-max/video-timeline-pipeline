@@ -3163,8 +3163,6 @@ def index_connection(root: Path) -> sqlite3.Connection:
             content_hash TEXT NOT NULL,
             chunker_version TEXT NOT NULL
         );
-        CREATE INDEX IF NOT EXISTS occurrences_job_idx ON occurrences(job);
-        CREATE INDEX IF NOT EXISTS occurrences_hash_idx ON occurrences(content_hash);
         CREATE TABLE IF NOT EXISTS occurrence_provenance (
             occurrence_id TEXT PRIMARY KEY,
             library_id TEXT NOT NULL,
@@ -3248,6 +3246,9 @@ def index_connection(root: Path) -> sqlite3.Connection:
             """
         )
         migrated = True
+    # DROP TABLE also removes its indexes during the legacy schema rebuild.
+    connection.execute("CREATE INDEX IF NOT EXISTS occurrences_job_idx ON occurrences(job)")
+    connection.execute("CREATE INDEX IF NOT EXISTS occurrences_hash_idx ON occurrences(content_hash)")
     if migrated:
         connection.execute("DELETE FROM index_state")
     connection.execute(
@@ -3733,6 +3734,11 @@ def index_job(connection: sqlite3.Connection, job_dir: Path) -> int:
     source = manifest.get("source") or {}
     timeline_path = job_dir / "timeline.json"
     summary_path = job_dir / "summary.json"
+    # Hash and parse the same bytes even when a pipeline replaces an artifact.
+    snapshots = {path: path.read_bytes() if path.is_file() else None
+                 for path in (timeline_path, summary_path)}
+    artifact_hashes = {path: hashlib.sha256(data).hexdigest() if data is not None else None
+                       for path, data in snapshots.items()}
     meta = video_source_meta(job_dir, manifest)
     library_id = connection.execute("SELECT library_id FROM library_identity WHERE singleton=1").fetchone()[0]
     # A revision describes the original analysis artifacts/source, not their
@@ -3745,13 +3751,13 @@ def index_job(connection: sqlite3.Connection, job_dir: Path) -> int:
         "models": manifest.get("models") or {},
         "analysis_config": {key: value for key, value in (manifest.get("config") or {}).items()
                             if key not in {"workers", "vision_workers", "sync_open_notebook", "notebook_id"}},
-        "timeline": file_sha256(timeline_path) if timeline_path.is_file() else None,
-        "summary": file_sha256(summary_path) if summary_path.is_file() else None,
+        "timeline": artifact_hashes[timeline_path],
+        "summary": artifact_hashes[summary_path],
     }, ensure_ascii=False, sort_keys=True, separators=(",", ":")))
     signature = checked_text_hash(
         json.dumps(
             {
-                "version": 3,
+                "version": 4,
                 "library_id": library_id,
                 "analysis_revision": analysis_revision,
                 "chunker_version": CHUNKER_VERSION,
@@ -3764,8 +3770,8 @@ def index_job(connection: sqlite3.Connection, job_dir: Path) -> int:
                 "duration": (manifest.get("video") or {}).get("duration_seconds"),
                 "categories": manifest.get("categories") or [],
                 "meta": meta,
-                "timeline": file_fingerprint(timeline_path) if timeline_path.is_file() else None,
-                "summary": file_fingerprint(summary_path) if summary_path.is_file() else None,
+                "timeline": artifact_hashes[timeline_path],
+                "summary": artifact_hashes[summary_path],
             },
             ensure_ascii=False,
             sort_keys=True,
@@ -3814,6 +3820,13 @@ def index_job(connection: sqlite3.Connection, job_dir: Path) -> int:
     def add_occurrence(kind: str, start: Any, end: Any, timestamp_kind: str, text: str,
                        original_segment_ids: list[str] | None = None) -> None:
         original_segment_ids = original_segment_ids or []
+        if timestamp_kind != "source_level":
+            if type(start) not in (int, float) or not 0 <= start <= sys.float_info.max:
+                start, end, timestamp_kind = None, None, "unknown"
+            elif type(end) not in (int, float) or not start <= end <= sys.float_info.max:
+                end, timestamp_kind = None, "point"
+            else:
+                timestamp_kind = "range"
         digest = checked_text_hash(text)
         ordinal = 0
         while True:
@@ -3834,21 +3847,24 @@ def index_job(connection: sqlite3.Connection, job_dir: Path) -> int:
         rows.append((job, start, kind, occurrence_id, text))
 
     def original_ids(item: dict[str, Any]) -> list[str]:
-        values = item.get("source_ids") or []
-        if not isinstance(values, list):
-            values = []
-        for name in ("segment_id", "id"):
-            if isinstance(item.get(name), str) and item[name]:
-                values = [*values, item[name]]
-        return list(dict.fromkeys(value for value in values if isinstance(value, str) and value))
+        values = []
+        for container in (item, item.get("source"), item.get("data")):
+            if not isinstance(container, dict):
+                continue
+            source_ids = container.get("source_ids")
+            if isinstance(source_ids, list):
+                values.extend(source_ids)
+            values.extend(container.get(name) for name in ("segment_id", "id"))
+        return list(dict.fromkeys(str(value) for value in values
+                                  if (isinstance(value, str) and value) or type(value) is int))
 
     if source.get("title"):  # 用影片名找片是最直覺的查法，標題也得進全文索引
         # 標題是影片級中繼資料，timestamp=0 不是證據時間——標 source_level 且 start 為 NULL
         add_occurrence("title", None, None, "source_level", str(source["title"]))
-    if timeline_path.is_file():
+    if snapshots[timeline_path] is not None:
         try:
-            timeline = json.loads(timeline_path.read_text(encoding="utf-8"))
-        except (json.JSONDecodeError, OSError):
+            timeline = json.loads(snapshots[timeline_path].decode("utf-8"))
+        except (ValueError, UnicodeError):
             timeline = []
         for event in timeline:
             if not isinstance(event, dict):
@@ -3865,10 +3881,10 @@ def index_job(connection: sqlite3.Connection, job_dir: Path) -> int:
             timestamp_kind = "unknown" if start is None else "range" if end is not None else "point"
             add_occurrence(str(event.get("type", "")), start, end, timestamp_kind, text, original_ids(event))
 
-    if summary_path.is_file():
+    if snapshots[summary_path] is not None:
         try:
-            summary = json.loads(summary_path.read_text(encoding="utf-8"))
-        except (json.JSONDecodeError, OSError):
+            summary = json.loads(snapshots[summary_path].decode("utf-8"))
+        except (ValueError, UnicodeError):
             summary = {}
         if isinstance(summary, dict) and summary.get("status") != "skipped":
             text = flatten_text(summary).strip()
@@ -4600,7 +4616,7 @@ def rerank_hits(
         )
     if not isinstance(response, dict):
         raise RuntimeError("rerank 回應必須是物件。")
-    results = response.get("results") or response.get("data") or []
+    results = response["results"] if "results" in response else response.get("data")
     if not isinstance(results, list):
         raise RuntimeError("rerank 回應必須包含 results/data 陣列。")
     indices: list[int] = []
@@ -4630,6 +4646,26 @@ def rerank_hits(
     return reranked
 
 
+def _rerank_candidates(
+    query: str, hits: list[dict[str, Any]], limit: int, api_key: str, model: str = ""
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    info: dict[str, Any] = {"applied": False}
+    if not hits:
+        return hits, info
+    if not api_key:
+        return hits, {**info, "error": "missing_api_key"}
+    count = max(limit, 20)
+    try:
+        reranked = rerank_hits(query, hits[:count], api_key, model)
+        return reranked + hits[count:], {
+            "applied": True, "model": model or "default", "count": len(reranked),
+        }
+    except budget_blocked_error():
+        raise
+    except (RuntimeError, urllib.error.URLError, KeyError, ValueError) as exc:
+        return hits, {**info, "error": str(exc)}
+
+
 def hybrid_search(
     root: Path,
     query: str,
@@ -4652,6 +4688,7 @@ def hybrid_search(
     """
     if not query.strip():
         raise RuntimeError("搜尋字串不可為空。")
+    candidate_k = max(candidate_k, limit)
     filters = filters or SearchFilter()
     connection = read_connection(root)
     try:
@@ -4718,22 +4755,7 @@ def hybrid_search(
 
     rerank_info: dict[str, Any] = {"applied": False}
     if rerank and fused:
-        rerank_k = max(limit, 20)
-        if not rerank_key:
-            rerank_info["error"] = "missing_api_key"
-        else:
-            try:
-                reranked = rerank_hits(query, fused[:rerank_k], rerank_key, rerank_model)
-                fused = reranked + fused[rerank_k:]
-                rerank_info = {
-                    "applied": True,
-                    "model": rerank_model or "default",
-                    "count": min(len(reranked), rerank_k),
-                }
-            except budget_blocked_error():
-                raise
-            except (RuntimeError, urllib.error.URLError, KeyError, ValueError) as exc:
-                rerank_info = {"applied": False, "error": str(exc)}
+        fused, rerank_info = _rerank_candidates(query, fused, limit, rerank_key, rerank_model)
 
     return {
         "query": query,
@@ -4826,7 +4848,7 @@ def pack_context(
                 and end is not None
                 and current["ranges"]
                 and current["ranges"][-1][1] is not None
-                and start <= current["ranges"][-1][1] + merge_gap
+                and start <= max(end for _, end in current["ranges"]) + merge_gap
             )
             if mergeable:
                 merged = {
@@ -5137,6 +5159,7 @@ def answer_question(
     rerank: bool = False,
     rerank_key: str = "",
     context_budget: int = ASK_CONTEXT_TOKENS,
+    min_similarity: float | None = None,
 ) -> dict[str, Any]:
     """Return server-rendered, complete quotes bound to supplied occurrences.
 
@@ -5150,28 +5173,32 @@ def answer_question(
         retrieval = hybrid_search(
             root,
             question,
-            limit,
+            max(limit, 20) if rerank else limit,
             filters=filters,
             embed_key=embed_key,
             embed_model=embed_model,
             embed_backend=embed_backend or "openrouter",
             strict=strict,
-            rerank=rerank,
-            rerank_key=rerank_key,
+            min_similarity=min_similarity,
         )
         if retrieval.get("degraded_reason"):
             # 保留一般 FTS Ask 的關鍵詞檢索；整句問題在 FTS5 中是精確片語。
             keywords, hits = _keyword_search_hits(
-                root, question, api_key, model, limit, filters=filters
+                root, question, api_key, model, max(limit, 20) if rerank else limit, filters=filters
             )
+            retrieval["counts"] = {"fts": len(hits), "vector": 0, "fused": len(hits)}
         else:
             hits = retrieval["hits"]
             keywords = ["（混合檢索）"]
+        if rerank:
+            hits, retrieval["rerank"] = _rerank_candidates(question, hits, limit, rerank_key)
+        hits = hits[:limit]
     elif mode == "semantic":
         # 有向量就直接拿問句比對語意，不必先抽關鍵詞——少一次呼叫，命中也更準。
         keywords = ["（語意檢索）"]
         hits = semantic_search(
-            root, question, embed_key, embed_model, limit, embed_backend, filters=filters
+            root, question, embed_key, embed_model, limit, embed_backend,
+            threshold=min_similarity, filters=filters
         )
         retrieval = {"retrieval_mode": "semantic", "degraded_reason": None}
     else:
@@ -8899,9 +8926,11 @@ def run_pipeline(args: argparse.Namespace) -> Path:
         manifest["open_notebook"] = {**previous_sync, "source_id": previous_source_id}  # 這次沒同步也不能弄丟
     # 後處理階段（--categorize）寫進 manifest 的欄位，也要跟著保留：
     # manifest 每次重建，重跑一次批次就會把分類全部沖掉，下次 --categorize 又得整批重來。
-    for preserved in ("categories", "level"):
+    for preserved in ("categories", "level", "first_completed_at"):
         if previous.get(preserved):
             manifest[preserved] = previous[preserved]
+    if "first_completed_at" not in manifest and previous.get("completed_at"):
+        manifest["first_completed_at"] = previous["completed_at"]
     # Preserve an existing completed manifest until its source byte binding
     # passes. A refused retry must not erase the cache authority and thereby
     # make the next retry silently regenerate paid evidence.
@@ -9207,6 +9236,9 @@ def run_pipeline(args: argparse.Namespace) -> Path:
         manifest["artifacts"]["source"] = artifact_path(job_dir / "source.json", root)
         if not args.no_video:
             assert_analysis_source(video_path, manifest["source_sha256"])
+        if (manifest["status"] == "completed" and not manifest.get("first_completed_at")
+                and previous.get("status") != "completed"):
+            manifest["first_completed_at"] = rss_now()
         write_json(manifest_path, manifest)
         connection = index_connection(root)
         try:
@@ -9386,9 +9418,11 @@ def main() -> int:
                 raise RuntimeError("--ask 需要非空白的問題。")
             if args.search_limit < 1 or args.ask_limit < 1:
                 raise RuntimeError("--search-limit／--ask-limit 必須 ≥ 1。")
+            progress_stream = sys.stderr if args.json else sys.stdout
             if args.index:
                 db_path, video_count, event_count = build_index(root)
-                print(f"索引完成：{db_path}（{video_count} 支影片、{event_count} 筆片段）")
+                print(f"索引完成：{db_path}（{video_count} 支影片、{event_count} 筆片段）",
+                      file=progress_stream)
             embed_model = args.embed_model or DEFAULT_EMBED_MODEL[args.embed_backend]
             embed_key = os.getenv("OPENROUTER_API_KEY", "")
             filters = search_filter_from_args(args)
@@ -9405,23 +9439,28 @@ def main() -> int:
             semantic_backend = args.embed_backend if args.semantic else ""
             if args.embed_plan:
                 plan = plan_embeddings(root, args.embed_backend, embed_model, rebuild=args.rebuild_embeddings)
-                print(f"embedding 計畫：{json.dumps(plan, ensure_ascii=False, indent=2)}")
+                print(f"embedding 計畫：{json.dumps(plan, ensure_ascii=False, indent=2)}",
+                      file=progress_stream)
             if args.rebuild_embeddings:
                 # 重建＝重付一次向量費用：先看計畫，雲端後端要明確 opt-in
                 plan = plan_embeddings(root, args.embed_backend, embed_model, rebuild=True)
-                print(f"重建計畫：{json.dumps(plan, ensure_ascii=False)}")
+                print(f"重建計畫：{json.dumps(plan, ensure_ascii=False)}", file=progress_stream)
                 if args.embed_backend != "local" and not args.allow_batch_cloud:
                     raise RuntimeError(
                         "重建會重新計費雲端向量：確認支出控制後加 --allow-batch-cloud。"
                     )
-                result = rebuild_embeddings(root, embed_key, embed_model, args.embed_backend)
+                with contextlib.redirect_stdout(progress_stream):
+                    result = rebuild_embeddings(root, embed_key, embed_model, args.embed_backend)
                 print(
                     f"向量重建完成：刪 {result['deleted']}、新增 {result['added']}、"
-                    f"共 {result['total']} 筆（{result['plan']['model']}）"
+                    f"共 {result['total']} 筆（{result['plan']['model']}）",
+                    file=progress_stream,
                 )
             if args.embed:
-                added, total = build_embeddings(root, embed_key, embed_model, args.embed_backend)
-                print(f"向量完成：新增 {added} 筆，索引共 {total} 筆（{args.embed_backend}／{embed_model}）")
+                with contextlib.redirect_stdout(progress_stream):
+                    added, total = build_embeddings(root, embed_key, embed_model, args.embed_backend)
+                print(f"向量完成：新增 {added} 筆，索引共 {total} 筆（{args.embed_backend}／{embed_model}）",
+                      file=progress_stream)
             if args.search is not None:
                 hybrid_result: dict[str, Any] | None = None
                 if args.hybrid:
@@ -9486,11 +9525,14 @@ def main() -> int:
                     if args.explain and hit.get("rank_detail"):
                         print(f"    排序依據：{json.dumps(hit['rank_detail'], ensure_ascii=False)}")
             if args.categorize:
-                cats, assigned = categorize_library(root, minimax_subscription_key(), minimax_model())
-                print(f"分類完成：{len(cats)} 個分類，{assigned} 支影片已歸類（記得重跑 --index）")
+                with contextlib.redirect_stdout(progress_stream):
+                    cats, assigned = categorize_library(root, minimax_subscription_key(), minimax_model())
+                print(f"分類完成：{len(cats)} 個分類，{assigned} 支影片已歸類（記得重跑 --index）",
+                      file=progress_stream)
             if args.digest:
-                digest_path = build_digest(root, minimax_subscription_key(), minimax_model())
-                print(f"總覽已產生：{digest_path}")
+                with contextlib.redirect_stdout(progress_stream):
+                    digest_path = build_digest(root, minimax_subscription_key(), minimax_model())
+                print(f"總覽已產生：{digest_path}", file=progress_stream)
             if args.ask is not None:
                 ask_mode = "hybrid" if args.hybrid else ("semantic" if semantic_backend else "fts")
                 result = answer_question(
@@ -9507,6 +9549,7 @@ def main() -> int:
                     strict=args.strict_retrieval,
                     rerank=args.rerank,
                     rerank_key=embed_key,
+                    min_similarity=args.min_similarity,
                 )
                 if args.json:
                     print(json.dumps(result, ensure_ascii=False, indent=2))

@@ -1,0 +1,80 @@
+{
+  "pr": 21,
+  "head": "a68babd000a320d1a9a06e602d0f4c254f4af837",
+  "findings": [
+    {
+      "severity": "med",
+      "file": "pipeline.py",
+      "line": 3837,
+      "issue": "original_ids ignores production speech event.source and visual event.data, including valid numeric segment IDs, so indexed citations lose existing provenance."
+    },
+    {
+      "severity": "med",
+      "file": "pipeline.py",
+      "line": 3884,
+      "issue": "Unvalidated chapter/event start and end values enter occurrences; a provider end such as 00:00:10 makes Ask fail while rendering context, and non-finite or reversed ranges can produce false timestamps."
+    },
+    {
+      "severity": "med",
+      "file": "pipeline.py",
+      "line": 9496,
+      "issue": "Ask never forwards --min-similarity to either semantic or hybrid retrieval, so explicitly excluded evidence still reaches the answer model."
+    },
+    {
+      "severity": "med",
+      "file": "pipeline.py",
+      "line": 5162,
+      "issue": "Degraded hybrid Ask replaces already-reranked hits with keyword results but retains rerank.applied=true and stale counts, discarding a paid ranking."
+    },
+    {
+      "severity": "med",
+      "file": "pipeline.py",
+      "line": 4658,
+      "issue": "Hybrid candidate_k remains 60 even when the requested limit is higher, silently truncating eligible results."
+    },
+    {
+      "severity": "med",
+      "file": "pipeline.py",
+      "line": 9391,
+      "issue": "Combining --index/embedding preparation with --search or --ask --json prints progress to stdout, making an exit-0 JSON result unparsable."
+    },
+    {
+      "severity": "med",
+      "file": "pipeline.py",
+      "line": 3705,
+      "issue": "first_completed_at is exposed as a date filter but run_pipeline never writes or preserves it, so newly completed jobs remain unknown and are excluded."
+    },
+    {
+      "severity": "high",
+      "file": "pipeline.py",
+      "line": 3748,
+      "issue": "Artifact hashing and parsing use separate reads; a concurrent writer can bind replacement text to the previous artifact's analysis_revision."
+    },
+    {
+      "severity": "med",
+      "file": "pipeline.py",
+      "line": 4829,
+      "issue": "Context merging compares only the last range end; nested overlapping ranges split continuous evidence and can drop it under the per-job cap."
+    },
+    {
+      "severity": "med",
+      "file": "pipeline.py",
+      "line": 4603,
+      "issue": "Missing or false-valued rerank results/data is treated as an empty successful ranking, falsely reporting applied=true for malformed provider output."
+    },
+    {
+      "severity": "med",
+      "file": "pipeline.py",
+      "line": 3232,
+      "issue": "Migrating an old occurrences schema drops both lookup indexes after their initial creation and never recreates them."
+    },
+    {
+      "severity": "med",
+      "file": "pipeline.py",
+      "line": 4086,
+      "issue": "needs-human: A5 requires partial analysis to be visible, but manifest.visual_status is absent from search hits and Ask evidence. Selecting an output-schema/status policy versus excluding incomplete evidence changes the public contract; left unchanged for human decision."
+    }
+  ],
+  "fixed": true,
+  "summary": "Fixed 11 provenance/retrieval defects with regression tests proven red before repair; 118 Python tests (159 subtests) and 35 widget scenarios pass, and compilation/diff checks exit 0. The full suite has 467 passed, 20 failed and 14 skipped (exit 1); all failure IDs match the exact PR base. Needs-human: choose how partial analysis is exposed in search/Ask; A5 semantic support, A9 human evaluation and real embedding revision acceptance remain unverified, and no push was performed."
+}

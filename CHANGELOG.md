@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- PR #21 自我審查：修正原始片段 ID 投影、索引 artifact 快照、時間驗證、首次完成日期、Ask 相似度與降級 rerank、候選上限、JSON 進度輸出、重疊 context 合併及舊表索引遺失；新增離線紅綠回歸測試。partial 分析狀態的搜尋／Ask 呈現契約仍待確認，A5／A9 與真實供應商驗收仍未完成。
+
 - 補齊 issue #5 的 library／analysis revision 引用命名空間、原始 segment IDs、完整起訖／未知時間與完整 SHA-256；用本機原文安全遷移可證明的短雜湊向量，隔離歧義並比較快取實際原文。相同原文仍共用向量，遷移不呼叫模型；A5 語意與 A9 人工／供應商驗收仍未完成。
 - 將既有 PR #37 成本守衛整合到 retrieval 候選，保留目前 main 的佇列／媒體安全；新增 rerank 邊界守衛，query embedding 或 rerank 遭預算拒絕時不吞掉錯誤或嘗試另一個 provider。完整 suite 以假傳輸驗證，真 API／部署驗收未執行。
 
