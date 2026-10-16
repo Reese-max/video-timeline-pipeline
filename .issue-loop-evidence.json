@@ -1,0 +1,12 @@
+{
+  "repo": "Reese-max/video-timeline-pipeline",
+  "issue": 5,
+  "base_sha": "42d225936ba704cf70b93cac7bdf84da85ac86b8",
+  "red_proof": "Before implementation: test_openrouter_indices_are_ordered_and_validated ... FAIL; AssertionError: Lists differ: [[0, 1], [1, 0]] != [[1, 0], [0, 1]]. test_queries_are_read_only_even_for_legacy_schema ... FAIL; AssertionError: write connection. Ran 16 tests in 1.225s. FAILED (failures=18, errors=10). Review regressions were also run RED before their fixes, including KeyError: 'max_completion_tokens' and missing first_completed_at before auto-indexing.",
+  "test_command": "python -X utf8 -B -m unittest discover -s tests -p 'test_*retriev*.py' -v",
+  "test_exit": 0,
+  "tests_passed": 33,
+  "tests_failed": 0,
+  "summary": "Added shared read-only metadata-filtered retrieval, stable source occurrences, optional bounded hybrid RRF, visible fallback, and grounded extractive Ask with checked source citations and context/output limits (A0-A6, A8, A10). Added validated contract-scoped embedding caches, explicit legacy adoption, shadow activation, completion-date backfill, and active/shadow coverage audit without forced re-embedding or model downloads (A1, A4, A7). Added 25 fixed synthetic replay questions against the admitted FTS/semantic baseline and regression tests for provider failures, cost guards, injection, provenance, and CLI safety; acceptance mapping and measured limitations are in docs/issue-5-retrieval.md (A9).",
+  "not_done": "No push, PR, merge, issue close, deployment, real provider calls, paid rerank canary, model downloads, new chunking, Dashboard/MCP entrance, or user-library re-embedding. Human-reviewed golden labels/time ranges, human semantic support rate, real-model answer quality/token/latency and isolated per-route RSS remain unverified; the replay uses agent-authored synthetic labels and deterministic fake vectors. No standalone lint/coverage-ratchet/CRAP/mutation gate is configured in this project."
+}
