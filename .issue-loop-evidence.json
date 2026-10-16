@@ -1,0 +1,15 @@
+{
+  "repo": "Reese-max/video-timeline-pipeline",
+  "issue": 19,
+  "base_sha": "5b02434ad41d2f1c069e504f3dce824accb25801",
+  "red_proof": "Copied the new tests/test_cost_timezone_regression.py onto an isolated git archive of admitted head 5b02434ad41d2f1c069e504f3dce824accb25801 and ran python -X utf8 -m unittest discover -s tests -p test_cost_timezone_regression.py -v: exit 1, Ran 8 tests, FAILED (failures=18, errors=1), including subtest failures. Assertions demonstrate local-month spend 0.0 instead of 0.001, an incorrectly approved second budget, mismatched 23/25-hour DST and monthly edge totals, ignored legacy reservations, missing ValueError before DB access, missing timezone key, and rejected estimates counted as spend. Red log SHA256: 8f2b03213aa4d61a80274ce0476c66ffa693704dff1571ba852e2c46b2678d1a. Separately, a clean Windows venv without undeclared tzdata ran python -X utf8 -m unittest discover -s tests -p test_cost_tracker.py -k uses_configured_timezone -v against the original implementation: exit 1, 2 failures (Taipei daily 2026-01-15 instead of 2026-01-16, monthly 2026-01 instead of 2026-02).",
+  "test_command": "python -X utf8 -m unittest discover -s tests -p test_cost_timezone_regression.py -v && python -X utf8 -m unittest discover -s tests -p test_cost_tracker.py -k PeriodIdTimezoneTests -v",
+  "test_exit": 0,
+  "tests_passed": 11,
+  "tests_failed": 0,
+  "summary": "Fixed six timezone/accounting review findings with eight provider-free SQLite regressions plus three period tests; the Git Bash test_command passes 11/11. A clean Windows venv installed only requirements.txt (including tzdata) and independently passed the same 11 tests. Isolated public CLI checks for budget status and daily/monthly reports return the effective timezone, and invalid-zone CLI fails without creating operations.db; socket/HTTP calls are forbidden. Compilation and git diff --check pass. The existing incorrect UTC-fallback test was strengthened to assert the issue's explicit-failure contract.",
+  "not_done": [
+    "Full Windows suite is not green: python -X utf8 -m pytest -q --tb=line exits 1 with 40 passed, 8 failed (14 subtests passed). All eight failures are WinError 32 from unclosed SQLite handles during temporary-directory cleanup. Exact PR parent dc421fef263ccc5b7321910304a9fa910c1a5c5d independently reproduces the same eight failing test IDs (29 passed, 8 failed); those unrelated connection-lifecycle defects were not changed.",
+    "The full fixed-persona portfolio/runtime protocol and hosted CI were not run; evidence is limited to local provider-free accounting tests and isolated CLI smoke checks."
+  ]
+}

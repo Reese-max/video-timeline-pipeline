@@ -423,6 +423,16 @@ OpenRouter 的 `/embeddings` 與 `/rerank` 端點在模型清單裡查不到、�
 
 `--ask --semantic` 會直接拿問句比對語意，跳過「先抽關鍵詞」那一步：少一次 API 呼叫，命中也更準。
 
+## 成本預算與會計時區
+
+先執行 `python -X utf8 -m pip install -r requirements.txt`；其中 `tzdata` 提供 Windows 所需的 IANA 時區資料。
+`COST_TIMEZONE` 預設為 `Asia/Taipei`，每日與每月期間依該時區的日曆切換，支援日光節約時間。
+無效或無法載入的時區會在預算／報表開啟資料庫前明確報錯。
+
+設定 `DAILY_BUDGET_USD` 與 `BUDGET_HARD_STOP=true` 可啟用每日硬上限；`0` 表示未設定限額。
+`--budget-status` 與 `--cost-report daily`（或 `monthly`）的 JSON 輸出包含生效的 `timezone`。
+UTC 紀錄以當地期間換算出的 UTC 起訖查詢；拒絕的提案不計入費用，既有預留的原始期間標籤保留不變。
+
 ## Open Notebook 知識庫
 
 > **選用，預設不啟用。** 開源自架的 Open Notebook（不是 Google NotebookLM），要另外用 Docker 跑起來。本專案的資料庫是上面那個 `library.db` 單檔，查詢用 `--search` 就夠；只有想要筆記介面與 RAG 問答時才需要這一節。以下步驟經實測可用，但沒跑這套服務完全不影響管線。

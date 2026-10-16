@@ -218,10 +218,9 @@ class PeriodIdTimezoneTests(unittest.TestCase):
             self._period_at("UTC", "2026-01-31T20:00:00", "monthly"), "2026-01"
         )
 
-    def test_unknown_timezone_falls_back_to_utc(self) -> None:
-        self.assertEqual(
-            self._period_at("Not/AZone", "2026-01-15T16:30:00"), "2026-01-15"
-        )
+    def test_unknown_timezone_fails_explicitly(self) -> None:
+        with self.assertRaisesRegex(ValueError, "COST_TIMEZONE.*Not/AZone"):
+            self._period_at("Not/AZone", "2026-01-15T16:30:00")
 
 
 if __name__ == "__main__":

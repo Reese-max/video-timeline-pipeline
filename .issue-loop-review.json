@@ -1,0 +1,14 @@
+{
+  "pr": 19,
+  "head": "5b02434ad41d2f1c069e504f3dce824accb25801",
+  "findings": [
+    {"severity":"high","file":"cost_tracker.py","line":161,"issue":"Local period IDs are used as prefixes of UTC created_at values in admission, status and daily/monthly reports. Settled costs disappear around local boundaries, allowing a second full daily budget; legacy UTC-labelled outstanding reservations can also be missed. Use a shared local-calendar window converted to UTC for every ledger query without rewriting original reservation labels."},
+    {"severity":"med","file":"cost_tracker.py","line":157,"issue":"Invalid COST_TIMEZONE silently falls back to UTC, contrary to issue #18's explicit-failure requirement. Validate configuration before opening or initializing the operations database; the new fallback test asserts the wrong contract."},
+    {"severity":"med","file":"requirements.txt","line":3,"issue":"The new ZoneInfo budget path requires IANA data unavailable in a clean Windows installation, but tzdata is undeclared. A valid Asia/Taipei setting therefore silently becomes UTC."},
+    {"severity":"med","file":"cost_tracker.py","line":401,"issue":"Budget/status and cost-report results omit the effective accounting timezone required by issue #18; budget event receipts also cannot identify the configured boundary."},
+    {"severity":"med","file":"tests/test_cost_tracker.py","line":202,"issue":"The new tests only check formatted IDs. They omit real ledger admission/reporting at Taipei 07:59/08:01 and midnight, DST calendar windows, and reservation settlement across rollover, leaving the budget bypass undetected."},
+    {"severity":"med","file":"cost_tracker.py","line":377,"issue":"Cost reports include blocked_budget proposal estimates as spend, while admission and budget status exclude them. This pre-existing inconsistency is exposed by the required blocked-admission/report boundary regression and can be corrected in the same query."}
+  ],
+  "fixed": true,
+  "summary": "Fixed all six review findings: consistent UTC windows for local accounting and legacy reservations, explicit invalid-zone rejection before DB access, Windows tzdata, timezone receipts, boundary regressions, and exclusion of rejected proposals from spend. All 11 focused tests pass both locally and in a clean requirements-only Windows environment; isolated CLI checks also pass with HTTP/socket calls forbidden. The full suite has 40 passing and eight failing tests, with the same eight Windows SQLite cleanup failures independently reproduced on the PR parent."
+}

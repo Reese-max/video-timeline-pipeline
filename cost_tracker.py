@@ -17,6 +17,7 @@ import sqlite3
 import uuid
 from pathlib import Path
 from typing import Any, Literal
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from notifications import get_operations_db
 
@@ -146,22 +147,34 @@ def _utc_now_iso() -> str:
     return datetime.datetime.now(datetime.timezone.utc).isoformat()
 
 
-def _current_period_id(period_type: str = "daily") -> str:
-    # COST_TIMEZONE is part of the budget safety contract: daily/monthly
-    # buckets must reset on the configured local calendar boundary, not UTC.
+def _current_period_window(period_type: str = "daily") -> tuple[str, str, str, str]:
+    """Return the local label, half-open UTC bounds and effective IANA timezone."""
     tz_name = os.getenv("COST_TIMEZONE", "Asia/Taipei")
     try:
-        from zoneinfo import ZoneInfo
-
         tz = ZoneInfo(tz_name)
-    except Exception:
-        # Unknown/broken tz name: fail to UTC rather than silently picking a
-        # different local day than the operator configured.
-        tz = datetime.timezone.utc
+    except (ZoneInfoNotFoundError, ValueError) as exc:
+        raise ValueError(
+            f"Invalid COST_TIMEZONE {tz_name!r}; ensure IANA timezone data (tzdata) is installed"
+        ) from exc
     now = datetime.datetime.now(tz)
+    start = now.replace(hour=0, minute=0, second=0, microsecond=0, fold=0)
     if period_type == "monthly":
-        return now.strftime("%Y-%m")
-    return now.strftime("%Y-%m-%d")
+        start = start.replace(day=1)
+        end = (start + datetime.timedelta(days=32)).replace(day=1)
+        period_id = start.strftime("%Y-%m")
+    else:
+        end = start + datetime.timedelta(days=1)
+        period_id = start.strftime("%Y-%m-%d")
+    return (
+        period_id,
+        start.astimezone(datetime.timezone.utc).isoformat(),
+        end.astimezone(datetime.timezone.utc).isoformat(),
+        tz.key,
+    )
+
+
+def _current_period_id(period_type: str = "daily") -> str:
+    return _current_period_window(period_type)[0]
 
 
 def estimate_operation_cost_micro_usd(provider: str, model: str | None, prompt_tokens: int, completion_tokens: int) -> int:
@@ -200,10 +213,9 @@ def check_and_reserve_budget(
     daily_budget_usd = float(os.getenv("DAILY_BUDGET_USD", "0"))
     daily_budget_micro = int(daily_budget_usd * 1_000_000)
 
+    period_id, period_start, period_end, timezone = _current_period_window("daily")
     conn = get_operations_db(root)
     _init_cost_schema(conn)
-
-    period_id = _current_period_id("daily")
 
     with conn:
         cur = conn.cursor()
@@ -212,20 +224,23 @@ def check_and_reserve_budget(
             """
             SELECT COALESCE(SUM(estimated_micro_usd), 0)
             FROM usage_costs
-            WHERE account_scope = ? AND created_at LIKE ? AND status != 'blocked_budget'
+            WHERE account_scope = ? AND created_at >= ? AND created_at < ?
+                  AND status != 'blocked_budget'
             """,
-            (account_scope, f"{period_id}%"),
+            (account_scope, period_start, period_end),
         )
         settled_micro = int(cur.fetchone()[0])
 
-        # Sum outstanding reservations
+        # Classify legacy UTC-labelled reservations by creation time without
+        # rewriting their original period_id, including after settlement.
         cur.execute(
             """
             SELECT COALESCE(SUM(max_micro_usd), 0)
             FROM budget_reservations
-            WHERE account_scope = ? AND period_id = ? AND status = 'reserved'
+            WHERE account_scope = ? AND created_at >= ? AND created_at < ?
+                  AND status = 'reserved'
             """,
-            (account_scope, period_id),
+            (account_scope, period_start, period_end),
         )
         outstanding_micro = int(cur.fetchone()[0])
 
@@ -255,8 +270,8 @@ def check_and_reserve_budget(
                     library_id=None,
                     job=None,
                     analysis_revision=None,
-                    payload={"reason": reason, "period_id": period_id, "account_scope": account_scope},
-                    dedup_key=f"budget_blocked_{period_id}_{account_scope}",
+                    payload={"reason": reason, "period_id": period_id, "timezone": timezone, "account_scope": account_scope},
+                    dedup_key=f"budget_blocked_{timezone}_{period_id}_{account_scope}",
                 )
             except Exception:
                 pass
@@ -358,10 +373,9 @@ def record_usage(
 
 def get_cost_report(root: Path, period_type: str = "daily") -> dict[str, Any]:
     """Compile read-only financial and token usage report."""
+    period_id, period_start, period_end, timezone = _current_period_window(period_type)
     conn = get_operations_db(root)
     _init_cost_schema(conn)
-
-    period_id = _current_period_id(period_type)
 
     cur = conn.cursor()
     cur.execute(
@@ -374,10 +388,10 @@ def get_cost_report(root: Path, period_type: str = "daily") -> dict[str, Any]:
                SUM(estimated_micro_usd) as total_estimated_uUSD,
                SUM(COALESCE(actual_micro_usd, 0)) as total_actual_uUSD
         FROM usage_costs
-        WHERE created_at LIKE ?
+        WHERE created_at >= ? AND created_at < ? AND status != 'blocked_budget'
         GROUP BY provider
         """,
-        (f"{period_id}%",),
+        (period_start, period_end),
     )
     rows = cur.fetchall()
 
@@ -401,6 +415,7 @@ def get_cost_report(root: Path, period_type: str = "daily") -> dict[str, Any]:
     return {
         "period": period_id,
         "period_type": period_type,
+        "timezone": timezone,
         "grand_total_estimated_usd": round(grand_total_uUSD / 1_000_000.0, 4),
         "providers": provider_breakdown,
     }
@@ -408,10 +423,9 @@ def get_cost_report(root: Path, period_type: str = "daily") -> dict[str, Any]:
 
 def get_budget_status(root: Path) -> dict[str, Any]:
     """Return current budget usage vs limits."""
+    period_id, period_start, period_end, timezone = _current_period_window("daily")
     conn = get_operations_db(root)
     _init_cost_schema(conn)
-
-    period_id = _current_period_id("daily")
     daily_budget_usd = float(os.getenv("DAILY_BUDGET_USD", "0"))
     hard_stop = os.getenv("BUDGET_HARD_STOP", "false").lower() in ("true", "1", "yes")
 
@@ -420,9 +434,9 @@ def get_budget_status(root: Path) -> dict[str, Any]:
         """
         SELECT COALESCE(SUM(estimated_micro_usd), 0)
         FROM usage_costs
-        WHERE created_at LIKE ? AND status != 'blocked_budget'
+        WHERE created_at >= ? AND created_at < ? AND status != 'blocked_budget'
         """,
-        (f"{period_id}%",),
+        (period_start, period_end),
     )
     spent_micro = int(cur.fetchone()[0])
     spent_usd = round(spent_micro / 1_000_000.0, 4)
@@ -431,9 +445,9 @@ def get_budget_status(root: Path) -> dict[str, Any]:
         """
         SELECT COUNT(*)
         FROM usage_costs
-        WHERE status = 'blocked_budget' AND created_at LIKE ?
+        WHERE status = 'blocked_budget' AND created_at >= ? AND created_at < ?
         """,
-        (f"{period_id}%",),
+        (period_start, period_end),
     )
     blocked_count = int(cur.fetchone()[0])
 
@@ -441,6 +455,7 @@ def get_budget_status(root: Path) -> dict[str, Any]:
 
     return {
         "period": period_id,
+        "timezone": timezone,
         "daily_budget_limit_usd": daily_budget_usd if daily_budget_usd > 0 else "unlimited",
         "spent_usd": spent_usd,
         "remaining_usd": remaining_usd,
