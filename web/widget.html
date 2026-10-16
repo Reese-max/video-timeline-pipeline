@@ -191,7 +191,7 @@ function request(method, params) {
 function ensureBridge() {
   if (!bridgePromise) bridgePromise = request("ui/initialize", {
     protocolVersion: "2026-01-26", appCapabilities: {},
-    appInfo: { name: "video-timeline-pipeline", version: "14" },
+    appInfo: { name: "video-timeline-pipeline", version: "15" },
   }).then(result => {
     window.parent.postMessage({ jsonrpc: "2.0", method: "ui/notifications/initialized", params: {} }, "*");
     return result;
@@ -832,16 +832,23 @@ async function refreshReport(version) {
     if (snapshot.report && !applyReport(snapshot.report)) throw new Error("報告快照綁定不符；請重新取得狀態。");
   } catch (error) { if (current(version)) status("A 分析已完成，但無法取得報告狀態：" + error.message); }
 }
-function scheduleReportPoll(version, seconds) {
+function scheduleReportPoll(version, seconds, remaining = 60) {
   const epoch = reportPollEpoch, delay = Math.min(10, Math.max(1, Number(seconds) || 2));
   reportPollTimer = setTimeout(() => {
-    if (current(version) && epoch === reportPollEpoch) pollReportOperation(version, epoch, delay);
+    if (current(version) && epoch === reportPollEpoch) pollReportOperation(version, epoch, delay, remaining);
   }, delay * 1000);
 }
-async function pollReportOperation(version, epoch, delay) {
+async function pollReportOperation(version, epoch, delay, remaining) {
   const report = reportResult, id = report?.operation?.operation_id;
-  if (!id) return;
+  if (!report) return;
   try {
+    if (!id) {
+      const snapshot = await callTool("get_prepared_video", { job_id: report.job_id }, version);
+      if (!current(version) || epoch !== reportPollEpoch) return;
+      if (snapshot.prepared?.job_id !== report.job_id || !snapshot.report || ["job_id", "cache_signature", "analysis_sha256", "report_sha256"].some(key => snapshot.report[key] !== report[key])) throw new Error("報告快照綁定不符；請重新取得狀態。");
+      applyReport(snapshot.report, delay * 2, remaining - 1);
+      return;
+    }
     const value = await callTool("get_video_job", { operation_id: id }, version);
     if (!current(version) || epoch !== reportPollEpoch) return;
     if (value.operation_id !== id || value.operation !== "report" || value.job_id !== data?.job_id) throw new Error("報告背景工作識別碼或工作不符。");
@@ -861,13 +868,15 @@ async function pollReportOperation(version, epoch, delay) {
   }
 }
 function clearReport() { stopReportPolling(); reportSubmitting = false; reportResult = null; $("analysis-report").hidden = true; $("report-link").hidden = true; $("copy-merge").disabled = true; }
-function applyReport(result, seconds = result?.operation?.retry_after_seconds) {
+function applyReport(result, seconds = result?.operation?.retry_after_seconds, remaining = 60) {
   if (!analysisResult || result?.job_id !== data?.job_id || result.cache_signature !== analysisResult.cache_signature) return false;
   stopReportPolling(); reportResult = result;
   $("analysis-report").hidden = false;
   const ready = result.status === "report_ready" && result.verified === true && result.file_id && result.merge_text && result.report_sha256;
+  const waiting = result.status === "awaiting_segments" && result.summary_status === "caller_submitted";
   const message = ready ? "A 已完成：A_server_analysis.md 已放進 Drive，可複製合併指令。"
     : result.summary_status === "pending_chatgpt" ? "A 分析已完成，等待 ChatGPT 整理摘要後才會上傳 A_server_analysis.md。"
+    : waiting ? "A 摘要已提交，等待影片片段上傳與背景工作結束；尚未確認 Drive 報告。"
     : isPending(result) ? "A 摘要已提交，報告排隊／上傳中；尚未確認 Drive 檔案。"
     : "A 報告尚未確認上傳至 Drive，請核對下方狀態。";
   const error = result.error || result.operation?.error;
@@ -876,7 +885,9 @@ function applyReport(result, seconds = result?.operation?.retry_after_seconds) {
   $("report-link").hidden = !download; if (download) $("report-link").href = download;
   $("copy-merge").disabled = !ready;
   $("finalize-report").disabled = reportSubmitting || !result.analysis_sha256;
-  if (isPending(result) && result.operation?.operation_id) scheduleReportPoll(generation, seconds);
+  // ponytail: cap prerequisite snapshots at 60 reads; explicit refresh starts another wait.
+  if (waiting && remaining <= 0) status("等待 A 報告排程逾時；請按「重新取得狀態」。未重新提交摘要或上傳。");
+  else if (waiting || (isPending(result) && result.operation?.operation_id)) scheduleReportPoll(generation, seconds, remaining);
   return true;
 }
 async function submitReportSummary() {
