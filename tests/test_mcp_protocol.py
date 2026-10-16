@@ -36,6 +36,33 @@ class ProtocolSmokeTests(unittest.TestCase):
                     self.assertEqual(set(tools), {'prepare_video_for_chatgpt', 'analyze_prepared_video', 'upload_prepared_video_to_drive', 'get_prepared_video', 'get_video_job', 'cancel_video_job', 'resume_video_job', 'collect_social_post', 'ingest_video_segments', 'finalize_analysis_report'})
                     self.assertEqual(tools['get_video_job']['inputSchema']['required'], ['operation_id'])
                     self.assertIn('background', tools['prepare_video_for_chatgpt']['inputSchema']['properties'])
+                    files = [{'file_id': 'file-preview', 'download_url': 'https://files.example/preview.jpg',
+                              'mime_type': 'image/jpeg', 'file_name': 'preview_000.jpg'}]
+                    ranges = [{'start_seconds': 0.125, 'end_seconds': 119.875}]
+                    with patch.object(server, 'normalize_file_references', wraps=server.normalize_file_references) as receive:
+                        handoff = call('tools/call', {'name': 'ingest_video_segments',
+                                       'arguments': {'files': files, 'segment_ranges': ranges}}, 5)
+                    self.assertFalse(handoff.get('isError', False))
+                    receive.assert_called_once_with(files)
+                    self.assertEqual(handoff['structuredContent']['files_received'], 1)
+                    self.assertEqual(handoff['structuredContent']['files'][0]['start_seconds'], 0.125)
+                    for number, bad_files in enumerate(([], ['https://files.example/preview.jpg'],
+                            [{'download_url': 'https://files.example/preview.jpg'}],
+                            [{'file_id': 'file-preview'}],
+                            [{'file_id': ' ', 'download_url': 'https://files.example/preview.jpg'}],
+                            [{'file_id': 'file-preview', 'download_url': 'http://files.example/preview.jpg'}],
+                            [files[0], files[0]]), 6):
+                        with self.subTest(files=bad_files):
+                            denied = call('tools/call', {'name': 'ingest_video_segments',
+                                          'arguments': {'files': bad_files}}, number)
+                            self.assertTrue(denied['isError'])
+                            self.assertNotIn('structuredContent', denied)
+                    with patch.object(server, 'prepare_video_locked', side_effect=server.JobBusyError('busy')):
+                        busy = call('tools/call', {'name': 'prepare_video_for_chatgpt',
+                                    'arguments': {'url': 'https://video.example/test.mp4'}}, 13)
+                    self.assertFalse(busy.get('isError', False))
+                    self.assertEqual(busy['structuredContent']['status'], 'busy')
+                    self.assertEqual(busy['structuredContent']['error_code'], 'MCP_BUSY')
                     resource = call('resources/list', {}, 3)['resources'][0]
                     contents = call('resources/read', {'uri': resource['uri']}, 4)['contents']
                     self.assertIn('<html', contents[0]['text'])

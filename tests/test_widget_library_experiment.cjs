@@ -22,7 +22,8 @@ class Element {
   set src(value) { this.attributes.src = value; } get src() { return this.attributes.src; }
   focus() { this.focused = true; } load() { this.loads = (this.loads || 0) + 1; } fire(event) { return this.listeners[event]?.({ target: this }); }
 }
-function harness({ output = job('first'), saved = {}, snapshot, respond, bridge = true, persistence = true, sendError, messageResult = {}, upload = async () => ({ fileId: 'file-library' }), download = async () => ({ downloadUrl: 'https://download.example/private?sig=DOWNLOAD' }), fetchImpl, subtle = true } = {}) {
+const received = args => ({ status: 'files_received', files_received: args.files.length, files: args.files.map(({ download_url, ...file }) => file) });
+function harness({ output = job('first'), saved = {}, snapshot, respond, bridge = true, persistence = true, sendError, messageResult = {}, upload = async () => ({ fileId: 'file-library' }), download = async () => ({ downloadUrl: 'https://download.example/private?sig=DOWNLOAD' }), ingest = async args => received(args), fetchImpl, subtle = true } = {}) {
   const fetches = [], uploads = [], downloads = [];
   const elements = new Map(), listeners = {}, calls = [], prompts = [], states = [], timers = new Map(), methods = [], fallbackCalls = [];
   let timerId = 0;
@@ -34,7 +35,8 @@ function harness({ output = job('first'), saved = {}, snapshot, respond, bridge 
   const notifyTool = payload => notify({ method: 'ui/notifications/tool-result', params: { structuredContent: payload } });
   async function callTool(name, args) {
     calls.push({ name, args: clone(args) });
-    const payload = respond ? await respond(name, args, calls.length) : name === 'get_prepared_video' ? (snapshot || { prepared: job(args.job_id), analysis: null })
+    const payload = name === 'ingest_video_segments' ? await ingest(args)
+      : respond ? await respond(name, args, calls.length) : name === 'get_prepared_video' ? (snapshot || { prepared: job(args.job_id), analysis: null })
       : name === 'analyze_prepared_video' ? pending() : name === 'get_video_job' ? completed(analysis('first'))
       : name === 'upload_prepared_video_to_drive' ? completed(drive(args.job_id), 'drive', 'drive-1')
       : name === 'cancel_video_job' ? { ...pending(args.operation_id), status: 'cancelled' } : pending('operation-resumed');
@@ -84,6 +86,84 @@ const noLeaks = h => {
 let count = 0, failures = 0;
 async function test(name, run) { try { await run(); count++; console.log('ok ' + count + ' - ' + name); } catch (error) { failures++; console.error('FAIL - ' + name, error); } }
 (async () => {
+  await test('fileParams receipt precedes model state and prompt and preserves the selected range', async () => {
+    const wait = deferred(), h = harness({ ingest: () => wait.promise });
+    await h.flush(); await uploadClick(h, false, 1);
+    const asking = h.elements.get('library-ask').fire('click'); await h.flush();
+    try {
+      assert.equal(h.prompts.length, 0);
+      assert(!JSON.stringify(h.states).includes('uploaded_file_ids'));
+      const call = h.calls.find(call => call.name === 'ingest_video_segments'); assert(call);
+      assert.deepEqual(call.args, { files: [{ file_id: 'file-library', download_url: 'https://download.example/private?sig=DOWNLOAD', mime_type: 'video/mp4', file_name: 'segment_001.mp4' }],
+        segment_ranges: [{ start_seconds: job('first').segments[1].start_seconds, end_seconds: job('first').segments[1].end_seconds }] });
+      assert.equal(h.downloads.length, 2);
+    } finally { wait.resolve({ status: 'files_received', files_received: 1, files: [{ file_id: 'file-library' }] }); await asking; await h.flush(); }
+    assert.equal(h.prompts.length, 1); noLeaks(h);
+  });
+  await test('missing invalid or failed download references never request model analysis', async () => {
+    for (const download of [null, async () => ({}), async () => ({ downloadUrl: 'http://download.example/private' }),
+      async () => ({ downloadUrl: 'https://user:password@download.example/private' }),
+      async () => { throw new Error('download failed https://download.example/private?sig=DOWNLOAD'); }]) {
+      const h = harness({ download }); await h.flush(); await uploadClick(h); await h.click('library-ask');
+      assert.equal(h.prompts.length, 0); assert(!h.calls.some(call => call.name === 'ingest_video_segments'));
+      assert(!JSON.stringify(h.states).includes('uploaded_file_ids')); noLeaks(h);
+    }
+  });
+  await test('failed incomplete or mismatched ingestion cannot publish model IDs or prompts', async () => {
+    for (const response of [{ status: 'error', error: 'denied' }, { status: 'queued' },
+      { status: 'files_received', files_received: 0, files: [] },
+      { status: 'files_received', files_received: 1, files: [{ file_id: 'different-file' }] }]) {
+      const h = harness({ ingest: async () => response }); await h.flush(); await uploadClick(h); await h.click('library-ask');
+      assert.equal(h.prompts.length, 0); assert.equal(h.calls.filter(call => call.name === 'ingest_video_segments').length, 1);
+      assert(!JSON.stringify(h.states).includes('uploaded_file_ids')); noLeaks(h);
+    }
+  });
+  for (const stage of ['download-reference', 'ingestion']) {
+    await test('job change discards stale ' + stage + ' before exposing model IDs', async () => {
+      const wait = deferred(); let downloads = 0;
+      const h = harness({ download: async () => ++downloads === 2 && stage === 'download-reference' ? wait.promise : { downloadUrl: 'https://download.example/private?sig=DOWNLOAD' },
+        ingest: async args => stage === 'ingestion' ? wait.promise : received(args) });
+      await h.flush(); await uploadClick(h);
+      const asking = h.elements.get('library-ask').fire('click'); await h.flush();
+      h.notifyTool(job('second')); await h.flush();
+      wait.resolve(stage === 'ingestion' ? { status: 'files_received', files_received: 1, files: [{ file_id: 'file-library' }] } : { downloadUrl: 'https://download.example/private?sig=DOWNLOAD' });
+      await asking; await h.flush(); assert.equal(h.prompts.length, 0);
+      assert(!JSON.stringify(h.states).includes('uploaded_file_ids')); noLeaks(h);
+    });
+  }
+  await test('same-job expiry during bridge wait prevents stale ingestion', async () => {
+    const h = harness(), wait = deferred(); await h.flush(); await uploadClick(h);
+    h.context.handoffBridge = wait.promise;
+    vm.runInContext('bridgePromise = handoffBridge', h.context);
+    const asking = h.elements.get('library-ask').fire('click'); await h.flush();
+    assert.equal(h.downloads.length, 2);
+    vm.runInContext("acceptOperation({ ...activeOperation, operation: 'analyze', operation_id: 'expired-op', job_id: 'first', status: 'failed', error_code: 'MEDIA_EXPIRED' }, generation)", h.context);
+    wait.resolve({}); await asking; await h.flush();
+    assert(!h.calls.some(call => call.name === 'ingest_video_segments'));
+    assert.equal(h.prompts.length, 0); assert(!JSON.stringify(h.states).includes('uploaded_file_ids')); noLeaks(h);
+  });
+  for (const bridge of [true, false]) {
+    await test('same-job expiry before native prompt dispatch stops ' + (bridge ? 'bridge' : 'fallback'), async () => {
+      const h = harness({ bridge }); await h.flush(); await uploadClick(h);
+      const save = h.openai.setWidgetState; let scheduled = false, expired = false;
+      h.openai.setWidgetState = function(state) {
+        const result = save.call(this, state);
+        if (!scheduled && JSON.stringify(state.modelContent).includes('uploaded_file_ids')) {
+          scheduled = true;
+          const tick = n => Promise.resolve().then(() => {
+            if (n > 0) return tick(n - 1);
+            expired = true;
+            vm.runInContext("acceptOperation({ ...activeOperation, operation: 'analyze', operation_id: 'expired-op', job_id: 'first', status: 'failed', error_code: 'MEDIA_EXPIRED' }, generation)", h.context);
+          });
+          tick(2);
+        }
+        return result;
+      };
+      await h.click('library-ask');
+      assert(expired); assert.equal(h.prompts.length, 0);
+      assert(!JSON.stringify(h.openai.widgetState.modelContent).includes('uploaded_file_ids')); noLeaks(h);
+    });
+  }
   await test('serialized ordinary summary waits for its durable sending receipt', async () => {
     const h = harness({ snapshot: { prepared: job('first'), analysis: analysis('first') } });
     await h.flush();
