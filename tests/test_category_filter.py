@@ -1,3 +1,5 @@
+import contextlib
+import io
 import sqlite3
 import tempfile
 import unittest
@@ -53,9 +55,10 @@ class CategoryFilterTests(unittest.TestCase):
         _seed(self.root)
 
     def test_category_requires_an_exact_json_string_element(self) -> None:
-        hits = pipeline.search_index(self.root, "測試關鍵字", 10, "AI")
-        jobs = {h["job"] for h in hits}
-        self.assertEqual(jobs, {"job-ai-exact"})
+        for query in ("測試關鍵字", "測試"):
+            with self.subTest(query=query):
+                hits = pipeline.search_index(self.root, query, 10, "AI")
+                self.assertEqual({h["job"] for h in hits}, {"job-ai-exact"})
 
     def test_percent_is_literal_and_category_still_requires_exact_match(self) -> None:
         hits = pipeline.search_index(self.root, "測試關鍵字", 10, "100%")
@@ -72,7 +75,7 @@ class CategoryFilterTests(unittest.TestCase):
     def test_list_filter_uses_exact_category(self) -> None:
         self.assertEqual(pipeline.list_videos(self.root, "AI"), 1)
 
-    def test_semantic_search_category_filter(self) -> None:
+    def _seed_vectors(self) -> None:
         # 假向量：直接 seed vectors 表並 mock embed_texts
         connection = sqlite3.connect(self.root / "library.db")
         dim = 4
@@ -85,12 +88,70 @@ class CategoryFilterTests(unittest.TestCase):
             )
         connection.commit()
         connection.close()
+
+    def test_semantic_search_category_filter(self) -> None:
+        self._seed_vectors()
         with mock.patch.object(pipeline, "embed_texts", return_value=[[1.0, 0.0, 0.0, 0.0]]):
             hits = pipeline.semantic_search(
                 self.root, "query", "key", "test-model", 10, backend="x", category="AI"
             )
         self.assertTrue(hits)
         self.assertEqual({h["job"] for h in hits}, {"job-ai-exact"})
+
+    def test_semantic_category_miss_returns_no_hits(self) -> None:
+        self._seed_vectors()
+        with mock.patch.object(pipeline, "embed_texts", return_value=[[1.0, 0.0, 0.0, 0.0]]):
+            self.assertEqual(pipeline.semantic_search(
+                self.root, "query", "key", "test-model", 10, category="不存在"
+            ), [])
+
+    def test_semantic_ask_respects_exact_and_missing_categories(self) -> None:
+        self._seed_vectors()
+        for category, jobs in (("AI", {"job-ai-exact"}), ("不存在", set())):
+            with (
+                self.subTest(category=category),
+                mock.patch.object(pipeline, "embed_texts", return_value=[[1.0, 0.0, 0.0, 0.0]]),
+                mock.patch.object(pipeline, "minimax_chat", return_value="答案 [1]") as ask,
+                mock.patch.object(pipeline, "question_keywords") as keywords,
+            ):
+                result = pipeline.answer_question(
+                    self.root, "問題", "key", "model", 10,
+                    embed_model="test-model", embed_backend="local", category=category,
+                )
+                self.assertEqual({h["job"] for h in result["citations"]}, jobs)
+                keywords.assert_not_called()
+                if jobs:
+                    ask.assert_called_once()
+                else:
+                    self.assertEqual(result["answer"], "索引裡找不到相關片段。")
+                    ask.assert_not_called()
+
+    def test_semantic_category_still_requires_model_vectors(self) -> None:
+        with mock.patch.object(pipeline, "embed_texts", return_value=[[1.0, 0.0, 0.0, 0.0]]):
+            with self.assertRaisesRegex(RuntimeError, "先執行 `--embed`"):
+                pipeline.semantic_search(
+                    self.root, "query", "key", "test-model", 10, category="AI"
+                )
+
+    def test_semantic_cli_category_miss_succeeds(self) -> None:
+        self._seed_vectors()
+        for action, expected in (("--search", "命中 0 筆"), ("--ask", "索引裡找不到相關片段。")):
+            output, errors = io.StringIO(), io.StringIO()
+            with (
+                self.subTest(action=action),
+                contextlib.redirect_stdout(output), contextlib.redirect_stderr(errors),
+                mock.patch("sys.argv", ["pipeline.py", "--root", str(self.root), action, "query",
+                                       "--category", "不存在", "--semantic",
+                                       "--embed-backend", "local", "--embed-model", "test-model"]),
+                mock.patch.object(pipeline, "load_dotenv"),
+                mock.patch.object(pipeline, "embed_texts", return_value=[[1.0, 0.0, 0.0, 0.0]]),
+                mock.patch.object(pipeline, "minimax_subscription_key", return_value="key"),
+                mock.patch.object(pipeline, "minimax_model", return_value="model"),
+                mock.patch.object(pipeline, "minimax_chat") as ask,
+            ):
+                self.assertEqual(pipeline.main(), 0, errors.getvalue())
+                self.assertIn(expected, output.getvalue())
+                ask.assert_not_called()
 
     def test_keyword_ask_passes_exact_category_to_retrieval(self) -> None:
         with (

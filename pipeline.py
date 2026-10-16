@@ -4633,7 +4633,7 @@ def semantic_search(
         ]
     finally:
         connection.close()
-    if not rows:
+    if not rows and not (category and stored):
         raise RuntimeError(f"索引裡沒有 {model} 的向量；先執行 `--embed`。")
     # ponytail: 純 Python 全掃描。幾千個向量是毫秒級；真的大到會慢再換 sqlite-vec。
     scored = sorted(

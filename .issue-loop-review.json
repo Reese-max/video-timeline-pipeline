@@ -1,0 +1,14 @@
+{
+  "pr": 12,
+  "head": "bc895d6102344f151a13e497ff7e6713b9f60acd",
+  "findings": [
+    {
+      "severity": "med",
+      "file": "pipeline.py",
+      "line": 4636,
+      "issue": "A category with no eligible events makes semantic_search raise the missing-vector error even when this model already has cached vectors. Both semantic Search and Ask fail instead of returning empty results; preserve the missing-model error while allowing a filtered no-match result."
+    }
+  ],
+  "fixed": true,
+  "summary": "Fixed one medium-severity defect: semantic category filters with no matches now return empty Search results and Ask evidence instead of incorrectly requesting --embed. Regression tests fail before the one-line fix and pass afterward; all 24 relevant tests and 94 independent widget controls pass. The full offline runner still fails with two Windows WinError 87 process-launch errors, both reproduced using the original head under the same subprocess invocation."
+}
