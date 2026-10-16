@@ -2302,7 +2302,11 @@ def like_pattern(query: str) -> str:
     return f"%{escaped}%"
 
 
-def search_index(root: Path, query: str, limit: int, category: str = "") -> list[dict[str, Any]]:
+def search_index(
+    root: Path, query: str, limit: int, category: str = "", *,
+    connection: sqlite3.Connection | None = None,
+) -> list[dict[str, Any]]:
+    """Search local events; a supplied connection remains owned by its caller."""
     db_path = root / "library.db"
     if not db_path.is_file():
         raise RuntimeError(f"索引不存在：{db_path}；先執行 `--index`。")
@@ -2337,7 +2341,9 @@ def search_index(root: Path, query: str, limit: int, category: str = "") -> list
         category_params = (f"%{category}%",) if category else ()
         params = ('"' + query.replace('"', '""') + '"',) + category_params + (limit,)
 
-    connection = index_connection(root)
+    close_connection = connection is None
+    if connection is None:
+        connection = index_connection(root)
     try:
         cursor = connection.execute(
             f"""
@@ -2364,7 +2370,8 @@ def search_index(root: Path, query: str, limit: int, category: str = "") -> list
             for row in cursor
         ]
     finally:
-        connection.close()
+        if close_connection:
+            connection.close()
 
 
 _LOCAL_EMBEDDERS: dict[str, Any] = {}
@@ -6174,14 +6181,11 @@ def main() -> int:
     if args.serve:  # 唯讀 dashboard：loopback、唯讀 DB、無付費 API
         import webapp
 
-        root = args.root.resolve()
-        if args.host not in webapp.LOCAL_HOSTS and args.host != "[::1]":
-            print(
-                f"警告：--host {args.host} 不是 loopback；dashboard 會暴露在本機網段。"
-                "Host 白名單仍只允許 localhost 名稱，但請確認這是你要的。",
-                file=sys.stderr,
-            )
-        webapp.serve(root, args.host, args.port)
+        try:
+            webapp.serve(args.root.resolve(), args.host, args.port)
+        except (ValueError, OSError) as exc:
+            print(f"Dashboard ERROR: {exc}", file=sys.stderr)
+            return 1
         return 0
     if args.list or args.show:  # 純本地查詢，不需要金鑰
         root = args.root.resolve()

@@ -6,7 +6,7 @@ hit paid APIs and are deliberately NOT exposed here.
 
 安全起點：
 - 預設 loopback（127.0.0.1）；Host header 白名單只允許本機名稱
-- 全部路由唯讀（DB 以 mode=ro 開啟）；非 GET 一律 405
+- 全部路由唯讀（DB 以 mode=ro 開啟）；拒絕寫入方法
 - 不啟動 worker／排程／下載／寄信
 - 錯誤對外遮罩；HTML 一律 escape
 """
@@ -14,11 +14,13 @@ from __future__ import annotations
 
 import html
 import json
+import re
+import socket
 import sqlite3
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, quote, unquote, urlsplit
 
 LOCAL_HOSTS = {"localhost", "127.0.0.1", "::1", "[::1]"}
 
@@ -31,6 +33,10 @@ SECURITY_HEADERS = {
 }
 
 
+class MigrationRequired(RuntimeError):
+    """The dashboard never migrates an incompatible index."""
+
+
 def _esc(value: object) -> str:
     return html.escape(str(value if value is not None else ""))
 
@@ -39,7 +45,15 @@ def _readonly_db(root: Path) -> sqlite3.Connection:
     db = root / "library.db"
     if not db.is_file():
         raise FileNotFoundError(f"索引不存在：{db}")
-    connection = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+    connection = sqlite3.connect(db.resolve().as_uri() + "?mode=ro", uri=True)
+    try:
+        connection.execute("SELECT job, title, source, duration, categories FROM videos LIMIT 0")
+        connection.execute("SELECT job, timestamp, kind, text FROM events LIMIT 0")
+    except sqlite3.Error as exc:
+        connection.close()
+        if exc.sqlite_errorcode == sqlite3.SQLITE_ERROR:
+            raise MigrationRequired("migration_required") from exc
+        raise
     return connection
 
 
@@ -89,7 +103,11 @@ def _search(root: Path, query: str, limit: int = 20) -> list[dict[str, object]]:
 
     if not query.strip():
         return []
-    return pipeline.search_index(root, query, limit)
+    connection = _readonly_db(root)
+    try:
+        return pipeline.search_index(root, query, limit, connection=connection)
+    finally:
+        connection.close()
 
 
 def _page(title: str, body: str) -> bytes:
@@ -121,20 +139,43 @@ def make_handler(root: Path):
                 self.send_header(name, value)
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
-            self.wfile.write(body)
+            if self.command != "HEAD":
+                self.wfile.write(body)
 
         def do_GET(self) -> None:  # noqa: N802 — stdlib hook
-            # Host allowlist：只有本機名稱能連（DNS rebinding 擋不住就擋 Host）
-            host = (self.headers.get("Host") or "").split(":")[0].lower()
-            if host not in LOCAL_HOSTS:
+            # Validate the whole authority, including bracketed IPv6 and port.
+            hosts = self.headers.get_all("Host", [])
+            origins = self.headers.get_all("Origin", [])
+            host = hosts[0].lower() if len(hosts) == 1 else ""
+            allowed = re.fullmatch(r"(?:localhost|127\.0\.0\.1|\[::1\])(?::[0-9]{1,5})?", host) is not None
+            try:
+                target = urlsplit("http://" + host)
+                target_port = target.port or 80
+                if origins:
+                    origin = urlsplit(origins[0])
+                    allowed = allowed and len(origins) == 1 and (
+                        origin.scheme == "http"
+                        and (origin.hostname, origin.port or 80) == (target.hostname, target_port)
+                        and origin.username is None and origin.password is None
+                        and not (origin.path or origin.query or origin.fragment)
+                    )
+            except ValueError:
+                allowed = False
+            if not allowed:
                 self._send(HTTPStatus.FORBIDDEN, _page("403", "<h1>403 Forbidden</h1>"))
                 return
-            parsed = urlparse(self.path)
             try:
-                if parsed.path == "/":
+                parsed = urlsplit(self.path)
+            except ValueError:
+                self._send(HTTPStatus.BAD_REQUEST, _page("400", "<h1>400 Bad Request</h1>"))
+                return
+            try:
+                if parsed.path == "/api/health":
+                    self._send(200, b'{"status":"ok"}', "application/json")
+                elif parsed.path == "/":
                     videos = _list_videos(root)
                     items = "".join(
-                        f'<li><a href="/video/{_esc(v["job"])}">{_esc(v["title"])}</a> '
+                        f'<li><a href="/video/{quote(str(v["job"]), safe="")}">{_esc(v["title"])}</a> '
                         f'<span class="cats">{"".join(f"<span>{_esc(c)}</span>" for c in v["categories"])}</span></li>'
                         for v in videos
                     )
@@ -149,7 +190,7 @@ def make_handler(root: Path):
                     )
                     self._send(200, _page(f"搜尋：{query}", f"<h1>搜尋「{_esc(query)}」— {len(hits)} 筆</h1>{body}"))
                 elif parsed.path.startswith("/video/"):
-                    job = parsed.path.removeprefix("/video/")
+                    job = unquote(parsed.path.removeprefix("/video/"))
                     detail = _video_detail(root, job)
                     if not detail:
                         self._send(HTTPStatus.NOT_FOUND, _page("404", "<h1>404 Not Found</h1>"))
@@ -164,6 +205,14 @@ def make_handler(root: Path):
                         f"<ul>{events}</ul>"))
                 else:
                     self._send(HTTPStatus.NOT_FOUND, _page("404", "<h1>404 Not Found</h1>"))
+            except MigrationRequired:
+                self._send(HTTPStatus.SERVICE_UNAVAILABLE, _page(
+                    "migration_required", "<h1>migration_required</h1><p>請先停止 dashboard，再由明確的索引維護流程更新資料庫。</p>"
+                ))
+            except FileNotFoundError:
+                self._send(HTTPStatus.SERVICE_UNAVAILABLE, _page(
+                    "index_required", "<h1>index_required</h1><p>請先以 --index 建立本機索引。</p>"
+                ))
             except Exception:
                 # 錯誤遮罩：不把例外內容洩給瀏覽器
                 self._send(HTTPStatus.INTERNAL_SERVER_ERROR, _page("500", "<h1>500 Internal Server Error</h1>"))
@@ -172,11 +221,29 @@ def make_handler(root: Path):
             self._send(HTTPStatus.METHOD_NOT_ALLOWED, b"405 Method Not Allowed", "text/plain")
 
         do_PUT = do_DELETE = do_PATCH = do_POST  # type: ignore[assignment]
+        do_HEAD = do_OPTIONS = do_TRACE = do_CONNECT = do_POST
 
     return Handler
 
 
+class _IPv6HTTPServer(ThreadingHTTPServer):
+    address_family = socket.AF_INET6
+
+
 def serve(root: Path, host: str = "127.0.0.1", port: int = 8080) -> None:
-    server = ThreadingHTTPServer((host, port), make_handler(root))
-    print(f"唯讀 dashboard：http://{host}:{server.server_address[1]}/（Ctrl+C 結束）")
-    server.serve_forever()
+    host = host.lower()
+    if host not in LOCAL_HOSTS:
+        raise ValueError("W0 dashboard 僅允許 loopback；遠端存取須先具備認證與安全通道。")
+    if not 0 <= port <= 65535:
+        raise ValueError("port 必須介於 0 與 65535。")
+    host = "::1" if host == "[::1]" else "127.0.0.1" if host == "localhost" else host
+    server_type = _IPv6HTTPServer if host == "::1" else ThreadingHTTPServer
+    server = server_type((host, port), make_handler(root))
+    try:
+        address = f"[{host}]" if host == "::1" else host
+        print(f"唯讀 dashboard：http://{address}:{server.server_address[1]}/（Ctrl+C 結束）")
+        server.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        server.server_close()

@@ -1,0 +1,15 @@
+{
+  "repo": "Reese-max/video-timeline-pipeline",
+  "issue": 13,
+  "base_sha": "aaa92d954d92b7b6db709bb02b3949cc884bb4dc",
+  "red_proof": "Before implementation, Git Bash `python -m pytest -q tests/test_webapp.py --tb=short` exited 1 with regression failures covering every finding. The final unchanged regression tests were also replayed against an archive of reviewed HEAD aaa92d954d92b7b6db709bb02b3949cc884bb4dc using `python -m pytest -q tests/test_webapp.py --tb=line`: exit 1, 22 failed assertion/subtest records, 12 passed, 4 subtests passed. Failures included test_search_preserves_legacy_vectors_and_database_bytes (GET changed database bytes), test_readonly_db_encodes_filesystem_uri (wrong database opened), test_serve_refuses_remote_before_binding (no rejection), test_foreign_origin_rejected_before_search, test_ipv6_and_invalid_host_headers, test_serve_accepts_ipv6_loopback, test_incompatible_schema_reports_migration_without_writing, test_missing_index_reports_safe_maintenance_state, test_health_is_available_without_index, test_serve_closes_socket_on_interrupt, test_malformed_request_target_returns_400, test_video_links_round_trip_known_job_ids and HEAD/OPTIONS/TRACE/CONNECT subtests in test_post_rejected. The path-identity assertion resolves Windows long/short path aliases and still fails against the original URI code; the write-rejection assertion is retained.",
+  "test_command": "python -m pytest -q tests/test_pipeline.py tests/test_webapp.py && python pipeline.py --self-test",
+  "test_exit": 0,
+  "tests_passed": 27,
+  "tests_failed": 0,
+  "summary": "Fixed all 11 review findings with regression coverage. Web routes share the existing search logic using a caller-owned, encoded mode=ro connection, preserve legacy schemas, and expose safe index maintenance states. Loopback-only startup, strict Host/Origin checks, IPv6, health, masked malformed-request handling, URL-safe job links, method rejection and Ctrl+C cleanup are covered, including a real CLI-to-HTTP subprocess smoke test without API keys; CLI search initialization remains compatible. README documents W0 scope and health semantics.",
+  "not_done": [
+    "The entire suite is not green on Windows Python 3.11: `python -m pytest -q --tb=line` exits 1 with 50 passed, 8 failed and 21 subtests passed. The same eight operations.db WinError 32 cleanup failures occurred before changes (37 passed, 8 failed) and on unchanged main (75 passed, 8 failed); cost_tracker.py, notifications.py, scoring.py and their affected test files are identical between main and the reviewed HEAD. These pre-existing failures were not changed or suppressed.",
+    "W1-W11 features, remote authentication/TLS, push and remote CI are outside this local W0 self-review. No deployment or external write was performed."
+  ]
+}
