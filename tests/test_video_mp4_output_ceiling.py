@@ -71,13 +71,13 @@ class VideoMp4OutputCeilingTests(unittest.TestCase):
 
     def test_whole_video_call_requests_model_maximum_output(self) -> None:
         _, chat = self._run(552.0)
-        kwargs = chat.call_args.kwargs
+        kwargs = chat.call_args_list[0].kwargs  # the whole-video request
         self.assertEqual(kwargs["max_completion_tokens"], pipeline.MINIMAX_VIDEO_MAX_COMPLETION_TOKENS)
         self.assertGreaterEqual(kwargs["timeout"], 3600)
 
     def test_prompt_no_longer_caps_event_count(self) -> None:
         _, chat = self._run(552.0)
-        prompt = chat.call_args.args[0][0]["content"][0]["text"]
+        prompt = chat.call_args_list[0].args[0][0]["content"][0]["text"]  # the whole-video request
         self.assertNotIn("20 筆", prompt)
         self.assertIn("不設筆數上限", prompt)
 

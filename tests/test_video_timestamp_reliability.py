@@ -20,8 +20,10 @@ class VideoTimestampReliabilityTests(unittest.TestCase):
             video = root / "clip.mp4"
             video.write_bytes(b"fake-mp4")
             response = json.dumps({"events": [self.event(stamp) for stamp in stamps]})
+            # Gap filling has its own tests; these fixtures are sparse on purpose.
             with mock.patch.object(pipeline, "minimax_upload_video_understanding", return_value="file"), \
-                 mock.patch.object(pipeline, "minimax_chat", return_value=response) as chat:
+                 mock.patch.object(pipeline, "minimax_chat", return_value=response) as chat, \
+                 mock.patch.object(pipeline, "_fill_video_event_gaps", side_effect=lambda rows, **_: rows):
                 observations = pipeline.analyze_video_mp4(
                     video, "fake-key", "MiniMax-M3", duration=duration, work_dir=root / "work")
             self.assertEqual(chat.call_count, 1)

@@ -16,7 +16,8 @@ class VideoTimestampSchemaRegressionTests(unittest.TestCase):
             response = json.dumps({"events": events, "overall_summary": "Synthetic summary"})
             with mock.patch.object(pipeline, "minimax_upload_video_understanding", return_value="owned-file") as upload, \
                  mock.patch.object(pipeline, "minimax_chat", return_value=response) as chat, \
-                 mock.patch.object(pipeline, "compress_video_for_minimax_upload") as compress:
+                 mock.patch.object(pipeline, "compress_video_for_minimax_upload") as compress, \
+                 mock.patch.object(pipeline, "_fill_video_event_gaps", side_effect=lambda rows, **_: rows):  # gap filling is tested separately
                 observations = pipeline.analyze_video_mp4(
                     video, "owned-not-a-credential", "MiniMax-M3", duration=166.6,
                     work_dir=root / "work", cache_dir=root / "cache")
