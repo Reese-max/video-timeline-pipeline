@@ -631,6 +631,7 @@ async function restoreJob() {
       return;
     }
     if (snapshot.prepared?.job_id !== id) throw new Error("恢復資料的工作不符。");
+    if (activeOperation?.error_code === "MEDIA_EXPIRED") status("");
     renderPrepared(snapshot.prepared);
     const restoredVersion = generation;
     viewVersion = restoredVersion; uncertainStart = false;
@@ -779,6 +780,11 @@ function receiveToolResult(value, initial = false) {
   if (closed) return;
   const payload = normalize(value);
   if (payload.status === "ready" && Array.isArray(payload.segments)) {
+    if (payload.job_id === data?.job_id && activeOperation?.error_code === "MEDIA_EXPIRED") {
+      // A same-job ready notification needs fresh server confirmation before lifting expiry.
+      generation++; stopPolling(); restoreJob();
+      return;
+    }
     const changed = renderPrepared(payload);
     // 初次掛載不自動啟動；只有開著介面時新完成的 prepare 才自動並行 A＋B。
     if (changed) { restoredOperationId = saved.jobId === payload.job_id ? saved.operationId : null; autoStartArmed = !initial; restoreJob(); }

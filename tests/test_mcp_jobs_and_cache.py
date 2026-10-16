@@ -12,6 +12,7 @@ from starlette.applications import Starlette
 from starlette.routing import Route
 from starlette.testclient import TestClient
 import mcp_server as server
+import media_retention
 from job_queue import JobQueue
 
 
@@ -113,6 +114,50 @@ class IntegrationTests(unittest.TestCase):
         self.assertIsNone(snapshot['analysis'])
         self.assertIsNone(snapshot['active_operation'])
         self.assertIsNone(snapshot['latest_operation'])
+
+    def test_retention_apply_then_restore_returns_structured_media_expired(self):
+        source = self.job / 'source.mp4'
+        segment = self.job / 'segments' / 'segment_000.mp4'
+        now = time.time()
+        os.utime(source, (now - 8 * 86400,) * 2)
+        fingerprint = server.pipeline.file_fingerprint(source)
+        self.manifest['source']['fingerprint'] = fingerprint
+        manifest_path = self.job / 'manifest.json'
+        manifest_path.write_text(json.dumps(self.manifest), encoding='utf-8')
+        result_path = self.job / 'analysis' / 'result.json'
+        result_path.parent.mkdir()
+        result = {'status': 'complete', 'job_id': self.job_id,
+                  'source_fingerprint': fingerprint,
+                  'source_sha256': server.pipeline.file_sha256(source),
+                  'cache_signature': server.analysis_cache_signature(source, self.manifest),
+                  'quality': {'status': 'evidence_available'}, 'transcript': 'retained evidence'}
+        result_path.write_text(json.dumps(result), encoding='utf-8')
+        preserved = {path: path.read_bytes() for path in [manifest_path, result_path]}
+        for path in self.job.rglob('*'):
+            if path.is_file():
+                os.utime(path, (now - 8 * 86400,) * 2)
+
+        removed = media_retention.cleanup(self.jobs, apply=True, now=now)
+        self.assertEqual(removed['deleted_files'], 2)
+        self.assertEqual(removed['errors'], [])
+        self.assertFalse(source.exists())
+        self.assertFalse(segment.exists())
+        queue = JobQueue(self.root / 'queue', autostart=False)
+        try:
+            with patch.object(server, 'get_queue', return_value=queue):
+                restored = asyncio.run(server.get_prepared_video(self.job_id))
+        finally:
+            queue.close()
+        self.assertEqual(restored['status'], 'expired')
+        self.assertEqual(restored['error_code'], 'MEDIA_EXPIRED')
+        self.assertEqual(restored['job_id'], self.job_id)
+        self.assertIsNone(restored['prepared'])
+        self.assertIsNone(restored['analysis'])
+        self.assertIsNone(restored['active_operation'])
+        self.assertIsNone(restored['latest_operation'])
+        self.assertIn('重新準備', restored['error'])
+        for path, content in preserved.items():
+            self.assertEqual(path.read_bytes(), content)
 
     def test_partial_media_cleanup_also_returns_media_expired(self):
         # An interrupted cleanup can leave the source while segments are already gone.
