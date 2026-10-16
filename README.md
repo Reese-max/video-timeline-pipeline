@@ -80,6 +80,8 @@ python pipeline.py --video 'D:\path\to\video.mp4' --dry-run --slide-extractor st
 
 準備／分析／Drive 工具支援 `background=true`；可用 `get_video_job` 查進度，`cancel_video_job` 取消，`resume_video_job` 續跑，`get_prepared_video` 恢復結果及更新下載網址。新介面使用背景模式，舊客戶端的同步預設仍相容。準備完成後 widget 自動同時送出分析與 Drive 背景工作（Drive 先送；paired worker 允許同一 job 的分析與 Drive 片段上傳並行，最多兩個 worker；其他工作依佇列排程）；未設定 Drive 時只自動跑分析。兩路互不等待、失敗隔離；手動按鈕保留重試入口。交接內容只放檔案 ID／網址／大小與原片分段時間，不含任何 A 的結果，並提供「一鍵複製」與「開新一般對話」。
 
+取消或續跑其中一路時，另一條路線仍會繼續查詢進度；Drive 上傳完成後，交接內容與「一鍵複製」「開新一般對話」仍會立即可用。
+
 A 分析完成時，本機產生 `A_server_analysis.md`（逐字稿、畫面時間軸、品質與待整理摘要），widget 自動取得報告快照並提示等待 ChatGPT 整理摘要。「交給 ChatGPT 整理」要求 ChatGPT 先讀取目前證據與報告綁定，再呼叫 `finalize_analysis_report` 提交摘要及來源註記；也可在 widget 明確填寫後提交。只有 `summary_status=caller_submitted`、影片片段已在 Drive 且兩路 worker 已停止，才會排入獨立的報告上傳工作，放進同一個 Drive 資料夾。widget 追蹤 queued／running 報告；`report_ready` 且 `verified` 時顯示「A 已完成」並啟用「複製合併指令」。指令以「合併：」開頭，保留 file_id、SHA-256 與未獨立驗證聲明。
 
 畫面由 MiniMax 讀取整支影片，舊版抽幀結果讀取時會被剔除並要求重新分析。快取比對來源 SHA-256、模型、語言、後端、整片分析設定及程式版本。介面可切換逐字稿／畫面觀察、點時間碼核對原片，並顯示證據缺漏限制。

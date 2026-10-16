@@ -726,7 +726,9 @@ async function changeOperation(action) {
   const target = [activeOperation, driveOperation].find(op => op?.operation_id && op.error_code !== "MEDIA_EXPIRED" && (action === "cancel" ? isPending(op) : terminal.has(op.status)));
   if (!target || acting || driveActing || restoring || uncertainStart) return;
   const version = generation, id = target.operation_id;
-  acting = true; stopPolling(); stopDrivePolling(); updateButtons();
+  acting = true;
+  if (target.operation === "drive") stopDrivePolling(); else stopPolling();
+  updateButtons();
   try { acceptOperation(await callTool(action === "cancel" ? "cancel_video_job" : "resume_video_job", { operation_id: id }, version), version); }
   catch (error) { if (current(version)) status(error.message + " 請重新取得伺服器狀態，確認工作是否已接受操作。"); }
   finally { if (current(version)) { acting = false; updateButtons(); } }
