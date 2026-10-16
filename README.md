@@ -86,9 +86,47 @@ A 分析完成時，本機產生 `A_server_analysis.md`（逐字稿、畫面時�
 
 簽名下載網址預設 24 小時有效；受管媒體預設保留七天，總量 20 GiB、單工作 4 GiB、保留至少 1 GiB 空間。清理需 `MCP_STORAGE_CLEANUP_ENABLED=1`，只處理已明確納管且到期的工作，保護執行中工作及有效分享。舊工作不會在部署時被批次納管。設定、相容性及驗證界線詳見 [操作說明](docs/video-mcp-operations.md)。
 
-UI URI 已升為 `ui://video-timeline-pipeline/v14-<媒體網址 hash>.html`。更新服務後需重新整理外掛動作並產生新 widget；歷史 widget 不會自動更新。以下 v8–v11 段落保留歷史修復紀錄，操作以 v14 說明為準。
+UI URI 已升為 `ui://video-timeline-pipeline/v14-fileparams-<媒體網址 hash>.html`。更新服務後需重新整理外掛動作並產生新 widget；歷史 widget 不會自動更新。以下 v8–v11 段落保留歷史修復紀錄，操作以 v14 說明為準。
 
-v14 的可收合「實驗：存到 ChatGPT 檔案庫（#59）」只在使用者點擊分段按鈕後下載 MP4，再以宿主 `uploadFile(file, { library: true })` 上傳；一般上傳備援也必須另行點擊，不自動重送。這是選用的用戶端路徑，主流程維持既有伺服器分析。畫面顯示 fileId、大小、耗時、現算 SHA-256 與是否取得下載網址，不顯示或保存簽章網址。另按「請模型讀這個檔案」才將檔案 ID 加入模型可見狀態並送出追問；缺少宿主 API 時顯示能力診斷。成功回傳不代表檔案已出現在檔案庫或模型能讀取：大小／型別上限、真實錯誤格式及 library 不可用時的行為均未驗證，需在真實 ChatGPT 工作階段測試。
+v14 的可收合「實驗：存到 ChatGPT 檔案庫（#59）」只在使用者點擊分段按鈕後下載 MP4，再以宿主 `uploadFile(file, { library: true })` 上傳；一般上傳備援也必須另行點擊，不自動重送。這是選用的用戶端路徑，主流程維持既有伺服器分析。畫面顯示 fileId、大小、耗時、現算 SHA-256 與是否取得下載網址，不顯示或保存簽章網址。另按「請模型讀這個檔案」會先取得新的 `getFileDownloadUrl`，再交給 `ingest_video_segments`；確認接收數量與檔案 ID 相符後，才將 ID 加入模型可見狀態並送出追問。缺少宿主 API、下載引用無效或 ingestion 失敗時明確停止，不自動重送。成功回傳不代表檔案已出現在檔案庫或模型能讀取：大小／型別上限、真實錯誤格式及 library 不可用時的行為均未驗證，需在真實 ChatGPT 工作階段測試。
+
+### 原生檔案交接契約（#23）
+
+`ingest_video_segments` 重用既有接收器，以 `_meta["openai/fileParams"] = ["files"]` 接收 MP4 或代表影格的檔案引用。依 [OpenAI 官方 file inputs 契約](https://developers.openai.com/plugins/reference#define-file-inputs)，每個 file object 宣告 `file_id`、`download_url`、`mime_type`、`file_name` 四欄，前兩欄必填。只有公開媒體網址或 ResourceLink 不能通過交接。
+
+可選的 `segment_ranges` 與 `files` 依索引一一對應，從 prepare 結果複製原片的 `start_seconds`／`end_seconds`，保留小數秒；同一片段的影格與 MP4 可以共用範圍。起訖必須是有限數值、起點不小於零、終點大於起點；長度不符或任何檔案無效時整批拒絕。舊客戶端可省略此參數，回傳時間為 `null`，不自行猜測時間。範例參數：
+
+```json
+{
+  "files": [{
+    "file_id": "file-example",
+    "download_url": "https://files.example/segment.mp4",
+    "mime_type": "video/mp4",
+    "file_name": "segment_000.mp4"
+  }],
+  "segment_ranges": [{"start_seconds": 0.125, "end_seconds": 119.875}]
+}
+```
+
+成功的 `files_received` 僅表示接收並檢查了引用格式，回傳檔案 ID、MIME、檔名與呼叫端提供的時間；不回傳或儲存暫時下載網址，也不下載內容或啟動付費分析。結果的 `limitation` 要求模型先讀取實際檔案並指出可核對的內容；宿主無法交接／讀取時必須明確停止，禁止 metadata-only 摘要。缺少 `uploadFile` 或沒有檔案 ID 時，既有 widget 實驗入口會顯示能力／上傳錯誤。此支線不改變 v14 的伺服器分析與 Drive 流程，也不宣稱引用已被模型讀取。
+
+prepare 與 ingestion 都宣告正式 `outputSchema`；prepare schema 包含鎖忙時的 `status=busy`、`error_code=MCP_BUSY` 與重試間隔，避免客戶端把正常忙碌狀態判為 schema 錯誤。本地完整檢查使用 `python -X utf8 -B scripts/check_offline.py`。Windows Git Bash 可直接執行同一套離線回歸，避開 Python 檢查器巢狀啟動程序的 `WinError 87`：
+
+```bash
+.venv/Scripts/python.exe -X utf8 -B -m unittest discover -s tests -p 'test_*.py' -v &&
+node tests/test_widget_handoff.cjs &&
+node tests/test_parallel_submission.cjs &&
+node tests/test_widget_analysis_report.cjs &&
+node tests/test_widget_library_experiment.cjs && git diff --check
+```
+
+| Issue #23 驗收 | 本地證據與尚缺驗收 |
+|---|---|
+| ingestion 實際收到 ID 與下載網址 | HTTP MCP 測試確認兩欄抵達接收器；真實 ChatGPT 呼叫仍未驗證。 |
+| 代表影格可被模型讀取 | 本地只驗證 JPEG 引用契約；模型指出可核對畫面的驗收未驗證。 |
+| 支援 MP4 時依分段時間摘要 | 本地驗證 MP4／影格引用與小數時間對應；真實宿主解碼及內容摘要未驗證。 |
+| 交接失敗不產生 metadata-only 摘要 | 缺 ID／網址、空陣列、重複 ID、非 HTTPS 與錯誤範圍皆拒絕；widget 等待相符的 ingestion 回執後才公開模型 ID／追問，失敗及過期工作不會送出。 |
+| 媒體端點、無上限分段與重啟不回退 | 沿用完整離線回歸，相關實作未變更；本地測試不代表公開端點或部署重啟驗收。 |
 
 ### MCP 影音暫存保留 7 天（有 Drive 完整備份時改為分析後清理）
 
@@ -122,7 +160,7 @@ $env:MCP_PORT = '8787'
 .\.venv\Scripts\python mcp_server.py
 ```
 
-本機檢查：`Invoke-RestMethod http://127.0.0.1:8787/health`；ChatGPT Developer Mode 則新增 MCP app，填入 MCP tunnel 網址加 `/mcp`。需在 MCP 主機設定既有的 `GROQ_API_KEY` 與 `MINIMAX_SUBSCRIPTION_KEY`。`MCP_MEDIA_BASE_URL` 僅供預覽／分段連結使用；主流程不透過瀏覽器抓取 MP4。分析工具回傳來源大小／SHA-256、逐字稿與整支影片畫面時間軸，再由 widget 送出 ChatGPT 整理要求；這不是 ChatGPT 親自讀取 MP4。`ingest_video_segments` 保留舊 API 相容，但新 widget 不呼叫它。
+本機檢查：`Invoke-RestMethod http://127.0.0.1:8787/health`；ChatGPT Developer Mode 則新增 MCP app，填入 MCP tunnel 網址加 `/mcp`。需在 MCP 主機設定既有的 `GROQ_API_KEY` 與 `MINIMAX_SUBSCRIPTION_KEY`。`MCP_MEDIA_BASE_URL` 僅供預覽／分段連結使用；主流程不透過瀏覽器抓取 MP4。分析工具回傳來源大小／SHA-256、逐字稿與整支影片畫面時間軸，再由 widget 送出 ChatGPT 整理要求；這不是 ChatGPT 親自讀取 MP4。`ingest_video_segments` 保留舊 API 相容，widget 僅在使用者明確點擊原生上傳實驗的模型讀檔按鈕時呼叫它。
 
 v11 的 `quality` 是保守證據檢查，不是準確率評分：分析階段失敗、有音軌卻無可用逐字稿、缺畫面描述、未完成回應，或畫面自報信心缺漏／不高於 0.5，會回傳 `needs_review`。沒有音軌不是 ASR 失敗。模型自報信心未經校準，即使 `evidence_available` 也不保證內容正確；畫面是抽樣，非逐幀檢視。品質不足時不送出一般摘要要求，改走自動上傳的 Drive 原片覆核交接內容（B 路線：一般對話用官方 connector 讀原片，保持獨立）；「開始分析」「上傳到我的 Drive」按鈕保留手動重試入口。若 ChatGPT 整理時發現矛盾或使用者認為品質差，也走此入口。工具例外或 Drive 失敗時明確停止，保留重試入口，不把 metadata 當成讀取成功。
 
