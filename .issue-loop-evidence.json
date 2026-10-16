@@ -1,0 +1,12 @@
+{
+  "repo": "Reese-max/video-timeline-pipeline",
+  "issue": 57,
+  "base_sha": "42d225936ba704cf70b93cac7bdf84da85ac86b8",
+  "red_proof": "Before implementation: node tests/test_widget_handoff.cjs (exit 1).\nok 11 - late poll cannot overwrite cancellation\nAssertionError [ERR_ASSERTION]: No poll timer\n    at Object.poll (C:\\Users\\Administrator\\issue-loop\\worktrees\\Reese-max_video-timeline-pipeline-issue-57\\tests\\test_widget_handoff.cjs:65:95)\n    at C:\\Users\\Administrator\\issue-loop\\worktrees\\Reese-max_video-timeline-pipeline-issue-57\\tests\\test_widget_handoff.cjs:134:13\n    at async test (C:\\Users\\Administrator\\issue-loop\\worktrees\\Reese-max_video-timeline-pipeline-issue-57\\tests\\test_widget_handoff.cjs:68:34)\n    at async C:\\Users\\Administrator\\issue-loop\\worktrees\\Reese-max_video-timeline-pipeline-issue-57\\tests\\test_widget_handoff.cjs:118:46 {\n  generatedMessage: false,\n  code: 'ERR_ASSERTION',\n  actual: undefined,\n  expected: true,\n  operator: '==',\n  diff: 'simple'\n}",
+  "test_command": "node tests/test_widget_handoff.cjs && node tests/test_parallel_submission.cjs",
+  "test_exit": 0,
+  "tests_passed": 48,
+  "tests_failed": 0,
+  "summary": "Preserved independent Drive polling when cancelling or resuming server analysis (A), so a completed upload still shows the A-free handoff and enables copy/new ordinary-chat controls without waiting for A. Added two regressions using the existing widget harness (44 to 46 handoff scenarios) and updated README. Full native PowerShell offline checks passed: 597 Python passed, 24 skipped, and 96 Node scenarios passed; the Bash-runnable driver command passes 48 relevant handoff/submission scenarios.",
+  "not_done": "No push, PR, deployment, issue closure, real Facebook download, provider/model call, or Drive upload was performed. Live start-time skew below 10 seconds, actual Drive delivery while A runs, and real ChatGPT clipboard/new ordinary-conversation acceptance remain unverified, so issue #57 is not claimed closed. The full Python suite under Git Bash still encounters two baseline WinError 87 errors in unchanged test_execution_control.py when tests clear the environment; the full suite passed under native PowerShell instead. No lint, coverage-ratchet, CRAP, or mutation gates are configured in the repo, and none were added."
+}
