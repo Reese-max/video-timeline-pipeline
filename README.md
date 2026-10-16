@@ -495,7 +495,7 @@ python pipeline.py --search '時間軸合併'
 python pipeline.py --search 'ffmpeg' --search-limit 50
 ```
 
-搜尋涵蓋影片標題、逐字稿、畫面觀察與摘要，結果附時間戳與來源 URL。索引用 `trigram` 斷詞：`unicode61` 會把整句中文吃成單一 token，中文查詢一律落空。
+搜尋涵蓋影片標題、逐字稿、畫面觀察與摘要，結果附來源 URL 與可核對的時間。標題／整份摘要是 `source_level`，時間為 null；不提供假的 00:00 跳轉。每次來源出現都有穩定的 `occurrence_id`，同文在不同時間仍保留兩筆，向量則可共用。索引用 `trigram` 斷詞：`unicode61` 會把整句中文吃成單一 token，中文查詢一律落空。
 
 `trigram` 的索引窗口是 3 字元，`AI`、`影片` 這類兩字詞 `MATCH` 必定落空，因此短於 3 字元的查詢會自動回退全表掃描（輸出會標示模式），並依「標題 → 摘要 → 逐字稿／畫面」與命中次數排序。實測 5 萬筆片段約 80 ms、線性成長，沒有效能疑慮：
 
@@ -504,24 +504,34 @@ python pipeline.py --search 'AI'      # 命中 N 筆（全表掃描：查詢短�
 python pipeline.py --search '時間軸'   # 命中 N 筆（索引）
 ```
 
-`library.db` 可直接用任何 SQLite 工具開；`videos` 表一支影片一列，`events` 表是全文索引。
+`library.db` 可直接用任何 SQLite 工具開；`videos` 表一支影片一列，`events` 表是全文索引。查詢、列表與 audit 使用唯讀連線；舊索引只抑制未遷移的視覺事件，請明確執行 `--index` 做本機遷移，不會呼叫 embedding API。
+
+Search 與 Ask 共用 metadata filters；類別是 JSON 完整成員比對。日期預設 `published_at`，也可選 `first_completed_at`／`indexed_at`；`--until YYYY-MM-DD` 包含該 UTC 日。日期未知預設排除，回傳 `unknown_date_count`；明確加 `--include-unknown-dates` 才納入。作者、發布日只從現有 manifest／來源資訊回填，完成日期從既有 manifest、RSS 或完成事件取最早可核對紀錄，全部保留 provenance。
+
+```powershell
+python pipeline.py --search 'AI' --category '資安' --since 2026-09-01 --until 2026-09-30 --json
+python pipeline.py --search '密碼' --author '作者名稱' --platform Youtube --kind speech --search-limit 20
+python pipeline.py --ask '有哪些相關片段？' --job JOB_ID --date-field first_completed_at --until 2026-09-30 --json
+```
 
 ## 問答與總覽
 
-兩者都需要 `MINIMAX_SUBSCRIPTION_KEY`，不需要額外服務。
+雲端回答與總覽需要 `MINIMAX_SUBSCRIPTION_KEY`，不需要額外服務。`--ask --local-only`／`--dry-run` 只讀取本機證據並回傳 `insufficient_evidence`，不要求模型設定，也不呼叫供應商。
 
 ```powershell
 python pipeline.py --ask '這些影片有提過怎麼設定 ffmpeg 嗎？'
 python pipeline.py --digest
 ```
 
-`--ask` 先讓模型把問句拆成檢索詞（整句丟進 FTS5 是 phrase 比對，長問句必定 0 筆），再用檢索到的片段生成答案，並標註 `[1]`、`[2]` 對應到影片標題與時間戳。提示詞限定只能引用片段內容，資訊不足時會直說找不到，不會臆造。
+`--ask` 先讓模型把問句拆成檢索詞，再以輪流取樣保留跨影片證據。內部回答為 `claims`＋`evidence_ids`＋完整原文 `quotes`＋`support_kind`；程式回查目前來源位置、文字、時間與 revision，並產生片名、URL 及 `[1]` 引用。驗證採保守的完整摘錄契約，任意改寫不會被當成已支持；無證據、捏造 ID、刪除否定詞或摘要冒充講者時回傳 `insufficient_evidence`。這是來源核對，不能證明影片說法符合現況；人類輸出會區分講者說法、跨片綜合、模型推論與需外部查證。
+
+上下文保留完整片段，以 UTF-8 bytes 作保守 token 上界，計入問題、指令、metadata 與輸出預留。`--context-tokens 12000 --output-reserve 2048` 可調整；單片問題沒有固定三段上限，省略原因列於 JSON 的 `context.omitted`。來源中的字幕、OCR 與命令視為不可信資料，回答不會執行其動作，也不會無聲再呼叫模型修復答案。
 
 不可靠的畫面時間碼（含未驗證的舊 MP4 觀察）仍可搜尋，但 `--search`／`--ask` 引用顯示「時間碼不可靠」且不提供跳轉；`--show` 與重新產生的知識檔章節／待查證資訊也會抑制落在不可靠整數秒的連結，同秒有可靠事件時保留連結。更新後請先執行 `--index` 重建本機索引。
 
 `--digest` 把各支影片的摘要合成 `digest.md`：主題分群、跨影片反覆出現的術語、建議觀看順序、涵蓋落差。只吃跑過完整流程的 job，`--local-only`／`--dry-run` 的 job 沒有真摘要會被跳過。
 
-> 呼叫 MiniMax 一律不設 `max_tokens`。MiniMax-M3 是 reasoning 模型，`<think>` 會先吃掉配額，設了上限常常在真正的答案輸出前就用完，回傳半截 JSON。
+> Ask 將 `--output-reserve` 同時傳為 `max_completion_tokens`，成本守衛也計入該輸出預留。若 reasoning 用完額度而使輸出截斷，該次明確失敗，不自動付費重試；需要時由使用者調高預留及總 context budget。
 
 ## 語意檢索
 
@@ -537,21 +547,31 @@ python pipeline.py --ask '他對長鼻子有什麼評論？' --semantic
 
 | 後端 | 預設模型 | 需要 | 成本 |
 |---|---|---|---|
-| `openrouter`（預設） | `nvidia/nemotron-3-embed-1b:free`（2048 維） | `OPENROUTER_API_KEY` | **0**（實測 `cost=0`） |
-| `local` | `BAAI/bge-m3`（1024 維） | `sentence-transformers` + `torch` | **0**，且離線、內容不外傳 |
+| `openrouter`（預設） | `nvidia/nemotron-3-embed-1b:free` | `OPENROUTER_API_KEY` | 依目前帳戶與供應商費率；歷史免費測試不保證現在可用 |
+| `local` | `BAAI/bge-m3` | 已快取模型、`sentence-transformers` + `torch` | 本機運算，內容不外傳 |
 
 ```powershell
-python pipeline.py --embed                        # 免費雲端
+python pipeline.py --embed-plan --json           # 唯讀計畫，不呼叫模型
+python pipeline.py --embed                        # 明確執行缺少的雲端嵌入
 python pipeline.py --embed --embed-backend local  # 本機
 ```
 
-其他可用模型：`baai/bge-m3`、`qwen/qwen3-embedding-8b`（皆 US$0.01/M）、`nvidia/llama-nemotron-embed-vl-1b-v2:free`。
+OpenRouter 已有 [embeddings 官方契約](https://openrouter.ai/docs/api_reference/embeddings) 與 [rerank 官方契約](https://openrouter.ai/docs/api/api-reference/rerank/submit-a-rerank-request)。實作驗證回傳數量、input index、維度、有限數值與非零向量，拒絕缺漏或錯序配對；模型的帳戶可用性與價格仍需獨立 canary，這次離線驗收沒有呼叫真實 provider。
 
-OpenRouter 的 `/embeddings` 與 `/rerank` 端點在模型清單裡查不到、官方文件也沒寫，但實測可用。要注意 chat 的 `:free` 清單與 embedding 的模型池是分開的：chat 那些 id 打 embeddings 會回 `does not exist`；而 NVIDIA 那幾顆**必須加 `:free` 後綴**才有 provider，不加會回 `No endpoints found`。
+本機模型須由使用者事先安裝及快取；普通檢索使用 `local_files_only=True`，不自動下載。ML 依賴延遲載入，最多保留一個常駐模型，每批最多 256 段。
 
-本機後端首次使用要下載約 2.2 GB 模型。CPU 實測約 94 筆/秒；裝的若是 `torch+cpu` 就吃不到 GPU，要 GPU 得另外裝 CUDA 版。
+向量契約包含 backend、model、`--embed-revision`、維度及前處理版本；相同完整文字＋契約共用快取，重建 FTS／搬移資料庫不要求重算。新契約先建立 shadow，所有批次通過才啟用，失敗保留舊契約。`--embed-plan` 列出 chunks、可重用及待嵌入數量；必須單獨執行，不能混入寄送或其他寫入命令。`--audit` 顯示 active／shadow 的覆蓋、stale、invalid。
 
-`--embed` 只補算「這個模型還沒算過」的片段：重跑不重複付費，換模型則自動重算。`vectors` 表記錄了模型名稱，查詢時只用相符的向量——混用不同模型的向量算出來的相似度沒有意義。
+舊 `vectors` 表保留原樣，因缺少 provider／revision，不能只憑 model 名稱自動認定相容。確認契約後可先執行 `--adopt-legacy-embeddings --embed-backend local --embed-model MODEL` 本機驗證映射，再看 `--embed-plan`；`requires_embedding=0` 時 `--embed` 只驗證並啟用，不送出請求。
+
+Hybrid 為明確 opt-in：metadata eligible-set → FTS／vector 各取最多 1000 候選 → occurrence 去重 → RRF（k=60，ID 作 tie-break）→ 可選 rerank。保留 `--semantic` 單一路徑；向量掃描使用游標與有界 Top-K。缺能力時可見地降為 FTS；`--search-strict` 改為失敗，預算拒絕一律向上回報。`--explain-ranking` 只呈現本次排名，不另發起 rerank；semantic／hybrid 本身仍會做一次 query embedding。
+
+```powershell
+python pipeline.py --search '厚皮動物' --hybrid --explain-ranking --json
+python pipeline.py --ask '有哪些比較？' --hybrid --search-strict --ask-limit 12 --json
+```
+
+Rerank 預設關閉，只有明確提供 `--rerank-model MODEL` 才啟用 OpenRouter 請求，禁止 provider fallback，走既有成本守衛；沒有做帳戶授權 canary。`--local-only`／`--dry-run` 禁止 query embedding／rerank，保留 FTS 與可見的降級資訊。JSON 模式只允許一個查詢目標。
 
 ### 為什麼不直接嵌入截圖
 
@@ -578,9 +598,9 @@ OpenRouter 的 `/embeddings` 與 `/rerank` 端點在模型清單裡查不到、�
 
 寫死絕對門檻必定誤殺其中一種，所以預設取「最高分的一半」再加一個很低的地板（`SIMILARITY_FLOOR`）。要固定值就用 `--min-similarity`。
 
-輸出會標示相似度分數，低於 `0.35` 的視為不相關直接濾掉（`pipeline.py` 的 `MIN_SIMILARITY`）—— 少了下限，每次查詢都會回傳整個索引，末幾筆只是「最不像的那些」而不是命中。
+預設 cutoff 是 `max(0.10, top_score * 0.5)`；cosine 與 RRF 都只是排名／檢索參數，不能解讀為真實性信心百分比。
 
-`--ask --semantic` 會直接拿問句比對語意，跳過「先抽關鍵詞」那一步：少一次 API 呼叫，命中也更準。
+`--ask --semantic`／`--hybrid` 直接使用問句查向量，跳過抽關鍵詞呼叫。25 題固定離線回播、baseline 比較、驗收對照與限制見 [Issue #5 驗收紀錄](docs/issue-5-retrieval.md)；假向量結果不代表真實語意模型的準確率或效能。
 
 ## Open Notebook 知識庫
 
@@ -637,7 +657,7 @@ OPEN_NOTEBOOK_PASSWORD=不要提交到版本控制
 | Groq | `audio.transcriptions` | 每個音訊片段送出前（命中本機快取時不預留、不產生新費用） |
 | MiniMax | `chat.completions`（整支影片畫面分析）、`summarize.*`、`query.keywords`、`query.answer`、`digest.report`、`library.classify` | 每次送出前，同一則 `finish_reason` 重試會各自入帳 |
 | MiniMax | `files.upload` | 每次 upload attempt 送出前；bytes 是請求單位，未知價格記為 unknown，strict 模式拒絕送出 |
-| OpenRouter | `embeddings` | 每個 batch 送出前（向量已存在時不送出、不預留） |
+| OpenRouter | `embeddings.document`、`embeddings.query`、`query.rerank` | 每個文件 batch／query／明確 rerank 送出前（文件快取命中時不送出、不預留） |
 | Meta Graph | `graph.query` | 每次分頁請求 |
 | Apify | `actor.run.start` | 只送出一次啟動 POST，不自動重試；金額以供應商端 `APIFY_MAX_TOTAL_CHARGE_USD` 封頂。timeout／5xx 保留未確認預留；後續 poll／dataset 讀取屬同一筆遠端工作，不重複計完整 Actor 費用 |
 | Bright Data | `datasets.trigger` | 寫入 `.submitted` 回執前；被拒絕時不會留下「送出狀態不明」的標記 |

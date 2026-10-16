@@ -138,32 +138,17 @@ def retrieve_history_evidence(
 
     if db_path.is_file():
         try:
-            with closing(sqlite3.connect(db_path)) as conn:
-                conn.row_factory = sqlite3.Row
-                # Search for keyword matches across events
-                for kw in keywords[:4]:
-                    if len(evidence) >= max_evidence:
-                        break
-                    cur = conn.cursor()
-                    cur.execute(
-                        """
-                        SELECT job, kind, timestamp, snippet
-                        FROM events
-                        WHERE job != ? AND snippet LIKE ?
-                        LIMIT 3
-                        """,
-                        (current_job, f"%{kw}%"),
-                    )
-                    for row in cur.fetchall():
-                        evidence.append(
-                            {
-                                "job": row["job"],
-                                "kind": row["kind"],
-                                "timestamp": row["timestamp"],
-                                "text": row["snippet"][:250],
-                            }
-                        )
-        except Exception:
+            from pipeline import SearchFilter, search_index
+
+            filters = SearchFilter(exclude_job=current_job, until=cutoff_time or "",
+                                   date_field="first_completed_at")
+            seen: set[str] = set()
+            for keyword in keywords[:4]:
+                for hit in search_index(root, keyword, max_evidence, filters=filters):
+                    if hit["occurrence_id"] not in seen and len(evidence) < max_evidence:
+                        seen.add(hit["occurrence_id"])
+                        evidence.append(hit)
+        except (RuntimeError, ValueError, sqlite3.Error):
             pass
 
     serialized = json.dumps(evidence, sort_keys=True, ensure_ascii=False)
