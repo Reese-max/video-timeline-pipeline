@@ -1,0 +1,92 @@
+{
+  "repo": "Reese-max/video-timeline-pipeline",
+  "issue": 60,
+  "base_sha": "42d225936ba704cf70b93cac7bdf84da85ac86b8",
+  "red_proof": "NO ISSUE-SPECIFIC RED PROOF: #60 was already documented in the admitted base via merged PR #61. The initial, unchanged-base offline runner failed before any implementation with this output:\nERROR: test_cooperative_cancellation_stops_child (test_execution_control.ExecutionControlTests.test_cooperative_cancellation_stops_child)\nOSError: [WinError 87] 參數錯誤。\nERROR: test_normal_command_output_and_failed_exit_mapping_are_preserved (test_execution_control.ExecutionControlTests.test_normal_command_output_and_failed_exit_mapping_are_preserved)\nOSError: [WinError 87] 參數錯誤。\nRan 621 tests in 138.992s\nFAILED (errors=2, skipped=24)\nThese unrelated Windows Store Python nested-runner errors are NOT TDD evidence for #60. The isolated test file and full suite passed when invoked directly from Bash; no test or implementation was changed and no missing requirement was invented.",
+  "test_command": "python -X utf8 -B -m unittest discover -s tests -v && node tests/test_widget_handoff.cjs && node tests/test_parallel_submission.cjs && node tests/test_widget_analysis_report.cjs && node tests/test_widget_library_experiment.cjs && git diff --check",
+  "test_exit": 0,
+  "tests_passed": 691,
+  "tests_failed": 0,
+  "summary": "Issue #60 is already handled at the admitted base: merged PR #61 documents the stale Cursor Fixed Workspace upload, deleted grokbot-2 parent, menu without deletion, dated uninstalled/non-callable state, and use of the new connection. Local ancestry checks and an independent read-only scope review found no missing repository requirement. This commit adds only the verification receipt and classifies the issue as an already-done / close-candidate; it does not claim a new implementation.",
+  "not_done": "No new issue-specific failing test or red-to-green implementation was produced because the reported repository work already exists. Actual deletion of the stale ChatGPT entry and current ChatGPT UI state were not attempted or verified; documentation describes the historical observation. No product/source/test files changed, no push or PR, no issue closure, no merge, and no deployment. The nested scripts/check_offline.py Windows Store Python failure was recorded, not fixed under this unrelated issue.",
+  "disposition": "already_done_close_candidate",
+  "implementation_performed": false,
+  "test_breakdown": {
+    "python": {
+      "ran": 621,
+      "passed": 597,
+      "failed": 0,
+      "skipped": 24
+    },
+    "widget_handoff": {
+      "passed": 44,
+      "failed": 0
+    },
+    "parallel_submission": {
+      "passed": 2,
+      "failed": 0
+    },
+    "widget_analysis_report": {
+      "passed": 16,
+      "failed": 0
+    },
+    "widget_library_experiment": {
+      "passed": 32,
+      "failed": 0
+    },
+    "git_diff_check_exit": 0
+  },
+  "existing_resolution": {
+    "implementation_commit": "e07aab4c1863ec6c2d335a8c754b165bd4db957b",
+    "pull_request": 61,
+    "merge_commit": "d4474456d1819ec9a1e4b93c4742db8f3f8771f2",
+    "merge_is_ancestor_of_admitted_base_exit": 0
+  },
+  "acceptance_mapping": [
+    {
+      "requirement": "Identify the stale Cursor Fixed Workspace upload and its deleted grokbot-2 parent.",
+      "status": "already_present",
+      "evidence": "README.md:139; docs/ideas/01-test-results.md:11"
+    },
+    {
+      "requirement": "Record the edit/download ZIP/upload new version menu without claiming deletion is available.",
+      "status": "already_present",
+      "evidence": "README.md:139; docs/ideas/01-test-results.md:12-13"
+    },
+    {
+      "requirement": "Record that the item was uninstalled and not called; use the new connection.",
+      "status": "already_present_historical_observation",
+      "evidence": "README.md:139; docs/ideas/01-test-results.md:14"
+    },
+    {
+      "requirement": "Track #60 and its existing documentation PR.",
+      "status": "already_present",
+      "evidence": "docs/ideas/01-test-results.md:15; docs/ideas/README.md:36"
+    }
+  ],
+  "quality_gates": {
+    "whitespace": "git diff --check: exit 0",
+    "shell_syntax": "bash -n scripts/start-mcp-supervised.sh; bash -n scripts/sync-linux.sh; bash -n scripts/bootstrap-gitops.sh: all exit 0",
+    "windows_sync_fixtures": "pwsh -NoProfile -NonInteractive -File tests/test_windows_sync.ps1: exit 0, PASS, 30 checks in isolated temporary repositories",
+    "lint_coverage_crap_mutation": "No dedicated lint, coverage-ratchet, CRAP or mutation configuration was found; no tooling was installed.",
+    "scope_review": "Independent read-only review confirmed the issue was already handled and found no legitimate missing requirement."
+  },
+  "initial_baseline": {
+    "command": "python -X utf8 -B scripts/check_offline.py",
+    "exit": 1,
+    "python_ran": 621,
+    "python_passed": 595,
+    "python_errors": 2,
+    "python_skipped": 24,
+    "isolated_recheck_command": "python -X utf8 -B -m unittest discover -s tests -p test_execution_control.py -v",
+    "isolated_recheck_exit": 0,
+    "isolated_recheck_ran": 13,
+    "isolated_recheck_skipped": 2
+  },
+  "logs": [
+    ".runtime/issue-60-baseline.log",
+    ".runtime/issue-60-execution-control-repro.log",
+    ".runtime/issue-60-direct-suite.log",
+    ".runtime/issue-60-windows-sync.log"
+  ]
+}
