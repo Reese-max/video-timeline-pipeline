@@ -135,6 +135,7 @@ class ReliabilityTests(unittest.TestCase):
                   "transcript": {"segments": [{"text": "hello"}], "backfill_errors": [],
                                  "gap_check": {"max_gap": 5, "remaining": [{"start": 118, "end": 150}]}},
                   "timeline": [{"type": "visual", "data": {"visual_summary": "可用畫面", "confidence": 0.9,
+                                                            "analysis_method": "minimax_video",
                                                             "timestamp_reliable": False}}]}
         response = server.analysis_tool_result(result)
         quality = response.structuredContent["quality"]

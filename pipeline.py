@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import argparse
 import array
-import base64
 import concurrent.futures
 import contextlib
 import csv
@@ -1232,170 +1231,6 @@ def extract_candidates(
     return candidates, metadata
 
 
-def _showinfo_timestamps(output: str) -> list[float]:
-    return [float(value) for value in re.findall(
-        r"\[Parsed_showinfo_[^\]]+\].*?\bn:\s*\d+.*?\bpts_time:([\d.eE+-]+)", output
-    )]
-
-
-def _select_budgeted_probe_indexes(probes: list[dict[str, Any]], max_frames: int) -> list[int]:
-    """Keep endpoints and one scene-weighted representative per temporal window."""
-    if max_frames <= 0:
-        raise ValueError("max_frames must be positive")
-    if len(probes) <= max_frames:
-        return list(range(len(probes)))
-    if max_frames == 1:
-        return [0]
-    selected = {0, len(probes) - 1}
-    windows = max_frames - 2
-    if windows:
-        duration = max(float(probes[-1]["timestamp"]), 0.000001)
-        for window in range(windows):
-            left, right = duration * window / windows, duration * (window + 1) / windows
-            members = [index for index in range(1, len(probes) - 1)
-                       if left <= float(probes[index]["timestamp"]) < right]
-            if members:
-                middle = (left + right) / 2
-                width = max(right - left, 0.000001)
-                selected.add(max(members, key=lambda index: (
-                    float(probes[index]["scene_score"])
-                    + 0.05 * (1 - abs(float(probes[index]["timestamp"]) - middle) / width),
-                    -index,
-                )))
-    # Sparse/VFR inputs may have empty windows. Fill their capacity deterministically
-    # using change strength and distance from already selected frames.
-    while len(selected) < min(max_frames, len(probes)):
-        remaining = [index for index in range(len(probes)) if index not in selected]
-        selected.add(max(remaining, key=lambda index: (
-            float(probes[index]["scene_score"])
-            + min(abs(index - other) for other in selected) / len(probes), -index,
-        )))
-    return sorted(selected)
-
-
-def extract_budgeted_candidates(
-    video_path: Path,
-    job_dir: Path,
-    duration: float,
-    max_frames: int = 40,
-    candidate_budget: int = 240,
-) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-    """MCP sampling: bounded grayscale probes, then only selected full-size JPEGs.
-
-    This is deliberately separate from extract_candidates, whose fixed-interval
-    behavior remains available to CLI callers. Sampling is sparse evidence, not a
-    guarantee that every transient event in a long video has been observed.
-    """
-    if not math.isfinite(duration) or duration <= 0:
-        raise ValueError("duration must be positive and finite")
-    if max_frames < 1 or candidate_budget < max_frames or candidate_budget < 2:
-        raise ValueError("candidate_budget must be >= max_frames and >= 2")
-    budget = OperationBudget("Video sampling", 3600, "VIDEO_PROCESS_TIMEOUT_SECONDS")
-    job_dir.mkdir(parents=True, exist_ok=True)
-    frames_dir = job_dir / "budgeted-frames"
-    frames_dir.mkdir(parents=True, exist_ok=True)
-    manifest_path = frames_dir / "sampling.json"
-    signature = {
-        "version": 1, "source": file_fingerprint(video_path),
-        "duration": duration, "max_frames": max_frames, "candidate_budget": candidate_budget,
-    }
-    if manifest_path.is_file():
-        try:
-            cached = json.loads(manifest_path.read_text(encoding="utf-8"))
-            rows = cached["candidates"]
-            if cached.get("signature") == signature and rows and all(
-                Path(row["path"]).is_file() and Path(row["path"]).stat().st_size > 0 for row in rows
-            ):
-                return rows, cached["stats"]
-        except (OSError, ValueError, KeyError, TypeError):
-            pass
-    for stale in frames_dir.glob("frame_*.jpg"):
-        stale.unlink()
-    probe_count = min(candidate_budget, max(2, math.ceil(duration) + 1))
-    interval = duration / (probe_count - 1)
-    pixels = 64 * 36
-    ffmpeg = require_tool("ffmpeg")
-    with tempfile.TemporaryDirectory(prefix="sampling-", dir=job_dir) as temporary:
-        temporary_dir = Path(temporary)
-        probe_path = temporary_dir / "probes.gray"
-        output = run_external([
-            ffmpeg, "-y", "-hide_banner", "-loglevel", "info", "-i", str(video_path),
-            "-vf", f"select='isnan(prev_selected_t)+gte(t-prev_selected_t,{interval:.9f})',scale=64:36,format=gray,showinfo",
-            "-frames:v", str(probe_count - 1), "-fps_mode", "vfr",
-            "-f", "rawvideo", "-pix_fmt", "gray", str(probe_path),
-        ], timeout=budget.remaining(), include_stderr=True)
-        if probe_path.stat().st_size > pixels * (probe_count - 1):
-            raise RuntimeError("FFmpeg sampling exceeded the grayscale probe budget")
-        raw = probe_path.read_bytes()
-        timestamps = _showinfo_timestamps(output)
-        count = len(raw) // pixels
-        if not count or len(raw) % pixels or len(timestamps) < count:
-            raise RuntimeError("FFmpeg sampling probe bytes and timestamps do not match")
-        probe_rows = [(timestamps[index], raw[index * pixels:(index + 1) * pixels]) for index in range(count)]
-        # Decode only the final second at tiny resolution. Reverse after showinfo
-        # emits the actual last frame while retaining its original PTS in the log.
-        tail_path = temporary_dir / "tail.gray"
-        tail_seek = max(0.0, duration - 1.0)
-        output = run_external([
-            ffmpeg, "-y", "-hide_banner", "-loglevel", "info", "-copyts", "-start_at_zero",
-            "-ss", f"{tail_seek:.9f}", "-noaccurate_seek",
-            "-i", str(video_path), "-vf", "scale=64:36,format=gray,showinfo,reverse",
-            "-frames:v", "1", "-fps_mode", "vfr", "-f", "rawvideo", "-pix_fmt", "gray", str(tail_path),
-        ], timeout=budget.remaining(), include_stderr=True)
-        tail = tail_path.read_bytes() if tail_path.stat().st_size == pixels else b""
-        tail_timestamps = _showinfo_timestamps(output)
-        if len(tail) == pixels and tail_timestamps:
-            tail_timestamp = tail_timestamps[-1]
-            if tail_timestamp > probe_rows[-1][0] + 0.000001:
-                probe_rows.append((tail_timestamp, tail))
-        probes: list[dict[str, Any]] = []
-        previous: bytes | None = None
-        for timestamp, gray in probe_rows:
-            budget.check()
-            score = sum(abs(a - b) for a, b in zip(gray, previous)) / (pixels * 255) if previous else 0.0
-            probes.append({"timestamp": timestamp, "scene_score": score})
-            previous = gray
-        selected = _select_budgeted_probe_indexes(probes, max_frames)
-        candidates: list[dict[str, Any]] = []
-        previous_hash = ""
-        for number, index in enumerate(selected, 1):
-            budget.check()
-            probe = probes[index]
-            seek = max(0.0, float(probe["timestamp"]) - 0.001)
-            frame_path = frames_dir / f"frame_{number:06d}.jpg"
-            output = run_external([
-                ffmpeg, "-y", "-hide_banner", "-loglevel", "info", "-copyts", "-start_at_zero", "-ss", f"{seek:.9f}",
-                "-i", str(video_path), "-frames:v", "1", "-vf",
-                "scale=1280:-2:force_original_aspect_ratio=decrease,showinfo", "-q:v", "3", str(frame_path),
-            ], timeout=budget.remaining(), include_stderr=True)
-            actual_pts = _showinfo_timestamps(output)
-            if not frame_path.is_file() or not frame_path.stat().st_size or not actual_pts:
-                raise RuntimeError("FFmpeg did not produce a selected frame with a timestamp")
-            image_hash = average_hash(frame_path)
-            candidates.append({
-                "timestamp": round(actual_pts[0], 6), "path": str(frame_path),
-                "hash": image_hash, "hash_distance": hash_distance(previous_hash, image_hash) if previous_hash else 64,
-                "ocr_text": "", "ocr_confidence": None,
-                "scene_score": round(float(probe["scene_score"]), 6),
-                "reasons": ["time_coverage"] + (["scene_change"] if probe["scene_score"] >= 0.03 else []),
-            })
-            previous_hash = image_hash
-    probe_gaps = [float(right["timestamp"]) - float(left["timestamp"]) for left, right in zip(probes, probes[1:])]
-    stats = {
-        "method": "budgeted_temporal_windows_with_scene_weighting", "sampling_version": 1,
-        "all_frame_count": len(probes), "probe_count": len(probes), "candidate_count": len(candidates),
-        "candidate_budget": candidate_budget, "frame_budget": max_frames,
-        "probe_interval_seconds": round(interval, 6), "duration_seconds": duration,
-        "max_probe_gap_seconds": round(max(probe_gaps, default=0.0), 6),
-        "probe_resolution": [64, 36], "timestamps_source": "ffmpeg_pts",
-        "sparse_sampling": interval > 1.0,
-        "first_sample_seconds": candidates[0]["timestamp"], "last_sample_seconds": candidates[-1]["timestamp"],
-        "ocr": {"enabled": False, "status": "not enabled in budgeted MCP sampling"},
-    }
-    write_json(manifest_path, {"signature": signature, "candidates": candidates, "stats": stats})
-    return candidates, stats
-
-
 def steipete_command() -> list[str]:
     executable = shutil.which("summarize")
     if executable:
@@ -2459,43 +2294,6 @@ def transcribe_local(
     }
 
 
-def image_data_url(image_path: Path) -> str:
-    try:
-        from PIL import Image
-
-        with Image.open(image_path) as image:
-            image = image.convert("RGB")
-            image.thumbnail((1280, 1280))
-            buffer = io.BytesIO()
-            image.save(buffer, format="JPEG", quality=80, optimize=True)
-            encoded = base64.b64encode(buffer.getvalue()).decode("ascii")
-            return f"data:image/jpeg;base64,{encoded}"
-    except ImportError:
-        encoded = base64.b64encode(image_path.read_bytes()).decode("ascii")
-        mime = mimetypes.guess_type(image_path.name)[0] or "image/jpeg"
-        return f"data:{mime};base64,{encoded}"
-
-
-def uniform_image_observation(image_path: Path) -> dict[str, Any] | None:
-    try:
-        from PIL import Image, ImageStat
-
-        with Image.open(image_path) as image:
-            deviation = max(ImageStat.Stat(image.convert("RGB").resize((64, 64))).stddev)
-    except (ImportError, OSError):
-        return None
-    if deviation > 1.0:
-        return None
-    return {
-        "screen_type": "uniform_frame",
-        "visible_text": [],
-        "visual_summary": "畫面幾乎為單一顏色，沒有可辨識的文字或物件。",
-        "important_details": [],
-        "confidence": 0.99,
-        "analysis_method": "local_uniformity_check",
-    }
-
-
 def minimax_endpoint() -> str:
     base_url = os.getenv("MINIMAX_BASE_URL", "").rstrip("/")
     allowed = {"https://api.minimax.io/v1", "https://api.minimaxi.com/v1"}
@@ -2645,31 +2443,6 @@ def usable_visual_observation(observation: Any) -> bool:
         and math.isfinite(confidence)
         and 0 <= confidence <= 1
     )
-
-
-def reusable_visual_observation(observation: Any, candidate: dict[str, Any]) -> bool:
-    """Check persisted metadata as well as the model's visual schema."""
-    return (
-        usable_visual_observation(observation)
-        and isinstance(observation.get("source_image"), str)
-        and bool(observation["source_image"])
-        and observation.get("timestamp") == candidate.get("timestamp")
-    )
-
-
-def reusable_visual_artifact(observations: Any, candidates: list[dict[str, Any]]) -> bool:
-    """The aggregate cache must cover every selected frame with valid evidence."""
-    return (
-        isinstance(observations, list)
-        and len(observations) == len(candidates)
-        and all(
-            reusable_visual_observation(observation, candidate)
-            and isinstance(candidate.get("path"), (str, Path))
-            and observation["source_image"] == str(candidate["path"])
-            for observation, candidate in zip(observations, candidates)
-        )
-    )
-
 
 
 def minimax_base_url() -> str:
@@ -2893,10 +2666,11 @@ def visual_mode() -> str:
     if mode in {"video", "video_mp4", "mp4"}:
         return "video_mp4"
     if mode in {"frames", "frame", "images", "image"}:
-        return "frames"
-    raise RuntimeError(
-        "ANALYZE_VISUAL_MODE 只能是 video_mp4 或 frames。"
-    )
+        raise RuntimeError(
+            "抽幀模式（ANALYZE_VISUAL_MODE=frames）已移除：影片一律交給 MiniMax 直接讀取，"
+            "請刪除這個設定。"
+        )
+    raise RuntimeError("ANALYZE_VISUAL_MODE 只能是 video_mp4。")
 
 
 def parse_video_timestamp(value: Any, *, allow_negative: bool = False) -> float | None:
@@ -3012,12 +2786,25 @@ def _parse_video_mp4_events(parsed: dict[str, Any]) -> list[dict[str, Any]]:
     return observations
 
 
+# Frame sampling was removed; only whole-video MiniMax answers count as visual evidence.
+WHOLE_VIDEO_ANALYSIS_METHODS = frozenset({"minimax_video", "minimax_video_compressed"})
+
+
+def whole_video_observation(data: Any) -> bool:
+    """True only for evidence MiniMax produced by reading the whole video (never sampled frames)."""
+    return isinstance(data, dict) and data.get("analysis_method") in WHOLE_VIDEO_ANALYSIS_METHODS
+
+
+class VideoMp4UnavailableError(RuntimeError):
+    """The video could not be handed to MiniMax even after compression; there is no frame fallback."""
+
+
 def reusable_video_artifact(observations: Any) -> bool:
-    """MP4 caches require per-event validation; sampled frames use ffmpeg time."""
+    """MP4 caches require per-event validation; frame-sampled results are never reused."""
     return isinstance(observations, list) and bool(observations) and all(
         usable_visual_observation(item)
-        and (isinstance(item.get("timestamp_reliable"), bool)
-             or item.get("analysis_method") == "minimax_video_fallback_frames")
+        and isinstance(item.get("timestamp_reliable"), bool)
+        and item.get("analysis_method") in WHOLE_VIDEO_ANALYSIS_METHODS
         for item in observations
     )
 
@@ -3224,57 +3011,6 @@ def _analyze_video_mp4_core(
 
 
 
-def analyze_video_mp4_frames_fallback(
-    video_path: Path,
-    api_key: str,
-    model: str,
-    *,
-    work_dir: Path,
-    duration: float | None = None,
-    frames_workers: int = 4,
-    max_frames: int | None = None,
-    cache_dir: Path | None = None,
-    fallback_reason: str,
-) -> list[dict[str, Any]]:
-    """Frame-sampling fallback when full MP4 upload cannot proceed; never labeled as full-video."""
-    seconds = float(duration or 0.0)
-    if seconds <= 0:
-        try:
-            seconds = video_duration(probe_video(video_path))
-        except Exception:
-            seconds = 60.0
-    frame_cap = vision_frame_limit(seconds, max_frames)
-    frames_dir = work_dir / "vision-fallback-frames"
-    frames_dir.mkdir(parents=True, exist_ok=True)
-    print(f"! video_mp4 改抽幀備援：{fallback_reason}")
-    candidates, stats = extract_budgeted_candidates(
-        video_path,
-        frames_dir,
-        seconds,
-        max_frames=frame_cap,
-        candidate_budget=240,
-    )
-    vision_cache = cache_dir if cache_dir is not None else frames_dir / "vision-cache"
-    observations = analyze_images(
-        candidates,
-        api_key,
-        model,
-        workers=frames_workers,
-        cache_dir=vision_cache,
-    )
-    extra = {
-        "fallback_reason": fallback_reason,
-        "fallback_from": "video_mp4",
-        "fallback_sampling": stats,
-    }
-    return _stamp_video_observations(
-        observations,
-        analysis_method="minimax_video_fallback_frames",
-        source_video=video_path,
-        extra=extra,
-    )
-
-
 def analyze_video_mp4(
     video_path: Path,
     api_key: str,
@@ -3286,16 +3022,13 @@ def analyze_video_mp4(
     detail: str | None = None,
     timeout: int | None = None,
     work_dir: Path | None = None,
-    frames_workers: int = 4,
-    max_frames: int | None = None,
-    allow_frames_fallback: bool = True,
 ) -> list[dict[str, Any]]:
     """Send the whole MP4 to MiniMax-M3 via Files API + video_url (not per-frame images).
 
     When the source exceeds the Files API ~512MB limit or upload rejects for size,
     prefer ffmpeg compress/transcode under ~450MB and retry. If compress is
-    unavailable, fails, or still too large, fall back to frame sampling and mark
-    analysis_method as minimax_video_fallback_frames (never silently as full-video).
+    unavailable, fails, or still too large, raise: frame sampling was removed and
+    the video is never analysed as individual images.
     """
     if cache_dir is not None:
         cache_dir.mkdir(parents=True, exist_ok=True)
@@ -3393,38 +3126,6 @@ def analyze_video_mp4(
             )
         return observations
 
-    def frames_or_raise(reason: str) -> list[dict[str, Any]]:
-        detail = reason
-        if failure_reasons:
-            detail = reason + " | prior: " + " ; ".join(failure_reasons)
-        if not allow_frames_fallback:
-            raise RuntimeError(f"video_mp4 無法繼續且 frames 備援已關閉：{detail}")
-        return analyze_video_mp4_frames_fallback(
-            video_path,
-            api_key,
-            model,
-            work_dir=scratch,
-            duration=duration,
-            frames_workers=frames_workers,
-            max_frames=max_frames,
-            cache_dir=None if cache_dir is None else cache_dir / "frames-fallback",
-            fallback_reason=detail,
-        )
-
-    def finish(observations: list[dict[str, Any]], parsed: dict[str, Any] | None, file_id: str | None) -> list[dict[str, Any]]:
-        # A truncated whole-video answer (finish_reason=length) leaves zero visual
-        # evidence; long videos hit the output cap routinely, so sample frames instead.
-        # Other incomplete outcomes (e.g. timestamp_coverage) stay fail-closed.
-        truncated = any(
-            isinstance(item, dict)
-            and item.get("completion_status") == "incomplete"
-            and item.get("finish_reason") == "length"
-            for item in observations
-        )
-        if not truncated or not allow_frames_fallback:
-            return persist(observations, parsed, file_id)
-        return frames_or_raise("video_mp4 response truncated (finish_reason=length)")
-
     try:
         if strategy == "direct":
             core_result = None
@@ -3438,7 +3139,7 @@ def analyze_video_mp4(
                 failure_reasons.append(str(error))
                 print(f"! MiniMax video_mp4 上傳因大小／上限失敗，改試壓縮：{error}")
             if core_result is not None:
-                return finish(*core_result)
+                return persist(*core_result)
 
         # compress_first (oversized source) or retry after size reject
         compressed_path = scratch / "minimax-compressed.mp4"
@@ -3477,7 +3178,7 @@ def analyze_video_mp4(
                 except Exception as upload_error:
                     if is_minimax_video_size_error(upload_error):
                         raise
-                    # Compress succeeded; non-size upload/analyze errors are not a frames fallback.
+                    # Compress succeeded; non-size upload/analyze errors propagate unchanged.
                     raise
                 compressed_result = (observations, parsed, file_id)
                 break
@@ -3505,122 +3206,20 @@ def analyze_video_mp4(
                     continue
                 raise
         if compressed_result is not None:
-            return finish(*compressed_result)
+            return persist(*compressed_result)
 
         reason = (
-            f"source {source_size} bytes requires fallback; compress failed"
+            f"source {source_size} bytes exceeds the MiniMax upload limit; compress failed"
             if compress_error is None
             else f"compress/upload failed: {compress_error}"
         )
-        return frames_or_raise(reason)
+        if failure_reasons:
+            reason += " | prior: " + " ; ".join(failure_reasons)
+        raise VideoMp4UnavailableError(f"video_mp4 無法交給 MiniMax 直接讀取（抽幀備援已移除）：{reason}")
     finally:
         if owned_temp is not None:
             owned_temp.cleanup()
 
-
-
-def analyze_images(
-    candidates: list[dict[str, Any]],
-    api_key: str,
-    model: str,
-    workers: int = 8,
-    cache_dir: Path | None = None,
-) -> list[dict[str, Any]]:
-    if cache_dir is not None:
-        cache_dir.mkdir(parents=True, exist_ok=True)
-
-    def one(item: tuple[int, dict[str, Any]]) -> tuple[int, dict[str, Any]]:
-        index, candidate = item
-        local_ocr = str(candidate.get("ocr_text", "")).strip()
-        prompt = (
-            "請分析這張影片截圖，只輸出 JSON object，不要 Markdown。"
-            "欄位必須包含 screen_type、visible_text（字串陣列）、visual_summary、"
-            "important_details（字串陣列）、confidence（0 到 1）。"
-            "若看不清楚，保留空陣列並降低 confidence。"
-            # 同上：畫面觀察也要統一成繁體中文，知識庫才能用同一種語言檢索。
-            "描述文字一律用繁體中文，畫面上的原文照抄不要翻譯。"
-        )
-        if local_ocr:
-            prompt += f"\n本地 OCR 初篩文字（僅供交叉確認）：{local_ocr}"
-        image_path = Path(str(candidate["path"]))
-        cache_path: Path | None = None
-        if cache_dir is not None:
-            material = json.dumps(
-                {
-                    "version": 3,
-                    "model": model,
-                    "prompt": prompt,
-                    "timestamp": candidate["timestamp"],
-                    "image_sha256": file_sha256(image_path),
-                },
-                ensure_ascii=False,
-                sort_keys=True,
-                separators=(",", ":"),
-            )
-            cache_path = cache_dir / (hashlib.sha256(material.encode("utf-8")).hexdigest() + ".json")
-            cached = reuse_artifact(cache_path)
-            if reusable_visual_observation(cached, candidate):
-                record_cost_cache_hit("minimax", "vision.analyze_images", model=model)
-                cached = dict(cached)
-                cached["source_image"] = str(image_path)
-                return index, cached
-        observation = uniform_image_observation(image_path)
-        if observation is None:
-            try:
-                response = minimax_chat(
-                    [
-                        {
-                            "role": "user",
-                            "content": [
-                                {"type": "text", "text": prompt},
-                                {"type": "image_url", "image_url": {"url": image_data_url(image_path)}},
-                            ],
-                        }
-                    ],
-                    api_key,
-                    model,
-                    operation="vision.analyze_images",
-                )
-                observation = parse_json_object(response)
-            except MiniMaxIncompleteError as error:
-                observation = {
-                    "completion_status": "incomplete",
-                    "finish_reason": error.finish_reason or "missing",
-                }
-            if not usable_visual_observation(observation):
-                # 截斷或不符 schema 的觀察不能進快取，也不能標成已核對畫面。
-                incomplete = {
-                    "screen_type": "候選畫面",
-                    "visible_text": [],
-                    "visual_summary": VISUAL_NOT_ANALYZED,
-                    "important_details": [],
-                    "confidence": None,
-                    "completion_status": "incomplete",
-                    "finish_reason": observation.get("finish_reason") or "stop",
-                }
-                if "raw" in observation:
-                    incomplete["raw"] = observation["raw"]
-                observation = incomplete
-            else:
-                observation["analysis_method"] = "minimax"
-        if usable_visual_observation(observation):
-            observation["visual_schema_version"] = VISUAL_OBSERVATION_SCHEMA_VERSION
-            observation["completion_status"] = "complete"
-        observation["timestamp"] = candidate["timestamp"]
-        observation["source_image"] = str(image_path)
-        observation["local_ocr_text"] = local_ocr
-        observation["local_ocr_confidence"] = candidate.get("ocr_confidence")
-        if cache_path is not None and reusable_visual_observation(observation, candidate):
-            write_json(cache_path, observation)
-        return index, observation
-
-    results: dict[int, dict[str, Any]] = {}
-    with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, min(workers, 8))) as pool:
-        futures = [pool.submit(one, item) for item in enumerate(candidates)]
-        for future in concurrent.futures.as_completed(futures):
-            index, observation = future.result()
-            results[index] = observation
-    return [results[index] for index in sorted(results)]
 
 
 def run_parallel_stages(
@@ -4267,6 +3866,9 @@ def flatten_text(value: Any) -> str:
     return ""
 
 
+LIBRARY_SCHEMA_VERSION = 3
+
+
 def index_connection(root: Path) -> sqlite3.Connection:
     connection = sqlite3.connect(root / "library.db")
     # tokenize='trigram'：unicode61 會把整句中文吃成單一 token，中文查詢一律落空。
@@ -4329,6 +3931,14 @@ def index_connection(root: Path) -> sqlite3.Connection:
         )
         """
     )
+    # Libraries built before frame sampling was removed may hold frame-derived
+    # visual rows; drop every visual row and force a rebuild, so --search/--ask
+    # never read them even when --index has not been run since the upgrade.
+    if connection.execute("PRAGMA user_version").fetchone()[0] < LIBRARY_SCHEMA_VERSION:
+        connection.execute("DELETE FROM events WHERE kind = 'visual'")
+        connection.execute("DELETE FROM index_state")
+        connection.execute(f"PRAGMA user_version = {LIBRARY_SCHEMA_VERSION}")
+        connection.commit()
     return connection
 
 
@@ -4358,7 +3968,7 @@ def index_job(connection: sqlite3.Connection, job_dir: Path) -> int:
     signature = text_hash(
         json.dumps(
             {
-                "version": 2,
+                "version": 3,
                 "source": {
                     "title": source.get("title"),
                     "url": source.get("url"),
@@ -4413,6 +4023,8 @@ def index_job(connection: sqlite3.Connection, job_dir: Path) -> int:
                 text = str(event.get("text", "")).strip()
             else:
                 data = event.get("data")
+                if event.get("type") == "visual" and not whole_video_observation(data):
+                    continue  # frame-sampled evidence (removed mode) must not feed search or Q&A
                 if not visual_time_reliable(data):
                     timestamp = None
                 if isinstance(data, dict):
@@ -7686,32 +7298,6 @@ def self_test() -> None:
     except RuntimeError as exc:
         assert "Credits" in str(exc)
 
-    # 併發回收後必須還原輸入順序，否則時間軸會跟錯圖。
-    # 讓越前面的圖睡越久，完成順序必定反轉：沒排序就會被抓到。
-    count = 8
-    vision_barrier = threading.Barrier(count)
-    original_chat, original_data_url = minimax_chat, image_data_url
-    globals()["image_data_url"] = lambda path: "data:image/jpeg;base64,x"
-
-    def parallel_vision_chat(messages: list[dict[str, Any]], *args: Any, **kwargs: Any) -> str:
-        tag = messages[0]["content"][0]["text"].rsplit("：", 1)[-1]
-        vision_barrier.wait(timeout=5)
-        time.sleep((count - int(tag[3:])) * 0.02)
-        return json.dumps({"tag": tag, "screen_type": "slide", "visible_text": [], "visual_summary": tag, "important_details": [], "confidence": 0.5})
-
-    globals()["minimax_chat"] = parallel_vision_chat
-    try:
-        observations = analyze_images(
-            [{"timestamp": i, "path": f"f{i}.jpg", "ocr_text": f"OCR{i}"} for i in range(count)],
-            "key",
-            "model",
-            workers=8,
-        )
-    finally:
-        globals()["minimax_chat"], globals()["image_data_url"] = original_chat, original_data_url
-    assert [item["tag"] for item in observations] == [f"OCR{i}" for i in range(count)]
-    assert [item["timestamp"] for item in observations] == list(range(count))
-
     # Groq 與 MiniMax 是不同供應商，兩個階段應同時啟動。
     cloud_barrier = threading.Barrier(2)
 
@@ -7722,51 +7308,6 @@ def self_test() -> None:
     assert run_parallel_stages(
         lambda: cloud_stage("transcript"), lambda: cloud_stage("visual")
     ) == ("transcript", "visual")
-
-    # 純色轉場沒有可分析內容，不應交給視覺模型自由補故事。
-    with tempfile.TemporaryDirectory() as temporary:
-        from PIL import Image
-
-        uniform = Path(temporary) / "uniform.png"
-        varied = Path(temporary) / "varied.png"
-        Image.new("RGB", (16, 16), (0, 1, 127)).save(uniform)
-        varied_image = Image.new("RGB", (16, 16), "black")
-        varied_image.paste("white", (8, 0, 16, 16))
-        varied_image.save(varied)
-        assert uniform_image_observation(uniform)["screen_type"] == "uniform_frame"
-        assert uniform_image_observation(varied) is None
-
-    # 每張圖的 MiniMax 結果各自落盤；重跑不再呼叫已成功的圖片。
-    with tempfile.TemporaryDirectory() as temporary:
-        vision_root = Path(temporary)
-        image = vision_root / "frame.jpg"
-        image.write_bytes(b"frame")
-        original_chat, original_data_url = minimax_chat, image_data_url
-        globals()["image_data_url"] = lambda path: "data:image/jpeg;base64,x"
-        globals()["minimax_chat"] = lambda *args, **kwargs: json.dumps(
-            {"screen_type": "slide", "visible_text": [], "visual_summary": "slide", "important_details": [], "confidence": 0.5}
-        )
-        try:
-            first = analyze_images(
-                [{"timestamp": 1, "path": str(image), "ocr_text": "OCR"}],
-                "key",
-                "model",
-                cache_dir=vision_root / "cache",
-            )
-
-            def unexpected_chat(*args: Any, **kwargs: Any) -> str:
-                raise AssertionError("視覺快取命中時不應呼叫 MiniMax")
-
-            globals()["minimax_chat"] = unexpected_chat
-            second = analyze_images(
-                [{"timestamp": 1, "path": str(image), "ocr_text": "OCR"}],
-                "key",
-                "model",
-                cache_dir=vision_root / "cache",
-            )
-        finally:
-            globals()["minimax_chat"], globals()["image_data_url"] = original_chat, original_data_url
-        assert first == second
 
     assert flatten_text({"a": ["x", {"b": "y"}]}) == "x y"
 
@@ -7904,8 +7445,10 @@ def self_test() -> None:
             fake_job / "timeline.json",
             [
                 {"timestamp": 3.0, "type": "speech", "text": "這段說明時間軸合併的做法"},
-                {"timestamp": 5.0, "type": "visual", "data": {"visual_summary": "終端機畫面"}},
-                {"timestamp": 7.0, "type": "visual", "data": {"visual_summary": "合併前後對照，合併結果如圖"}},
+                {"timestamp": 5.0, "type": "visual", "data": {"visual_summary": "終端機畫面",
+                                                              "analysis_method": "minimax_video", "timestamp_reliable": True}},
+                {"timestamp": 7.0, "type": "visual", "data": {"visual_summary": "合併前後對照，合併結果如圖",
+                                                              "analysis_method": "minimax_video", "timestamp_reliable": True}},
             ],
         )
         assert build_index(index_root)[1:] == (1, 4)
@@ -8049,7 +7592,7 @@ def parse_args() -> argparse.Namespace:
         "--vision-workers",
         type=int,
         default=8,
-        help="MiniMax 畫面分析併發數，預設／最多 8",
+        help="已無作用：抽幀畫面分析已移除，畫面一律由 MiniMax 讀整支影片；保留參數只為相容舊指令",
     )
     parser.add_argument("--language", default=None, help="逐字稿語言；auto 交給 Whisper 自動偵測")
     parser.add_argument(
@@ -8516,23 +8059,24 @@ def run_pipeline(args: argparse.Namespace) -> Path:
                     )
 
             def visual_stage() -> list[dict[str, Any]]:
-                if visual_mode() == "video_mp4":
-                    if not has_video:
-                        return []
-                    previous_mode = (previous.get("config") or {}).get("visual_mode")
-                    cached = (
-                        reuse_artifact(job_dir / "visual.json")
-                        if reuse_cloud
-                        and previous_mode == "video_mp4"
-                        and previous.get("models", {}).get("visual") == model
-                        and previous.get("source", {}).get("resolved_video")
-                        == artifact_path(video_path, root)
-                        else None
-                    )
-                    if reusable_video_artifact(cached):
-                        print("· 重用既有整支影片視覺觀察")
-                        return cached
-                    print("· MiniMax 直接讀取 mp4（CLI）")
+                visual_mode()  # rejects the removed frame-sampling mode
+                if not has_video:
+                    return []
+                previous_mode = (previous.get("config") or {}).get("visual_mode")
+                cached = (
+                    reuse_artifact(job_dir / "visual.json")
+                    if reuse_cloud
+                    and previous_mode == "video_mp4"
+                    and previous.get("models", {}).get("visual") == model
+                    and previous.get("source", {}).get("resolved_video")
+                    == artifact_path(video_path, root)
+                    else None
+                )
+                if reusable_video_artifact(cached):
+                    print("· 重用既有整支影片視覺觀察")
+                    return cached
+                print("· MiniMax 直接讀取 mp4（CLI）")
+                try:
                     return analyze_video_mp4(
                         video_path,
                         minimax_subscription_key(),
@@ -8540,41 +8084,28 @@ def run_pipeline(args: argparse.Namespace) -> Path:
                         duration=duration_seconds,
                         cache_dir=None if args.refresh else job_dir / "vision-video-cache",
                         work_dir=job_dir / "vision-video-work",
-                        frames_workers=args.vision_workers,
-                        max_frames=args.max_vision_frames,
                     )
-                previous_config = previous.get("config") or {}
-                previous_frames_match = previous.get("frame_candidate_cache_key") == frame_cache_key
-                if not previous.get("frame_candidate_cache_key"):
-                    previous_frames_match = all(
-                        previous_config.get(key) == artifact_config.get(key)
-                        for key in (
-                            "frame_interval",
-                            "hash_threshold",
-                            "slide_extractor",
-                            "scene_threshold",
-                            "min_slide_duration",
-                            "max_vision_frames",
-                            "ocr",
-                        )
+                except VideoMp4UnavailableError as error:
+                    # Without a frame fallback the visual stage fails alone; the
+                    # transcript from the parallel stage must still be written.
+                    print(f"! 畫面分析未完成：{error}")
+                    return _stamp_video_observations(
+                        [
+                            {
+                                "timestamp": 0.0,
+                                "screen_type": "影片",
+                                "visible_text": [],
+                                "visual_summary": VISUAL_NOT_ANALYZED,
+                                "important_details": [],
+                                "confidence": None,
+                                "completion_status": "incomplete",
+                                "finish_reason": "video_unavailable",
+                                "error": str(error)[:500],
+                            }
+                        ],
+                        analysis_method="minimax_video",
+                        source_video=video_path,
                     )
-                cached = (
-                    reuse_artifact(job_dir / "visual.json")
-                    if reuse_cloud
-                    and previous_frames_match
-                    and previous.get("models", {}).get("visual") == model
-                    else None
-                )
-                if reusable_visual_artifact(cached, candidates):
-                    print("· 重用既有視覺觀察")
-                    return cached
-                return analyze_images(
-                    candidates,
-                    minimax_subscription_key(),
-                    model,
-                    args.vision_workers,
-                    None if args.refresh else job_dir / "vision-cache",
-                )
 
             cloud_started = time.monotonic()
             (transcript, transcript_raw), observations = run_parallel_stages(

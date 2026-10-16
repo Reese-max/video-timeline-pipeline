@@ -147,7 +147,7 @@ class VideoTimestampReliabilityTests(unittest.TestCase):
             upload.assert_not_called()
             self.assertEqual(cached, fresh)
 
-    def test_aggregate_mp4_cache_requires_validation_except_real_frames(self):
+    def test_aggregate_mp4_cache_requires_validation_and_rejects_frames(self):
         legacy = {**self.event(90), "analysis_method": "minimax_video"}
         self.assertFalse(pipeline.reusable_video_artifact([legacy]))
         self.assertFalse(pipeline.reusable_video_artifact([{**legacy, "analysis_method": "minimax_video_compressed"}]))
@@ -156,7 +156,7 @@ class VideoTimestampReliabilityTests(unittest.TestCase):
         self.assertTrue(pipeline.reusable_video_artifact([validated]))
         self.assertFalse(pipeline.reusable_video_artifact([validated, legacy]))
         self.assertFalse(pipeline.reusable_video_artifact([{**validated, "completion_status": "incomplete"}]))
-        self.assertTrue(pipeline.reusable_video_artifact([{**legacy, "analysis_method": "minimax_video_fallback_frames"}]))
+        self.assertFalse(pipeline.reusable_video_artifact([{**legacy, "analysis_method": "minimax_video_fallback_frames"}]))
 
     def test_markdown_unreliable_visual_time_has_no_jump_link(self):
         with tempfile.TemporaryDirectory() as temporary:

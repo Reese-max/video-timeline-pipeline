@@ -41,7 +41,7 @@ obey `VIDEO_PROCESS_TIMEOUT_SECONDS` (3600) and `VIDEO_API_TIMEOUT_SECONDS` (900
 bounded by the remaining job deadline. These time limits do not guarantee that
 an already accepted remote API request is unbilled or cancelled remotely.
 
-Whole-video MiniMax analysis (`ANALYZE_VISUAL_MODE=video_mp4`, the default) always
+Whole-video MiniMax analysis (`ANALYZE_VISUAL_MODE=video_mp4`, the only mode) always
 sends `max_completion_tokens` (`ANALYZE_VIDEO_MAX_TOKENS`, default and ceiling
 524288); without it MiniMax applies a small server default and long videos end
 with `finish_reason=length`. The call waits up to `ANALYZE_VIDEO_TIMEOUT_SECONDS`
@@ -51,17 +51,16 @@ stay under ~800k of the 1M context (floor 0.2 fps).
 
 ## Sampling and cache correctness
 
-The MCP visual stage uses at most 240 low-resolution probes across the full
-timeline, with time-window representatives and scene-change weighting. Only up
-to 40 selected full-resolution JPEGs are written. Frame timestamps come from
-FFmpeg PTS, including the last decodable frame. The returned `sampling` object
-reports actual counts and sparse sampling; a 40-frame budget cannot establish
-that every event in a long video was observed. This limits frame preparation and
-disk use; it does not promise a percentage reduction in provider charges.
+The MCP visual stage uploads the whole video to MiniMax; frame sampling and the
+frame fallback were removed, and `ANALYZE_VISUAL_MODE=frames` now raises. If the
+video cannot be uploaded (even after compression) or the answer is truncated,
+the visual stage is reported incomplete instead of switching to images. Visual
+events are the model's summary of the whole video, not a frame-by-frame record;
+the returned `sampling` object reports the fps, detail and output ceiling sent.
 
 `cache_signature` covers source SHA-256, code/prompt/schema versions, vision model
 and endpoint, ASR backend/model/language, local ASR settings, audio chunk length
-and sampling configuration. Credentials are excluded. A same-size source with
+and whole-video settings (fps, detail, output ceiling). Credentials are excluded. A same-size source with
 the same modification time but different bytes invalidates the cache. Partial
 results are saved and available for review; only complete matching results skip
 analysis. `get_prepared_video` never restores a completed analysis under a stale

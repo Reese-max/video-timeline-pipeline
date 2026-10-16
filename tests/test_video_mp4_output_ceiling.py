@@ -63,39 +63,37 @@ class VideoMp4OutputCeilingTests(unittest.TestCase):
         video.write_bytes(b"fake-mp4-bytes")
         with mock.patch.dict(os.environ, env or {}, clear=False), \
              mock.patch.object(pipeline, "minimax_upload_video_understanding", return_value="fid"), \
-             mock.patch.object(pipeline, "minimax_chat", return_value=_spread_response(duration)) as chat, \
-             mock.patch.object(pipeline, "analyze_video_mp4_frames_fallback") as frames:
+             mock.patch.object(pipeline, "minimax_chat", return_value=_spread_response(duration)) as chat:
             observations = pipeline.analyze_video_mp4(
                 video, "key", "MiniMax-M3", duration=duration, work_dir=root / "work"
             )
-        return observations, chat, frames
+        return observations, chat
 
     def test_whole_video_call_requests_model_maximum_output(self) -> None:
-        _, chat, frames = self._run(552.0)
+        _, chat = self._run(552.0)
         kwargs = chat.call_args.kwargs
         self.assertEqual(kwargs["max_completion_tokens"], pipeline.MINIMAX_VIDEO_MAX_COMPLETION_TOKENS)
         self.assertGreaterEqual(kwargs["timeout"], 3600)
-        frames.assert_not_called()
 
     def test_prompt_no_longer_caps_event_count(self) -> None:
-        _, chat, _ = self._run(552.0)
+        _, chat = self._run(552.0)
         prompt = chat.call_args.args[0][0]["content"][0]["text"]
         self.assertNotIn("20 筆", prompt)
         self.assertIn("不設筆數上限", prompt)
 
     def test_env_can_lower_ceiling_but_not_exceed_model_limit(self) -> None:
-        _, chat, _ = self._run(60.0, {"ANALYZE_VIDEO_MAX_TOKENS": "999999999"})
+        _, chat = self._run(60.0, {"ANALYZE_VIDEO_MAX_TOKENS": "999999999"})
         self.assertEqual(chat.call_args.kwargs["max_completion_tokens"], 524288)
-        _, chat, _ = self._run(60.0, {"ANALYZE_VIDEO_MAX_TOKENS": "65536"})
+        _, chat = self._run(60.0, {"ANALYZE_VIDEO_MAX_TOKENS": "65536"})
         self.assertEqual(chat.call_args.kwargs["max_completion_tokens"], 65536)
 
     def test_short_video_keeps_requested_fps(self) -> None:
-        _, chat, _ = self._run(552.0)
+        _, chat = self._run(552.0)
         video_part = chat.call_args.args[0][0]["content"][1]["video_url"]
         self.assertEqual(video_part["fps"], 1.0)
 
     def test_long_video_fps_drops_to_fit_context(self) -> None:
-        _, chat, _ = self._run(7200.0)
+        _, chat = self._run(7200.0)
         fps = chat.call_args.args[0][0]["content"][1]["video_url"]["fps"]
         self.assertLess(fps, 1.0)
         self.assertLessEqual(

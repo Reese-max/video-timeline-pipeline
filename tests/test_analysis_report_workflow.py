@@ -42,7 +42,7 @@ class AnalysisReportTests(unittest.TestCase):
                       patch.object(server.pipeline,'probe_video',return_value={'format':{'duration':'2'},'streams':[{'codec_type':'video'},{'codec_type':'audio'}]}),
                       patch.object(server.pipeline,'extract_audio',return_value=[{'path':str(self.job/'source.mp4')}]),
                       patch.object(server.pipeline,'transcribe_local',return_value={'provider':'owned-inert','segments':[{'start':0,'end':1,'text':'owned speech <source>'}]}),
-                      patch.object(server.pipeline,'analyze_video_mp4',return_value=[{'timestamp':0,'visual_summary':'owned visual <source>','visible_text':['42'],'confidence':0.9}]),
+                      patch.object(server.pipeline,'analyze_video_mp4',return_value=[{'timestamp':0,'visual_summary':'owned visual <source>','visible_text':['42'],'confidence':0.9,'analysis_method':'minimax_video','timestamp_reliable':True}]),
                       patch.object(server.pipeline,'create_summary',side_effect=AssertionError('No duplicate summary provider'))):s.enter_context(p)
             return server.analyze_prepared_sync(self.job_id)
 

@@ -399,16 +399,9 @@ class MCPValidationTests(unittest.TestCase):
                 patch.object(mcp_server.pipeline, "minimax_model", return_value="MiniMax-M3"),
                 patch.object(mcp_server.pipeline, "minimax_endpoint", return_value="https://api.minimax.io/v1"),
                 patch.object(mcp_server.pipeline, "minimax_subscription_key", return_value="key"),
-                patch.object(
-                    mcp_server.pipeline,
-                    "extract_budgeted_candidates",
-                    return_value=(
-                        [{"timestamp": 0, "path": str(video_path), "ocr_text": ""}],
-                        {},
-                    ),
-                ) as extract_candidates_mock,
-                patch.object(mcp_server.pipeline, "analyze_images", return_value=[{
-                    "timestamp": 0, "visual_summary": "A visible sign", "confidence": 0.9}]),
+                patch.object(mcp_server.pipeline, "analyze_video_mp4", return_value=[{
+                    "timestamp": 0, "visual_summary": "A visible sign", "confidence": 0.9,
+                    "analysis_method": "minimax_video"}]) as analyze_video_mock,
                 patch.object(
                     mcp_server.pipeline,
                     "extract_audio",
@@ -436,7 +429,7 @@ class MCPValidationTests(unittest.TestCase):
                 patch.object(mcp_server.pipeline, "create_summary") as create_summary_mock,
                 patch.object(mcp_server.pipeline, "file_sha256", return_value="sha"),
                 patch.object(mcp_server.pipeline, "write_json"),
-                patch.dict(mcp_server.os.environ, {"GROQ_API_KEY": "groq", "ANALYZE_VISUAL_MODE": "frames"}, clear=False),
+                patch.dict(mcp_server.os.environ, {"GROQ_API_KEY": "groq", "ANALYZE_VISUAL_MODE": "video_mp4"}, clear=False),
             ):
                 result = mcp_server.analyze_prepared_sync("0123456789ab")
 
@@ -447,8 +440,8 @@ class MCPValidationTests(unittest.TestCase):
         self.assertEqual(result["summary"]["status"], "pending_chatgpt")
         self.assertEqual(result["quality"]["status"], "evidence_available")
         create_summary_mock.assert_not_called()
-        self.assertEqual(extract_candidates_mock.call_args.kwargs["candidate_budget"], 240)
-        self.assertEqual(extract_candidates_mock.call_args.args[2], 2)
+        analyze_video_mock.assert_called_once()
+        self.assertEqual(analyze_video_mock.call_args.kwargs["duration"], 2)
 
     def test_drive_upload_caches_verified_segment_metadata(self) -> None:
         with tempfile.TemporaryDirectory() as raw_dir:

@@ -45,6 +45,7 @@ def eligible_media(job: Path, cutoff: float) -> tuple[list[Path], str]:
                 or result.get("errors") or result["quality"]["status"] != "evidence_available"
                 or result["quality"].get("warnings")
                 or any(pipeline.saved_visual_timestamp_issue(row, result.get("duration_seconds"))
+                       or not pipeline.whole_video_observation(row.get("data"))
                        for row in result.get("timeline", []) if row.get("type") == "visual")):
             return [], "not_complete_or_needs_review"
         source = pipeline.locate_source_video(job)
