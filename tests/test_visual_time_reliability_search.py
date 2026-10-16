@@ -202,6 +202,21 @@ class VisualTimeReliabilitySearchTests(unittest.TestCase):
             self.assertEqual(pipeline.index_job(connection, self.job), 7)
             self.assertEqual(connection.total_changes, changes)
 
+    def test_pre_upgrade_library_drops_visual_rows_before_any_search(self):
+        pipeline.build_index(self.root)
+        with contextlib.closing(pipeline.index_connection(self.root)) as connection:
+            connection.execute("INSERT INTO events VALUES (?, ?, ?, ?)",
+                               (self.job.name, 95, "visual", "舊抽幀畫面殘留"))
+            connection.execute("PRAGMA user_version = 2")
+            connection.commit()
+        # No --index run: opening the library for search must already purge it.
+        self.assertEqual(pipeline.search_index(self.root, "舊抽幀畫面殘留", 10), [])
+        with contextlib.closing(pipeline.index_connection(self.root)) as connection:
+            self.assertEqual(connection.execute("SELECT count(*) FROM events WHERE kind = 'visual'").fetchone()[0], 0)
+            self.assertEqual(connection.execute("SELECT count(*) FROM index_state").fetchone()[0], 0)
+            self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], pipeline.LIBRARY_SCHEMA_VERSION)
+        self.assertEqual(pipeline.build_index(self.root)[1:], (1, 7))
+
     def test_index_bad_timeline_leaves_chapters_untainted(self):
         (self.job / "timeline.json").write_text("invalid JSON", encoding="utf-8")
         self.assertEqual(pipeline.build_index(self.root)[1:], (1, 4))

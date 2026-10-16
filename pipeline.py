@@ -3866,6 +3866,9 @@ def flatten_text(value: Any) -> str:
     return ""
 
 
+LIBRARY_SCHEMA_VERSION = 3
+
+
 def index_connection(root: Path) -> sqlite3.Connection:
     connection = sqlite3.connect(root / "library.db")
     # tokenize='trigram'：unicode61 會把整句中文吃成單一 token，中文查詢一律落空。
@@ -3928,6 +3931,14 @@ def index_connection(root: Path) -> sqlite3.Connection:
         )
         """
     )
+    # Libraries built before frame sampling was removed may hold frame-derived
+    # visual rows; drop every visual row and force a rebuild, so --search/--ask
+    # never read them even when --index has not been run since the upgrade.
+    if connection.execute("PRAGMA user_version").fetchone()[0] < LIBRARY_SCHEMA_VERSION:
+        connection.execute("DELETE FROM events WHERE kind = 'visual'")
+        connection.execute("DELETE FROM index_state")
+        connection.execute(f"PRAGMA user_version = {LIBRARY_SCHEMA_VERSION}")
+        connection.commit()
     return connection
 
 

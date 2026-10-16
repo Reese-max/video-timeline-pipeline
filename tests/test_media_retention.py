@@ -58,7 +58,7 @@ class RetentionTests(unittest.TestCase):
             self.assertEqual(retention.cleanup(root, apply=True, now=self.now)["deleted_files"], 0)
 
     def test_ineligible_jobs_are_untouched(self):
-        for reason in ["exactly_7_days", "recent_write", "partial", "needs_review", "drive", "manual_hold", "invalid", "source_changed", "unfinished"]:
+        for reason in ["exactly_7_days", "recent_write", "partial", "needs_review", "drive", "manual_hold", "invalid", "source_changed", "unfinished", "frame_era"]:
             with self.subTest(reason=reason), tempfile.TemporaryDirectory() as directory:
                 root = Path(directory).resolve() / "mcp_jobs"
                 job = self.make_job(root, 7 if reason == "exactly_7_days" else 8)
@@ -81,6 +81,13 @@ class RetentionTests(unittest.TestCase):
                     (job / "source.mp4").write_bytes(b"changed")
                 elif reason == "unfinished":
                     (job / "source.mp4.part").touch()
+                elif reason == "frame_era":
+                    # A pre-removal frame-sampled result must keep the source for re-analysis.
+                    data = json.loads(result.read_text())
+                    data["timeline"] = [{"type": "visual", "timestamp": 1.0, "data": {
+                        "visual_summary": "old frame", "confidence": 0.9, "analysis_method": "minimax"}}]
+                    pipeline.write_json(result, data)
+                    os.utime(result, (self.now - 8 * 86400,) * 2)
                 self.assertEqual(retention.cleanup(root, apply=True, now=self.now)["deleted_files"], 0)
                 self.assertTrue((job / "source.mp4").exists())
 
