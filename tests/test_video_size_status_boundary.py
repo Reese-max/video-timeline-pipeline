@@ -32,7 +32,7 @@ class SizeStatusBoundaryTests(unittest.TestCase):
             with self.subTest(error=type(error).__name__, message=str(error)):
                 self.assertFalse(pipeline.is_minimax_video_size_error(error))
 
-    def test_real_oversize_branch_preserves_two_compressions_then_frames(self) -> None:
+    def test_real_oversize_branch_preserves_two_compressions_then_raises(self) -> None:
         with tempfile.TemporaryDirectory(prefix="owned-video-size-boundary-") as directory:
             root = Path(directory)
             video = root / "clip.mp4"
@@ -51,17 +51,16 @@ class SizeStatusBoundaryTests(unittest.TestCase):
                 destination.write_bytes(b"owned compressed fixture")
                 return destination
 
-            observations = [{"timestamp": 0.0, "analysis_method": "minimax_video_fallback_frames", "fallback_reason": "owned size fixture"}]
-            with mock.patch.object(Path, "stat", size_stat), mock.patch.object(pipeline, "compress_video_for_minimax_upload", side_effect=compress) as compressed_calls, mock.patch.object(pipeline, "minimax_upload_video_understanding") as uploads, mock.patch.object(pipeline, "minimax_chat") as chats, mock.patch.object(pipeline, "analyze_video_mp4_frames_fallback", return_value=observations) as frames:
-                result = pipeline.analyze_video_mp4(video, "owned-synthetic-key", "MiniMax-M3", duration=120.0, work_dir=root / "work")
-            self.assertEqual(result, observations)
+            with mock.patch.object(Path, "stat", size_stat), mock.patch.object(pipeline, "compress_video_for_minimax_upload", side_effect=compress) as compressed_calls, mock.patch.object(pipeline, "minimax_upload_video_understanding") as uploads, mock.patch.object(pipeline, "minimax_chat") as chats:
+                with self.assertRaises(RuntimeError) as ctx:
+                    pipeline.analyze_video_mp4(video, "owned-synthetic-key", "MiniMax-M3", duration=120.0, work_dir=root / "work")
             self.assertEqual(compressed_calls.call_count, 2)
             self.assertEqual([call.kwargs["target_bytes"] for call in compressed_calls.call_args_list], [pipeline.MINIMAX_VIDEO_COMPRESS_TARGET_BYTES, pipeline.MINIMAX_VIDEO_COMPRESS_RETRY_BYTES])
             uploads.assert_not_called()
             chats.assert_not_called()
-            frames.assert_called_once()
-            self.assertIn("642900000 bytes", frames.call_args.kwargs["fallback_reason"])
-            self.assertIn("512 MB", frames.call_args.kwargs["fallback_reason"])
+            self.assertIn("抽幀備援已移除", str(ctx.exception))
+            self.assertIn("642900000 bytes", str(ctx.exception))
+            self.assertIn("512 MB", str(ctx.exception))
 
 
 if __name__ == "__main__":

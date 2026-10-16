@@ -50,9 +50,9 @@ VidBee 完成的本機影音（或影片 URL） → FFmpeg
 | `summary-cache/` | 提示詞版本＋模型＋實際輸入；超長內容逐段保存後再整合 |
 | `library.db` 的 `index_state` | 時間軸、摘要與分類未變時，不再刪除並重建全文索引 |
 
-Groq 轉錄與 MiniMax 畫面分析會同時執行；超長逐字稿的 MiniMax 分段摘要也會受限並行。`--workers` 預設／最多 4；畫面分析另由 `--vision-workers` 控制，預設／最多 8。畫面張數預設依片長每 30 秒約 1 張、最少 8、最多 40；`--max-vision-frames N` 可手動覆寫。抽樣點會保持穩定，增加張數時可沿用已分析畫面的快取。不會為了速度切換到較不精確的 Whisper turbo。純色／空白畫面會先由 Pillow 判定，避免視覺模型捏造內容；MiniMax-M3 摘要使用官方 `thinking: {"type":"disabled"}` 直接回答，畫面分析仍保留 adaptive thinking。
+Groq 轉錄與 MiniMax 畫面分析會同時執行；超長逐字稿的 MiniMax 分段摘要也會受限並行。`--workers` 預設／最多 4。不會為了速度切換到較不精確的 Whisper turbo。`--dry-run`／`--local-only` 不呼叫雲端，只在本機擷取畫面做 OCR 預覽（`--max-vision-frames N` 控制張數），這些畫面不會交給 MiniMax。MiniMax-M3 摘要使用官方 `thinking: {"type":"disabled"}` 直接回答，畫面分析仍保留 adaptive thinking。
 
- 視覺分析預設 `ANALYZE_VISUAL_MODE=video_mp4`：整支 MP4 經 MiniMax Files API 上傳後以 `video_url` 交給 MiniMax-M3 直接理解（不再抽 JPEG 逐張分析）。若要舊行為設 `ANALYZE_VISUAL_MODE=frames`。可調 `ANALYZE_VIDEO_FPS`（0.2–5）與 `ANALYZE_VIDEO_DETAIL`（low|default|high）。來源超過 Files API 約 512MB（或上傳因大小被拒）時，會先用 ffmpeg 壓到約 400–480MB 再重試；壓縮失敗或仍過大則改抽幀備援，並以 `analysis_method=minimax_video_fallback_frames`（或壓縮成功時的 `minimax_video_compressed`）標明，不會假裝成一般整支影片分析。`video_mp4` 的畫面時間碼一律是從 0 起算的原片秒數：提示詞要求事件覆蓋全片到片尾，解析接受純數字與 `MM:SS`／中文時間並丟棄無法解析的事件（不再靜默記為 0.0）；事件峰值不到 `min(片長-30 秒, 片長一半)` 或超出片長 30 秒以上時只重問一次（沿用已上傳的檔案 ID，短片豁免），仍對不上就以 `finish_reason=timestamp_coverage` 標示未完成、不寫入可重用快取。MCP `analysis/result.json` 只有在畫面無未完成標示、且逐字稿無剩餘斷層（`gap_check.remaining`）與補轉失敗（`backfill_errors`）時才會以 `status=complete` 寫入並被重用；否則記為未完成，重跑會再次呼叫模型。
+ 視覺分析只有一種方式：整支 MP4 經 MiniMax Files API 上傳後以 `video_url` 交給 MiniMax-M3 直接理解。抽幀模式與抽幀備援已移除，設定 `ANALYZE_VISUAL_MODE=frames` 會直接報錯。可調 `ANALYZE_VIDEO_FPS`（0.2–5）與 `ANALYZE_VIDEO_DETAIL`（low|default|high）。來源超過 Files API 約 512MB（或上傳因大小被拒）時，會先用 ffmpeg 壓到約 400–480MB 再重試；壓縮失敗或仍過大則該次畫面分析失敗（只保留逐字稿），不會改用抽幀；壓縮成功時以 `analysis_method=minimax_video_compressed` 標明。MiniMax 回應被截斷（`finish_reason=length`）時標示未完成、不寫入快取。`video_mp4` 的畫面時間碼一律是從 0 起算的原片秒數：提示詞要求事件覆蓋全片到片尾，解析接受純數字與 `MM:SS`／中文時間並丟棄無法解析的事件（不再靜默記為 0.0）；事件峰值不到 `min(片長-30 秒, 片長一半)` 或超出片長 30 秒以上時只重問一次（沿用已上傳的檔案 ID，短片豁免），仍對不上就以 `finish_reason=timestamp_coverage` 標示未完成、不寫入可重用快取。MCP `analysis/result.json` 只有在畫面無未完成標示、且逐字稿無剩餘斷層（`gap_check.remaining`）與補轉失敗（`backfill_errors`）時才會以 `status=complete` 寫入並被重用；否則記為未完成，重跑會再次呼叫模型。
 
 `reasoning_split` 只改回傳格式，不能關閉推理。
 
@@ -74,7 +74,7 @@ python pipeline.py --video 'D:\path\to\video.mp4' --dry-run --slide-extractor st
 
 ## ChatGPT 網頁 MCP 影片摘要
 
-`mcp_server.py` 是 ChatGPT Apps/MCP 入口：公開影片 URL → 既有下載器 → FFmpeg 分段 → Groq 語音辨識／MiniMax 抽樣畫面分析 → ChatGPT 根據工具證據整理時間軸。v14 widget 在準備完成後自動同時啟動伺服器分析（A）與 Drive 上傳（B，已設定時），兩者互不等待；再由「交給 ChatGPT 整理」送出整理要求；重新開啟不會自動重跑或重送。CLI 的 MiniMax 摘要流程不變；MCP 不另呼叫 MiniMax 產生摘要。影片放在 Git 忽略的 `mcp_jobs\`，工作佇列及簽章金鑰在私有 `.video-state/`。
+`mcp_server.py` 是 ChatGPT Apps/MCP 入口：公開影片 URL → 既有下載器 → FFmpeg 分段 → Groq 語音辨識／MiniMax 整支影片畫面分析 → ChatGPT 根據工具證據整理時間軸。v14 widget 在準備完成後自動同時啟動伺服器分析（A）與 Drive 上傳（B，已設定時），兩者互不等待；再由「交給 ChatGPT 整理」送出整理要求；重新開啟不會自動重跑或重送。CLI 的 MiniMax 摘要流程不變；MCP 不另呼叫 MiniMax 產生摘要。影片放在 Git 忽略的 `mcp_jobs\`，工作佇列及簽章金鑰在私有 `.video-state/`。
 
 ### v14：背景工作、可核對證據與儲存管理
 
@@ -82,7 +82,7 @@ python pipeline.py --video 'D:\path\to\video.mp4' --dry-run --slide-extractor st
 
 A 分析完成時，本機產生 `A_server_analysis.md`（逐字稿、畫面時間軸、品質與待整理摘要），widget 自動取得報告快照並提示等待 ChatGPT 整理摘要。「交給 ChatGPT 整理」要求 ChatGPT 先讀取目前證據與報告綁定，再呼叫 `finalize_analysis_report` 提交摘要及來源註記；也可在 widget 明確填寫後提交。只有 `summary_status=caller_submitted`、影片片段已在 Drive 且兩路 worker 已停止，才會排入獨立的報告上傳工作，放進同一個 Drive 資料夾。widget 追蹤 queued／running 報告；`report_ready` 且 `verified` 時顯示「A 已完成」並啟用「複製合併指令」。指令以「合併：」開頭，保留 file_id、SHA-256 與未獨立驗證聲明。
 
-長片最多使用 240 個低解析度探針、40 張入選影格；時間窗與場景變化兼顧全片範圍。快取比對來源 SHA-256、模型、語言、後端、取樣設定及程式版本。介面可切換逐字稿／畫面觀察、點時間碼核對原片，並顯示抽樣與缺漏限制。
+長片最多使用 240 個低解析度探針、40 張入選影格；時間窗與場景變化兼顧全片範圍。快取比對來源 SHA-256、模型、語言、後端、取樣設定及程式版本。介面可切換逐字稿／畫面觀察、點時間碼核對原片，並顯示證據缺漏限制。
 
 簽名下載網址預設 24 小時有效；受管媒體預設保留七天，總量 20 GiB、單工作 4 GiB、保留至少 1 GiB 空間。清理需 `MCP_STORAGE_CLEANUP_ENABLED=1`，只處理已明確納管且到期的工作，保護執行中工作及有效分享。舊工作不會在部署時被批次納管。設定、相容性及驗證界線詳見 [操作說明](docs/video-mcp-operations.md)。
 
@@ -120,7 +120,7 @@ $env:MCP_PORT = '8787'
 .\.venv\Scripts\python mcp_server.py
 ```
 
-本機檢查：`Invoke-RestMethod http://127.0.0.1:8787/health`；ChatGPT Developer Mode 則新增 MCP app，填入 MCP tunnel 網址加 `/mcp`。需在 MCP 主機設定既有的 `GROQ_API_KEY` 與 `MINIMAX_SUBSCRIPTION_KEY`。`MCP_MEDIA_BASE_URL` 僅供預覽／分段連結使用；主流程不透過瀏覽器抓取 MP4。分析工具回傳來源大小／SHA-256、逐字稿與抽樣畫面時間軸，再由 widget 送出 ChatGPT 整理要求；這不是 ChatGPT 親自讀取 MP4。`ingest_video_segments` 保留舊 API 相容，但新 widget 不呼叫它。
+本機檢查：`Invoke-RestMethod http://127.0.0.1:8787/health`；ChatGPT Developer Mode 則新增 MCP app，填入 MCP tunnel 網址加 `/mcp`。需在 MCP 主機設定既有的 `GROQ_API_KEY` 與 `MINIMAX_SUBSCRIPTION_KEY`。`MCP_MEDIA_BASE_URL` 僅供預覽／分段連結使用；主流程不透過瀏覽器抓取 MP4。分析工具回傳來源大小／SHA-256、逐字稿與整支影片畫面時間軸，再由 widget 送出 ChatGPT 整理要求；這不是 ChatGPT 親自讀取 MP4。`ingest_video_segments` 保留舊 API 相容，但新 widget 不呼叫它。
 
 v11 的 `quality` 是保守證據檢查，不是準確率評分：分析階段失敗、有音軌卻無可用逐字稿、缺畫面描述、未完成回應，或畫面自報信心缺漏／不高於 0.5，會回傳 `needs_review`。沒有音軌不是 ASR 失敗。模型自報信心未經校準，即使 `evidence_available` 也不保證內容正確；畫面是抽樣，非逐幀檢視。品質不足時不送出一般摘要要求，改走自動上傳的 Drive 原片覆核交接內容（B 路線：一般對話用官方 connector 讀原片，保持獨立）；「開始分析」「上傳到我的 Drive」按鈕保留手動重試入口。若 ChatGPT 整理時發現矛盾或使用者認為品質差，也走此入口。工具例外或 Drive 失敗時明確停止，保留重試入口，不把 metadata 當成讀取成功。
 

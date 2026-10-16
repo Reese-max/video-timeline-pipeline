@@ -1,4 +1,4 @@
-"""Unit tests for ANALYZE_VISUAL_MODE helpers and >512MB video_mp4 fallback."""
+"""Unit tests for ANALYZE_VISUAL_MODE and >512MB video_mp4 compression (no frame fallback)."""
 
 from __future__ import annotations
 
@@ -43,9 +43,6 @@ class VisualModeTests(unittest.TestCase):
             ("video_mp4", "video_mp4"),
             ("VIDEO", "video_mp4"),
             ("mp4", "video_mp4"),
-            ("frames", "frames"),
-            ("frame", "frames"),
-            ("images", "frames"),
         ]:
             with mock.patch.dict(os.environ, {"ANALYZE_VISUAL_MODE": raw}):
                 self.assertEqual(pipeline.visual_mode(), expected)
@@ -135,15 +132,13 @@ class AnalyzeVideoMp4FallbackTests(unittest.TestCase):
             video.write_bytes(b"fake-mp4-bytes")
             with mock.patch.object(pipeline, "minimax_upload_video_understanding", return_value="fid-1") as upload, \
                  mock.patch.object(pipeline, "minimax_chat", return_value=_good_video_response()) as chat, \
-                 mock.patch.object(pipeline, "compress_video_for_minimax_upload") as compress, \
-                 mock.patch.object(pipeline, "analyze_video_mp4_frames_fallback") as frames:
+                 mock.patch.object(pipeline, "compress_video_for_minimax_upload") as compress:
                 observations = pipeline.analyze_video_mp4(
                     video, "key", "MiniMax-M3", duration=5.0, work_dir=root / "work"
                 )
             upload.assert_called_once()
             chat.assert_called_once()
             compress.assert_not_called()
-            frames.assert_not_called()
             self.assertEqual(observations[0]["analysis_method"], "minimax_video")
             self.assertEqual(observations[0]["minimax_file_id"], "fid-1")
             self.assertEqual(observations[0]["visual_summary"], "測試畫面摘要")
@@ -175,14 +170,12 @@ class AnalyzeVideoMp4FallbackTests(unittest.TestCase):
             with mock.patch.object(Path, "stat", fake_stat), \
                  mock.patch.object(pipeline, "compress_video_for_minimax_upload", side_effect=fake_compress) as compress, \
                  mock.patch.object(pipeline, "minimax_upload_video_understanding", return_value="fid-c") as upload, \
-                 mock.patch.object(pipeline, "minimax_chat", return_value=_good_video_response((1.0, 118.5))), \
-                 mock.patch.object(pipeline, "analyze_video_mp4_frames_fallback") as frames:
+                 mock.patch.object(pipeline, "minimax_chat", return_value=_good_video_response((1.0, 118.5))):
                 observations = pipeline.analyze_video_mp4(
                     video, "key", "MiniMax-M3", duration=120.0, work_dir=root / "work"
                 )
             compress.assert_called()
             upload.assert_called_once()
-            frames.assert_not_called()
             self.assertEqual(observations[0]["analysis_method"], "minimax_video_compressed")
             self.assertEqual(observations[0]["minimax_file_id"], "fid-c")
             self.assertIn("compressed_from_bytes", observations[0])
@@ -211,17 +204,15 @@ class AnalyzeVideoMp4FallbackTests(unittest.TestCase):
                 ],
             ) as upload, \
                  mock.patch.object(pipeline, "compress_video_for_minimax_upload", side_effect=fake_compress) as compress, \
-                 mock.patch.object(pipeline, "minimax_chat", return_value=_good_video_response()), \
-                 mock.patch.object(pipeline, "analyze_video_mp4_frames_fallback") as frames:
+                 mock.patch.object(pipeline, "minimax_chat", return_value=_good_video_response()):
                 observations = pipeline.analyze_video_mp4(
                     video, "key", "MiniMax-M3", duration=10.0, work_dir=root / "work"
                 )
             self.assertEqual(upload.call_count, 2)
             compress.assert_called()
-            frames.assert_not_called()
             self.assertEqual(observations[0]["analysis_method"], "minimax_video_compressed")
 
-    def test_compress_failure_falls_back_to_frames(self) -> None:
+    def test_compress_failure_raises_without_frames(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             video = root / "huge.mp4"
@@ -238,84 +229,20 @@ class AnalyzeVideoMp4FallbackTests(unittest.TestCase):
                     )
                 return result
 
-            fallback_obs = [
-                {
-                    "timestamp": 0.0,
-                    "screen_type": "抽幀",
-                    "visible_text": [],
-                    "visual_summary": "備援觀察",
-                    "important_details": [],
-                    "confidence": 0.5,
-                    "analysis_method": "minimax_video_fallback_frames",
-                    "fallback_reason": "ffmpeg missing",
-                    "visual_schema_version": pipeline.VISUAL_OBSERVATION_SCHEMA_VERSION,
-                    "completion_status": "complete",
-                }
-            ]
             with mock.patch.object(Path, "stat", fake_stat), \
                  mock.patch.object(
                      pipeline,
                      "compress_video_for_minimax_upload",
                      side_effect=RuntimeError("找不到 ffmpeg，請先安裝並加入 PATH。"),
                  ), \
-                 mock.patch.object(
-                     pipeline,
-                     "analyze_video_mp4_frames_fallback",
-                     return_value=fallback_obs,
-                 ) as frames:
-                observations = pipeline.analyze_video_mp4(
-                    video, "key", "MiniMax-M3", duration=30.0, work_dir=root / "work"
-                )
-            frames.assert_called_once()
-            self.assertEqual(observations[0]["analysis_method"], "minimax_video_fallback_frames")
-            self.assertIn("fallback_reason", observations[0])
-
-    def test_frames_fallback_marks_method_clearly(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            video = root / "clip.mp4"
-            video.write_bytes(b"fake")
-            candidate = {
-                "path": str(root / "frame.jpg"),
-                "timestamp": 1.5,
-                "ocr_text": "",
-                "ocr_confidence": None,
-            }
-            (root / "frame.jpg").write_bytes(b"jpg")
-            good = {
-                "screen_type": "畫面",
-                "visible_text": [],
-                "visual_summary": "抽幀內容",
-                "important_details": [],
-                "confidence": 0.8,
-            }
-            with mock.patch.object(pipeline, "extract_budgeted_candidates", return_value=([candidate], {"method": "budgeted"})), \
-                 mock.patch.object(
-                     pipeline,
-                     "analyze_images",
-                     return_value=[
-                         {
-                             **good,
-                             "timestamp": 1.5,
-                             "analysis_method": "minimax",
-                             "visual_schema_version": pipeline.VISUAL_OBSERVATION_SCHEMA_VERSION,
-                             "completion_status": "complete",
-                         }
-                     ],
-                 ), \
-                 mock.patch.object(pipeline, "probe_video", return_value={"format": {"duration": "10"}}):
-                observations = pipeline.analyze_video_mp4_frames_fallback(
-                    video,
-                    "key",
-                    "MiniMax-M3",
-                    work_dir=root / "work",
-                    duration=10.0,
-                    fallback_reason="compress failed",
-                )
-            self.assertEqual(observations[0]["analysis_method"], "minimax_video_fallback_frames")
-            self.assertEqual(observations[0]["fallback_reason"], "compress failed")
-            self.assertEqual(observations[0]["fallback_from"], "video_mp4")
-            self.assertNotEqual(observations[0]["analysis_method"], "minimax_video")
+                 mock.patch.object(pipeline, "minimax_upload_video_understanding") as upload:
+                with self.assertRaises(RuntimeError) as ctx:
+                    pipeline.analyze_video_mp4(
+                        video, "key", "MiniMax-M3", duration=30.0, work_dir=root / "work"
+                    )
+            upload.assert_not_called()
+            self.assertIn("抽幀備援已移除", str(ctx.exception))
+            self.assertIn("ffmpeg", str(ctx.exception))
 
     def test_upload_rate_limit_exceeded_raises_without_compress_or_frames_fallback(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -327,8 +254,7 @@ class AnalyzeVideoMp4FallbackTests(unittest.TestCase):
                 "minimax_upload_video_understanding",
                 side_effect=RuntimeError("API HTTP 429: rate limit exceeded"),
             ) as upload, \
-                 mock.patch.object(pipeline, "compress_video_for_minimax_upload") as compress, \
-                 mock.patch.object(pipeline, "analyze_video_mp4_frames_fallback") as frames:
+                 mock.patch.object(pipeline, "compress_video_for_minimax_upload") as compress:
                 with self.assertRaises(RuntimeError) as ctx:
                     pipeline.analyze_video_mp4(
                         video, "key", "MiniMax-M3", duration=8.0, work_dir=root / "work"
@@ -336,7 +262,6 @@ class AnalyzeVideoMp4FallbackTests(unittest.TestCase):
                 self.assertIn("rate limit exceeded", str(ctx.exception))
             self.assertEqual(upload.call_count, 1)
             compress.assert_not_called()
-            frames.assert_not_called()
 
     def test_upload_budget_blocked_raises_without_compress_or_frames_fallback(self) -> None:
         from cost_tracker import BudgetBlockedError
@@ -354,8 +279,7 @@ class AnalyzeVideoMp4FallbackTests(unittest.TestCase):
                     operation="files.upload",
                 ),
             ) as upload, \
-                 mock.patch.object(pipeline, "compress_video_for_minimax_upload") as compress, \
-                 mock.patch.object(pipeline, "analyze_video_mp4_frames_fallback") as frames:
+                 mock.patch.object(pipeline, "compress_video_for_minimax_upload") as compress:
                 with self.assertRaises(BudgetBlockedError) as ctx:
                     pipeline.analyze_video_mp4(
                         video, "key", "MiniMax-M3", duration=8.0, work_dir=root / "work"
@@ -363,7 +287,6 @@ class AnalyzeVideoMp4FallbackTests(unittest.TestCase):
                 self.assertIn("exceeds daily limit", str(ctx.exception))
             self.assertEqual(upload.call_count, 1)
             compress.assert_not_called()
-            frames.assert_not_called()
 
     def test_oversize_upload_rate_limit_raises_without_retry_or_frames(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -394,8 +317,7 @@ class AnalyzeVideoMp4FallbackTests(unittest.TestCase):
                      pipeline,
                      "minimax_upload_video_understanding",
                      side_effect=RuntimeError("API HTTP 429: rate limit exceeded"),
-                 ) as upload, \
-                 mock.patch.object(pipeline, "analyze_video_mp4_frames_fallback") as frames:
+                 ) as upload:
                 with self.assertRaises(RuntimeError) as ctx:
                     pipeline.analyze_video_mp4(
                         video, "key", "MiniMax-M3", duration=120.0, work_dir=root / "work"
@@ -403,7 +325,6 @@ class AnalyzeVideoMp4FallbackTests(unittest.TestCase):
                 self.assertIn("rate limit exceeded", str(ctx.exception))
             self.assertEqual(compress.call_count, 1)
             self.assertEqual(upload.call_count, 1)
-            frames.assert_not_called()
 
 
 

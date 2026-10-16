@@ -90,7 +90,7 @@ class AnalysisCacheRegressionTests(unittest.TestCase):
         """Run analyze_prepared_sync twice with real disk cache; return results + mocks."""
         analyze_mock = MagicMock(return_value=[dict(observations[0])])
         transcribe_mock = MagicMock(return_value=(dict(transcript), {}))
-        env = {"GROQ_API_KEY": "test-key", "ANALYZE_VISUAL_MODE": "frames"}
+        env = {"GROQ_API_KEY": "test-key", "ANALYZE_VISUAL_MODE": "video_mp4"}
         patches = [
             patch.object(mcp_server, "MCP_ROOT", self.root),
             patch.object(mcp_server, "MCP_JOBS_ROOT", self.root / "mcp_jobs"),
@@ -105,10 +105,7 @@ class AnalysisCacheRegressionTests(unittest.TestCase):
             patch.object(mcp_server.pipeline, "minimax_endpoint",
                          return_value="https://api.minimax.io/v1"),
             patch.object(mcp_server.pipeline, "minimax_subscription_key", return_value="key"),
-            patch.object(mcp_server.pipeline, "extract_budgeted_candidates",
-                         return_value=([{"timestamp": 0, "path": str(self.source),
-                                         "ocr_text": ""}], {})),
-            patch.object(mcp_server.pipeline, "analyze_images", analyze_mock),
+            patch.object(mcp_server.pipeline, "analyze_video_mp4", analyze_mock),
             patch.object(mcp_server.pipeline, "extract_audio", return_value=[{
                 "index": 0, "path": str(self.source), "source_start": 0,
                 "source_end": 2, "sha256": "audio"}]),

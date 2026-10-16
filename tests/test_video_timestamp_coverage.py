@@ -96,7 +96,6 @@ class TimestampCoverageTests(unittest.TestCase):
             mock.patch.object(pipeline, "minimax_upload_video_understanding", return_value="fid-56"),
             mock.patch.object(pipeline, "minimax_chat", side_effect=responses),
             mock.patch.object(pipeline, "compress_video_for_minimax_upload"),
-            mock.patch.object(pipeline, "analyze_video_mp4_frames_fallback"),
         ]
         for patch in patches:
             patch.start()

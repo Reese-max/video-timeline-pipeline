@@ -455,7 +455,7 @@ function applyAnalysis(result) {
   if (!evidenceRows.some(row => row.type === "visual")) gaps.push("缺少畫面觀察，不能以逐字稿代替畫面證據。");
   if (evidenceRows.some(row => row.timestamp === null)) gaps.push("部分證據缺少時間碼，無法直接跳到原片核對。");
   if (!result.source_sha256 || !result.source_size_bytes) gaps.push("缺少來源檔案核對資訊。");
-  gaps.push(result.quality?.limitation || "畫面為抽樣觀察，逐字稿與模型描述可能有誤；重要資訊請核對原片。");
+  gaps.push(result.quality?.limitation || "畫面事件為模型讀完整支影片後的摘要，逐字稿與模型描述可能有誤；重要資訊請核對原片。");
   $("quality").textContent = result.status === "complete" && result.quality?.status === "evidence_available" && result.source_sha256 && result.source_size_bytes ? "已取得伺服器分析證據；請核對時間碼與原片。" : "結果需要覆核；缺漏如下。你可以先整理已知證據，或明確選擇上傳 Drive。";
   $("gaps").replaceChildren();
   for (const gap of new Set(gaps.map(String).filter(Boolean))) { const item = document.createElement("li"); item.textContent = gap; $("gaps").append(item); }
