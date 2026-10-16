@@ -295,11 +295,12 @@ class StoragePolicy:
             self._write_marker(path, marker)
             return dict(marker)
 
-    def protect_until(self, job_id: str, expires) -> dict:
+    def protect_until(self, job_id: str, expires, *, link: bool = False) -> dict:
         """Persist the latest live link expiry before returning its URL.
 
         Unmanaged legacy jobs already have indefinite protection and are not
-        silently adopted by this operation.
+        silently adopted by this operation. ``link`` marks a playback URL, kept
+        separately so Drive-backed cleanup waits only for issued links.
         """
         expires = _timestamp(expires)
         with self._guard():
@@ -308,6 +309,8 @@ class StoragePolicy:
             if marker is None:
                 return {"managed": False, "protected_until": expires}
             marker["protected_until"] = max(expires, marker["protected_until"])
+            if link:
+                marker["link_until"] = max(expires, _timestamp(marker.get("link_until", 0)))
             self._write_marker(path, marker)
             return {"managed": True, "protected_until": marker["protected_until"]}
 
