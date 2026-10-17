@@ -72,6 +72,19 @@ python pipeline.py --video 'D:\path\to\video.mp4' --dry-run --slide-extractor st
 
 `--dry-run` 不會下載、不會上傳、不會呼叫雲端 API，但會用本機 `ffprobe`／`ffmpeg` 產生音訊片段與候選截圖。輸出在 `jobs\<12字元雜湊>\`。
 
+## 本機唯讀 Dashboard（W0）
+
+```powershell
+python pipeline.py --serve
+python pipeline.py --serve --root 'D:\path\to\library' --host 127.0.0.1 --port 8080
+```
+
+在瀏覽器開啟 `http://127.0.0.1:8080/`，可瀏覽影片、既有片段與本機 FTS 搜尋結果；不需新增 Web 依賴或 API 金鑰，也不啟動下載、分析、模型、worker、排程或寄信。按 Ctrl+C 會關閉服務並釋放監聽 socket。
+
+W0 僅允許 loopback（`127.0.0.1`、`localhost`、`::1`），拒絕非本機 Host 與跨來源 Origin，且不開放跨域讀取或寫入方法。搜尋、列表與詳情皆以唯讀連線查詢 `library.db`，不自動建立或遷移 schema；缺少索引會顯示 `index_required`，不相容會顯示 `migration_required`，須先停止服務再明確執行索引維護。
+
+`GET /api/health` 回傳 `{"status":"ok"}`，只確認 HTTP 服務可回應，不代表索引已建立或相容。此版本只涵蓋 W0；成本、評分、佇列操作、付費查詢與寄送介面仍未開放。
+
 ## ChatGPT 網頁 MCP 影片摘要
 
 `mcp_server.py` 是 ChatGPT Apps/MCP 入口：公開影片 URL → 既有下載器 → FFmpeg 分段 → Groq 語音辨識／MiniMax 整支影片畫面分析 → ChatGPT 根據工具證據整理時間軸。v14 widget 在準備完成後自動同時啟動伺服器分析（A）與 Drive 上傳（B，已設定時），兩者互不等待；再由「交給 ChatGPT 整理」送出整理要求；重新開啟不會自動重跑或重送。CLI 的 MiniMax 摘要流程不變；MCP 不另呼叫 MiniMax 產生摘要。影片放在 Git 忽略的 `mcp_jobs\`，工作佇列及簽章金鑰在私有 `.video-state/`。
