@@ -11,9 +11,15 @@ Covers:
 
 from __future__ import annotations
 
+import contextlib
+import datetime
+import io
+import json
 import os
+import sys
 import tempfile
 import unittest
+from contextlib import closing
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -178,6 +184,407 @@ class ReportingAndHealthTests(unittest.TestCase):
         failed_list = cost_tracker.get_failed_list(self.root)
         self.assertEqual(len(failed_list), 2)
         self.assertEqual(failed_list[0]["safe_error"], "Rate limited by Apify")
+
+
+class _FrozenDatetimeModule:
+    """Stand-in for the ``datetime`` module with ``datetime.now()`` frozen.
+
+    ``cost_tracker`` does ``import datetime``; patching the module attribute pins
+    ``_utc_now_iso()`` and the period-id derivation to the same instant without
+    any provider or network call.
+    """
+
+    def __init__(self, frozen_utc: datetime.datetime) -> None:
+        if frozen_utc.tzinfo is None:
+            raise ValueError("frozen_utc must be timezone-aware")
+
+        class FrozenDatetime(datetime.datetime):
+            @classmethod
+            def now(cls, tz=None):
+                if tz is None:
+                    return frozen_utc.replace(tzinfo=None)
+                return frozen_utc.astimezone(tz)
+
+        self.datetime = FrozenDatetime
+        self.timezone = datetime.timezone
+        self.timedelta = datetime.timedelta
+        self.date = datetime.date
+        self.time = datetime.time
+        self.tzinfo = datetime.tzinfo
+
+
+class BudgetTimezoneAccountingTests(unittest.TestCase):
+    """Issue #18: COST_TIMEZONE must drive daily/monthly budget period boundaries."""
+
+    def setUp(self) -> None:
+        self.tmp_dir = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp_dir.name)
+
+    def tearDown(self) -> None:
+        self.tmp_dir.cleanup()
+
+    def _freeze(self, *utc_args: int):
+        """Patch cost_tracker.datetime so now() returns the given UTC instant."""
+        frozen = datetime.datetime(*utc_args, tzinfo=datetime.timezone.utc)
+        return patch.object(cost_tracker, "datetime", _FrozenDatetimeModule(frozen))
+
+    def _reservation_period(self, reservation_id: str) -> str:
+        with closing(cost_tracker.get_operations_db(self.root)) as conn:
+            row = conn.execute(
+                "SELECT period_id FROM budget_reservations WHERE reservation_id = ?",
+                (reservation_id,),
+            ).fetchone()
+        self.assertIsNotNone(row)
+        return row["period_id"]
+
+    def _reservation_status(self, reservation_id: str) -> str:
+        with closing(cost_tracker.get_operations_db(self.root)) as conn:
+            row = conn.execute(
+                "SELECT status FROM budget_reservations WHERE reservation_id = ?",
+                (reservation_id,),
+            ).fetchone()
+        self.assertIsNotNone(row)
+        return row["status"]
+
+    def test_taipei_day_spans_utc_date_boundary(self) -> None:
+        env = {"COST_TIMEZONE": "Asia/Taipei", "DAILY_BUDGET_USD": "0.010", "BUDGET_HARD_STOP": "true"}
+        with patch.dict(os.environ, env):
+            # 2026-09-30 23:59 UTC == 2026-10-01 07:59 in Asia/Taipei
+            with self._freeze(2026, 9, 30, 23, 59):
+                allowed, reservation_id, _ = cost_tracker.check_and_reserve_budget(
+                    self.root, operation_name="transcribe", estimated_micro_usd=6000
+                )
+                self.assertTrue(allowed)
+                self.assertEqual(self._reservation_period(reservation_id), "2026-10-01")
+                # Settled spend: apify estimates 50,000 uUSD per scrape run.
+                cost_tracker.record_usage(
+                    self.root,
+                    provider="apify",
+                    operation="scrape",
+                    reservation_id=reservation_id,
+                    status="succeeded",
+                )
+
+            # 2026-10-01 00:01 UTC == 2026-10-01 08:01 Taipei: the same configured
+            # local day, so the earlier settled spend must still count toward it.
+            with self._freeze(2026, 10, 1, 0, 1):
+                allowed2, reservation_id2, reason2 = cost_tracker.check_and_reserve_budget(
+                    self.root, operation_name="transcribe", estimated_micro_usd=5000
+                )
+                self.assertFalse(allowed2)
+                self.assertIsNone(reservation_id2)
+                self.assertIn("Budget blocked", reason2)
+
+                status = cost_tracker.get_budget_status(self.root)
+                self.assertEqual(status["period"], "2026-10-01")
+
+    def test_local_midnight_rollover_boundary(self) -> None:
+        with patch.dict(os.environ, {"COST_TIMEZONE": "Asia/Taipei"}):
+            # 2026-10-01 15:59:59 UTC == 23:59:59 Taipei on Oct 1
+            with self._freeze(2026, 10, 1, 15, 59, 59):
+                self.assertEqual(cost_tracker._current_period_id("daily"), "2026-10-01")
+                self.assertEqual(cost_tracker._current_period_id("monthly"), "2026-10")
+            # 2026-10-01 16:00:01 UTC == 00:00:01 Taipei on Oct 2
+            with self._freeze(2026, 10, 1, 16, 0, 1):
+                self.assertEqual(cost_tracker._current_period_id("daily"), "2026-10-02")
+                self.assertEqual(cost_tracker._current_period_id("monthly"), "2026-10")
+            # 2026-12-31 16:30 UTC == 2027-01-01 00:30 Taipei — Dec→Jan rollover
+            with self._freeze(2026, 12, 31, 16, 30):
+                self.assertEqual(cost_tracker._current_period_id("daily"), "2027-01-01")
+                self.assertEqual(cost_tracker._current_period_id("monthly"), "2027-01")
+
+    def test_boundary_spend_belongs_to_the_new_local_period(self) -> None:
+        """The window is half-open: [start, end) in the configured zone.
+
+        Spend stamped exactly at local midnight is simultaneously the end of the
+        outgoing period and the start of the incoming one, so it must be counted
+        exactly once — by the new period.
+        """
+        with patch.dict(os.environ, {"COST_TIMEZONE": "Asia/Taipei"}):
+            # 2026-10-01 15:59:59 UTC == 23:59:59 Taipei on Oct 1
+            with self._freeze(2026, 10, 1, 15, 59, 59):
+                cost_tracker.record_usage(
+                    self.root, provider="groq", operation="t", request_units=60
+                )
+            # 2026-10-01 16:00:00 UTC == 00:00:00 Taipei on Oct 2, the instant
+            # the outgoing window closes and the incoming one opens.
+            with self._freeze(2026, 10, 1, 16, 0, 0):
+                cost_tracker.record_usage(
+                    self.root, provider="groq", operation="t", request_units=60
+                )
+                report = cost_tracker.get_cost_report(self.root, period_type="daily")
+
+        self.assertEqual(report["period"], "2026-10-02")
+        # One row's worth, not zero and not both.
+        self.assertEqual(report["grand_total_estimated_usd"], 0.001)
+
+    def test_reservation_window_filter_is_indexed(self) -> None:
+        """The reservations predicate must stay index-backed on the hot path.
+
+        The filter moved from ``period_id = ?`` to an ``account_scope`` +
+        ``created_at`` window, so the old ``(period_id, status)`` index no longer
+        has a usable leading column and every budget check would full-scan the
+        table.
+        """
+        with patch.dict(os.environ, {"COST_TIMEZONE": "Asia/Taipei"}):
+            cost_tracker.get_budget_status(self.root)
+
+        with closing(cost_tracker.get_operations_db(self.root)) as conn:
+            indexes = {
+                row["name"]: [
+                    column["name"] for column in conn.execute("SELECT name FROM pragma_index_info(?)", (row["name"],))
+                ]
+                for row in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = 'budget_reservations'"
+                )
+            }
+            plan = [
+                row[-1]
+                for row in conn.execute(
+                    """
+                    EXPLAIN QUERY PLAN
+                    SELECT COALESCE(SUM(max_micro_usd), 0) FROM budget_reservations
+                    WHERE account_scope = ? AND created_at >= ? AND created_at < ? AND status = 'reserved'
+                    """,
+                    ("default", "2026-01-01T00:00:00+00:00", "2026-01-02T00:00:00+00:00"),
+                )
+            ]
+
+        covering = [
+            name
+            for name, columns in indexes.items()
+            if columns[:2] == ["account_scope", "created_at"] and "status" in columns
+        ]
+        self.assertTrue(
+            covering,
+            f"no (account_scope, created_at, status) index on budget_reservations: {indexes}",
+        )
+        self.assertTrue(
+            any("USING INDEX" in detail or "USING COVERING INDEX" in detail for detail in plan),
+            f"reservation window query is not index-backed: {plan}",
+        )
+
+    def test_cli_reports_invalid_cost_timezone_without_traceback(self) -> None:
+        """The read-only CLI must surface the bad setting, not crash.
+
+        An invalid COST_TIMEZONE is a configuration error the operator has to be
+        able to read; the RSS path already reports it as a one-line message with
+        exit 1, and these two report commands must behave the same way.
+        """
+        import pipeline
+
+        for argv in (["--budget-status"], ["--cost-report", "daily"]):
+            with self.subTest(argv=argv):
+                stderr = io.StringIO()
+                with (
+                    patch.dict(os.environ, {"COST_TIMEZONE": "Not/AZone"}),
+                    patch.object(sys, "argv", ["pipeline.py", "--root", str(self.root), *argv]),
+                    contextlib.redirect_stderr(stderr),
+                ):
+                    exit_code = pipeline.main()
+                self.assertEqual(exit_code, 1)
+                self.assertIn("COST_TIMEZONE", stderr.getvalue())
+                self.assertNotIn("Traceback", stderr.getvalue())
+
+    def test_dst_zone_window_bounds_track_iana_offsets(self) -> None:
+        """The UTC window must move with the zone, not a frozen offset.
+
+        Asserting only the period *label* leaves the bounds untested: a build
+        that derives the label through ZoneInfo but the bounds from one fixed
+        offset would still label correctly while mis-bucketing an hour of spend
+        on each transition day.
+        """
+        with patch.dict(os.environ, {"COST_TIMEZONE": "America/New_York"}):
+            # 2026-03-08 is the US spring-forward day: the local day is 23h long.
+            with self._freeze(2026, 3, 8, 12, 0):
+                period_id, start, end, tz_key = cost_tracker._current_period("daily")
+                start_utc = datetime.datetime.fromisoformat(start)
+                end_utc = datetime.datetime.fromisoformat(end)
+            self.assertEqual(period_id, "2026-03-08")
+            self.assertEqual(tz_key, "America/New_York")
+            self.assertEqual(start, "2026-03-08T05:00:00+00:00")
+            self.assertEqual(end, "2026-03-09T04:00:00+00:00")
+            self.assertEqual(end_utc - start_utc, datetime.timedelta(hours=23))
+
+            # 2026-11-01 is the US fall-back day: the local day is 25h long.
+            with self._freeze(2026, 11, 1, 12, 0):
+                period_id, start, end, _ = cost_tracker._current_period("daily")
+                start_utc = datetime.datetime.fromisoformat(start)
+                end_utc = datetime.datetime.fromisoformat(end)
+            self.assertEqual(period_id, "2026-11-01")
+            self.assertEqual(start, "2026-11-01T04:00:00+00:00")
+            self.assertEqual(end, "2026-11-02T05:00:00+00:00")
+            self.assertEqual(end_utc - start_utc, datetime.timedelta(hours=25))
+
+    def test_outstanding_reservations_counted_across_timezone_change(self) -> None:
+        """Reservations must be bucketed by the same window as settled spend.
+
+        ``budget_reservations`` was filtered by its stored ``period_id`` label
+        while ``usage_costs`` moved to a UTC-instant window. Changing
+        COST_TIMEZONE relabels new periods but not old rows, so an outstanding
+        reservation could fall out of the bucket entirely and let hard-stop
+        admit a second full budget of paid work.
+        """
+        base_env = {"DAILY_BUDGET_USD": "0.010", "BUDGET_HARD_STOP": "true"}
+        # 2026-09-30 16:30 UTC == 2026-10-01 00:30 Taipei: the labels disagree.
+        with patch.dict(os.environ, {**base_env, "COST_TIMEZONE": "Asia/Taipei"}):
+            with self._freeze(2026, 9, 30, 16, 30):
+                allowed, reservation_id, _ = cost_tracker.check_and_reserve_budget(
+                    self.root, operation_name="op", estimated_micro_usd=9000
+                )
+                self.assertTrue(allowed)
+                self.assertEqual(self._reservation_period(reservation_id), "2026-10-01")
+
+        # Re-read the same instant with a UTC accounting zone: the reservation's
+        # created_at still falls inside the UTC day, so it must still count.
+        with patch.dict(os.environ, {**base_env, "COST_TIMEZONE": "UTC"}):
+            with self._freeze(2026, 9, 30, 20, 0):
+                allowed_again, blocked_id, reason = cost_tracker.check_and_reserve_budget(
+                    self.root, operation_name="op", estimated_micro_usd=5000
+                )
+                self.assertFalse(allowed_again)
+                self.assertIsNone(blocked_id)
+                self.assertIn("Budget blocked", reason)
+
+    def test_dst_zone_uses_iana_rules_not_fixed_offset(self) -> None:
+        with patch.dict(os.environ, {"COST_TIMEZONE": "America/New_York"}):
+            # 2026-07-01 04:30 UTC -> EDT (UTC-4) -> Jul 1 00:30 local.
+            # A fixed UTC-5 offset would produce Jun 30 23:30 instead.
+            with self._freeze(2026, 7, 1, 4, 30):
+                self.assertEqual(cost_tracker._current_period_id("daily"), "2026-07-01")
+            # 2026-01-15 04:30 UTC -> EST (UTC-5) -> Jan 14 23:30 local.
+            with self._freeze(2026, 1, 15, 4, 30):
+                self.assertEqual(cost_tracker._current_period_id("daily"), "2026-01-14")
+
+    def test_invalid_timezone_fails_explicitly(self) -> None:
+        # Pin the budget variables: check_and_reserve_budget parses
+        # DAILY_BUDGET_USD before resolving the period, so a non-numeric value
+        # would raise ValueError for the wrong reason and mask a broken guard.
+        env = {"COST_TIMEZONE": "", "DAILY_BUDGET_USD": "1.00", "BUDGET_HARD_STOP": "true"}
+        for bad_tz in ("Not/AZone", ""):
+            with self.subTest(tz=bad_tz), patch.dict(os.environ, {**env, "COST_TIMEZONE": bad_tz}):
+                with self.assertRaises(ValueError):
+                    cost_tracker.check_and_reserve_budget(
+                        self.root, operation_name="op", estimated_micro_usd=1
+                    )
+                with self.assertRaises(ValueError):
+                    cost_tracker.get_budget_status(self.root)
+                with self.assertRaises(ValueError):
+                    cost_tracker.get_cost_report(self.root)
+
+    def test_invalid_timezone_fails_before_any_database_side_effect(self) -> None:
+        """A misconfigured COST_TIMEZONE must abort before touching local state.
+
+        ``get_operations_db`` creates operations.db and runs migrations, so
+        resolving the timezone after opening the connection leaves a migrated
+        database behind even though the call failed. Configuration validation
+        has to happen first: a failed guard must not mutate the operator's
+        repository root.
+        """
+        calls = (
+            lambda root: cost_tracker.check_and_reserve_budget(
+                root, operation_name="op", estimated_micro_usd=1
+            ),
+            lambda root: cost_tracker.get_budget_status(root),
+            lambda root: cost_tracker.get_cost_report(root),
+        )
+        for index, call in enumerate(calls):
+            with self.subTest(call=index):
+                with tempfile.TemporaryDirectory() as raw_dir:
+                    root = Path(raw_dir)
+                    with patch.dict(os.environ, {"COST_TIMEZONE": "Not/AZone"}):
+                        with self.assertRaises(ValueError):
+                            call(root)
+                    self.assertFalse(
+                        (root / "operations.db").exists(),
+                        "invalid COST_TIMEZONE must not create operations.db",
+                    )
+
+    def test_reservations_stay_bound_to_original_period(self) -> None:
+        env = {"COST_TIMEZONE": "Asia/Taipei", "DAILY_BUDGET_USD": "1.00", "BUDGET_HARD_STOP": "true"}
+        with patch.dict(os.environ, env):
+            # 23:30 Taipei on Oct 1 (15:30 UTC)
+            with self._freeze(2026, 10, 1, 15, 30):
+                allowed1, res1, _ = cost_tracker.check_and_reserve_budget(
+                    self.root, operation_name="op", estimated_micro_usd=5000
+                )
+                self.assertTrue(allowed1)
+            # 00:30 Taipei on Oct 2 (Oct 1, 16:30 UTC) — after local-midnight rollover
+            with self._freeze(2026, 10, 1, 16, 30):
+                allowed2, res2, _ = cost_tracker.check_and_reserve_budget(
+                    self.root, operation_name="op", estimated_micro_usd=5000
+                )
+                self.assertTrue(allowed2)
+                status = cost_tracker.get_budget_status(self.root)
+                self.assertEqual(status["period"], "2026-10-02")
+
+            self.assertEqual(self._reservation_period(res1), "2026-10-01")
+            self.assertEqual(self._reservation_period(res2), "2026-10-02")
+
+            # Settle the prior-day reservation after local midnight. Settlement
+            # must not rewrite the period that was reserved before rollover.
+            with self._freeze(2026, 10, 1, 16, 45):
+                cost_tracker.record_usage(
+                    self.root,
+                    provider="groq",
+                    operation="transcribe",
+                    reservation_id=res1,
+                    status="succeeded",
+                )
+            self.assertEqual(self._reservation_period(res1), "2026-10-01")
+            self.assertEqual(self._reservation_status(res1), "settled")
+
+    def test_blocked_event_and_outputs_share_local_period(self) -> None:
+        env = {"COST_TIMEZONE": "Asia/Taipei", "DAILY_BUDGET_USD": "0.001", "BUDGET_HARD_STOP": "true"}
+        with patch.dict(os.environ, env):
+            # 2026-09-30 16:30 UTC == 2026-10-01 00:30 Taipei
+            with self._freeze(2026, 9, 30, 16, 30):
+                allowed, _, reason = cost_tracker.check_and_reserve_budget(
+                    self.root, operation_name="op", estimated_micro_usd=5000
+                )
+                self.assertFalse(allowed)
+                self.assertIn("Budget blocked", reason)
+                # A second block in the same configured period dedups to one event.
+                allowed_again, _, _ = cost_tracker.check_and_reserve_budget(
+                    self.root, operation_name="op", estimated_micro_usd=5000
+                )
+                self.assertFalse(allowed_again)
+                status = cost_tracker.get_budget_status(self.root)
+                report = cost_tracker.get_cost_report(self.root)
+
+            self.assertEqual(status["period"], "2026-10-01")
+            self.assertEqual(status["accounting_timezone"], "Asia/Taipei")
+            self.assertEqual(report["period"], "2026-10-01")
+            self.assertEqual(report["accounting_timezone"], "Asia/Taipei")
+
+            with closing(cost_tracker.get_operations_db(self.root)) as conn:
+                rows = conn.execute(
+                    "SELECT dedup_key, payload_json FROM notification_events "
+                    "WHERE event_type = 'budget.blocked'"
+                ).fetchall()
+            self.assertEqual(len(rows), 1)
+            self.assertIn("2026-10-01", rows[0]["dedup_key"])
+            payload = json.loads(rows[0]["payload_json"])
+            self.assertEqual(payload["period_id"], "2026-10-01")
+            self.assertEqual(payload["accounting_timezone"], "Asia/Taipei")
+
+    def test_monthly_report_uses_local_month_start(self) -> None:
+        with patch.dict(os.environ, {"COST_TIMEZONE": "Asia/Taipei"}):
+            # Sep 30 23:59 UTC == Oct 1 07:59 Taipei — Taipei October has started.
+            with self._freeze(2026, 9, 30, 23, 59):
+                cost_tracker.record_usage(
+                    self.root, provider="groq", operation="t", request_units=60
+                )
+            # Oct 1 00:30 UTC == 08:30 Taipei; the spend belongs to the same
+            # Taipei day/month even though its stored UTC date is Sep 30.
+            with self._freeze(2026, 10, 1, 0, 30):
+                daily = cost_tracker.get_cost_report(self.root, period_type="daily")
+                monthly = cost_tracker.get_cost_report(self.root, period_type="monthly")
+
+            self.assertEqual(daily["period"], "2026-10-01")
+            self.assertEqual(daily["grand_total_estimated_usd"], 0.001)
+            self.assertEqual(monthly["period"], "2026-10")
+            self.assertEqual(monthly["grand_total_estimated_usd"], 0.001)
 
 
 if __name__ == "__main__":
