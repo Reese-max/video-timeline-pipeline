@@ -42,16 +42,20 @@ def _esc(value: object) -> str:
 
 
 def _readonly_db(root: Path) -> sqlite3.Connection:
+    from pipeline import LIBRARY_SCHEMA_VERSION
+
     db = root / "library.db"
     if not db.is_file():
         raise FileNotFoundError(f"索引不存在：{db}")
     connection = sqlite3.connect(db.resolve().as_uri() + "?mode=ro", uri=True)
     try:
+        if connection.execute("PRAGMA user_version").fetchone()[0] != LIBRARY_SCHEMA_VERSION:
+            raise MigrationRequired("migration_required")
         connection.execute("SELECT job, title, source, duration, categories FROM videos LIMIT 0")
         connection.execute("SELECT job, timestamp, kind, text FROM events LIMIT 0")
-    except sqlite3.Error as exc:
+    except (sqlite3.Error, MigrationRequired) as exc:
         connection.close()
-        if exc.sqlite_errorcode == sqlite3.SQLITE_ERROR:
+        if isinstance(exc, sqlite3.Error) and exc.sqlite_errorcode == sqlite3.SQLITE_ERROR:
             raise MigrationRequired("migration_required") from exc
         raise
     return connection

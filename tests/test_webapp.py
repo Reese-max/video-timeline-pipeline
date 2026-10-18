@@ -16,6 +16,7 @@ from http.server import ThreadingHTTPServer
 from pathlib import Path
 from unittest import mock
 
+import pipeline
 import webapp
 
 
@@ -40,6 +41,7 @@ def _seed(root: Path) -> None:
     connection.execute(
         "INSERT INTO events (job, timestamp, kind, text) VALUES ('job1', '00:00:05', 'summary', '含有安全關鍵字的摘要')"
     )
+    connection.execute(f"PRAGMA user_version = {pipeline.LIBRARY_SCHEMA_VERSION}")
     connection.commit()
     connection.close()
 
@@ -164,6 +166,30 @@ class WebDashboardTests(unittest.TestCase):
                 self.assertIn("migration_required", body)
                 self.assertNotIn(str(self.root), body)
                 self.assertEqual((self.root / "library.db").read_bytes(), before)
+
+    def test_unsupported_index_versions_require_migration_without_writing(self) -> None:
+        connection = sqlite3.connect(self.root / "library.db")
+        connection.execute(
+            "INSERT INTO events VALUES ('job1', 5, 'visual', 'retired frame evidence')"
+        )
+        connection.commit()
+        connection.close()
+        for version in (0, pipeline.LIBRARY_SCHEMA_VERSION - 1, pipeline.LIBRARY_SCHEMA_VERSION + 1):
+            connection = sqlite3.connect(self.root / "library.db")
+            connection.execute(f"PRAGMA user_version = {version}")
+            connection.close()
+            before = (self.root / "library.db").read_bytes()
+            for path in ("/", "/video/job1", "/search?q=retired", "/search?q=re"):
+                with self.subTest(version=version, path=path):
+                    with self.assertRaises(urllib.error.HTTPError) as ctx:
+                        self._get(path)
+                    self.assertEqual(ctx.exception.code, 503)
+                    body = ctx.exception.read().decode()
+                    self.assertIn("migration_required", body)
+                    self.assertNotIn("retired frame evidence", body)
+                    self.assertNotIn(str(self.root), body)
+                    self.assertEqual((self.root / "library.db").read_bytes(), before)
+            self.assertEqual(self._get("/api/health").status, 200)
 
     def test_foreign_origin_rejected_before_search(self) -> None:
         with mock.patch.object(webapp, "_search") as search:

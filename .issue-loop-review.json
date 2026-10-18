@@ -1,19 +1,14 @@
 {
   "pr": 13,
-  "head": "aaa92d954d92b7b6db709bb02b3949cc884bb4dc",
+  "head": "3da71dc888d1c618cfb76dfeb6cf1d71e27fd21f",
   "findings": [
-    {"severity":"high","file":"webapp.py","line":92,"issue":"GET search uses search_index -> index_connection, which opens a writable connection and can DROP legacy videos/vectors tables. Web search must use a read-only connection without automatic schema migration."},
-    {"severity":"high","file":"webapp.py","line":42,"issue":"Interpolating an unescaped filesystem path into the SQLite URI lets a # in --root swallow mode=ro and can open/create a different writable file."},
-    {"severity":"high","file":"pipeline.py","line":6178,"issue":"Non-loopback --host only warns and exposes the unauthenticated library. A caller can supply a loopback Host header remotely; the issue excludes unauthenticated remote service."},
-    {"severity":"med","file":"webapp.py","line":128,"issue":"IPv6 loopback is allowlisted but Host parsing rejects [::1]:port, and serve uses an IPv4 server that cannot bind ::1."},
-    {"severity":"med","file":"webapp.py","line":126,"issue":"Foreign Origin requests with a valid local Host reach routes, contrary to W0's required Origin policy."},
-    {"severity":"med","file":"webapp.py","line":47,"issue":"Missing or incompatible indexes produce a generic 500 instead of safe maintenance states such as the W0-required migration_required; reads must leave legacy data untouched."},
-    {"severity":"med","file":"webapp.py","line":134,"issue":"W0 requires a health check, but no health route exists."},
-    {"severity":"med","file":"webapp.py","line":179,"issue":"KeyboardInterrupt escapes serve_forever without closing the server socket, so W0 graceful shutdown is incomplete."},
-    {"severity":"med","file":"webapp.py","line":132,"issue":"A malformed absolute request target such as http://[ raises ValueError outside the error boundary and drops the connection without an HTTP response."},
-    {"severity":"low","file":"webapp.py","line":139,"issue":"HTML escaping does not URL-encode indexed job IDs, and the detail route does not URL-decode them; IDs containing spaces, Unicode, #, ? or % cannot round-trip."},
-    {"severity":"low","file":"webapp.py","line":174,"issue":"HEAD, OPTIONS, TRACE and CONNECT fall through to stdlib 501 responses without the configured security headers, contradicting the claimed non-GET 405 behavior."}
+    {
+      "severity": "med",
+      "file": "webapp.py",
+      "line": 50,
+      "issue": "The read-only preflight checks column names but ignores PRAGMA user_version. A version-2 index still passes and GET /video/<job> and /search expose retired frame-derived visual evidence that pipeline.index_connection invalidates when upgrading to LIBRARY_SCHEMA_VERSION=3. Reject unsupported index versions with migration_required without modifying the database."
+    }
   ],
   "fixed": true,
-  "summary": "Fixed 11 W0 defects, including destructive GET search migrations, unescaped SQLite URIs, unauthenticated remote binds, and missing security/lifecycle handling. Git Bash validation passes 27 tests plus the CLI self-test; the full suite still has eight pre-existing Windows operations.db cleanup failures reproduced on unchanged main. All fixes are local; nothing was pushed."
+  "summary": "Fixed one W0 defect: read-only dashboard routes now reject unsupported library schema versions with migration_required, preventing retired visual evidence from bypassing the CLI migration gate while leaving database bytes unchanged. Git Bash UTF-8 validation passed 625 Python tests, 538 subtests and 94 widget scenarios (24 existing skips); 30 Windows sync checks and GitOps shell syntax checks also passed. The regression failed in all 12 version/route cases before the fix; all changes remain local with no push."
 }

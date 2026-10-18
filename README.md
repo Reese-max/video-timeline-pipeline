@@ -81,7 +81,7 @@ python pipeline.py --serve --root 'D:\path\to\library' --host 127.0.0.1 --port 8
 
 在瀏覽器開啟 `http://127.0.0.1:8080/`，可瀏覽影片、既有片段與本機 FTS 搜尋結果；不需新增 Web 依賴或 API 金鑰，也不啟動下載、分析、模型、worker、排程或寄信。按 Ctrl+C 會關閉服務並釋放監聽 socket。
 
-W0 僅允許 loopback（`127.0.0.1`、`localhost`、`::1`），拒絕非本機 Host 與跨來源 Origin，且不開放跨域讀取或寫入方法。搜尋、列表與詳情皆以唯讀連線查詢 `library.db`，不自動建立或遷移 schema；缺少索引會顯示 `index_required`，不相容會顯示 `migration_required`，須先停止服務再明確執行索引維護。
+W0 僅允許 loopback（`127.0.0.1`、`localhost`、`::1`），拒絕非本機 Host 與跨來源 Origin，且不開放跨域讀取或寫入方法。搜尋、列表與詳情皆以唯讀連線查詢 `library.db`，不自動建立或遷移 schema；缺少索引會顯示 `index_required`，欄位不相容或索引版本與程式不符會顯示 `migration_required`，須先停止服務再明確執行索引維護。
 
 `GET /api/health` 回傳 `{"status":"ok"}`，只確認 HTTP 服務可回應，不代表索引已建立或相容。此版本只涵蓋 W0；成本、評分、佇列操作、付費查詢與寄送介面仍未開放。
 
