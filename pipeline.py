@@ -5406,7 +5406,7 @@ def fetch_facebook_author_apify(author: str, since: str) -> dict[str, Any]:
             "raw_count": len(raw_items),
             "results_limit": results_limit,
             "results_limit_reached": len(raw_items) >= results_limit,
-            "max_total_charge_usd": max_charge,
+            "max_total_charge_usd": max_charge_usd,
             "usage_total_usd": run.get("usageTotalUsd"),
             "charged_event_counts": run.get("chargedEventCounts") or {},
             "status_message": str(run.get("statusMessage") or "")[:500],
@@ -6091,6 +6091,14 @@ def add_instagram_subscription(
     return subscription, counts, snapshot
 
 
+def paid_discovery_allowed(provider: str, allow_paid: bool) -> bool:
+    """--allow-batch-cloud 放行所有付費盤點；RSS_PAID_DISCOVERY（如 apify）列出排程刷新可自行使用的供應商。"""
+    if allow_paid:
+        return True
+    allowed = {name.strip().lower() for name in os.getenv("RSS_PAID_DISCOVERY", "").split(",") if name.strip()}
+    return provider.lower() in allowed
+
+
 def refresh_rss(root: Path, workers: int = 4, allow_paid: bool = False) -> dict[str, int]:
     state = load_rss_state(root)
     if not state["subscriptions"]:
@@ -6110,11 +6118,12 @@ def refresh_rss(root: Path, workers: int = 4, allow_paid: bool = False) -> dict[
                     or subscription.get("facebook_since")
                     or "365d"
                 )
+                provider = str(subscription.get("facebook_provider") or "meta")
                 return fetch_facebook_author(
                     str(subscription.get("facebook_page_id") or subscription["url"]),
                     since,
-                    str(subscription.get("facebook_provider") or "meta"),
-                    allow_paid=allow_paid,
+                    provider,
+                    allow_paid=paid_discovery_allowed(provider, allow_paid),
                 ), None
             if kind == "instagram-author":
                 since = str(
@@ -6132,7 +6141,7 @@ def refresh_rss(root: Path, workers: int = 4, allow_paid: bool = False) -> dict[
                     since,
                     max_items=subscription.get("instagram_max_items"),
                     exclude_ids=known_ids,
-                    allow_paid=allow_paid,
+                    allow_paid=paid_discovery_allowed("brightdata", allow_paid),
                     root=root,
                     previous_snapshot_id=str(subscription.get("instagram_last_snapshot_id") or ""),
                 ), None

@@ -507,6 +507,9 @@ class GuardModeTests(unittest.TestCase):
                 patch.object(urllib.request, "urlopen", side_effect=responses) as transport:
             result = pipeline.fetch_facebook_author_apify("https://www.facebook.com/somepage", "365d")
         self.assertEqual(result["items"], [])
+        # 10-21 A1 run: the discovery snapshot is saved as JSON; a Decimal here crashed after the paid run.
+        snapshot = pipeline.write_facebook_discovery(self.root, result)
+        self.assertEqual(json.loads(snapshot.read_text(encoding="utf-8"))["facebook"]["max_total_charge_usd"], "1")
         self.assertEqual([call.args[0].get_method() for call in transport.call_args_list], ["POST", "GET"])
         usage = rows(self.root, "usage_costs")
         self.assertEqual(len(usage), 1)
