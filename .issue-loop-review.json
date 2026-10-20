@@ -1,32 +1,32 @@
 {
   "pr": 107,
-  "head": "5ebb7c18f6b4ae513db0ff01623e32b94cb18270",
+  "head": "242237aeaad020349f8052a64445e07f8c7936ba",
   "findings": [
     {
-      "severity": "high",
+      "severity": "med",
       "file": "pipeline.py",
-      "line": 3196,
-      "issue": "Fixed: unanswered gap windows only reached the low-level cache writer through a transient output parameter. Returned observations still passed reusable_video_artifact, so CLI visual.json and MCP analysis/result.json were saved and reused as complete after a failed or unanswered second look. The gap-check outcome now survives serialization and gates completeness/reuse in every layer."
+      "line": 2848,
+      "issue": "Fixed: the stricter residual-gap policy reused receipt version 1. Earlier version-1 caches with events 0/50/100 at duration 120 and unanswered_gap_windows=[] bypassed gap checking despite two remaining 50-second gaps. Receipt version 2 now invalidates those vision/CLI artifacts; a new disk-cache regression failed on both the CLI helper and model-call count before the fix."
+    },
+    {
+      "severity": "med",
+      "file": "tests/test_video_event_gap_fill.py",
+      "line": 139,
+      "issue": "Fixed: two cache-hit fixtures retained 50-second or 45-second residual gaps, so HEAD refused those caches and subsequent empty mock responses raised StopIteration. Complete positive fixtures retain endpoint and zero-call cache assertions; both original sparse inputs remain explicitly covered as negative cache tests, and the original one-second dedupe test is unchanged."
+    },
+    {
+      "severity": "med",
+      "file": "tests/test_video_event_gap_fill.py",
+      "line": 184,
+      "issue": "Fixed: the new single-window regression began with 0/30 at duration 120, below the existing timestamp-coverage threshold of 60. Its fill was consumed by timestamp repair, causing three calls. Initial 0/30/60 plus fill70 now exercises a single 60-120 window, retains the two-call assertion and checks the remaining 70-120 gap is not cached."
     },
     {
       "severity": "med",
       "file": "pipeline.py",
-      "line": 3323,
-      "issue": "Fixed: the new cache-write restriction did not invalidate pre-fix vision or CLI artifacts, which could be returned before gap filling. Whole-video reuse now requires a current per-event gap-check receipt; legacy unversioned artifacts are recomputed."
-    },
-    {
-      "severity": "med",
-      "file": "pipeline.py",
-      "line": 2873,
-      "issue": "Fixed: ending_covered treated clamped out-of-range provider timestamps as genuine endpoints. At duration 100, initial events 0/30/60/120 became 0/30/60/100 with the last timestamp explicitly unreliable, suppressing the 60-100 second look. The tail exemption now checks endpoint equality before local clamping and excludes explicitly unreliable events."
-    },
-    {
-      "severity": "med",
-      "file": "pipeline.py",
-      "line": 3198,
-      "issue": "needs-human: issue #105 requires no reusable vision cache while gaps remain, but the PR explicitly permits caching once each original window has one added event. For duration 120, initial 0/100 plus fill 50 still caches 50-second subgaps. The PR documents this deliberate policy to preserve an existing cache-reuse contract; deciding between that contract and the issue's stricter acceptance requires human judgment."
+      "line": 2881,
+      "issue": "needs-human: the tail exemption is unbounded and also applies to the initial answer. At duration 100, events 0/1/100 hide a 99-second gap and allow immediate caching. Issue #105 explicitly exempts the 40-second 60-100 tail but does not define a maximum exemption or require a newly added endpoint; changing that policy needs an acceptance decision."
     }
   ],
   "fixed": false,
-  "summary": "Fixed three defects: unanswered-gap state now reaches CLI/MCP cache and completeness gates, legacy unversioned visual artifacts are recomputed, and unreliable clamped endpoints no longer suppress second looks. Regression tests failed before the fix; full Git Bash offline checks now pass (633 Python and 109 Node passed, 24 Python skipped, exit 0). needs-human: the PR's deliberate residual-subgap cache policy still conflicts with issue #105's literal acceptance, so fixed remains false until that finding is resolved."
+  "summary": "Fixed stale version-1 cache reuse and the three failing offline scenarios without weakening endpoint, cache or one-second dedupe assertions; added CLI manifest/Markdown coverage. The new cache regression failed before the fix, and full Git Bash offline checks now pass: 638 Python tests plus 109 Node scenarios, 24 Python skips, exit 0. needs-human: issue #105 does not define a maximum tail-gap exemption, so that behavior is unchanged and fixed remains false."
 }

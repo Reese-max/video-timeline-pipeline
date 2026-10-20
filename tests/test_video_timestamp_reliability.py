@@ -112,7 +112,8 @@ class VideoTimestampReliabilityTests(unittest.TestCase):
                         "visual_schema_version": pipeline.VISUAL_OBSERVATION_SCHEMA_VERSION,
                         "completion_status": "complete", "analysis_method": "minimax_video",
                         "source_video": row["source_video"], "minimax_file_id": "file",
-                        "video_gap_check_version": 1, "unanswered_gap_windows": [[16.6, 50.0], [50.0, 90.0]]}
+                        "video_gap_check_version": pipeline.VIDEO_EVENT_GAP_CHECK_VERSION,
+                        "unanswered_gap_windows": [[16.6, 50.0], [50.0, 90.0]]}
             self.assertEqual({key: value for key, value in row.items()
                               if key not in {"timestamp_original", "timestamp_reliable", "timestamp_issue"}}, expected)
 
@@ -160,7 +161,8 @@ class VideoTimestampReliabilityTests(unittest.TestCase):
         self.assertFalse(pipeline.reusable_video_artifact([legacy]))
         self.assertFalse(pipeline.reusable_video_artifact([{**legacy, "analysis_method": "minimax_video_compressed"}]))
         validated = {**legacy, "timestamp_original": 90, "timestamp_reliable": False,
-                     "timestamp_issue": "缺少影片長度，無法驗證時間碼", "video_gap_check_version": 1}
+                     "timestamp_issue": "缺少影片長度，無法驗證時間碼",
+                     "video_gap_check_version": pipeline.VIDEO_EVENT_GAP_CHECK_VERSION}
         self.assertTrue(pipeline.reusable_video_artifact([validated]))
         unversioned = {key: value for key, value in validated.items() if key != "video_gap_check_version"}
         self.assertFalse(pipeline.reusable_video_artifact([unversioned]))

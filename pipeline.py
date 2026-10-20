@@ -2845,7 +2845,7 @@ VIDEO_EVENT_FIELD_RULES = (
 )
 # Prompt contract for whole-video answers: no stretch of the video may go this long without an event.
 VIDEO_EVENT_MAX_GAP_SECONDS = 30.0
-VIDEO_EVENT_GAP_CHECK_VERSION = 1
+VIDEO_EVENT_GAP_CHECK_VERSION = 2  # Recheck receipts from the original-window-only policy.
 # A gap-fill event this close to one already listed describes the same screen.
 VIDEO_EVENT_DUPLICATE_SECONDS = 1.0
 
