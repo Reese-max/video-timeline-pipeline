@@ -102,17 +102,27 @@ python pipeline.py --root 'C:\Data\VideoLibrary' --web-worker
 
 `mcp_server.py` 是 ChatGPT Apps/MCP 入口：公開影片 URL → 既有下載器 → FFmpeg 分段 → Groq 語音辨識／MiniMax 整支影片畫面分析 → ChatGPT 根據工具證據整理時間軸。v14 widget 在準備完成後自動同時啟動伺服器分析（A）與 Drive 上傳（B，已設定時），兩者互不等待；再由「交給 ChatGPT 整理」送出整理要求；重新開啟不會自動重跑或重送。CLI 的 MiniMax 摘要流程不變；MCP 不另呼叫 MiniMax 產生摘要。影片放在 Git 忽略的 `mcp_jobs\`，工作佇列及簽章金鑰在私有 `.video-state/`。
 
-### v14：背景工作、可核對證據與儲存管理
+### v16：MiniMax 不穩時仍一次到位、升版免重新整理工具
+
+依 job `c9289f71a482` 實測（MiniMax 連續 4 次 HTTP 529）：語音可靠、畫面失敗的 A 報告也免摘要自動上傳 Drive（見下方 v15 報告段的 `speech_only`），B 第二步因此讀得到 A 的語音。widget 對所有可自動上傳的報告持續追蹤狀態、在分析缺語音或缺畫面時提示「建議加跑 B」；複製交接內容或合併指令被宿主擋下時，改用 `execCommand` 複製，仍失敗就全選文字框請使用者按 Ctrl+C。
+
+UI URI 升為 `ui://video-timeline-pipeline/v16-<媒體網址 hash>.html`，並保留前兩版（v14、v15）URI 回傳目前的 widget：10-20 部署日誌顯示 ChatGPT 在「重新整理工具」前仍讀舊 URI，找不到就顯示「無法開啟應用程式」。保留舊 URI 後不必先重新整理；實際 ChatGPT 行為仍待部署後驗證，若仍看到舊介面再到外掛設定按「重新整理工具」。
+
+成本帳本：HTTP 429／529 這類供應商明確拒絕、未做任何工作的嘗試記為 `cost_status=zero_rejected`、金額 0，不佔每日預算；其他失敗照舊保留估計值。MiniMax 同一份影片 24 小時內重跑時重用已上傳的 `file_id`（官方保留 7 天），紀錄放在分析工作目錄；重用的 id 被拒（非過載／限流）時重新上傳一次。529 仍不在請求內重試，直接走只含語音的報告。
+
+### v15：背景工作、可核對證據與儲存管理
 
 準備／分析／Drive 工具支援 `background=true`；可用 `get_video_job` 查進度，`cancel_video_job` 取消，`resume_video_job` 續跑，`get_prepared_video` 恢復結果及更新下載網址。新介面使用背景模式，舊客戶端的同步預設仍相容。準備完成後 widget 自動同時送出分析與 Drive 背景工作（Drive 先送；paired worker 允許同一 job 的分析與 Drive 片段上傳並行，最多兩個 worker；其他工作依佇列排程）；未設定 Drive 時只自動跑分析。兩路互不等待、失敗隔離；手動按鈕保留重試入口。交接內容只放檔案 ID／網址／大小與原片分段時間，不含任何 A 的結果，並提供「一鍵複製」與「開新一般對話」。
 
-A 分析完成時，本機產生 `A_server_analysis.md`（逐字稿、畫面時間軸、品質與待整理摘要），widget 自動取得報告快照並提示等待 ChatGPT 整理摘要。「交給 ChatGPT 整理」要求 ChatGPT 先讀取目前證據與報告綁定，再呼叫 `finalize_analysis_report` 提交摘要及來源註記；也可在 widget 明確填寫後提交。只有 `summary_status=caller_submitted`、影片片段已在 Drive 且兩路 worker 已停止，才會排入獨立的報告上傳工作，放進同一個 Drive 資料夾。widget 追蹤 queued／running 報告；`report_ready` 且 `verified` 時顯示「A 已完成」並啟用「複製合併指令」。指令以「合併：」開頭，保留 file_id、SHA-256 與未獨立驗證聲明。
+A 分析完成時，本機產生 `A_server_analysis.md`（逐字稿、畫面時間軸、品質與待整理摘要），widget 自動取得報告快照並提示等待 ChatGPT 整理摘要。「交給 ChatGPT 整理」要求 ChatGPT 先讀取目前證據與報告綁定，再呼叫 `finalize_analysis_report` 提交摘要及來源註記；也可在 widget 明確填寫後提交。影片片段已在 Drive 且兩路 worker 已停止時，排入獨立的報告上傳工作，放進同一個 Drive 資料夾：分析證據完整且不需覆核（`evidence_status=complete`、`quality.status=evidence_available`）時不必等摘要，直接上傳純證據版；畫面分析失敗但語音完整可靠（`visual_status=error`、`audio_status=complete`、`speech_reliable=true`、逐字稿無缺口）時標 `evidence_scope=speech_only`，報告開頭註明只含語音，同樣免摘要上傳；其餘情況仍要先有 `summary_status=caller_submitted`。之後再提交摘要會另外上傳一份同名新版（只差摘要段）。B 交接內容已含第二步：B 先獨立輸出，再自行讀取同資料夾的 A 報告合併；A 尚未就緒才需要貼合併指令。合併規則：畫面文字與數字採 B，A 的不同讀法放附錄；講話內容採 A，A 的 `quality.speech_reliable=false`（逐字稿只有低信心的片尾套語〔avg_logprob < -0.3〕、只有符號或沒有語音）時寫「沒有可信的語音內容」、A 的語音文字只列附錄，並在分析結果提示建議加跑 B（`quality.route_b_reasons` 列出缺少的是語音、逐字稿或畫面）。可免摘要上傳的報告在快照中顯示 `awaiting_segments`，widget 會自動追蹤到上傳完成。widget 追蹤 queued／running 報告；`report_ready` 且 `verified` 時顯示「A 已完成」並啟用「複製合併指令」。指令以「合併：」開頭，保留 file_id、SHA-256 與未獨立驗證聲明。
 
 畫面由 MiniMax 讀取整支影片，舊版抽幀結果讀取時會被剔除並要求重新分析。快取比對來源 SHA-256、模型、語言、後端、整片分析設定及程式版本。介面可切換逐字稿／畫面觀察、點時間碼核對原片，並顯示證據缺漏限制。
 
 簽名下載網址預設 24 小時有效；受管媒體預設保留七天，總量 20 GiB、單工作 4 GiB、保留至少 1 GiB 空間。清理需 `MCP_STORAGE_CLEANUP_ENABLED=1`，只處理已明確納管且到期的工作，保護執行中工作及有效分享。舊工作不會在部署時被批次納管。設定、相容性及驗證界線詳見 [操作說明](docs/video-mcp-operations.md)。
 
-UI URI 已升為 `ui://video-timeline-pipeline/v14-<媒體網址 hash>.html`。更新服務後需重新整理外掛動作並產生新 widget；歷史 widget 不會自動更新。以下 v8–v11 段落保留歷史修復紀錄，操作以 v14 說明為準。
+v15 修正摘要早於 Drive 上傳完成時的狀態追蹤：`caller_submitted` 報告若仍為 `awaiting_segments`，widget 以 1–10 秒退避唯讀查詢目前快照，取得報告工作後接續原有輪詢。最多查詢 60 次；超過次數、查詢失敗或報告綁定不符時停止並提示「重新取得狀態」，不重送摘要或上傳。切換影片或關閉介面會丟棄舊查詢結果。這些離線回歸不代表 #58 的真實 Drive／ChatGPT 驗收已完成。
+
+UI URI 曾升為 `ui://video-timeline-pipeline/v15-<媒體網址 hash>.html`（現行版本見上方 v16）。以下 v8–v14 段落保留歷史修復紀錄。
 
 v14 的可收合「實驗：存到 ChatGPT 檔案庫（#59）」只在使用者點擊分段按鈕後下載 MP4，再以宿主 `uploadFile(file, { library: true })` 上傳；一般上傳備援也必須另行點擊，不自動重送。這是選用的用戶端路徑，主流程維持既有伺服器分析。畫面顯示 fileId、大小、耗時、現算 SHA-256 與是否取得下載網址，不顯示或保存簽章網址。另按「請模型讀這個檔案」才將檔案 ID 加入模型可見狀態並送出追問；缺少宿主 API 時顯示能力診斷。成功回傳不代表檔案已出現在檔案庫或模型能讀取：大小／型別上限、真實錯誤格式及 library 不可用時的行為均未驗證，需在真實 ChatGPT 工作階段測試。
 

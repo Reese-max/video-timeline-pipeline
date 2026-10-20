@@ -22,6 +22,7 @@ import urllib.request
 from pathlib import Path
 from typing import Any
 
+import analysis_report
 from pipeline import write_json
 
 
@@ -625,7 +626,7 @@ def upload_analysis_report(job_dir: Path, report: dict, segments: dict) -> dict:
     try:
         if not configured():
             raise DriveNotConfigured("Google Drive fallback 尚未設定；報告未上傳。")
-        if report.get("summary_status") != "caller_submitted" or segments.get("status") != "drive_ready":
+        if not analysis_report.uploadable(report) or segments.get("status") != "drive_ready":
             raise ValueError("Report or segments are not ready")
         if report.get("job_id") != segments.get("job_id") or report.get("source_fingerprint") != segments.get("source_fingerprint"):
             raise ValueError("Report and segment source differ")
