@@ -36,9 +36,16 @@ class ProtocolSmokeTests(unittest.TestCase):
                     self.assertEqual(set(tools), {'prepare_video_for_chatgpt', 'analyze_prepared_video', 'upload_prepared_video_to_drive', 'get_prepared_video', 'get_video_job', 'cancel_video_job', 'resume_video_job', 'collect_social_post', 'ingest_video_segments', 'finalize_analysis_report'})
                     self.assertEqual(tools['get_video_job']['inputSchema']['required'], ['operation_id'])
                     self.assertIn('background', tools['prepare_video_for_chatgpt']['inputSchema']['properties'])
-                    resource = call('resources/list', {}, 3)['resources'][0]
+                    resources = call('resources/list', {}, 3)['resources']
+                    resource = resources[0]
                     contents = call('resources/read', {'uri': resource['uri']}, 4)['contents']
                     self.assertIn('<html', contents[0]['text'])
+                    # Hosts that still hold the previous tool definitions read the old URIs (10-20 deploy).
+                    self.assertEqual([item['uri'] for item in resources], [server.UI_URI, *server.LEGACY_UI_URIS])
+                    for number, legacy in enumerate(server.LEGACY_UI_URIS, 5):
+                        self.assertEqual(call('resources/read', {'uri': legacy}, number)['contents'][0]['text'], contents[0]['text'])
+                    self.assertEqual([uri.split('/')[-1].split('-')[0] for uri in server.LEGACY_UI_URIS], ['v14', 'v15'])
+                    self.assertEqual(tools['prepare_video_for_chatgpt']['_meta']['openai/outputTemplate'], server.UI_URI)
                     health = client.get('/health').json()
                     deadline = time.monotonic() + 3
                     while health['writer_busy'] and time.monotonic() < deadline:
@@ -48,9 +55,9 @@ class ProtocolSmokeTests(unittest.TestCase):
                     self.assertFalse(health['writer_busy'])
                     self.assertFalse(health['deployment_draining'])
                     self.assertEqual(health['runtime_sha256'], server.RUNTIME_SHA256)
-                    self.assertEqual(health['version'], 15)
-                    self.assertIn('/v15-', str(resource['uri']))
-                    self.assertIn('version: "15"', contents[0]['text'])
+                    self.assertEqual(health['version'], 16)
+                    self.assertIn('/v16-', str(resource['uri']))
+                    self.assertIn('version: "16"', contents[0]['text'])
                 finally:
                     if server._QUEUE is not None:
                         server._QUEUE.close()
