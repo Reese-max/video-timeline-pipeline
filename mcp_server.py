@@ -1198,6 +1198,8 @@ def visual_observations_incomplete(rows: list[dict[str, Any]] | None) -> bool:
     ``completion_status=incomplete`` / ``finish_reason=timestamp_coverage``.
     Absent markers (healthy observations) count as usable.
     """
+    if pipeline.visual_gaps_pending(rows):
+        return True
     for row in rows or []:
         if not isinstance(row, dict):
             return True

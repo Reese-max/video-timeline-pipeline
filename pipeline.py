@@ -2845,6 +2845,7 @@ VIDEO_EVENT_FIELD_RULES = (
 )
 # Prompt contract for whole-video answers: no stretch of the video may go this long without an event.
 VIDEO_EVENT_MAX_GAP_SECONDS = 30.0
+VIDEO_EVENT_GAP_CHECK_VERSION = 1
 # A gap-fill event this close to one already listed describes the same screen.
 VIDEO_EVENT_DUPLICATE_SECONDS = 1.0
 
@@ -2861,7 +2862,7 @@ def video_event_gaps(
 ) -> list[tuple[float, float]]:
     """Spans longer than max_gap with no visual event, measured from 0 to the end of the video.
 
-    The fill prompt prints each span as a closed interval, so an event exactly at the
+    The fill prompt prints each span as a closed interval, so a reliable event exactly at the
     end of the video answers the final stretch instead of leaving it open (issue #105).
     An opening event at 0 does not cover the stretch after it, and a tail event short
     of the video end does not cover the rest.
@@ -2870,7 +2871,10 @@ def video_event_gaps(
         return []
     stamps = sorted(max(0.0, min(float(row["timestamp"]), duration)) for row in observations)
     edges = [0.0, *stamps, float(duration)]
-    ending_covered = bool(stamps) and stamps[-1] == duration
+    ending_covered = any(
+        float(row["timestamp"]) == duration and row.get("timestamp_reliable") is not False
+        for row in observations
+    )
     return [
         (start, end)
         for start, end in zip(edges, edges[1:])
@@ -2959,10 +2963,15 @@ class VideoMp4UnavailableError(RuntimeError):
     """The video could not be handed to MiniMax even after compression; there is no frame fallback."""
 
 
+def visual_gaps_pending(observations: list[dict[str, Any]] | None) -> bool:
+    return any(isinstance(row, dict) and row.get("unanswered_gap_windows") for row in observations or [])
+
+
 def reusable_video_artifact(observations: Any) -> bool:
-    """MP4 caches require per-event validation; frame-sampled results are never reused."""
-    return isinstance(observations, list) and bool(observations) and all(
+    """MP4 caches require a current gap-check receipt and no unanswered windows."""
+    return isinstance(observations, list) and bool(observations) and not visual_gaps_pending(observations) and all(
         usable_visual_observation(item)
+        and item.get("video_gap_check_version") == VIDEO_EVENT_GAP_CHECK_VERSION
         and isinstance(item.get("timestamp_reliable"), bool)
         and item.get("analysis_method") in WHOLE_VIDEO_ANALYSIS_METHODS
         for item in observations
@@ -3008,7 +3017,6 @@ def _analyze_video_mp4_core(
     duration_hint: float | None = None,
     max_completion_tokens: int | None = None,
     upload_record_dir: Path | None = None,
-    unanswered_windows: list[tuple[float, float]] | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, Any] | None, str | None]:
     """Upload once (or reuse a recent upload of the same bytes), then chat.
 
@@ -3178,6 +3186,7 @@ def _analyze_video_mp4_core(
                 observation["timestamp_reliable"] = False
                 if not observation.get("timestamp_issue"):
                     observation["timestamp_issue"] = "時間碼疑似被壓縮，需覆核原片"
+    unanswered_windows: list[list[float]] = []
     if from_events:
         # After the first answer's own checks, so added events never dilute its warnings.
         prefill_rows = observations
@@ -3193,23 +3202,24 @@ def _analyze_video_mp4_core(
             duration=duration_hint,
             max_completion_tokens=max_completion_tokens,
         )
-        if prefill_gaps and unanswered_windows is not None:
+        if prefill_gaps:
             # Issue #105: a window counts as filled only when the second look added an
             # event inside its closed range; unanswered windows must not be cached.
             prefill_stamps = {float(row["timestamp"]) for row in prefill_rows}
             added_stamps = {float(row["timestamp"]) for row in observations} - prefill_stamps
-            unanswered_windows.extend(
-                (start, end)
+            unanswered_windows = [
+                [start, end]
                 for start, end in prefill_gaps
                 if not any(start <= stamp <= end for stamp in added_stamps)
-            )
+            ]
 
     _stamp_video_observations(
         observations,
         analysis_method=analysis_method,
         source_video=source_video,
         file_id=file_id,
-        extra=extra_meta,
+        extra={**(extra_meta or {}), "video_gap_check_version": VIDEO_EVENT_GAP_CHECK_VERSION,
+               "unanswered_gap_windows": unanswered_windows},
     )
     return observations, parsed if isinstance(parsed, dict) else None, file_id
 
@@ -3291,8 +3301,6 @@ def analyze_video_mp4(
         scratch = Path(owned_temp.name)
     else:
         scratch.mkdir(parents=True, exist_ok=True)
-    # Gap windows the second look never answered; the cache must not claim completeness (issue #105).
-    unanswered_gap_windows: list[tuple[float, float]] = []
 
     def run_core(
         path: Path,
@@ -3300,7 +3308,6 @@ def analyze_video_mp4(
         analysis_method: str,
         extra_meta: dict[str, Any] | None = None,
     ) -> tuple[list[dict[str, Any]], dict[str, Any] | None, str | None]:
-        unanswered_gap_windows.clear()
         return _analyze_video_mp4_core(
             path,
             api_key,
@@ -3316,15 +3323,13 @@ def analyze_video_mp4(
             max_completion_tokens=max_completion_tokens,
             # The visual cache holds only finished evidence; upload receipts live with the work files.
             upload_record_dir=work_dir,
-            unanswered_windows=unanswered_gap_windows,
         )
 
     def persist(observations: list[dict[str, Any]], parsed: dict[str, Any] | None, file_id: str | None) -> list[dict[str, Any]]:
         if (
             cache_path is not None
             and parsed is not None
-            and all(usable_visual_observation(item) for item in observations)
-            and not unanswered_gap_windows
+            and reusable_video_artifact(observations)
         ):
             write_json(
                 cache_path,
@@ -3967,7 +3972,7 @@ def render_knowledge_markdown(
 
     visual_complete = bool(observations) and all(
         usable_visual_observation(item) for item in observations
-    )
+    ) and not visual_gaps_pending(observations)
     minimax_checked = any(
         item.get("analysis_method") != "local_uniformity_check" for item in observations
     )
@@ -8327,6 +8332,7 @@ def run_pipeline(args: argparse.Namespace) -> Path:
         # Provider 未完整完成時，整體流程仍可保存逐字稿與部分結果，但視覺狀態須明確。
         manifest["visual_status"] = (
             "complete" if observations and all(usable_visual_observation(item) for item in observations)
+            and not visual_gaps_pending(observations)
             else "incomplete"
         )
         # 記下每個階段實際由誰產生：換模型後回頭看產物才知道該不該重跑

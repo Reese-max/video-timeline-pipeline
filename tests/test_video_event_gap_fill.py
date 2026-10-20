@@ -42,6 +42,12 @@ class VideoEventGapTests(unittest.TestCase):
         self.assertEqual(
             pipeline.video_event_gaps([{"timestamp": 0}, {"timestamp": 100}], 100), [(0.0, 100.0)])
 
+    def test_out_of_range_or_unreliable_ending_does_not_cover_the_tail(self):
+        rows = [{"timestamp": stamp} for stamp in (0, 30, 60)]
+        for ending in ({"timestamp": 120}, {"timestamp": 100, "timestamp_reliable": False}):
+            with self.subTest(ending=ending):
+                self.assertEqual(pipeline.video_event_gaps([*rows, ending], 100), [(60.0, 100.0)])
+
 
 class CliVisualReuseTests(unittest.TestCase):
     def test_visual_json_from_before_gap_filling_is_not_reused(self):
@@ -171,6 +177,36 @@ class VideoGapFillCallTests(unittest.TestCase):
         self.assertEqual([row["timestamp"] for row in rows], [30, 70])
         self.assertEqual(pipeline.video_event_gaps(rows, 120), [(30.0, 70.0), (70.0, 120.0)])
         self.assertEqual(list(cache.glob("*.json")), [])
+
+    def test_unanswered_windows_survive_visual_json_serialization(self):
+        for fill in (RuntimeError("fill failed"), answer(30)):
+            with self.subTest(fill=fill):
+                rows, _, _ = self.run_mp4([answer(70), fill], 120)
+                # CLI saves this list as visual.json and uses this exact reuse gate.
+                saved = json.loads(json.dumps(rows))
+                self.assertFalse(pipeline.reusable_video_artifact(saved))
+                self.assertTrue(all(row["completion_status"] == "complete" for row in saved))
+                self.assertTrue(all([70.0, 120.0] in row["unanswered_gap_windows"] for row in saved))
+
+    def test_pre_fix_endpoint_cache_is_recomputed(self):
+        cache = self.root / "legacy-cache"
+        self.run_mp4([answer(0, 30, 60, 100)], 100, cache_dir=cache)
+        cache_path, = cache.glob("*.json")
+        legacy = json.loads(cache_path.read_text(encoding="utf-8"))
+        legacy["observations"] = [row for row in legacy["observations"] if row["timestamp"] != 100]
+        for row in legacy["observations"]:
+            row.pop("video_gap_check_version", None)
+        pipeline.write_json(cache_path, legacy)
+        self.assertFalse(pipeline.reusable_video_artifact(legacy["observations"]))
+        rows, chat, _ = self.run_mp4([answer(0, 30, 60), answer(100)], 100, cache_dir=cache)
+        self.assertEqual(chat.call_count, 2)
+        self.assertEqual([row["timestamp"] for row in rows], [0, 30, 60, 100])
+
+    def test_clamped_ending_still_gets_a_second_look(self):
+        rows, chat, _ = self.run_mp4([answer(0, 30, 60, 120), answer(80)], 100)
+        self.assertEqual(chat.call_count, 2)
+        self.assertEqual([row["timestamp"] for row in rows], [0, 30, 60, 80, 100])
+        self.assertIs(rows[-1]["timestamp_reliable"], False)
 
 
 if __name__ == "__main__":

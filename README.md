@@ -54,6 +54,8 @@ Groq 轉錄與 MiniMax 畫面分析會同時執行；超長逐字稿的 MiniMax 
 
  視覺分析只有一種方式：整支 MP4 經 MiniMax Files API 上傳後以 `video_url` 交給 MiniMax-M3 直接理解。抽幀模式與抽幀備援已移除，設定 `ANALYZE_VISUAL_MODE=frames` 會直接報錯。可調 `ANALYZE_VIDEO_FPS`（0.2–5）與 `ANALYZE_VIDEO_DETAIL`（low|default|high）。來源超過 Files API 約 512MB（或上傳因大小被拒）時，會先用 ffmpeg 壓到約 400–480MB 再重試；壓縮失敗或仍過大則該次畫面分析失敗（只保留逐字稿），不會改用抽幀；壓縮成功時以 `analysis_method=minimax_video_compressed` 標明。MiniMax 回應被截斷（`finish_reason=length`）時標示未完成、不寫入快取。`video_mp4` 的畫面時間碼一律是從 0 起算的原片秒數：提示詞要求事件覆蓋全片到片尾，解析接受純數字與 `MM:SS`／中文時間並丟棄無法解析的事件（不再靜默記為 0.0）；事件峰值不到 `min(片長-30 秒, 片長一半)` 或超出片長 30 秒以上時只重問一次（沿用已上傳的檔案 ID，短片豁免），仍對不上就以 `finish_reason=timestamp_coverage` 標示未完成、不寫入可重用快取。超過 30 秒的空檔會以閉區間（如「60.0–100.0 秒」）補問一次：落在區間端點的事件（片頭 0 秒、片尾）也會被保留，事件剛好落在片尾時視為已覆蓋該尾段；補問後仍有未獲回應的空檔時不寫入可重用快取，重跑會再補（#105）。MCP `analysis/result.json` 只有在畫面無未完成標示、且逐字稿無剩餘斷層（`gap_check.remaining`）與補轉失敗（`backfill_errors`）時才會以 `status=complete` 寫入並被重用；否則記為未完成，重跑會再次呼叫模型。
 
+補漏未獲回應的時段會隨畫面事件保存，CLI `visual.json` 與 MCP `analysis/result.json` 也會據此標為未完成並在重跑時補問；既有事件仍保留。缺少新版補漏驗證標記的 vision／CLI 快取會重新分析。超出片長而被夾到片尾、時間碼不可靠的事件不能免除尾段補問。
+
 `reasoning_split` 只改回傳格式，不能關閉推理。
 
 2026-09-01 以同一支 8 秒公開合成影片、全新輸出目錄與真實 Groq／MiniMax API 實測：調整前兩次首跑為 17.003、23.049 秒；調整後為 14.352、18.732 秒，兩次平均約縮短 17%。Groq 轉錄僅 0.438–0.484 秒，剩餘波動主要在 MiniMax；這是小樣本觀察值，不是供應商延遲保證。兩次輸出皆有 2 段逐字稿、5 題問答、有效引用、`notes.md` 與 `transcript.srt`。

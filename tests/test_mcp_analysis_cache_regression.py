@@ -89,9 +89,10 @@ class AnalysisCacheRegressionTests(unittest.TestCase):
     def tearDown(self):
         self.temp_root.cleanup()
 
-    def _run_twice(self, observations, transcript, seed_legacy_bad_cache=False):
+    def _run_twice(self, observations, transcript, seed_legacy_bad_cache=False, vision_responses=None):
         """Run analyze_prepared_sync twice with real disk cache; return results + mocks."""
-        analyze_mock = MagicMock(return_value=[dict(observations[0])])
+        analyze_mock = (MagicMock(wraps=pipeline.analyze_video_mp4) if vision_responses is not None
+                        else MagicMock(return_value=[dict(observations[0])]))
         transcribe_mock = MagicMock(return_value=(dict(transcript), {}))
         env = {"GROQ_API_KEY": "test-key", "ANALYZE_VISUAL_MODE": "video_mp4"}
         patches = [
@@ -114,6 +115,11 @@ class AnalysisCacheRegressionTests(unittest.TestCase):
                 "source_end": 2, "sha256": "audio"}]),
             patch.object(mcp_server.pipeline, "transcribe_all", transcribe_mock),
         ]
+        if vision_responses is not None:
+            patches.extend([
+                patch.object(pipeline, "minimax_upload_video_understanding", return_value="fid"),
+                patch.object(pipeline, "minimax_chat", side_effect=vision_responses),
+            ])
         for patcher in patches:
             patcher.start()
         self.addCleanup(lambda: [patcher.stop() for patcher in reversed(patches)])
@@ -193,6 +199,20 @@ class AnalysisCacheRegressionTests(unittest.TestCase):
         self.assertEqual(second["status"], "complete")
         self.assertEqual(analyze_mock.call_count, 1)
         self.assertEqual(transcribe_mock.call_count, 1)
+
+    def test_unanswered_visual_gap_retries_through_the_real_pipeline(self):
+        from test_video_event_gap_fill import answer
+
+        first, stored, second, analyze_mock, _ = self._run_twice(
+            [GOOD_OBSERVATION], CLEAN_TRANSCRIPT,
+            vision_responses=[answer(0, 100), RuntimeError("fill failed"),
+                              answer(0, 30, 60, 90, 120, 150, DURATION)])
+        self.assertEqual(analyze_mock.call_count, 2)
+        self.assertNotEqual(first["visual_status"], "complete")
+        self.assertNotEqual(stored["status"], "complete")
+        self.assertEqual(first["quality"]["status"], "needs_review")
+        self.assertEqual(len([row for row in first["timeline"] if row["type"] == "visual"]), 2)
+        self.assertEqual(second["status"], "complete")
 
 
 class TranscriptGapHelperTests(unittest.TestCase):

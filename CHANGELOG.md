@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- 修正 #105 的快取驗收缺口：補漏未回應狀態隨事件保存，CLI／MCP 外層快取也會要求重跑；舊版未記錄補漏驗證的 vision／CLI 快取不再重用。被夾到片尾的不可靠時間碼仍須補問尾段。
+
 - 修正 #105：畫面補漏不再丟掉提示時段端點的事件。空檔提示以閉區間印出（如「60.0–100.0 秒」），接受條件改為 `start ≤ timestamp ≤ end` 與提示一致，片頭 0 秒與片尾事件不再被開區間過濾丟棄（既有 1 秒去重仍會丟掉真正重複的邊界）；事件剛好落在片尾（timestamp ＝ 片長）且其前方已有其他事件時，`video_event_gaps` 視為已覆蓋該尾段（單獨的片尾事件或片頭事件不覆蓋其後時段）；補問後若仍有空檔未獲任何補漏事件回應，結果不寫入可重用 vision 快取，重跑會再補，不再把缺漏永久快取。
 
 - 改進 A／B 韌性（依 job c9289f71a482 實測：MiniMax 連續 4 次 HTTP 529）：語音可靠、畫面失敗的 partial 報告標 `evidence_scope=speech_only` 並免摘要自動上傳 Drive（報告開頭註明只含語音）；快照對所有可自動上傳的報告回 `awaiting_segments`，widget v16 自動追蹤、提示建議加跑 B（`quality.route_b_reasons`）、複製改三段備援；保留 v14／v15 widget URI 避免升版後「無法開啟應用程式」；HTTP 429／529 拒絕記 `zero_rejected` 不佔預算；MiniMax 同一影片 24 小時內重跑重用 `file_id`。
