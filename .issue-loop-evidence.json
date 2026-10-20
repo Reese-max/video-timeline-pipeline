@@ -1,12 +1,24 @@
 {
   "repo": "Reese-max/video-timeline-pipeline",
-  "issue": 58,
-  "base_sha": "42d225936ba704cf70b93cac7bdf84da85ac86b8",
-  "red_proof": "Before implementation: node tests/test_widget_analysis_report.cjs (exit 1)\nFAIL - submission follows a submitted report while its Drive prerequisites finish AssertionError [ERR_ASSERTION]: No poll timer\nFAIL - notification follows a submitted report while its Drive prerequisites finish AssertionError [ERR_ASSERTION]: No poll timer\nFAIL - restore follows a submitted report while its Drive prerequisites finish AssertionError [ERR_ASSERTION]: No poll timer\nFAIL - waiting report snapshot errors and mismatched bindings stop without resubmission AssertionError [ERR_ASSERTION]: No poll timer\nFAIL - waiting snapshot polling is bounded and explicit refresh can start a new read-only wait AssertionError [ERR_ASSERTION]: The input did not match the regular expression /重新取得狀態/. Input:\nError: 5 widget report scenarios failed",
-  "test_command": "env -u _ /c/Users/Administrator/.venvs/vtp-test/Scripts/python.exe -X utf8 -B scripts/check_offline.py",
+  "issue": 12,
+  "base_sha": "bc895d6102344f151a13e497ff7e6713b9f60acd",
+  "red_proof": "Before changing pipeline.py at the admitted head, ran: python -X utf8 -m pytest tests/test_category_filter.py -q (exit 1). FAILED test_semantic_category_miss_returns_no_hits: RuntimeError: 索引裡沒有 test-model 的向量；先執行 `--embed`。 SUBFAILED test_semantic_ask_respects_exact_and_missing_categories(category='不存在') with the same RuntimeError. SUBFAILED test_semantic_cli_category_miss_succeeds(action='--search') and (action='--ask'): AssertionError: 1 != 0. Result: 4 failed, 10 passed, 3 subtests passed in 1.25s.",
+  "test_command": "python -X utf8 -B -m unittest discover -s tests -p test_category_filter.py -v && python -X utf8 -B -m unittest discover -s tests -p test_visual_time_reliability_search.py -v",
   "test_exit": 0,
-  "tests_passed": 698,
+  "tests_passed": 24,
   "tests_failed": 0,
-  "summary": "修正 #58 在摘要早於 Drive 片段上傳／兩路 worker 結束前提交時，widget 停在 awaiting_segments 的缺口，改以唯讀快照接續既有報告工作輪詢。查詢核對 job、cache signature、分析與報告雜湊，最多等待 60 次，錯誤、換影片及關閉均停止，僅既有 verified 報告可顯示「A 已完成」並複製合併指令。沿用既有含摘要／逐字稿／畫面時間軸的同資料夾上傳與 caller_submitted 來源聲明，UI URI／bridge／health 同步升為 v15；報告情境由 16 增至 23。完整離線檢查共 597 個 Python 與 101 個 Node 測試通過，另有 24 個 Windows 平台略過。",
-  "not_done": "未執行 §4.5 指定 Facebook 真實媒體、真實 Drive 同資料夾上傳與 ChatGPT 小工具／B 對話的合併品質驗收，故不能據本機測試關閉 #58；未部署、未 push、未建立 PR，未變更其他分支。未重跑遠端 CI／Linux；專案沒有 lint、coverage ratchet、CRAP 或 mutation gates，本次未新增。"
+  "summary": "Fixed the semantic category no-match guard with a one-line change, preserving the existing error when model vectors are absent. Added regression coverage for direct semantic retrieval, semantic Ask citations, CLI Search/Ask zero-hit success, and the missing-model control; also exercised the short-query exact-membership branch and documented category behavior.",
+  "not_done": "No push, provider calls, production operations, or hosted CI. The rest of Issue #5 remains outside this bounded A4 review. Full offline command python -X utf8 -B scripts/check_offline.py exited 1: 590 Python tests run, 2 errors, 24 skipped. The failures are test_execution_control.ExecutionControlTests.test_cooperative_cancellation_stops_child and test_normal_command_output_and_failed_exit_mapping_are_preserved, both OSError WinError 87 in subprocess.Popen; both reproduce with pipeline.py loaded from original head bc895d6102344f151a13e497ff7e6713b9f60acd when the tests are launched as a subprocess like the offline runner (13 run, 2 errors, 2 skipped). No third full-suite retry or unrelated process-launch fix was attempted. The four widget scripts were run separately because the offline runner stopped after Python tests; all 94 controls passed with exit 0.",
+  "merged_main_evidence": {
+    "repo": "Reese-max/video-timeline-pipeline",
+    "issue": 58,
+    "base_sha": "42d225936ba704cf70b93cac7bdf84da85ac86b8",
+    "red_proof": "Before implementation: node tests/test_widget_analysis_report.cjs (exit 1)\nFAIL - submission follows a submitted report while its Drive prerequisites finish AssertionError [ERR_ASSERTION]: No poll timer\nFAIL - notification follows a submitted report while its Drive prerequisites finish AssertionError [ERR_ASSERTION]: No poll timer\nFAIL - restore follows a submitted report while its Drive prerequisites finish AssertionError [ERR_ASSERTION]: No poll timer\nFAIL - waiting report snapshot errors and mismatched bindings stop without resubmission AssertionError [ERR_ASSERTION]: No poll timer\nFAIL - waiting snapshot polling is bounded and explicit refresh can start a new read-only wait AssertionError [ERR_ASSERTION]: The input did not match the regular expression /重新取得狀態/. Input:\nError: 5 widget report scenarios failed",
+    "test_command": "env -u _ /c/Users/Administrator/.venvs/vtp-test/Scripts/python.exe -X utf8 -B scripts/check_offline.py",
+    "test_exit": 0,
+    "tests_passed": 698,
+    "tests_failed": 0,
+    "summary": "修正 #58 在摘要早於 Drive 片段上傳／兩路 worker 結束前提交時，widget 停在 awaiting_segments 的缺口，改以唯讀快照接續既有報告工作輪詢。查詢核對 job、cache signature、分析與報告雜湊，最多等待 60 次，錯誤、換影片及關閉均停止，僅既有 verified 報告可顯示「A 已完成」並複製合併指令。沿用既有含摘要／逐字稿／畫面時間軸的同資料夾上傳與 caller_submitted 來源聲明，UI URI／bridge／health 同步升為 v15；報告情境由 16 增至 23。完整離線檢查共 597 個 Python 與 101 個 Node 測試通過，另有 24 個 Windows 平台略過。",
+    "not_done": "未執行 §4.5 指定 Facebook 真實媒體、真實 Drive 同資料夾上傳與 ChatGPT 小工具／B 對話的合併品質驗收，故不能據本機測試關閉 #58；未部署、未 push、未建立 PR，未變更其他分支。未重跑遠端 CI／Linux；專案沒有 lint、coverage ratchet、CRAP 或 mutation gates，本次未新增。"
+  }
 }
