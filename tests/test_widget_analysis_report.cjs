@@ -46,7 +46,7 @@ function harness({ output = job('first'), saved = {}, snapshot, respond, bridge 
     Promise.resolve().then(async () => {
       try {
         if (!bridge) throw Object.assign(new Error('Unsupported bridge'), { code: -32601 });
-        if (message.method === 'ui/initialize') { assert.equal(message.params.appInfo?.name, 'video-timeline-pipeline'); assert.equal(message.params.appInfo?.version, '14'); assert.equal(message.params.protocolVersion, '2026-01-26'); assert.equal(typeof message.params.appCapabilities, 'object'); }
+        if (message.method === 'ui/initialize') { assert.equal(message.params.appInfo?.name, 'video-timeline-pipeline'); assert.equal(message.params.appInfo?.version, '15'); assert.equal(message.params.protocolVersion, '2026-01-26'); assert.equal(typeof message.params.appCapabilities, 'object'); }
         if (message.method === 'ui/message') { assert.equal(message.params.role, 'user'); assert(Array.isArray(message.params.content)); }
         const result = message.method === 'tools/call' ? await callTool(message.params.name, message.params.arguments) : message.method === 'ui/message' ? await send(message.params.content[0].text) : {};
         notify({ id: message.id, result });
@@ -103,6 +103,70 @@ async function test(name, run) { try { await run(); count++; console.log('ok ' +
   function readyReport() { return { ...r('report_ready'),summary_status:'caller_submitted',verified:true,file_id:'fixture-report',merge_text:'合併：讀取同資料夾的 A_server_analysis.md，和你剛才的分析合併成一份摘要。' }; }
   function reportCompleted(result = readyReport()) { return { ...completed(result,'report','report-1'),operation:'report' }; }
   function fillSummary(h) { h.elements.get('report-summary').value='explicit summary';h.elements.get('report-provenance').value='unknown author'; }
+  function awaitingReport() { return { ...r('awaiting_segments'),summary_status:'caller_submitted' }; }
+  for(const origin of ['submission','notification','restore']) await test(origin+' follows a submitted report while its Drive prerequisites finish', async () => {
+    let reads=0;
+    const h=setup(origin==='restore'?awaitingReport():r(),name=> {
+      if(name==='get_prepared_video') return {prepared:job('first'),analysis:a(),report:++reads===1?(origin==='restore'?awaitingReport():r()):reads===2?awaitingReport():queuedReport()};
+      if(name==='finalize_analysis_report') return awaitingReport();
+      if(name==='get_video_job') return reportCompleted();
+      throw new Error('Unexpected '+name);
+    });
+    await h.flush();
+    if(origin==='submission') { fillSummary(h);await h.click('finalize-report'); }
+    if(origin==='notification') { h.notifyTool(awaitingReport());await h.flush(); }
+    for(let i=0;i<3;i++) {
+      assert.equal(h.elements.get('copy-merge').disabled,true);
+      assert(!h.elements.get('report-state').textContent.includes('已放進 Drive'));
+      await h.poll();
+    }
+    assert.equal(reads,3);assert.equal(h.elements.get('copy-merge').disabled,false);
+    assert.match(h.elements.get('report-state').textContent,/A 已完成/);
+    assert.equal(h.calls.filter(x=>x.name==='finalize_analysis_report').length,origin==='submission'?1:0);
+    assert(h.calls.every(x=>['get_prepared_video','get_video_job','finalize_analysis_report'].includes(x.name)));
+  });
+  await test('waiting report snapshot errors and mismatched bindings stop without resubmission', async () => {
+    const message='REPORT_WAIT: 完整快照錯誤';
+    for(const changed of [null,{prepared:job('other')},{report:null},{report:{...awaitingReport(),job_id:'other'}},
+                         ...['cache_signature','analysis_sha256','report_sha256'].map(key=>({report:{...awaitingReport(),[key]:'f'.repeat(64)}}))]) {
+      let reads=0;
+      const snapshot={prepared:job('first'),analysis:a(),report:awaitingReport()};
+      const h=setup(awaitingReport(),()=> {
+        if(++reads===1) return snapshot;
+        if(changed===null) throw new Error(message);
+        return {...snapshot,...changed};
+      });
+      await h.flush();await h.poll();
+      assert.equal(h.elements.get('copy-merge').disabled,true);
+      assert.match(h.elements.get('status').textContent,changed===null?/REPORT_WAIT: 完整快照錯誤/:/不符/);
+      assert(![...h.timers.values()].some(x=>x.ms<=10000));
+      assert(h.calls.every(x=>x.name==='get_prepared_video'));
+    }
+  });
+  await test('waiting snapshot polling is bounded and explicit refresh can start a new read-only wait', async () => {
+    const snapshot={prepared:job('first'),analysis:a(),report:awaitingReport()};
+    const waiting=setup(awaitingReport(),()=>snapshot);await waiting.flush();
+    for(let i=0;i<100&&[...waiting.timers.values()].some(x=>x.ms<=10000);i++) await waiting.poll();
+    assert(![...waiting.timers.values()].some(x=>x.ms<=10000));
+    assert.match(waiting.elements.get('status').textContent,/重新取得狀態/);
+    assert(waiting.calls.length<=61);assert(waiting.calls.every(x=>x.name==='get_prepared_video'));
+    await waiting.click('refresh');assert([...waiting.timers.values()].some(x=>x.ms<=10000));
+    waiting.teardown();
+  });
+  for(const action of ['switch','teardown']) await test(action+' discards an in-flight waiting report snapshot', async () => {
+    let reads=0,release;
+    const h=setup(awaitingReport(),(name,args)=> {
+      assert.equal(name,'get_prepared_video');
+      if(args.job_id!=='first') return {prepared:job(args.job_id),analysis:{...a(),job_id:args.job_id},report:null};
+      if(++reads===1) return {prepared:job('first'),analysis:a(),report:awaitingReport()};
+      return new Promise(resolve=>{release=()=>resolve({prepared:job('first'),analysis:a(),report:readyReport()});});
+    });
+    await h.flush();await h.poll();assert.equal(typeof release,'function');
+    if(action==='switch') h.notifyTool(job('second'));else h.teardown();await h.flush();
+    release();await h.flush();
+    assert.equal(h.elements.get('copy-merge').disabled,true);
+    assert(![...h.timers.values()].some(x=>x.ms<=10000));
+  });
   await test('A completion automatically reads report once and honestly waits for ChatGPT summary', async () => {
     let reads=0;
     const h=harness({respond(name,args) {
