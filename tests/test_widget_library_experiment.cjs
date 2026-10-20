@@ -109,6 +109,38 @@ async function test(name, run) { try { await run(); count++; console.log('ok ' +
     assert(!h.prompts[0].includes('回答它的 SHA-256'));
     assert.match(h.prompts[0], /第 10 秒/);
   });
+  for (const [name, start, end, expected, absent] of [
+    ['first clip', 0, 120, ['片段第 30 秒（原片 0:30）', '片段第 65 秒（原片 1:05）'], ['原片 2:10']],
+    ['second clip', 120, 166, ['片段第 10 秒（原片 2:10）'], ['原片 0:30', '原片 1:05']],
+    ['checkpoint at clip start', 30, 65, ['片段第 0 秒（原片 0:30）'], ['原片 1:05']],
+    ['checkpoint at next clip start', 65, 130, ['片段第 0 秒（原片 1:05）'], ['原片 2:10']],
+    ['short unrelated clip', 180, 184, ['片段第 2 秒（原片 3:02）'], ['第 10 秒']],
+    ['fractional checkpoint', 120.04, 166.047, ['片段第 9.96 秒（原片 2:10）'], ['9.959999999999994']],
+    ['short fractional fallback', 180, 181, ['片段第 0.5 秒（原片 3:00.5）'], ['原片 3:00）']],
+    ['fractional original time', 180.25, 184.25, ['片段第 2 秒（原片 3:02.25）'], ['原片 3:02）']],
+    ['unknown clip bounds', undefined, undefined, ['時間範圍未知'], ['第 10 秒']],
+  ]) {
+    await test('model read checks use uploaded clip times: ' + name, async () => {
+      const value = job('first');
+      Object.assign(value.segments[0], { start_seconds: start, end_seconds: end });
+      const h = harness({ output: value, snapshot: { prepared: value } });
+      await h.flush(); await uploadClick(h); await h.click('library-ask');
+      assert.equal(h.prompts.length, 1);
+      for (const text of expected) assert(h.prompts[0].includes(text), 'Missing checkpoint: ' + text);
+      for (const text of absent) assert(!h.prompts[0].includes(text), 'Unexpected checkpoint: ' + text);
+      for (const answer of ['PRIVATE WORKBENCH', 'CareArk', '1522.40', '53572b408974589c7fded269dcbacbe38f71d2cb8944c92083a8f109fadb26b4']) assert(!h.prompts[0].includes(answer));
+      noLeaks(h);
+    });
+  }
+  await test('refresh cannot change checkpoints for a clip that was already uploaded', async () => {
+    const value = job('first');
+    Object.assign(value.segments[0], { start_seconds: 120, end_seconds: 166 });
+    const h = harness({ output: value, snapshot: { prepared: value } });
+    await h.flush(); await uploadClick(h);
+    h.notifyTool(job('first')); await h.flush(); await h.click('library-ask');
+    assert(h.prompts[0].includes('片段第 10 秒（原片 2:10）'));
+    assert(!h.prompts[0].includes('原片 0:30'));
+  });
   await test('review encoded URL upload responses never become file IDs', async () => {
     for (const value of ['//media.example/file?sig=SECRET', 'https%3A%2F%2Fmedia.example%2Ffile%3Fsig%3DSECRET', 'https:\\/\\/media.example/file?sig=SECRET']) {
       const h = harness({ upload: async () => value }); await h.flush(); await uploadClick(h);

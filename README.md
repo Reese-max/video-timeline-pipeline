@@ -74,7 +74,7 @@ python pipeline.py --video 'D:\path\to\video.mp4' --dry-run --slide-extractor st
 
 ## ChatGPT 網頁 MCP 影片摘要
 
-`mcp_server.py` 是 ChatGPT Apps/MCP 入口：公開影片 URL → 既有下載器 → FFmpeg 分段 → Groq 語音辨識／MiniMax 整支影片畫面分析 → ChatGPT 根據工具證據整理時間軸。v14 widget 在準備完成後自動同時啟動伺服器分析（A）與 Drive 上傳（B，已設定時），兩者互不等待；再由「交給 ChatGPT 整理」送出整理要求；重新開啟不會自動重跑或重送。CLI 的 MiniMax 摘要流程不變；MCP 不另呼叫 MiniMax 產生摘要。影片放在 Git 忽略的 `mcp_jobs\`，工作佇列及簽章金鑰在私有 `.video-state/`。
+`mcp_server.py` 是 ChatGPT Apps/MCP 入口：公開影片 URL → 既有下載器 → FFmpeg 分段 → Groq 語音辨識／MiniMax 整支影片畫面分析 → ChatGPT 根據工具證據整理時間軸。v16 widget 在準備完成後自動同時啟動伺服器分析（A）與 Drive 上傳（B，已設定時），兩者互不等待；再由「交給 ChatGPT 整理」送出整理要求；重新開啟不會自動重跑或重送。CLI 的 MiniMax 摘要流程不變；MCP 不另呼叫 MiniMax 產生摘要。影片放在 Git 忽略的 `mcp_jobs\`，工作佇列及簽章金鑰在私有 `.video-state/`。
 
 ### v16：MiniMax 不穩時仍一次到位、升版免重新整理工具
 
@@ -98,7 +98,7 @@ v15 修正摘要早於 Drive 上傳完成時的狀態追蹤：`caller_submitted`
 
 UI URI 曾升為 `ui://video-timeline-pipeline/v15-<媒體網址 hash>.html`（現行版本見上方 v16）。以下 v8–v14 段落保留歷史修復紀錄。
 
-v14 的可收合「實驗：存到 ChatGPT 檔案庫（#59）」只在使用者點擊分段按鈕後下載 MP4，再以宿主 `uploadFile(file, { library: true })` 上傳；一般上傳備援也必須另行點擊，不自動重送。這是選用的用戶端路徑，主流程維持既有伺服器分析。畫面顯示 fileId、大小、耗時、現算 SHA-256 與是否取得下載網址，不顯示或保存簽章網址。另按「請模型讀這個檔案」才將檔案 ID 加入模型可見狀態並送出追問；缺少宿主 API 時顯示能力診斷。成功回傳不代表檔案已出現在檔案庫或模型能讀取：大小／型別上限、真實錯誤格式及 library 不可用時的行為均未驗證，需在真實 ChatGPT 工作階段測試。
+v15 的可收合「實驗：存到 ChatGPT 檔案庫（#59）」只在使用者點擊分段按鈕後下載 MP4，再以宿主 `uploadFile(file, { library: true })` 上傳；一般上傳備援也必須另行點擊，不自動重送。這是選用的用戶端路徑，主流程維持既有伺服器分析。畫面顯示 fileId、大小、耗時、現算 SHA-256 與是否取得下載網址，不顯示或保存簽章網址。另按「請模型讀這個檔案」才將檔案 ID 加入模型可見狀態並送出追問；缺少宿主 API 時顯示能力診斷。追問依上傳時的片段起訖換算原片 0:30、1:05、2:10，並標明片段內秒數；不提供畫面標準答案，SHA-256 由本機另行核對。成功回傳不代表檔案已出現在檔案庫或模型能讀取：大小／型別上限、真實錯誤格式及 library 不可用時的行為均未驗證，需依 [#59 實測清單](tests/widget_manual_checks.md#59-chatgpt-檔案庫實驗) 在真實 ChatGPT 工作階段測試。
 
 ### MCP 影音暫存保留 7 天（有 Drive 完整備份時改為分析後清理）
 

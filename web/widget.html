@@ -131,11 +131,13 @@ const terminal = new Set(["failed", "cancelled", "expired", "interrupted"]);
 const isPending = value => ["queued", "running"].includes(value?.status);
 const errorText = value => typeof value === "string" ? value : value?.message || "未提供錯誤說明";
 const numericTime = value => typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : null;
-const formatTime = seconds => {
-  const value = numericTime(seconds);
-  if (value === null) return "時間未知";
+const formatTime = (seconds, milliseconds = false) => {
+  const raw = numericTime(seconds);
+  if (raw === null) return "時間未知";
+  const value = milliseconds ? Number(raw.toFixed(3)) : raw;
+  const fraction = milliseconds ? (value % 1).toFixed(3).slice(1).replace(/\.?0+$/, "") : "";
   const hours = Math.floor(value / 3600), minutes = Math.floor(value / 60) % 60;
-  return (hours ? hours + ":" + String(minutes).padStart(2, "0") : String(minutes)) + ":" + String(Math.floor(value % 60)).padStart(2, "0");
+  return (hours ? hours + ":" + String(minutes).padStart(2, "0") : String(minutes)) + ":" + String(Math.floor(value % 60)).padStart(2, "0") + fraction;
 };
 const safeURL = value => {
   try { const url = new URL(value); return ["https:", "http:"].includes(url.protocol) ? url.href : null; }
@@ -312,7 +314,7 @@ async function saveSegmentToLibrary(index, library = true) {
       check();
     }
     const ms = Math.round(nowMs() - started), mismatch = Number.isFinite(segment.size_bytes) && segment.size_bytes !== blob.size;
-    libraryResults.delete(index); libraryResults.set(index, { fileId, filename, size: blob.size, ms, sha256, library, hasDownloadUrl });
+    libraryResults.delete(index); libraryResults.set(index, { fileId, filename, size: blob.size, ms, sha256, library, hasDownloadUrl, start_seconds: segment.start_seconds, end_seconds: segment.end_seconds });
     output.textContent = `fileId：${fileId}\n大小：${blob.size} bytes${mismatch ? "（與分段資料大小不符）" : ""}\n耗時：${ms} ms\nlibrary:${library}\n下載網址：${hasDownloadUrl ? "已取得" : "未取得"}\nSHA-256：${sha256}${downloadError}\n尚未確認檔案庫介面或模型可讀取。`;
   } catch (error) {
     if (isCurrent()) {
@@ -342,7 +344,14 @@ async function askAboutLibraryFile() {
     }
     checkCurrent(version);
     if (epoch !== libraryEpoch) return;
-    const prompt = `這是 #59 實驗。我剛按下按鈕上傳影片片段 ${result.filename}（fileId=${result.fileId}，${result.size} bytes，library:${result.library}）；尚未確認已進 ChatGPT 檔案庫。請不要呼叫任何工具。若能讀取這個檔案，回答第 10 秒的畫面文字；若看不到或讀不到，直接回答「看不到」，不要猜測。SHA-256 由小工具在本機計算並另行核對，不要求模型猜測雜湊。`;
+    const start = numericTime(result.start_seconds), end = numericTime(result.end_seconds);
+    const knownRange = start !== null && end !== null && end > start;
+    const checkpoints = knownRange ? [30, 65, 130].filter(seconds => seconds >= start && seconds < end) : [];
+    if (knownRange && !checkpoints.length) checkpoints.push(start + Math.min(10, (end - start) / 2));
+    const question = checkpoints.length
+      ? "回答" + checkpoints.map(seconds => `片段第 ${Number((seconds - start).toFixed(3))} 秒（原片 ${formatTime(seconds, true)}）`).join("、") + "的畫面文字"
+      : "說明是否能讀取；片段時間範圍未知，無法核對指定時間點";
+    const prompt = `這是 #59 實驗。我剛按下按鈕上傳影片片段 ${result.filename}（fileId=${result.fileId}，${result.size} bytes，library:${result.library}）；尚未確認已進 ChatGPT 檔案庫。請不要呼叫任何工具。若能讀取這個檔案，${question}；若看不到或讀不到，直接回答「看不到」，不要猜測。SHA-256 由小工具在本機計算並另行核對，不要求模型猜測雜湊。`;
     const acknowledgment = await invoke("ui/message", { role: "user", content: [{ type: "text", text: prompt }] }, host()?.sendFollowUpMessage ? () => host().sendFollowUpMessage({ prompt }) : null, version);
     checkCurrent(version);
     if (epoch !== libraryEpoch) return;
