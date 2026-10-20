@@ -7,6 +7,17 @@
 產品目標：把既有下載/轉錄/畫面分析/知識庫
 補成「主動寄摘要、可追問、可監控」的本機優先系統。**先讓每日摘要可用**。
 
+## 既有能力與非重做範圍
+
+以下保存 r2 基準的能力盤點，後續實作前仍須依目前程式重新確認；沿用既有能力，不重做：
+
+- 下載／轉錄／畫面分析／摘要與分層快取已有管線；新增服務沿用其產物與恢復路徑。
+- 搜尋已有 SQLite FTS5、短中文字詞回退、分類篩選、時間戳與來源引用。
+- Ask（`--ask`）由 MiniMax 回答；OpenRouter 用於 embedding，另有本機 BGE-M3 後端，
+  以 `--semantic` 選用語意檢索；rerank 尚未接入，不能把端點實測當成整合完成。
+- RSS 佇列／重試／dead-letter／single writer 已存在，新增通知與監控只做整合。
+- 既有 `--digest` 會呼叫 MiniMax；#2 本機 Digest 預覽只組裝既有 summary，外部 API 呼叫=0。
+
 ## 已修正的假設（r2 對照）
 
 | 原假設 | 修正 |
@@ -24,7 +35,10 @@
 F0 由首個基礎 PR 負責，在 #2/#3/#4 開始寫 DB 前完成，不各自建立第二套 migration、event 或 job 身分。
 
 - **F0.1 儲存責任**：`operations.db` 保存永久操作帳與唯一 migration registry；
-  `library.db` 是可重建的搜尋投影，保留有效向量。讀取不隱式 DDL，未初始化回報
+  `library.db` 是可重建的搜尋投影，保留有效向量。先盤點並處理 legacy `DROP`／`REPLACE`
+  與 positional SQL（如 `INSERT INTO ... VALUES (...)`）的相容性；擴充 schema 時改用顯式欄位清單，
+  不得把永久操作資料接到搜尋表，並以舊資料升級／重建回歸確認操作帳與有效向量不遺失。
+  讀取不隱式 DDL，未初始化回報
   `unavailable`/`migration_required`；DB、檔案與 RSS JSON 不宣稱共用交易。
 - **F0.2 穩定身分**：持久保存 `library_id` UUID，`analysis_revision` 綁實際內容與版本，
   不綁路徑或執行時間。`processed_revisions` 完成登記與 deterministic outbox event

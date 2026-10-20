@@ -6,6 +6,33 @@ from pathlib import Path
 
 
 class RoadmapSnapshotTests(unittest.TestCase):
+    def test_existing_capabilities_and_non_rework_scope_are_preserved(self) -> None:
+        roadmap = (Path(__file__).resolve().parents[1] / "docs/roadmap-v0.6.md").read_text(encoding="utf-8")
+        inventory = re.search(r"(?ms)^## 既有能力與非重做範圍\n(.*?)(?=^## |\Z)", roadmap)
+        self.assertIsNotNone(inventory, "The snapshot must distinguish existing capabilities from planned work")
+        for contract in (
+            "下載／轉錄／畫面分析／摘要與分層快取",
+            "FTS5", "短中文字詞", "分類", "時間戳與來源引用",
+            "Ask（`--ask`）由 MiniMax 回答", "OpenRouter 用於 embedding",
+            "本機 BGE-M3", "rerank 尚未接入", "RSS 佇列／重試／dead-letter／single writer",
+            "`--digest` 會呼叫 MiniMax", "本機 Digest 預覽只組裝既有 summary",
+            "沿用既有能力，不重做",
+        ):
+            with self.subTest(contract=contract):
+                self.assertIn(contract, inventory.group(1))
+
+    def test_storage_contract_preserves_legacy_sql_compatibility(self) -> None:
+        roadmap = (Path(__file__).resolve().parents[1] / "docs/roadmap-v0.6.md").read_text(encoding="utf-8")
+        storage = re.search(r"(?ms)^- \*\*F0\.1\b(.*?)(?=^- \*\*F0\.|^## |\Z)", roadmap)
+        self.assertIsNotNone(storage)
+        for contract in (
+            "`operations.db` 保存永久操作帳", "`library.db` 是可重建的搜尋投影",
+            "legacy `DROP`／`REPLACE`", "positional SQL", "顯式欄位清單",
+            "不得把永久操作資料接到搜尋表", "舊資料升級／重建回歸", "保留有效向量",
+        ):
+            with self.subTest(contract=contract):
+                self.assertIn(contract, storage.group(1))
+
     def test_foundation_and_delivery_dependencies_are_preserved(self) -> None:
         roadmap = (Path(__file__).resolve().parents[1] / "docs/roadmap-v0.6.md").read_text(encoding="utf-8")
         self.assertRegex(roadmap, r"(?m)^## F0\b")
