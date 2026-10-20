@@ -2845,6 +2845,7 @@ VIDEO_EVENT_FIELD_RULES = (
 )
 # Prompt contract for whole-video answers: no stretch of the video may go this long without an event.
 VIDEO_EVENT_MAX_GAP_SECONDS = 30.0
+VIDEO_EVENT_GAP_CHECK_VERSION = 1
 # A gap-fill event this close to one already listed describes the same screen.
 VIDEO_EVENT_DUPLICATE_SECONDS = 1.0
 
@@ -2859,12 +2860,26 @@ def video_event_gaps(
     duration: float | None,
     max_gap: float = VIDEO_EVENT_MAX_GAP_SECONDS,
 ) -> list[tuple[float, float]]:
-    """Spans longer than max_gap with no visual event, measured from 0 to the end of the video."""
+    """Spans longer than max_gap with no visual event, measured from 0 to the end of the video.
+
+    The fill prompt prints each span as a closed interval, so a reliable event exactly at the
+    end of the video answers the final stretch instead of leaving it open (issue #105).
+    An opening event at 0 does not cover the stretch after it, and a tail event short
+    of the video end does not cover the rest.
+    """
     if duration is None or not math.isfinite(duration) or duration <= 0:
         return []
     stamps = sorted(max(0.0, min(float(row["timestamp"]), duration)) for row in observations)
     edges = [0.0, *stamps, float(duration)]
-    return [(start, end) for start, end in zip(edges, edges[1:]) if end - start > max_gap]
+    ending_covered = any(
+        float(row["timestamp"]) == duration and row.get("timestamp_reliable") is not False
+        for row in observations
+    )
+    return [
+        (start, end)
+        for start, end in zip(edges, edges[1:])
+        if end - start > max_gap and not (ending_covered and end == duration and start > 0.0)
+    ]
 
 
 def _fill_video_event_gaps(
@@ -2922,7 +2937,9 @@ def _fill_video_event_gaps(
     added: list[dict[str, Any]] = []
     for row in found:
         stamp = row["timestamp"]
-        if any(start < stamp < end for start, end in gaps) and all(
+        # Closed interval to match the prompt's 「start–end 秒」 wording (issue #105);
+        # the 1-second dedupe below still drops boundary events already listed.
+        if any(start <= stamp <= end for start, end in gaps) and all(
             abs(stamp - other) >= VIDEO_EVENT_DUPLICATE_SECONDS for other in taken
         ):
             taken.append(stamp)
@@ -2946,10 +2963,15 @@ class VideoMp4UnavailableError(RuntimeError):
     """The video could not be handed to MiniMax even after compression; there is no frame fallback."""
 
 
+def visual_gaps_pending(observations: list[dict[str, Any]] | None) -> bool:
+    return any(isinstance(row, dict) and row.get("unanswered_gap_windows") for row in observations or [])
+
+
 def reusable_video_artifact(observations: Any) -> bool:
-    """MP4 caches require per-event validation; frame-sampled results are never reused."""
-    return isinstance(observations, list) and bool(observations) and all(
+    """MP4 caches require a current gap-check receipt and no unanswered windows."""
+    return isinstance(observations, list) and bool(observations) and not visual_gaps_pending(observations) and all(
         usable_visual_observation(item)
+        and item.get("video_gap_check_version") == VIDEO_EVENT_GAP_CHECK_VERSION
         and isinstance(item.get("timestamp_reliable"), bool)
         and item.get("analysis_method") in WHOLE_VIDEO_ANALYSIS_METHODS
         for item in observations
@@ -3164,8 +3186,10 @@ def _analyze_video_mp4_core(
                 observation["timestamp_reliable"] = False
                 if not observation.get("timestamp_issue"):
                     observation["timestamp_issue"] = "時間碼疑似被壓縮，需覆核原片"
+    unanswered_windows: list[list[float]] = []
     if from_events:
         # After the first answer's own checks, so added events never dilute its warnings.
+        prefill_gaps = video_event_gaps(observations, duration_hint)
         observations = _fill_video_event_gaps(
             observations,
             file_id=file_id,
@@ -3177,13 +3201,17 @@ def _analyze_video_mp4_core(
             duration=duration_hint,
             max_completion_tokens=max_completion_tokens,
         )
+        if prefill_gaps:
+            # Issue #105: an event may split a gap and still leave an unfilled span.
+            unanswered_windows = [list(gap) for gap in video_event_gaps(observations, duration_hint)]
 
     _stamp_video_observations(
         observations,
         analysis_method=analysis_method,
         source_video=source_video,
         file_id=file_id,
-        extra=extra_meta,
+        extra={**(extra_meta or {}), "video_gap_check_version": VIDEO_EVENT_GAP_CHECK_VERSION,
+               "unanswered_gap_windows": unanswered_windows},
     )
     return observations, parsed if isinstance(parsed, dict) else None, file_id
 
@@ -3290,8 +3318,10 @@ def analyze_video_mp4(
         )
 
     def persist(observations: list[dict[str, Any]], parsed: dict[str, Any] | None, file_id: str | None) -> list[dict[str, Any]]:
-        if cache_path is not None and parsed is not None and all(
-            usable_visual_observation(item) for item in observations
+        if (
+            cache_path is not None
+            and parsed is not None
+            and reusable_video_artifact(observations)
         ):
             write_json(
                 cache_path,
@@ -3934,7 +3964,7 @@ def render_knowledge_markdown(
 
     visual_complete = bool(observations) and all(
         usable_visual_observation(item) for item in observations
-    )
+    ) and not visual_gaps_pending(observations)
     minimax_checked = any(
         item.get("analysis_method") != "local_uniformity_check" for item in observations
     )
@@ -8294,6 +8324,7 @@ def run_pipeline(args: argparse.Namespace) -> Path:
         # Provider 未完整完成時，整體流程仍可保存逐字稿與部分結果，但視覺狀態須明確。
         manifest["visual_status"] = (
             "complete" if observations and all(usable_visual_observation(item) for item in observations)
+            and not visual_gaps_pending(observations)
             else "incomplete"
         )
         # 記下每個階段實際由誰產生：換模型後回頭看產物才知道該不該重跑

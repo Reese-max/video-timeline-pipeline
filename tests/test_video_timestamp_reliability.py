@@ -101,7 +101,7 @@ class VideoTimestampReliabilityTests(unittest.TestCase):
         self.assertIs(observations[0]["timestamp_reliable"], False)
         self.assertEqual(observations[0]["timestamp_issue"], "缺少影片長度，無法驗證時間碼")
 
-    def test_normal_distribution_changes_only_reliability_fields(self):
+    def test_normal_distribution_preserves_content_and_records_gap_receipt(self):
         stamps = [0, 16.6, 50, 90, "02:46"]
         observations = self.run_response(stamps, 166)
         for stamp, row in zip(stamps, observations):
@@ -111,7 +111,8 @@ class VideoTimestampReliabilityTests(unittest.TestCase):
             expected = {**self.event(pipeline.parse_video_timestamp(stamp)),
                         "visual_schema_version": pipeline.VISUAL_OBSERVATION_SCHEMA_VERSION,
                         "completion_status": "complete", "analysis_method": "minimax_video",
-                        "source_video": row["source_video"], "minimax_file_id": "file"}
+                        "source_video": row["source_video"], "minimax_file_id": "file",
+                        "video_gap_check_version": 1, "unanswered_gap_windows": [[16.6, 50.0], [50.0, 90.0]]}
             self.assertEqual({key: value for key, value in row.items()
                               if key not in {"timestamp_original", "timestamp_reliable", "timestamp_issue"}}, expected)
 
@@ -138,10 +139,15 @@ class VideoTimestampReliabilityTests(unittest.TestCase):
             legacy = {**self.event(90), "analysis_method": "minimax_video"}
             with mock.patch.object(pipeline, "reuse_artifact", return_value={"observations": [legacy]}), \
                  mock.patch.object(pipeline, "minimax_upload_video_understanding", return_value="file") as upload, \
-                 mock.patch.object(pipeline, "minimax_chat", return_value=json.dumps({"events": [self.event(90)]})):
+                 mock.patch.object(pipeline, "minimax_chat", side_effect=[
+                     json.dumps({"events": [self.event(90)]}),
+                     json.dumps({"events": [self.event(stamp) for stamp in (0, 30, 60, 120, 150, 166)]}),
+                 ]) as chat:
                 fresh = pipeline.analyze_video_mp4(video, "key", "MiniMax-M3", duration=166,
                                                   cache_dir=root / "cache", work_dir=root / "work")
             upload.assert_called_once()
+            self.assertEqual(chat.call_count, 2)
+            self.assertTrue(pipeline.reusable_video_artifact(fresh))
             with mock.patch.object(pipeline, "reuse_artifact", return_value={"observations": fresh}), \
                  mock.patch.object(pipeline, "minimax_upload_video_understanding") as upload:
                 cached = pipeline.analyze_video_mp4(video, "key", "MiniMax-M3", duration=166,
@@ -154,8 +160,10 @@ class VideoTimestampReliabilityTests(unittest.TestCase):
         self.assertFalse(pipeline.reusable_video_artifact([legacy]))
         self.assertFalse(pipeline.reusable_video_artifact([{**legacy, "analysis_method": "minimax_video_compressed"}]))
         validated = {**legacy, "timestamp_original": 90, "timestamp_reliable": False,
-                     "timestamp_issue": "缺少影片長度，無法驗證時間碼"}
+                     "timestamp_issue": "缺少影片長度，無法驗證時間碼", "video_gap_check_version": 1}
         self.assertTrue(pipeline.reusable_video_artifact([validated]))
+        unversioned = {key: value for key, value in validated.items() if key != "video_gap_check_version"}
+        self.assertFalse(pipeline.reusable_video_artifact([unversioned]))
         self.assertFalse(pipeline.reusable_video_artifact([validated, legacy]))
         self.assertFalse(pipeline.reusable_video_artifact([{**validated, "completion_status": "incomplete"}]))
         self.assertFalse(pipeline.reusable_video_artifact([{**legacy, "analysis_method": "minimax_video_fallback_frames"}]))

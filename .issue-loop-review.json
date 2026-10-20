@@ -1,0 +1,32 @@
+{
+  "pr": 107,
+  "head": "5ebb7c18f6b4ae513db0ff01623e32b94cb18270",
+  "findings": [
+    {
+      "severity": "high",
+      "file": "pipeline.py",
+      "line": 3196,
+      "issue": "Fixed: unanswered gap windows only reached the low-level cache writer through a transient output parameter. Returned observations still passed reusable_video_artifact, so CLI visual.json and MCP analysis/result.json were saved and reused as complete after a failed or unanswered second look. The gap-check outcome now survives serialization and gates completeness/reuse in every layer."
+    },
+    {
+      "severity": "med",
+      "file": "pipeline.py",
+      "line": 3323,
+      "issue": "Fixed: the new cache-write restriction did not invalidate pre-fix vision or CLI artifacts, which could be returned before gap filling. Whole-video reuse now requires a current per-event gap-check receipt; legacy unversioned artifacts are recomputed."
+    },
+    {
+      "severity": "med",
+      "file": "pipeline.py",
+      "line": 2873,
+      "issue": "Fixed: ending_covered treated clamped out-of-range provider timestamps as genuine endpoints. At duration 100, initial events 0/30/60/120 became 0/30/60/100 with the last timestamp explicitly unreliable, suppressing the 60-100 second look. The tail exemption now checks endpoint equality before local clamping and excludes explicitly unreliable events."
+    },
+    {
+      "severity": "med",
+      "file": "pipeline.py",
+      "line": 3198,
+      "issue": "needs-human: issue #105 requires no reusable vision cache while gaps remain, but the PR explicitly permits caching once each original window has one added event. For duration 120, initial 0/100 plus fill 50 still caches 50-second subgaps. The PR documents this deliberate policy to preserve an existing cache-reuse contract; deciding between that contract and the issue's stricter acceptance requires human judgment."
+    }
+  ],
+  "fixed": false,
+  "summary": "Fixed three defects: unanswered-gap state now reaches CLI/MCP cache and completeness gates, legacy unversioned visual artifacts are recomputed, and unreliable clamped endpoints no longer suppress second looks. Regression tests failed before the fix; full Git Bash offline checks now pass (633 Python and 109 Node passed, 24 Python skipped, exit 0). needs-human: the PR's deliberate residual-subgap cache policy still conflicts with issue #105's literal acceptance, so fixed remains false until that finding is resolved."
+}
