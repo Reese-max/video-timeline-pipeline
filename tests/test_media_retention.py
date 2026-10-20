@@ -198,3 +198,52 @@ class RetentionTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ThreadsMediaRetentionTests(unittest.TestCase):
+    def setUp(self):
+        self.now = time.time()
+
+    def test_drive_backed_threads_media_fragments_are_cleaned(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve() / "mcp_jobs"
+            job = root / "0123456789ac"
+            stamp = self.now - 8 * 86400
+            for name in ["source.mp4", "threads_media_000.mp4", "threads_media_001.mp4"]:
+                path = job / name
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(b"media")
+                os.utime(path, (stamp, stamp))
+            fingerprint = pipeline.file_fingerprint(job / "source.mp4")
+            manifest = {"status": "ready", "job_id": job.name, "source": {"fingerprint": fingerprint}, "segments": []}
+            pipeline.write_json(job / "manifest.json", manifest)
+            pipeline.write_json(job / "analysis/result.json", {"status": "complete", "job_id": job.name,
+                "source_fingerprint": fingerprint, "source_sha256": pipeline.file_sha256(job / "source.mp4"),
+                "quality": {"status": "evidence_available"}, "transcript": "keep"})
+            state = {
+                "job_id": job.name,
+                "fingerprint": fingerprint,
+                "source_file": {"file_name": "source.mp4", "sha256": pipeline.file_sha256(job / "source.mp4")},
+                "segments": [],
+                "files": [
+                    {"relative_path": "source.mp4", "sha256": pipeline.file_sha256(job / "source.mp4")},
+                ],
+            }
+            pipeline.write_json(job / "drive-manifest.json", state)
+            pipeline.write_json(job / ".media-lifecycle.json", {
+                "version": 1,
+                "job_id": job.name,
+                "managed_at": self.now - 10 * 86400,
+                "last_used_at": self.now - 10 * 86400,
+                "protected_until": self.now - 1000,
+                "link_until": self.now - 1000,
+            })
+            with patch("drive_storage.backup_complete", return_value=True), \
+                 patch("drive_storage.local_matches_backup", return_value=True), \
+                 patch("drive_storage.backup_relative_paths", return_value={"source.mp4"}), \
+                 patch("drive_storage.verify_remote_backup", return_value=True):
+                report = retention.cleanup(root, apply=True, now=self.now)
+                self.assertGreater(report["deleted_files"], 0)
+                self.assertNotIn("unbacked_media", report["skipped"])
+                self.assertFalse((job / "threads_media_000.mp4").exists())
+                self.assertFalse((job / "threads_media_001.mp4").exists())
