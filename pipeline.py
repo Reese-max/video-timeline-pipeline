@@ -4281,6 +4281,7 @@ def category_filter(category: str) -> tuple[str, tuple[Any, ...]]:
     if not category:
         return "", ()
     return (
+        " AND json_type(videos.categories) = 'array'"
         " AND EXISTS (SELECT 1 FROM json_each(videos.categories) AS jc "
         "WHERE jc.type = 'text' AND jc.value = ?)",
         (category,),
@@ -4835,6 +4836,8 @@ def list_videos(root: Path, category: str = "") -> int:
         try:
             cats = json.loads(raw or "[]") or ["未分類"]
         except json.JSONDecodeError:
+            cats = ["未分類"]
+        if not isinstance(cats, list):
             cats = ["未分類"]
         for name in cats:
             if category and category != name:

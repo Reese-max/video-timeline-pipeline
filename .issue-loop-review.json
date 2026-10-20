@@ -1,14 +1,14 @@
 {
   "pr": 12,
-  "head": "bc895d6102344f151a13e497ff7e6713b9f60acd",
+  "head": "4f8ff3443a60bf963e826720be67b84b1a6ee8b8",
   "findings": [
     {
       "severity": "med",
       "file": "pipeline.py",
-      "line": 4636,
-      "issue": "A category with no eligible events makes semantic_search raise the missing-vector error even when this model already has cached vectors. Both semantic Search and Ask fail instead of returning empty results; preserve the missing-model error while allowing a filtered no-match result."
+      "line": 4284,
+      "issue": "Category membership does not require a JSON array. index_job preserves scalar and object manifest categories, so json_each treats categories=\"AI\" or {\"topic\":\"AI\"} as an AI membership in FTS, short-query, semantic and both Ask paths. list_videos instead treats the key of {\"AI\":\"elsewhere\"} as a category. Require array metadata in both readers so only actual category string elements can match."
     }
   ],
   "fixed": true,
-  "summary": "Fixed one medium-severity defect: semantic category filters with no matches now return empty Search results and Ask evidence instead of incorrectly requesting --embed. Regression tests fail before the one-line fix and pass afterward; all 24 relevant tests and 94 independent widget controls pass. The full offline runner still fails with two Windows WinError 87 process-launch errors, both reproduced using the original head under the same subprocess invocation."
+  "summary": "Fixed one medium-severity defect: non-array category metadata could become false memberships, with inconsistent results across Search, Ask and --list. A regression through build_index failed in all six affected paths before the three-line reader fix; full offline checks now pass (637 Python tests and 109 Node controls, with 24 Python skips)."
 }

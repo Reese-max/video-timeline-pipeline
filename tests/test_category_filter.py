@@ -72,6 +72,44 @@ class CategoryFilterTests(unittest.TestCase):
         hits = pipeline.search_index(self.root, "測試關鍵字", 10)
         self.assertEqual(len(hits), 6)
 
+    def test_category_membership_ignores_non_array_manifest_values(self) -> None:
+        for job, categories in (
+            ("scalar", "AI"),
+            ("object-value", {"topic": "AI"}),
+            ("object-key", {"AI": "elsewhere"}),
+        ):
+            job_dir = self.root / "jobs" / job
+            job_dir.mkdir(parents=True)
+            pipeline.write_json(job_dir / "manifest.json", {
+                "status": "completed", "source": {"title": "測試關鍵字"},
+                "categories": categories,
+            })
+        pipeline.build_index(self.root)
+        self._seed_vectors()
+        expected = {"job-ai-exact"}
+        for query in ("測試關鍵字", "測試"):
+            with self.subTest(mode="search", query=query):
+                hits = pipeline.search_index(self.root, query, 10, "AI")
+                self.assertEqual({hit["job"] for hit in hits}, expected)
+        with mock.patch.object(pipeline, "embed_texts", return_value=[[1.0, 0.0, 0.0, 0.0]]):
+            with self.subTest(mode="semantic"):
+                hits = pipeline.semantic_search(self.root, "query", "key", "test-model", 10, category="AI")
+                self.assertEqual({hit["job"] for hit in hits}, expected)
+            for backend in ("", "local"):
+                with (
+                    self.subTest(mode="ask", backend=backend),
+                    mock.patch.object(pipeline, "question_keywords", return_value=["測試關鍵字"]),
+                    mock.patch.object(pipeline, "minimax_chat", return_value="答案 [1]"),
+                ):
+                    result = pipeline.answer_question(
+                        self.root, "問題", "key", "model", 10,
+                        embed_model="test-model", embed_backend=backend, category="AI",
+                    )
+                    self.assertEqual({hit["job"] for hit in result["citations"]}, expected)
+        with self.subTest(mode="list"), contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(pipeline.list_videos(self.root, "AI"), 1)
+        self.assertEqual(len(pipeline.search_index(self.root, "測試關鍵字", 10)), 9)
+
     def test_list_filter_uses_exact_category(self) -> None:
         self.assertEqual(pipeline.list_videos(self.root, "AI"), 1)
 
