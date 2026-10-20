@@ -1,12 +1,26 @@
 {
   "repo": "Reese-max/video-timeline-pipeline",
-  "issue": 58,
+  "issue": 56,
   "base_sha": "42d225936ba704cf70b93cac7bdf84da85ac86b8",
-  "red_proof": "Before implementation: node tests/test_widget_analysis_report.cjs (exit 1)\nFAIL - submission follows a submitted report while its Drive prerequisites finish AssertionError [ERR_ASSERTION]: No poll timer\nFAIL - notification follows a submitted report while its Drive prerequisites finish AssertionError [ERR_ASSERTION]: No poll timer\nFAIL - restore follows a submitted report while its Drive prerequisites finish AssertionError [ERR_ASSERTION]: No poll timer\nFAIL - waiting report snapshot errors and mismatched bindings stop without resubmission AssertionError [ERR_ASSERTION]: No poll timer\nFAIL - waiting snapshot polling is bounded and explicit refresh can start a new read-only wait AssertionError [ERR_ASSERTION]: The input did not match the regular expression /重新取得狀態/. Input:\nError: 5 widget report scenarios failed",
-  "test_command": "env -u _ /c/Users/Administrator/.venvs/vtp-test/Scripts/python.exe -X utf8 -B scripts/check_offline.py",
+  "red_proof": "Before implementation: python -X utf8 -B -m unittest discover -s tests -p test_video_event_gap_fill.py -v (exit 1)\nFAIL: test_gap_fill_checks_its_own_compressed_timestamps_before_caching (test_video_event_gap_fill.VideoGapFillCallTests.test_gap_fill_checks_its_own_compressed_timestamps_before_caching)\n  self.assertIs(row[\"timestamp_reliable\"], False)\nAssertionError: True is not False\nRan 13 tests in 0.269s\nFAILED (failures=1)\nBefore cache invalidation: the same suite exited 1 with FAIL: test_visual_json_from_before_gap_filling_is_not_reused (AssertionError: True is not false) and FAIL: test_cache_from_before_gap_timestamp_checks_is_not_reused (AssertionError: Tuples differ: (0, 0) != (1, 2)); Ran 14 tests in 0.277s; FAILED (failures=2).",
+  "test_command": "python -X utf8 -B -m unittest discover -s tests -p test_video_event_gap_fill.py -v && python -X utf8 -B -m unittest discover -s tests -p 'test_video_timestamp*.py' -v",
   "test_exit": 0,
-  "tests_passed": 698,
+  "tests_passed": 43,
   "tests_failed": 0,
-  "summary": "修正 #58 在摘要早於 Drive 片段上傳／兩路 worker 結束前提交時，widget 停在 awaiting_segments 的缺口，改以唯讀快照接續既有報告工作輪詢。查詢核對 job、cache signature、分析與報告雜湊，最多等待 60 次，錯誤、換影片及關閉均停止，僅既有 verified 報告可顯示「A 已完成」並複製合併指令。沿用既有含摘要／逐字稿／畫面時間軸的同資料夾上傳與 caller_submitted 來源聲明，UI URI／bridge／health 同步升為 v15；報告情境由 16 增至 23。完整離線檢查共 597 個 Python 與 101 個 Node 測試通過，另有 24 個 Windows 平台略過。",
-  "not_done": "未執行 §4.5 指定 Facebook 真實媒體、真實 Drive 同資料夾上傳與 ChatGPT 小工具／B 對話的合併品質驗收，故不能據本機測試關閉 #58；未部署、未 push、未建立 PR，未變更其他分支。未重跑遠端 CI／Linux；專案沒有 lint、coverage ratchet、CRAP 或 mutation gates，本次未新增。"
+  "summary": "Reused the existing per-response source-time validator for gap-fill responses before merging so compressed timestamps are marked unreliable without rescaling or diluting first-answer warnings. A shared validation revision invalidates both raw MP4 and aggregate CLI caches; new cache readback preserves unreliable flags. The exact evidence command passed 43 relevant tests; the full offline checker separately passed 599 Python tests with 24 skips and 94 Node controls, and Windows synchronization fixtures passed 30 checks. Controlled 166.6-second fixtures cover this regression and existing range/coverage rules, but the original issue's real-model screenshot alignment acceptance remains unverified.",
+  "not_done": "No real MiniMax call or original 166.6-second video/screenshot comparison was performed, so the <=5-second alignment requirement remains unverified and issue #56 is not ready for closure. No push, PR, merge, deployment, issue closure, or modification to another branch was performed. The repository has no configured lint, coverage ratchet, CRAP, or mutation gate.",
+  "related_evidence": [
+    {
+      "repo": "Reese-max/video-timeline-pipeline",
+      "issue": 58,
+      "base_sha": "42d225936ba704cf70b93cac7bdf84da85ac86b8",
+      "red_proof": "Before implementation: node tests/test_widget_analysis_report.cjs (exit 1)\nFAIL - submission follows a submitted report while its Drive prerequisites finish AssertionError [ERR_ASSERTION]: No poll timer\nFAIL - notification follows a submitted report while its Drive prerequisites finish AssertionError [ERR_ASSERTION]: No poll timer\nFAIL - restore follows a submitted report while its Drive prerequisites finish AssertionError [ERR_ASSERTION]: No poll timer\nFAIL - waiting report snapshot errors and mismatched bindings stop without resubmission AssertionError [ERR_ASSERTION]: No poll timer\nFAIL - waiting snapshot polling is bounded and explicit refresh can start a new read-only wait AssertionError [ERR_ASSERTION]: The input did not match the regular expression /重新取得狀態/. Input:\nError: 5 widget report scenarios failed",
+      "test_command": "env -u _ /c/Users/Administrator/.venvs/vtp-test/Scripts/python.exe -X utf8 -B scripts/check_offline.py",
+      "test_exit": 0,
+      "tests_passed": 698,
+      "tests_failed": 0,
+      "summary": "修正 #58 在摘要早於 Drive 片段上傳／兩路 worker 結束前提交時，widget 停在 awaiting_segments 的缺口，改以唯讀快照接續既有報告工作輪詢。查詢核對 job、cache signature、分析與報告雜湊，最多等待 60 次，錯誤、換影片及關閉均停止，僅既有 verified 報告可顯示「A 已完成」並複製合併指令。沿用既有含摘要／逐字稿／畫面時間軸的同資料夾上傳與 caller_submitted 來源聲明，UI URI／bridge／health 同步升為 v15；報告情境由 16 增至 23。完整離線檢查共 597 個 Python 與 101 個 Node 測試通過，另有 24 個 Windows 平台略過。",
+      "not_done": "未執行 §4.5 指定 Facebook 真實媒體、真實 Drive 同資料夾上傳與 ChatGPT 小工具／B 對話的合併品質驗收，故不能據本機測試關閉 #58；未部署、未 push、未建立 PR，未變更其他分支。未重跑遠端 CI／Linux；專案沒有 lint、coverage ratchet、CRAP 或 mutation gates，本次未新增。"
+    }
+  ]
 }
