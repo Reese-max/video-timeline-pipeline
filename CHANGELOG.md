@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- 新增：RSS 處理完成的影片把 `knowledge.md` 存到 Drive「RSS 自動摘要」資料夾（ID 先存檔、同內容沿用、不覆寫被改動的檔案；Drive 失敗只記錄不讓影片失敗；`RSS_DRIVE_UPLOAD=false` 可關閉）；完成通知加上前 300 字摘要與 Drive 連結。
 - 介面：v17 widget 視覺更新（卡片式版面、主次按鈕、狀態與缺漏提示框、時間碼標籤、逐字稿／畫面觀察分色、跟隨 ChatGPT 淺色／深色主題）；Drive 交接改一顆「複製並開新一般對話」（先複製再嘗試開分頁並顯示連結備援，複製失敗不開分頁並顯示手動複製與連結，保留「只複製」）；其餘 id、文字與行為不變，UI URI 升為 v17 並保留 v15、v16。另修正報告區兩個簡體字（独立、实际）。
 - 改進 A／B 韌性（依 job c9289f71a482 實測：MiniMax 連續 4 次 HTTP 529）：語音可靠、畫面失敗的 partial 報告標 `evidence_scope=speech_only` 並免摘要自動上傳 Drive（報告開頭註明只含語音）；快照對所有可自動上傳的報告回 `awaiting_segments`，widget v16 自動追蹤、提示建議加跑 B（`quality.route_b_reasons`）、複製改三段備援；保留 v14／v15 widget URI 避免升版後「無法開啟應用程式」；HTTP 429／529 拒絕記 `zero_rejected` 不佔預算；MiniMax 同一影片 24 小時內重跑重用 `file_id`。
 

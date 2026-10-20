@@ -192,6 +192,12 @@ python pipeline.py --rss-list
 python pipeline.py --rss-refresh
 ```
 
+### RSS 結果存 Drive 與完成通知
+
+`--rss-process` 完成的影片（`status=completed`）會把 `knowledge.md` 複製到 Drive：`GOOGLE_DRIVE_FOLDER_ID` 底下的「RSS 自動摘要」資料夾，檔名為「標題 (job).md」。資料夾與檔案 ID 都在上傳前先存檔（`rss/drive-folder.json`、`jobs/<job>/drive-knowledge-*.json`），重跑同一份內容會沿用已核對的檔案；Drive 上的檔案被移動、改動或刪除時只報錯、不覆寫；知識檔內容變了就另存一份新檔。沒有 Drive 憑證時不上傳，設 `RSS_DRIVE_UPLOAD=false` 可關閉；上傳失敗記在 manifest 的 `drive`，不會讓影片變成失敗。dry-run、local-only 與手動單支執行都不上傳。
+
+設定 `DISCORD_WEBHOOK_URL` 時，每支完成的影片會送一則通知，內容有標題、原片連結、前 300 字摘要與 Drive 連結（有上傳時）。每日彙整信沿用 `--digest-send daily`（Resend／SMTP，見 `EMAIL_PROVIDER`）。
+
 ### Facebook 作者影片追蹤
 
 Meta Graph API 可盤點你有權管理的 Facebook Page，會同時讀取 `videos` 與 `video_reels`，用 cursor 持續分頁，沒有歷史總數硬上限。先將 Page Access Token 與目前 API 版本填入專案 `.env`，不要把 Token 貼進命令或提交到 Git：

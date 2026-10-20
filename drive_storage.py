@@ -702,3 +702,70 @@ def upload_analysis_report(job_dir: Path, report: dict, segments: dict) -> dict:
         return state
     finally:
         UPLOAD_LOCK.release()
+
+
+RSS_FOLDER_NAME = "RSS 自動摘要"
+
+
+def _load_owned_state(path: Path) -> dict[str, Any]:
+    if path.is_symlink():
+        raise ValueError("Drive upload state is not owned")
+    state = json.loads(path.read_bytes())
+    if not isinstance(state, dict):
+        raise ValueError("Unknown Drive upload state")
+    return state
+
+
+def _rss_folder(token: str, state_path: Path) -> str:
+    """One folder holds every RSS result; its ID is durable before the folder is created."""
+    parent_id = _env("GOOGLE_DRIVE_FOLDER_ID")
+    if state_path.exists():
+        state = _load_owned_state(state_path)
+        if state.get("parent_id") != parent_id or not _DRIVE_ID.fullmatch(str(state.get("folder_id") or "")):
+            raise ValueError("RSS Drive folder state does not match GOOGLE_DRIVE_FOLDER_ID")
+    else:
+        state = {"folder_id": _new_id(token), "parent_id": parent_id, "name": RSS_FOLDER_NAME}
+        write_json(state_path, state)
+    folder_id = state["folder_id"]
+    folder = _get_file(token, folder_id) or _create_folder(token, RSS_FOLDER_NAME, parent_id, folder_id)
+    if (folder.get("trashed") or folder.get("mimeType") != FOLDER_MIME or str(folder.get("id")) != folder_id
+            or (parent_id and parent_id not in folder.get("parents", []))):
+        raise ValueError("RSS Drive folder was moved, trashed or changed; no write")
+    return folder_id
+
+
+def upload_rss_knowledge(root: Path, job_dir: Path, title: str) -> dict[str, Any]:
+    """Copy one RSS job's knowledge.md into the RSS folder; changed bytes get a new file, never an overwrite."""
+    if not configured():
+        raise DriveNotConfigured("Google Drive 尚未設定；RSS 摘要只留在本機。")
+    path = job_dir / "knowledge.md"
+    if job_dir.is_symlink() or path.is_symlink() or not path.is_file():
+        raise ValueError("knowledge.md is missing or not owned")
+    local = _local_source(path)
+    if not local["size_bytes"]:
+        raise ValueError("knowledge.md is empty")
+    token = _access_token()
+    folder_id = _rss_folder(token, root / "rss" / "drive-folder.json")
+    state_path = job_dir / f"drive-knowledge-{local['sha256'][:16]}.json"
+    binding = {"job": job_dir.name, "sha256": local["sha256"], "size_bytes": local["size_bytes"], "folder_id": folder_id}
+    if state_path.exists():
+        state = _load_owned_state(state_path)
+        if (any(state.get(k) != v for k, v in binding.items()) or not _DRIVE_ID.fullmatch(str(state.get("file_id") or ""))
+                or not isinstance(state.get("file_name"), str)):
+            raise ValueError("Unknown existing RSS upload state")
+    else:
+        # The name is fixed at reservation: a later title fix must not turn the same bytes into a mismatch.
+        state = {**binding, "file_name": f"{_safe_name(title)} ({job_dir.name}).md", "file_id": _new_id(token), "verified": False}
+        write_json(state_path, state)  # ID is durable BEFORE any POST/PUT.
+    file_id, name = state["file_id"], state["file_name"]
+    remote = _get_file(token, file_id)
+    if not _matches_file(remote, file_id, local, folder_id, "text/markdown"):
+        if remote or state.get("verified"):
+            raise ValueError("Existing RSS copy was moved, changed or deleted; never overwrite")
+        _upload_file(token, path, name, folder_id, "text/markdown", file_id=file_id)
+        remote = _get_file(token, file_id)
+        if not _matches_file(remote, file_id, local, folder_id, "text/markdown"):
+            raise ValueError("Uploaded RSS copy failed identity/bytes/parent verification")
+    state.update(verified=True, url=str(remote["webViewLink"]))
+    write_json(state_path, state)
+    return state

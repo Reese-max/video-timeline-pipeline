@@ -6432,6 +6432,31 @@ def annotate_rss_manifest(root: Path, manifest_path: Path, item: dict[str, Any])
             connection.close()
 
 
+def upload_rss_result(root: Path, job_dir: Path, manifest: dict[str, Any]) -> dict[str, Any]:
+    """RSS 完成的知識檔也存一份到 Drive；Drive 失敗只記錄，不讓影片變成失敗。"""
+    if os.getenv("RSS_DRIVE_UPLOAD", "true").strip().lower() in {"0", "false", "no", "off"}:
+        return {"status": "disabled"}
+    try:
+        import drive_storage
+
+        if not drive_storage.configured():
+            return {"status": "not_configured"}
+        title = str((manifest.get("source") or {}).get("title") or job_dir.name)
+        state = drive_storage.upload_rss_knowledge(root, job_dir, title)
+        return {"status": "uploaded", "file_id": state["file_id"], "url": state["url"]}
+    except Exception as exc:
+        return {"status": "error", "error": sanitize_public_urls(str(exc))[:300]}
+
+
+def attach_rss_drive(root: Path, job_dir: Path, manifest_path: Path, manifest: dict[str, Any]) -> None:
+    """先上傳再通知，通知才帶得到 Drive 連結；寫回失敗也不改變影片已完成的結果。"""
+    manifest["drive"] = upload_rss_result(root, job_dir, manifest)
+    try:
+        write_json(manifest_path, manifest)
+    except OSError as exc:
+        print(f"! Drive 結果寫回 manifest 失敗（不影響影片產物）：{exc}")
+
+
 def recover_stale_rss_items(state: dict[str, Any], now: float | None = None) -> int:
     current = time.time() if now is None else now
     recovered = 0
@@ -8395,6 +8420,8 @@ def run_pipeline(args: argparse.Namespace) -> Path:
             connection.commit()
         finally:
             connection.close()
+        if getattr(args, "rss_item", False) and manifest.get("status") == "completed":
+            attach_rss_drive(root, job_dir, manifest_path, manifest)
         try:
             from notifications import record_pipeline_completed_event
 

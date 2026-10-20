@@ -642,6 +642,16 @@ def record_pipeline_completed_event(root: Path, job_dir: Path, manifest: dict[st
                 "analysis_revision": revision,
                 "created_at": _utc_now_iso(),
             }
+            drive = manifest.get("drive") or {}
+            if drive.get("status") == "uploaded" and drive.get("url"):
+                event_payload["drive_url"] = drive["url"]
+            try:
+                summary = json.loads((job_dir / "summary.json").read_text(encoding="utf-8"))
+                short = str(summary.get("short_summary") or "").strip()
+            except (OSError, ValueError, AttributeError):
+                short = ""
+            if short:
+                event_payload["summary"] = short if len(short) <= 300 else short[:299] + "…"
 
             event_id = record_event(
                 conn,
