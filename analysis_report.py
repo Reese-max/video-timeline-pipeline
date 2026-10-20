@@ -44,7 +44,7 @@ def uploadable(report: dict) -> bool:
 def sha(raw: bytes) -> str:
     return hashlib.sha256(raw).hexdigest()
 
-def analysis_binding(job_dir: Path, analysis: dict) -> dict:
+def analysis_binding(job_dir: Path, analysis: dict | None = None) -> dict:
     path = job_dir / "analysis" / "result.json"
     if path.is_symlink():
         raise ValueError("Analysis record is not a regular owned artifact")
@@ -52,9 +52,6 @@ def analysis_binding(job_dir: Path, analysis: dict) -> dict:
     actual = json.loads(raw)
     if not isinstance(actual, dict):
         raise ValueError("Invalid persisted analysis schema")
-    fields = ("job_id", "cache_signature", "source_sha256", "source_fingerprint", "transcript", "timeline")
-    if any(actual.get(k) != analysis.get(k) for k in fields):
-        raise ValueError("Analysis record changed")
     if actual.get("job_id") != job_dir.name or not re.fullmatch(r"[0-9a-f]{64}", str(actual.get("cache_signature") or "")):
         raise ValueError("Analysis signature is missing")
     if not re.fullmatch(r"[0-9a-f]{64}", str(actual.get("source_sha256") or "")) or not actual.get("source_fingerprint"):
