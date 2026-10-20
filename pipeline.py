@@ -11,6 +11,7 @@ import difflib
 from decimal import Decimal, InvalidOperation, ROUND_CEILING
 import email.utils
 import hashlib
+import http.client
 import http.cookiejar
 import importlib.util
 import io
@@ -2661,6 +2662,55 @@ def minimax_upload_video_understanding(video_path: Path, api_key: str) -> str:
     return str(file_id)
 
 
+# MiniMax keeps video_understanding uploads for up to 7 days; reuse well inside that window.
+MINIMAX_FILE_REUSE_SECONDS = 24 * 3600
+
+
+def minimax_reusable_upload(video_path: Path, api_key: str, record_dir: Path | None,
+                            *, fresh: bool = False) -> tuple[str, bool]:
+    """Return (file_id, reused). Re-running the same bytes within a day skips the upload.
+
+    Field test c9289f71a482 re-uploaded the same MP4 for each of four reruns while
+    MiniMax kept answering 529. A reused id that turns out unusable is replaced via fresh=True.
+    """
+    record_path = None
+    # File ids belong to one platform; the uploader itself validates this endpoint.
+    endpoint = os.getenv("MINIMAX_BASE_URL", "").rstrip("/")
+    if record_dir is not None:
+        digest = file_sha256(video_path)
+        record_path = record_dir / f"minimax-upload-{digest}.json"
+        saved = None if fresh else reuse_artifact(record_path)
+        if isinstance(saved, dict):
+            uploaded_at, age = saved.get("uploaded_at"), -1.0
+            if isinstance(uploaded_at, (int, float)) and not isinstance(uploaded_at, bool):
+                try:
+                    age = time.time() - float(uploaded_at)
+                except OverflowError:
+                    pass  # A malformed record is ignored, never fatal.
+            if (0 <= age < MINIMAX_FILE_REUSE_SECONDS and str(saved.get("file_id") or "").strip()
+                    and saved.get("sha256") == digest and saved.get("base_url") == endpoint
+                    and saved.get("size_bytes") == video_path.stat().st_size):
+                print(f"· MiniMax 重用 {int(age // 60)} 分鐘前上傳的 file_id={saved['file_id']}（同一份影片，不重新上傳）")
+                return str(saved["file_id"]), True
+    file_id = minimax_upload_video_understanding(video_path, api_key)
+    if record_path is not None:
+        record_path.parent.mkdir(parents=True, exist_ok=True)
+        write_json(record_path, {"file_id": file_id, "uploaded_at": time.time(), "sha256": digest,
+                                 "size_bytes": video_path.stat().st_size, "base_url": endpoint})
+    return file_id, False
+
+
+def minimax_transient_error(error: BaseException) -> bool:
+    """Overload, rate limit, timeout or lost connection: not evidence that a reused file id is gone."""
+    # urlopen's getresponse() and body reads can raise these unwrapped (RemoteDisconnected, IncompleteRead).
+    if isinstance(error, (OSError, http.client.HTTPException)):
+        return True
+    status = getattr(error, "status_code", None)
+    return (isinstance(error, ApiRequestError)
+            and ((isinstance(status, int) and (status in RETRY_STATUS or status == 529))
+                 or (status is None and error.provider_outcome_unknown)))
+
+
 def visual_mode() -> str:
     mode = os.getenv("ANALYZE_VISUAL_MODE", "video_mp4").strip().lower()
     if mode in {"video", "video_mp4", "mp4"}:
@@ -2944,40 +2994,57 @@ def _analyze_video_mp4_core(
     extra_meta: dict[str, Any] | None = None,
     duration_hint: float | None = None,
     max_completion_tokens: int | None = None,
+    upload_record_dir: Path | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, Any] | None, str | None]:
-    """Upload once, then chat (one repair retry on compressed timestamps).
+    """Upload once (or reuse a recent upload of the same bytes), then chat.
 
-    Raises on upload/API failures; incomplete chat returns incomplete obs.
+    One repair retry on compressed timestamps. Raises on upload/API failures;
+    incomplete chat returns incomplete obs.
     """
-    file_id = minimax_upload_video_understanding(video_path, api_key)
+    file_id, reused = minimax_reusable_upload(video_path, api_key, upload_record_dir)
     current_prompt = prompt
     parsed: dict[str, Any] | None = None
     observations: list[dict[str, Any]] = []
     timestamp_coverage_ok = True
+
+    def chat() -> str:
+        return minimax_chat(
+            [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": current_prompt},
+                        {
+                            "type": "video_url",
+                            "video_url": {
+                                "url": f"mm_file://{file_id}",
+                                "detail": detail_value,
+                                "fps": fps_value,
+                            },
+                        },
+                    ],
+                }
+            ],
+            api_key,
+            model,
+            timeout=timeout,
+            max_completion_tokens=max_completion_tokens,
+        )
+
     for attempt in range(2):
         try:
-            response = minimax_chat(
-                [
-                    {
-                        "role": "user",
-                        "content": [
-                            {"type": "text", "text": current_prompt},
-                            {
-                                "type": "video_url",
-                                "video_url": {
-                                    "url": f"mm_file://{file_id}",
-                                    "detail": detail_value,
-                                    "fps": fps_value,
-                                },
-                            },
-                        ],
-                    }
-                ],
-                api_key,
-                model,
-                timeout=timeout,
-                max_completion_tokens=max_completion_tokens,
-            )
+            try:
+                response = chat()
+            except (DeadlineExceeded, ExecutionCancelled, MiniMaxIncompleteError, budget_blocked_error()):
+                raise
+            except Exception as error:
+                # Overload still fails fast; only a reused id the provider refuses gets one fresh upload.
+                if not reused or minimax_transient_error(error):
+                    raise
+                print(f"! 重用的 MiniMax file_id 無法使用，重新上傳一次：{error}")
+                file_id, reused = minimax_reusable_upload(video_path, api_key, upload_record_dir, fresh=True)
+                response = chat()
+            reused = False
             parsed = parse_json_object(response)
         except MiniMaxIncompleteError as error:
             incomplete = _stamp_video_observations(
@@ -3218,6 +3285,8 @@ def analyze_video_mp4(
             extra_meta=extra_meta,
             duration_hint=duration,
             max_completion_tokens=max_completion_tokens,
+            # The visual cache holds only finished evidence; upload receipts live with the work files.
+            upload_record_dir=work_dir,
         )
 
     def persist(observations: list[dict[str, Any]], parsed: dict[str, Any] | None, file_id: str | None) -> list[dict[str, Any]]:

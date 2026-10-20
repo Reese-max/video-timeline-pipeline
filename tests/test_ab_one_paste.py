@@ -66,13 +66,34 @@ class SpeechReliabilityTests(unittest.TestCase):
         self.assertIs(quality["speech_reliable"], False)
         self.assertIs(quality["recommend_route_b"], True)
 
+    def test_route_b_reasons_name_the_missing_half(self):
+        # Field test c9289f71a482: speech was fine but MiniMax 529 left no visual evidence.
+        no_visual = {**_result(["今天來看三角洲行動的新地圖"]), "status": "partial", "visual_status": "error", "timeline": []}
+        quality = server.analysis_quality(no_visual)
+        self.assertIs(quality["speech_reliable"], True); self.assertIs(quality["recommend_route_b"], True)
+        self.assertEqual(quality["route_b_reasons"], ["伺服器畫面分析失敗或不完整"])
+        server.AnalysisQuality.model_validate(quality)
+        self.assertEqual(server.analysis_quality(_result(["♪"]))["route_b_reasons"], ["伺服器沒有可信的語音內容"])
+        # Speech exists but a failed backfill may have dropped words; B hears the original audio.
+        backfill = _result(["今天來看三角洲行動的新地圖"])
+        backfill["transcript"]["backfill_errors"] = ["inert backfill failure"]
+        self.assertEqual(server.analysis_quality(backfill)["route_b_reasons"], ["伺服器逐字稿補轉失敗，可能漏字"])
+        unfinished = {**_result(["今天來看三角洲行動的新地圖"]), "audio_status": "error"}
+        self.assertEqual(server.analysis_quality(unfinished)["route_b_reasons"], ["伺服器語音辨識未完成"])
+        self.assertEqual(server.analysis_quality(_result(["今天來看三角洲行動的新地圖"]))["route_b_reasons"], [])
+
     def test_analyze_tool_text_tells_chatgpt_to_suggest_b(self):
         result = {**_result(["ご視聴ありがとうございました"]), "job_id": "0123456789ab",
                   "source_size_bytes": 8, "source_sha256": "a" * 64, "duration_seconds": 30.0}
         text = server.analysis_tool_result(result).content[0].text
         self.assertIn("建議加跑 B", text)
         reliable = {**result, **_result(["今天來看三角洲行動的新地圖"])}
-        self.assertNotIn("建議加跑 B", server.analysis_tool_result(reliable).content[0].text)
+        reliable_text = server.analysis_tool_result(reliable).content[0].text
+        self.assertNotIn("建議加跑 B", reliable_text)
+        # Complete evidence uploads on its own; the tool text must not push ChatGPT into a summary call.
+        self.assertIn("不必先提交摘要", reliable_text)
+        review = {**reliable, "status": "partial", "audio_status": "error", "errors": ["音訊：inert"]}
+        self.assertNotIn("不必先提交摘要", server.analysis_tool_result(review).content[0].text)
 
 
 class OnePasteHandoffTests(unittest.TestCase):
