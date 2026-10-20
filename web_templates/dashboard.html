@@ -1,0 +1,88 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{{ page }} · 影片資料庫</title>
+  <link rel="stylesheet" href="/static/dashboard.css">
+  <script src="/static/dashboard.js" defer></script>
+</head>
+<body data-writes="{{ 'true' if write_enabled else 'false' }}">
+<a class="skip" href="#main">跳到主要內容</a>
+<header><a class="brand" href="/">影片資料庫<span>Video timeline</span></a><span class="mode">{{ '可排程工作' if write_enabled else '唯讀模式' }}</span></header>
+<nav aria-label="主要導覽">
+  <a href="/">總覽</a><a href="/videos">影片</a><a href="/operations">工作</a><a href="/costs">成本</a><a href="/digests">摘要與通知</a>
+</nav>
+<main id="main">
+<h1>{{ page }}</h1>
+<details class="authorization" {% if page == '登入' %}open{% endif %}>
+  <summary>操作授權</summary><form id="authorize"><label for="token">本機設定的存取權杖</label><input id="token" type="password" autocomplete="off" required><button>授權這次操作</button></form>
+  <p>權杖僅供這個頁面的操作使用，關閉頁面即清除。已送出的請求可能繼續或已計費。</p>
+</details>
+<p id="notice" role="status" aria-live="polite"></p>
+{% if state == 'migration_required' %}
+<section class="state"><h2>索引需要維護</h2><p>尚無相容的本機索引。請由管理者明確執行維護，再重新載入。</p></section>
+{% elif state != 'ready' %}<p class="state">{{ state }}：目前沒有可顯示的資料。</p>{% endif %}
+{% if page == '總覽' and data %}
+<p><a href="/?window=today">今日</a> · <a href="/?window=week">本週</a></p>
+<p class="caption">{{ data.window.from }} 至 {{ data.window.to }} · {{ data.timezone }}<br>資料時間 {{ data.as_of }} · 本機索引與工作紀錄</p>
+<section class="overview" aria-label="資料覆蓋">
+  <a class="metric" href="/videos?{{ data.video_filter|urlencode }}"><strong>{{ data.completed }}</strong><span>首次完成影片</span></a>
+  <div class="metric"><strong>{{ data.high_importance if data.high_importance is not none else '—' }}</strong><span>高重要性 · {{ '尚未評分' if data.scoring_state == 'unscored' else '已評分 ' ~ data.scored ~ ' 支' }}</span></div>
+  <div class="metric"><strong>{{ data.unknown_completion_time }}</strong><span>首次完成時間未知</span></div>
+</section>
+<h2>目前工作</h2><dl class="facts">{% for key in ['queued','running','failed','unknown','blocked'] %}<div><dt>{{ key }}</dt><dd>{{ data.counts.get(key, 0) }}</dd></div>{% endfor %}</dl>
+<p><a href="/costs">成本與用量</a>：{{ data.costs.state }} · 實際 {{ data.costs.actual if data.costs.actual is not none else 'unavailable' }} USD · 估計小計 {{ data.costs.estimated if data.costs.estimated is not none else 'unavailable' }} USD。金額僅涵蓋本程式紀錄，估計小計不是完整帳單。</p>
+{% endif %}
+{% if page == '影片資料庫' %}
+<form method="get" class="filters" aria-label="影片篩選">
+  <label>精確類別<input name="category" maxlength="200"></label><label>作者<input name="author" maxlength="200"></label>
+  <label>來源<select name="platform"><option value="">全部</option><option>youtube</option><option>facebook</option><option>instagram</option><option>threads</option></select></label>
+  <label>日期欄位<select name="date_field"><option value="first_completed_at">首次完成</option><option value="published_at">原片發佈</option></select></label>
+  <label>起日<input name="date_from" type="date"></label><label>迄日<input name="date_to" type="date"></label><button>篩選影片</button>
+</form>
+{% if data %}<p class="caption">共 {{ data.total }} 支 · 第 {{ data.page }} 頁 · 每頁 {{ data.page_size }} 支</p>
+<div class="videos">{% for video in data['items'] %}<article class="video">
+  <div class="ruler" aria-hidden="true">▶</div><div><h2><a href="/videos/{{ video.job }}">{{ video.title or video.job }}</a></h2>
+  <p>{{ video.platform or '來源未知' }} · {{ video.author or '作者未知' }} · {{ video.duration if video.duration is not none else '片長未知' }} 秒</p>
+  <p class="caption">發佈 {{ video.published_at or '未知' }} · 首次完成 {{ video.first_completed_at or '未知' }}<br>{{ video.categories|join(' · ') }} · {{ video.status }} · {{ '重要性 ' ~ video.score.importance if video.score else '尚未評分' }}</p></div>
+</article>{% else %}<p class="state">沒有符合篩選的影片。</p>{% endfor %}</div>
+<div class="pagination" data-page="{{ data.page }}" data-total="{{ data.total }}" data-size="{{ data.page_size }}"><button id="previous-page">上一頁</button><button id="next-page">下一頁</button></div>
+{% endif %}{% endif %}
+{% if page in ['總覽','影片資料庫'] %}
+<section class="search"><h2>搜尋與問答</h2><form id="search-form"><label for="query">搜尋已儲存的影片證據</label><input id="query" maxlength="500" required>
+<label for="search-mode">模式</label><select id="search-mode"><option value="fts">本機全文搜尋 · 無外部呼叫</option><option value="semantic">語意搜尋 · OpenRouter，可能消耗額度</option><option value="hybrid">混合搜尋 · OpenRouter，可能消耗額度</option><option value="ask">根據證據回答 · MiniMax，可能消耗額度</option></select><button>查詢</button></form><div id="search-results" aria-live="polite"></div></section>
+{% endif %}
+{% if page == '影片證據' and data %}
+<h2>{{ data.video.title }}</h2><p>{{ data.video.author or '作者未知' }} · {{ data.video.status }} · {{ data.score.status or '已評分' }}</p>
+{% if data.video.source %}<a href="{{ data.video.source }}" target="_blank" rel="noopener noreferrer">開啟原片</a>{% endif %}
+<section><h2>影片層級摘要</h2><p class="prose">{{ data.summary.short_summary or data.summary.brief or data.summary.summary or '尚無摘要' if data.summary else '尚無摘要' }}</p></section>
+<section><h2>評分依據</h2>{% if data.score.status == 'unscored' %}<p>尚未評分。</p>{% else %}<p>重要性 {{ data.score.importance }} · 新穎性 {{ data.score.novelty if data.score.novelty is not none else '未知' }} · {{ data.score.decision }}</p><p>{{ data.score.decision_reason }}</p>{% for dimension, reason in data.score.reasons.items() %}<p>{{ dimension }}：{{ reason }}</p>{% endfor %}{% endif %}</section>
+<section><h2>時間軸與原文</h2><p class="caption">共 {{ data.evidence.total }} 筆 · 第 {{ data.evidence.page }} 頁</p>
+{% for event in data.evidence['items'] %}<article class="evidence"><span class="time">{{ event.time_label }}</span><div><span class="caption">{{ event.kind }}</span><p class="prose">{{ event.text }}</p>{% if event.source_link %}<a href="{{ event.source_link }}" target="_blank" rel="noopener noreferrer">核對原片</a>{% endif %}</div></article>{% endfor %}
+<div class="pagination" data-page="{{ data.evidence.page }}" data-total="{{ data.evidence.total }}" data-size="{{ data.evidence.page_size }}"><button id="previous-page">上一頁</button><button id="next-page">下一頁</button></div></section>
+<section><h2>相關影片</h2>{% for video in data.related %}<p><a href="/videos/{{ video.job }}">{{ video.title }}</a></p>{% else %}<p>尚無相關影片。</p>{% endfor %}</section>
+<section><h2>這支影片的工作與用量</h2><p>僅列本機紀錄，各最多 50 筆；影片 ID 與工作 ID 分開顯示。</p>{% for task in data.operations.tasks['items'] %}<p>工作 {{ task.task_id }} · {{ task.type }} · {{ task.status }}</p>{% else %}<p>沒有此片的 Dashboard 工作。</p>{% endfor %}{% for usage in data.operations.usage['items'] %}<p>{{ usage.provider }} · {{ usage.operation }} · {{ usage.status }} · 費用 {{ usage.cost_status }}</p>{% endfor %}</section>
+{% endif %}
+{% if page == '成本與預算' and data %}
+<p>本程式可見範圍 · {{ data.state }}。供應商配額、Token Plan 包含額度與完整帳單可能無法取得。</p>
+<dl class="facts">{% for field, label in [('actual','實際金額 USD'),('estimated','估計小計 USD'),('unknown','價格未知筆數'),('confirmed_included','已確認含在方案內筆數'),('outstanding_reservations','未結清預留 USD')] %}<div><dt>{{ label }}</dt><dd>{{ data[field] if data[field] is defined and data[field] is not none else 'unavailable' }}</dd></div>{% endfor %}</dl>
+{% if data.budget %}<h2>每日預算</h2><p>已用 {{ data.budget.spent_usd }} USD · 未結清 {{ data.budget.outstanding_usd }} USD · 可用 {{ data.budget.remaining_usd if data.budget.remaining_usd is not none else '未設定上限' }} USD</p><p>{{ data.budget.accounting_timezone }} · {{ data.budget.period }} · 今日阻擋 {{ data.budget.blocked_operations_today }} 筆</p>{% endif %}
+{% endif %}
+{% if page == '工作與用量' and data %}
+<h2>工作紀錄</h2><p>取消只停止後續步驟，已送出的請求可能繼續或已計費，不保證退費。unknown 須先人工核對遠端狀態。</p>{% for task in data.tasks['items'] %}<p><code>{{ task.task_id }}</code> · {{ task.type }} · <strong>{{ task.status }}</strong> · {{ task.checkpoint }} · {{ task.safe_error or '' }} {% if write_enabled and task.status in ['queued','running'] %}<button class="cancel-task" data-task="{{ task.task_id }}">停止後續步驟</button>{% endif %}</p>{% else %}<p>目前沒有 Dashboard 工作。</p>{% endfor %}
+<h2>原 RSS 佇列</h2><p class="caption">來源 {{ data.rss.source }} · 更新 {{ data.rss.updated_at or '未知' }}</p>
+{% for item in data.rss['items'] %}<p>{{ item.id }} · {{ item.status }} · 嘗試 {{ item.attempts or 0 }} 次 {% if write_enabled and item.status == 'failed' %}<button class="retry-rss" data-job="{{ item.id }}">確認雲端使用並重排</button>{% endif %}</p>{% else %}<p>沒有 RSS 項目。</p>{% endfor %}
+<h2>供應商觀測</h2>{% for provider in data.providers.providers %}<p>{{ provider.provider }} · {{ provider.total_calls }} 個樣本 · 成功 {{ provider.successes }}／失敗 {{ provider.failures }} · 平均 {{ provider.avg_latency_ms }} ms<br>快取 {{ provider.cache_hits }} 筆／{{ provider.cache_hit_rate_pct }}% · 最近成功 {{ provider.last_success_at or '未知' }} · {{ provider.first_sample_at }} 至 {{ provider.last_sample_at }}</p>{% else %}<p>尚無用量樣本；無法推論服務 SLA。</p>{% endfor %}
+<h2>失敗與預算阻擋</h2>{% for failure in data.failed %}<p>{{ failure.operation }} · {{ failure.provider }} · {{ failure.safe_error }}</p>{% else %}<p>沒有已記錄的失敗。</p>{% endfor %}
+{% endif %}
+{% if page == '摘要與通知' %}
+<p>預覽僅使用本機摘要；送出須確認這次預覽的收件者與內容。供應商接受不代表送達。</p>
+<form id="digest-preview"><label>窗口<select id="digest-type"><option value="daily">日報</option><option value="weekly">週報</option></select></label><label>基準日期<input id="digest-date" type="date"></label><label><input id="digest-new-revision" type="checkbox">明確建立新版，供補寄／重寄確認</label><button>產生預覽</button></form>
+<div id="draft" aria-live="polite"></div><button id="digest-send" hidden>確認預覽並排入寄送</button>
+<h2>歷史與進度</h2>{% if data %}{% for draft in data['items'] %}<p>{{ draft.digest_id }} · 第 {{ draft.revision }} 版 · {{ draft.status }}</p>{% else %}<p>目前沒有摘要草稿。</p>{% endfor %}{% endif %}
+<button id="load-notifications">查看通知狀態</button><div id="notifications"></div>
+{% endif %}
+</main><footer>只讀取已存在的本機證據 · 啟動介面不啟動背景工作</footer>
+</body>
+</html>

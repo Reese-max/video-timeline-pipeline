@@ -381,10 +381,11 @@ def score_video(
         }
 
 
-def explain_score(root: Path, job: str) -> dict[str, Any]:
+def explain_score(root: Path, job: str, *, readonly: bool = False) -> dict[str, Any]:
     """Read-only score explanation without any API cost."""
-    with closing(get_operations_db(root)) as conn:
-        _init_scoring_schema(conn)
+    with closing(get_operations_db(root, readonly=readonly)) as conn:
+        if not readonly:
+            _init_scoring_schema(conn)
 
         cur = conn.cursor()
         cur.execute(

@@ -73,6 +73,7 @@ def collect_digest_candidates(
     root: Path,
     window_start_utc: datetime.datetime,
     window_end_utc: datetime.datetime,
+    *, include_chapters: bool = True,
 ) -> list[dict[str, Any]]:
     """Scan root/jobs/ for completed video artifacts created inside the time window."""
     jobs_dir = root / "jobs"
@@ -115,7 +116,7 @@ def collect_digest_candidates(
             source = manifest.get("source", {})
             timeline_file = job_path / "timeline.json"
             chapters = []
-            if timeline_file.is_file():
+            if include_chapters and timeline_file.is_file():
                 try:
                     timeline_data = json.loads(timeline_file.read_text(encoding="utf-8"))
                     chapters = timeline_data.get("chapters", [])
