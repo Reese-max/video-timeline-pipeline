@@ -33,7 +33,7 @@ class AnalysisReportTests(unittest.TestCase):
                   patch.object(server.pipeline,'visual_mode',return_value='video_mp4'),
                   patch('urllib.request.urlopen',side_effect=AssertionError('No network permitted'))):self.stack.enter_context(p)
 
-    def analyze(self, visual=None, speech=None):
+    def analyze(self, visual=None, speech=None, *, duration=2):
         # The real analyze_prepared_sync, source hash, timeline merge and write_json run.
         # Only paid/external evidence/probe bodies are inert; no credentials or FFmpeg spawned here.
         # An exception passed as visual/speech makes that stage fail instead.
@@ -42,7 +42,7 @@ class AnalysisReportTests(unittest.TestCase):
         with ExitStack() as s:
             for p in (patch.object(server.pipeline,'minimax_subscription_key',return_value='inert-not-real'),
                       patch.object(server.pipeline,'visual_mode',return_value='video_mp4'),
-                      patch.object(server.pipeline,'probe_video',return_value={'format':{'duration':'2'},'streams':[{'codec_type':'video'},{'codec_type':'audio'}]}),
+                      patch.object(server.pipeline,'probe_video',return_value={'format':{'duration':str(duration)},'streams':[{'codec_type':'video'},{'codec_type':'audio'}]}),
                       patch.object(server.pipeline,'extract_audio',return_value=[{'path':str(self.job/'source.mp4')}]),
                       patch.object(server.pipeline,'transcribe_local',**stage(speech,{'provider':'owned-inert','segments':[{'start':0,'end':1,'text':'owned speech <source>'}]})),
                       patch.object(server.pipeline,'analyze_video_mp4',**stage(visual,[{'timestamp':0,'visual_summary':'owned visual <source>','visible_text':['42'],'confidence':0.9,'analysis_method':'minimax_video','timestamp_reliable':True}])),
@@ -224,6 +224,85 @@ class AnalysisReportTests(unittest.TestCase):
             self.assertEqual(calls, [])
             uploaded = server.drive_storage.upload_analysis_report(self.job, report, drive)
         self.assertEqual(calls, ['report-fixture']); self.assertTrue(uploaded['verified'])
+
+    def assert_raw_binding_workflow(self, peak, scope):
+        # Use the real coverage gate, clamp and placeholder stamping; only transport/gap filling are inert.
+        events = [{'timestamp':stamp, 'visual_summary':'owned video event', 'confidence':0.9}
+                  for stamp in (0, peak)]
+        source = self.job/'source.mp4'
+        with patch.object(server.pipeline, 'minimax_reusable_upload', return_value=('inert-file', False)), \
+             patch.object(server.pipeline, 'minimax_chat', return_value=json.dumps({'events':events})), \
+             patch.object(server.pipeline, '_fill_video_event_gaps', side_effect=lambda rows, **_: rows):
+            visual, _, _ = server.pipeline._analyze_video_mp4_core(
+                source, 'inert-key', 'fixture-model', prompt='owned fixture', fps_value=1,
+                detail_value='default', timeout=1, analysis_method='minimax_video',
+                source_video=source, duration_hint=100)
+        result = self.analyze(visual=visual, duration=120)
+        raw_path = self.job/'analysis/result.json'; raw = raw_path.read_bytes()
+        cached = server.cached_analysis(self.job_id, self.manifest)
+        if peak == 90:
+            self.assertEqual(cached['timeline'], result['timeline'])
+        else:
+            self.assertNotEqual(cached['timeline'], result['timeline'])
+            self.assertTrue(any(row['timestamp'] is None for row in cached['timeline'] if row['type'] == 'visual'))
+        if scope == 'speech_only':
+            self.assertEqual(visual[0]['finish_reason'], 'timestamp_coverage')
+        module = self.report_module()
+        snapshot = server.report_snapshot(self.job_id, cached)
+        self.assertEqual((snapshot['status'], snapshot['evidence_scope']), ('awaiting_segments', scope))
+        self.assertEqual(snapshot['analysis_sha256'], hashlib.sha256(raw).hexdigest())
+        before = (self.job/snapshot['relative_path']).read_bytes()
+        atomic_json(self.job/'drive-manifest.json', self.drive_manifest())
+        queue = self.idle_queue()
+        for _ in range(3): server.report_queue_idle(queue)
+        report = module.read(self.job, cached)
+        self.assertEqual(queue.get(report['operation_id'])['status'], 'queued')
+        self.assertEqual(len(queue.for_job(self.job_id)['pending_operations']), 1)
+        with patch.object(server, 'get_queue', return_value=queue):
+            finalized = server.finalize_analysis_report_sync(
+                self.job_id, report['cache_signature'], report['analysis_sha256'],
+                'explicit fixture summary', 'owned fixture; caller submitted')
+        self.assertEqual((finalized['status'], finalized['summary_status']), ('queued', 'caller_submitted'))
+        after = (self.job/finalized['relative_path']).read_bytes()
+        # A summary must not turn display normalization into a rewrite of the bound evidence.
+        self.assertEqual(after.split(b'\n\n## Transcript\n\n')[1], before.split(b'\n\n## Transcript\n\n')[1])
+        self.assertEqual(finalized['analysis_sha256'], snapshot['analysis_sha256'])
+        self.assertEqual(raw_path.read_bytes(), raw)
+
+    def test_clamped_timestamp_report_queues_and_finalizes_with_raw_evidence(self):
+        self.assert_raw_binding_workflow(110, 'complete')
+
+    def test_timestamp_coverage_report_queues_and_finalizes_with_raw_evidence(self):
+        self.assert_raw_binding_workflow(1, 'speech_only')
+
+    def test_reliable_timestamp_report_queues_and_finalizes_with_raw_evidence(self):
+        self.assert_raw_binding_workflow(90, 'complete')
+
+    def test_binding_rejects_changed_source_or_transcript_without_writing(self):
+        result = self.analyze(); module = self.report_module()
+        pointer = self.job/'analysis-report.json'; before = pointer.read_bytes()
+        for field, value in (('job_id', 'f'*12), ('cache_signature', 'f'*64),
+                             ('source_sha256', 'f'*64), ('source_fingerprint', 'other-source'),
+                             ('transcript', {'segments':[{'start':0, 'end':1, 'text':'different evidence'}]})):
+            for operation in (module.analysis_binding, module.read, module.record):
+                with self.subTest(field=field, operation=operation.__name__):
+                    with self.assertRaisesRegex(ValueError, 'Analysis record changed'):
+                        operation(self.job, {**result, field:value})
+        self.assertEqual(pointer.read_bytes(), before)
+
+    def test_binding_rejects_stale_visual_evidence_from_same_source(self):
+        result = self.analyze(); module = self.report_module()
+        path = self.job/'analysis/result.json'; raw = path.read_bytes()
+        for field, value in (('visual_summary', 'new picture'), ('visible_text', ['99']),
+                             ('timestamp_original', 1), ('timestamp', 1)):
+            with self.subTest(field=field):
+                updated = json.loads(raw)
+                row = next(row for row in updated['timeline'] if row['type'] == 'visual')
+                row['data'][field] = value
+                if field == 'timestamp': row['timestamp'] = value
+                atomic_json(path, updated); module.record(self.job, updated)
+                with self.assertRaisesRegex(ValueError, 'Analysis record changed'):
+                    module.read(self.job, result)
 
     def test_unchanged_report_rewrite_keeps_scheduled_operation(self):
         result = self.analyze(); module = self.report_module()
@@ -609,8 +688,3 @@ else:
                 q._thread=None;q.close()
 
 if __name__=='__main__':unittest.main()
-
-
-class BindingRegressionTests(unittest.TestCase):
-    def test_binding_uses_persisted_raw_analysis(self):
-        self.assertTrue(True)

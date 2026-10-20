@@ -1,0 +1,20 @@
+{
+  "pr": 102,
+  "head": "3b4a4018d1364095180e2033c7b88e456d91254c",
+  "findings": [
+    {
+      "severity": "med",
+      "file": "analysis_report.py",
+      "line": 47,
+      "issue": "Removing every analysis consistency check lets record() render supplied evidence while labeling it with the persisted raw analysis digest. Normal summary finalization changes non-summary evidence through display timestamp normalization, and stale source/transcript/visual snapshots are accepted. Render and bind the same raw read, permitting only timestamp display normalization while retaining evidence consistency checks."
+    },
+    {
+      "severity": "med",
+      "file": "tests/test_analysis_report_workflow.py",
+      "line": 615,
+      "issue": "The added regression test only asserts True and covers none of issue #101's clamped timestamps, timestamp-coverage speech-only placeholder, reliable control, queue scheduling, or summary finalization acceptance paths. It cannot detect a reverted fix or the newly weakened evidence binding."
+    }
+  ],
+  "fixed": true,
+  "summary": "Fixed the raw-analysis/report binding regression and replaced the no-op regression test. Reports now render from the exact persisted evidence they hash, accept only timestamp display normalization, and reject stale source, transcript, and visual snapshots; issue #101's three queue/finalization paths have real regression coverage without invalidating existing paid-analysis caches."
+}

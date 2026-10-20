@@ -1,10 +1,12 @@
 """Deterministic local A reports. Caller summaries are untrusted, not attested model output."""
 from __future__ import annotations
+import copy
 import hashlib
 import json
 import re
 from pathlib import Path
 from job_queue import atomic_json
+import pipeline
 
 NAME = "A_server_analysis.md"
 # One rule set for the B handoff and the merge text. Field test e47517f85346: "以 B 為主"
@@ -44,7 +46,7 @@ def uploadable(report: dict) -> bool:
 def sha(raw: bytes) -> str:
     return hashlib.sha256(raw).hexdigest()
 
-def analysis_binding(job_dir: Path, analysis: dict | None = None) -> dict:
+def _bound_analysis(job_dir: Path, analysis: dict | None = None) -> tuple[dict, dict]:
     path = job_dir / "analysis" / "result.json"
     if path.is_symlink():
         raise ValueError("Analysis record is not a regular owned artifact")
@@ -52,19 +54,40 @@ def analysis_binding(job_dir: Path, analysis: dict | None = None) -> dict:
     actual = json.loads(raw)
     if not isinstance(actual, dict):
         raise ValueError("Invalid persisted analysis schema")
+    # Accept only timestamp display edits, never different evidence.
+    fields = ("job_id", "cache_signature", "source_sha256", "source_fingerprint", "transcript")
+    if analysis is not None:
+        timeline = actual.get("timeline")
+        if analysis.get("timeline") != timeline:
+            # ponytail: mirror refreshed_analysis's edits to preserve paid cache keys; share after cache versioning is decoupled.
+            timeline = copy.deepcopy(timeline)
+            for row in timeline:
+                if row.get("type") != "visual":
+                    continue
+                issue = pipeline.saved_visual_timestamp_issue(row, actual.get("duration_seconds"))
+                if issue:
+                    data = row["data"] = row.get("data") or {}
+                    data.setdefault("timestamp_original", row.get("timestamp"))
+                    data.update(timestamp=None, timestamp_reliable=False, timestamp_issue=issue)
+                    row["timestamp"] = None
+        if any(actual.get(k) != analysis.get(k) for k in fields) or analysis.get("timeline") != timeline:
+            raise ValueError("Analysis record changed")
     if actual.get("job_id") != job_dir.name or not re.fullmatch(r"[0-9a-f]{64}", str(actual.get("cache_signature") or "")):
         raise ValueError("Analysis signature is missing")
     if not re.fullmatch(r"[0-9a-f]{64}", str(actual.get("source_sha256") or "")) or not actual.get("source_fingerprint"):
         raise ValueError("Source binding is missing")
-    return {"job_id": job_dir.name, "analysis_sha256": sha(raw),
-            **{k: actual[k] for k in ("cache_signature", "source_sha256", "source_fingerprint")}}
+    return actual, {"job_id": job_dir.name, "analysis_sha256": sha(raw),
+                    **{k: actual[k] for k in ("cache_signature", "source_sha256", "source_fingerprint")}}
+
+def analysis_binding(job_dir: Path, analysis: dict | None = None) -> dict:
+    return _bound_analysis(job_dir, analysis)[1]
 
 def quoted(value) -> str:
     text = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False, indent=2)
     return "\n".join("> " + line for line in text.split("\n"))
 
 def record(job_dir: Path, analysis: dict, summary_text: str | None = None, provenance_note: str = "") -> dict:
-    binding = analysis_binding(job_dir, analysis)
+    analysis, binding = _bound_analysis(job_dir, analysis)
     previous = read(job_dir, analysis)
     if summary_text is None and previous and previous.get("summary_status") == "caller_submitted":
         return previous  # A cache hit never discards an explicitly supplied summary.
