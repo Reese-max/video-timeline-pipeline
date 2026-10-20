@@ -66,7 +66,17 @@ MCP_PUBLIC_BASE_URL = (
 MCP_MEDIA_BASE_URL = (
     os.getenv("MCP_MEDIA_BASE_URL", "") or MCP_PUBLIC_BASE_URL
 ).rstrip("/")
-UI_URI = f"ui://video-timeline-pipeline/v14-{hashlib.sha256(MCP_MEDIA_BASE_URL.encode()).hexdigest()[:12]}.html"
+WIDGET_VERSION = 16
+
+
+def ui_uri(version: int) -> str:
+    return f"ui://video-timeline-pipeline/v{version}-{hashlib.sha256(MCP_MEDIA_BASE_URL.encode()).hexdigest()[:12]}.html"
+
+
+UI_URI = ui_uri(WIDGET_VERSION)
+# ChatGPT keeps the outputTemplate from its last tool refresh; after an upgrade it still
+# reads the previous URI, and an unknown one shows "無法開啟應用程式" (10-20 deploy log).
+LEGACY_UI_URIS = tuple(ui_uri(version) for version in (WIDGET_VERSION - 2, WIDGET_VERSION - 1))
 PUBLIC_URL = urlsplit(MCP_PUBLIC_BASE_URL)
 MEDIA_URL = urlsplit(MCP_MEDIA_BASE_URL)
 UI_ORIGIN = f"{PUBLIC_URL.scheme}://{PUBLIC_URL.netloc}"
@@ -242,6 +252,9 @@ class AnalysisQuality(BaseModel):
     warnings: list[str] = []
     visual_frames: int
     speech_segments: int
+    speech_reliable: bool | None = None
+    recommend_route_b: bool = False
+    route_b_reasons: list[str] = []
     limitation: str
 
 
@@ -1086,6 +1099,30 @@ def prepared_job_dir(job_id: str) -> Path:
     return job_dir
 
 
+# Whisper on music-only audio emits whole-window outro phrases (job e47517f85346: both
+# 30-second windows were 「ご視聴ありがとうございました」). Quality flag only: the
+# transcription filter is unchanged so this cannot trigger extra paid backfills.
+OUTRO_HALLUCINATION = re.compile(r"(?:thankyouforwatching|thanksforwatching|thankyou|you|ご視聴ありがとうございま(?:した|す)|チャンネル登録(?:を)?お願いします|"
+                                 r"시청해주셔서감사합니다|구독과좋아요부탁드립니다|謝謝觀看|謝謝收看)+")
+
+
+def transcript_segment_is_speech(row: dict[str, Any]) -> bool:
+    """False for symbol-only text (♪, …) and for outro phrases decoded without confidence.
+
+    A clearly spoken outro keeps Whisper's usual decoding confidence (see
+    pipeline.CONFIDENT_SPEECH_LOGPROB); the field-test hallucinations were -0.46 and -0.74.
+    """
+    text = str(row.get("text") or "")
+    normalized = re.sub(r"[\W_]+", "", text.lower())
+    if not normalized:
+        return False
+    if not (pipeline.is_hallucination_text(text) or OUTRO_HALLUCINATION.fullmatch(normalized)):
+        return True
+    logprob = row.get("avg_logprob")
+    return (isinstance(logprob, (int, float)) and not isinstance(logprob, bool) and math.isfinite(logprob)
+            and logprob >= pipeline.CONFIDENT_SPEECH_LOGPROB)
+
+
 def analysis_quality(result: dict[str, Any]) -> dict[str, Any]:
     """Conservative evidence checks, not a semantic accuracy score."""
     reasons = []
@@ -1095,10 +1132,14 @@ def analysis_quality(result: dict[str, Any]) -> dict[str, Any]:
     transcript = result.get("transcript") or {}
     speech = [row for row in transcript.get("segments", [])
               if str(row.get("text") or "").strip()]
+    speech_reliable = any(transcript_segment_is_speech(row) for row in speech)
     if result.get("audio_status") not in {"complete", "skipped"}:
         reasons.append("語音辨識未完成。")
     elif result.get("audio_status") == "complete" and not speech:
         reasons.append("有音軌但沒有可用逐字稿；可能無語音，仍需確認。")
+    elif speech and not speech_reliable:
+        warnings.append("逐字稿只有「ご視聴ありがとうございました」這類低信心片尾套語或符號（如 ♪），"
+                        "可能是配樂造成的 Whisper 幻覺，不可當成說話內容。")
     gap_check = transcript.get("gap_check") or {}
     remaining = gap_check.get("remaining") or []
     backfill_errors = transcript.get("backfill_errors") or []
@@ -1128,16 +1169,24 @@ def analysis_quality(result: dict[str, Any]) -> dict[str, Any]:
     unreliable = sum(row.get("timestamp_reliable") is False for row in usable)
     if unreliable:
         warnings.append(f"{unreliable} 筆畫面時間碼不可靠，未提供跳轉。")
-    if result.get("visual_status") != "complete" or not usable or len(usable) != len(frames):
+    visual_missing = result.get("visual_status") != "complete" or not usable or len(usable) != len(frames)
+    if visual_missing:
         reasons.append("缺少可用畫面觀察，或部分畫面回應不完整。")
     # ponytail: model confidence is an uncalibrated warning, not proof of correctness.
     if any(not isinstance(row.get("confidence"), (int, float))
            or isinstance(row.get("confidence"), bool)
            or not 0.5 < row["confidence"] <= 1 for row in usable):
         reasons.append("部分畫面信心不足或缺少信心資訊。")
+    # B reads the original MP4, so it covers whichever half the server could not deliver.
+    route_b_reasons = ((["伺服器沒有可信的語音內容"] if not speech_reliable
+                        else ["伺服器語音辨識未完成"] if result.get("audio_status") not in {"complete", "skipped"}
+                        else ["伺服器逐字稿補轉失敗，可能漏字"] if backfill_errors else [])
+                       + (["伺服器畫面分析失敗或不完整"] if visual_missing else []))
     return {"status": "needs_review" if reasons else "evidence_available", "reasons": reasons,
             "warnings": warnings,
             "visual_frames": len(usable), "speech_segments": len(speech),
+            "speech_reliable": speech_reliable, "recommend_route_b": bool(route_b_reasons),
+            "route_b_reasons": route_b_reasons,
             "limitation": "僅檢查證據完整性與模型自報信心，不保證語意正確；畫面事件由 MiniMax 讀完整支影片後摘要，非逐幀檢視。"}
 
 
@@ -1470,6 +1519,15 @@ def analysis_tool_result(result: dict[str, Any]) -> types.CallToolResult:
     if quality.get("warnings"):
         text += "\n注意：" + "；".join(quality["warnings"])
         text += "不可靠的時間碼不可作為精確時間軸，也不可自行推算或比例縮放。"
+    if quality.get("recommend_route_b"):
+        text += ("\n建議加跑 B（" + "；".join(quality.get("route_b_reasons") or ["伺服器證據不足"])
+                 + "）：缺的部分要靠 B 讀原片核對。"
+                 "請提醒使用者把 widget 的 Drive 交接內容貼到一般對話；交接內容已含合併步驟。")
+    scope = analysis_report.evidence_scope(result)
+    if scope == "speech_only" or (scope == "complete" and quality["status"] == "evidence_available"):
+        text += (f"\n{'語音可靠，' if scope == 'speech_only' else ''}不必先提交摘要：已設定 Drive 時，"
+                 f"{analysis_report.NAME} 會在影片片段上傳完成後自動放進同一資料夾；"
+                 "只有使用者要求整理摘要時才呼叫 finalize_analysis_report。")
     text += "\n這是伺服器分析，不是 ChatGPT 直接讀取 MP4。"
     text += ("證據不足，請停止摘要，使用 widget 的 Drive 交接入口轉一般對話讀取原片。"
              if quality["status"] == "needs_review"
@@ -1495,7 +1553,8 @@ def analysis_tool_error_result(error: Exception) -> types.CallToolResult:
 def build_drive_handoff_text(prepared: dict[str, Any], drive_state: dict[str, Any]) -> str:
     """B 交接內容（03 §4.2）：只放 Drive ID／網址、分段時間、檔案大小。
 
-    輸入刻意不含任何 A 的逐字稿、畫面證據或摘要，讓 B 保持獨立。
+    輸入刻意不含任何 A 的逐字稿、畫面證據或摘要；B 先獨立輸出，之後才讀
+    同資料夾的 A 報告合併，使用者只需貼這一次。
     """
     prepared = prepared if isinstance(prepared, dict) else {}
     drive_state = drive_state if isinstance(drive_state, dict) else {}
@@ -1529,7 +1588,12 @@ def build_drive_handoff_text(prepared: dict[str, Any], drive_state: dict[str, An
         "- 一句話重點；",
         "- 分段表（原片時間／畫面內容／畫面上的文字與數字）；",
         "- 限制說明（哪些看不到、聽不到或不確定）。",
-        "A 的結果稍後會放在同一個 Drive 資料夾，收到「合併」指令前不要讀取。",
+        f"第二步：先完成並送出上面的 B 結果，在那之前不要讀取 {analysis_report.NAME}。",
+        f"送出後，讀取同一個 Drive 資料夾裡的 {analysis_report.NAME}（伺服器 A 的結果），"
+        "和你的 B 結果合併成一份摘要；同名檔有多份時用最新的一份，並記下它的 file_id 與 SHA-256。",
+        f"合併前先核對報告開頭的 job_id 是 {job_id}；不符就當作 A 尚未就緒。",
+        "資料夾裡還沒有這個檔案時，只交 B 的結果並註明「A 尚未就緒」；使用者之後會貼合併指令。",
+        analysis_report.MERGE_RULES,
     ])
     return "\n".join(lines)
 
@@ -1683,6 +1747,17 @@ def video_timeline_widget() -> str:
     return WIDGET_HTML
 
 
+for legacy_uri in LEGACY_UI_URIS:
+    mcp.resource(
+        legacy_uri,
+        name="video_timeline_widget_" + legacy_uri.rsplit("/", 1)[-1].split("-", 1)[0],
+        title="Video timeline analysis (previous URI)",
+        description="Serves the current widget to hosts that still hold the previous tool definitions.",
+        mime_type="text/html;profile=mcp-app",
+        meta=UI_META,
+    )(video_timeline_widget)
+
+
 @mcp.tool(
     name="prepare_video_for_chatgpt",
     title="Prepare video for ChatGPT",
@@ -1827,7 +1902,8 @@ def _report_snapshot_checked(job_id: str, analysis: dict | None, queue=None) -> 
         return None
     expires = int(time.time()) + MCP_MEDIA_TTL
     signature = media_signer().sign(job_id, report["relative_path"], expires)
-    result = {**report, "status": "summary_pending" if report["summary_status"] != "caller_submitted" else "awaiting_segments",
+    # Evidence that uploads without a summary waits on Drive like a submitted one, so the widget keeps polling.
+    result = {**report, "status": "awaiting_segments" if analysis_report.uploadable(report) else "summary_pending",
               "download_url": f"{MCP_MEDIA_BASE_URL}/media/{job_id}/{report['relative_path']}?expires={expires}&sig={signature}"}
     queue_id = report.get("operation_id")
     if queue_id and queue is not None:
@@ -1857,7 +1933,7 @@ def schedule_ready_report(queue, job_id: str) -> dict | None:
     analysis = cached_analysis(job_id, manifest, source)
     report = analysis_report.read(job_dir, analysis)
     drive = completed_drive_state(job_dir, manifest)
-    if not report or report["summary_status"] != "caller_submitted" or not drive or not drive.get("folder_id"):
+    if not report or not analysis_report.uploadable(report) or not drive or not drive.get("folder_id"):
         return None
     if report["source_fingerprint"] != (manifest.get("source") or {}).get("fingerprint"):
         raise ValueError("Report and prepared source differ")
@@ -1880,7 +1956,7 @@ def report_queue_idle(queue):
             stat = pointer.stat()
             signature = (stat.st_mtime_ns, stat.st_size)
             report = json.loads(pointer.read_bytes())
-            if not isinstance(report, dict) or report.get("summary_status") != "caller_submitted" or report.get("operation_id"):
+            if not isinstance(report, dict) or not analysis_report.uploadable(report) or report.get("operation_id"):
                 queue._report_idle_failures.pop(job_id, None)
                 continue
             with queue.connect() as db:
@@ -2159,7 +2235,7 @@ async def ingest_video_segments(
 @mcp.custom_route("/health", methods=["GET"], include_in_schema=False)
 async def health(_: Request) -> JSONResponse:
     queue = get_queue()
-    return JSONResponse({"status": "ok", "service": "video-timeline-pipeline", "version": 14,
+    return JSONResponse({"status": "ok", "service": "video-timeline-pipeline", "version": WIDGET_VERSION,
                          "jobs": queue.stats(), "media_links": "signed", "legacy_media_until": MCP_LEGACY_MEDIA_UNTIL,
                          "writer_busy": JOB_LOCK.locked(), "runtime_sha256": RUNTIME_SHA256,
                          "commit_sha": RELEASE_SHA or None,

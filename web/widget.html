@@ -191,7 +191,7 @@ function request(method, params) {
 function ensureBridge() {
   if (!bridgePromise) bridgePromise = request("ui/initialize", {
     protocolVersion: "2026-01-26", appCapabilities: {},
-    appInfo: { name: "video-timeline-pipeline", version: "14" },
+    appInfo: { name: "video-timeline-pipeline", version: "16" },
   }).then(result => {
     window.parent.postMessage({ jsonrpc: "2.0", method: "ui/notifications/initialized", params: {} }, "*");
     return result;
@@ -456,7 +456,10 @@ function applyAnalysis(result) {
   if (evidenceRows.some(row => row.timestamp === null)) gaps.push("部分證據缺少時間碼，無法直接跳到原片核對。");
   if (!result.source_sha256 || !result.source_size_bytes) gaps.push("缺少來源檔案核對資訊。");
   gaps.push(result.quality?.limitation || "畫面事件為模型讀完整支影片後的摘要，逐字稿與模型描述可能有誤；重要資訊請核對原片。");
-  $("quality").textContent = result.status === "complete" && result.quality?.status === "evidence_available" && result.source_sha256 && result.source_size_bytes ? "已取得伺服器分析證據；請核對時間碼與原片。" : "結果需要覆核；缺漏如下。你可以先整理已知證據，或明確選擇上傳 Drive。";
+  const routeB = result.quality?.recommend_route_b
+    ? ` 建議加跑 B（${(Array.isArray(result.quality.route_b_reasons) && result.quality.route_b_reasons.join("、")) || "伺服器證據不足"}）：把「Drive 原片交接」內容貼到一般對話，B 讀原片後會自行合併 A 報告。`
+    : "";
+  $("quality").textContent = (result.status === "complete" && result.quality?.status === "evidence_available" && result.source_sha256 && result.source_size_bytes ? "已取得伺服器分析證據；請核對時間碼與原片。" : "結果需要覆核；缺漏如下。你可以先整理已知證據，或明確選擇上傳 Drive。") + routeB;
   $("gaps").replaceChildren();
   for (const gap of new Set(gaps.map(String).filter(Boolean))) { const item = document.createElement("li"); item.textContent = gap; $("gaps").append(item); }
   $("findings").hidden = false;
@@ -731,17 +734,22 @@ async function changeOperation(action) {
   catch (error) { if (current(version)) status(error.message + " 請重新取得伺服器狀態，確認工作是否已接受操作。"); }
   finally { if (current(version)) { acting = false; updateButtons(); } }
 }
-async function copyHandoff() {
-  const text = $("drive-prompt").value;
-  if (!text) { status("目前沒有可複製的交接內容。"); return; }
+const MANUAL_COPY = "無法自動複製：已全選下方文字，請按 Ctrl+C（Mac 為 ⌘C）；沒有反白時請手動選取後複製。";
+async function copyText(text, box, version) {
+  // A sandboxed host can refuse the async clipboard; fall back to copying a selected textarea.
   try {
-    if (typeof navigator !== "undefined" && navigator.clipboard?.writeText) await navigator.clipboard.writeText(text);
-    else if (typeof document !== "undefined" && typeof document.execCommand === "function") {
-      $("drive-prompt").focus(); $("drive-prompt").select();
-      if (!document.execCommand("copy")) throw new Error("此環境不支援自動複製。");
-    } else throw new Error("此環境不支援自動複製。");
-    status("交接內容已複製。請在一般對話貼上，讓 ChatGPT 開始分析（B）。");
-  } catch (error) { status("自動複製失敗，請手動選取交接內容複製。" + error.message); }
+    if (typeof navigator !== "undefined" && navigator.clipboard?.writeText) { await navigator.clipboard.writeText(text); return true; }
+  } catch {}
+  if (!current(version)) return null;  // The video changed while the host answered; leave the new UI alone.
+  box.value = text; box.focus?.(); box.select?.();
+  try { return typeof document.execCommand === "function" && document.execCommand("copy") === true; }
+  catch { return false; }
+}
+async function copyHandoff() {
+  const text = $("drive-prompt").value, version = generation;
+  if (!text) { status("目前沒有可複製的交接內容。"); return; }
+  const copied = await copyText(text, $("drive-prompt"), version);
+  if (current(version)) status(copied ? "交接內容已複製。請在一般對話貼上，讓 ChatGPT 開始分析（B）。" : MANUAL_COPY);
 }
 function openNewChat() {
   const url = "https://chatgpt.com/";
@@ -832,16 +840,23 @@ async function refreshReport(version) {
     if (snapshot.report && !applyReport(snapshot.report)) throw new Error("報告快照綁定不符；請重新取得狀態。");
   } catch (error) { if (current(version)) status("A 分析已完成，但無法取得報告狀態：" + error.message); }
 }
-function scheduleReportPoll(version, seconds) {
+function scheduleReportPoll(version, seconds, remaining = 60) {
   const epoch = reportPollEpoch, delay = Math.min(10, Math.max(1, Number(seconds) || 2));
   reportPollTimer = setTimeout(() => {
-    if (current(version) && epoch === reportPollEpoch) pollReportOperation(version, epoch, delay);
+    if (current(version) && epoch === reportPollEpoch) pollReportOperation(version, epoch, delay, remaining);
   }, delay * 1000);
 }
-async function pollReportOperation(version, epoch, delay) {
+async function pollReportOperation(version, epoch, delay, remaining) {
   const report = reportResult, id = report?.operation?.operation_id;
-  if (!id) return;
+  if (!report) return;
   try {
+    if (!id) {
+      const snapshot = await callTool("get_prepared_video", { job_id: report.job_id }, version);
+      if (!current(version) || epoch !== reportPollEpoch) return;
+      if (snapshot.prepared?.job_id !== report.job_id || !snapshot.report || ["job_id", "cache_signature", "analysis_sha256", "report_sha256"].some(key => snapshot.report[key] !== report[key])) throw new Error("報告快照綁定不符；請重新取得狀態。");
+      applyReport(snapshot.report, delay * 2, remaining - 1);
+      return;
+    }
     const value = await callTool("get_video_job", { operation_id: id }, version);
     if (!current(version) || epoch !== reportPollEpoch) return;
     if (value.operation_id !== id || value.operation !== "report" || value.job_id !== data?.job_id) throw new Error("報告背景工作識別碼或工作不符。");
@@ -861,14 +876,23 @@ async function pollReportOperation(version, epoch, delay) {
   }
 }
 function clearReport() { stopReportPolling(); reportSubmitting = false; reportResult = null; $("analysis-report").hidden = true; $("report-link").hidden = true; $("copy-merge").disabled = true; }
-function applyReport(result, seconds = result?.operation?.retry_after_seconds) {
+function applyReport(result, seconds = result?.operation?.retry_after_seconds, remaining = 60) {
   if (!analysisResult || result?.job_id !== data?.job_id || result.cache_signature !== analysisResult.cache_signature) return false;
   stopReportPolling(); reportResult = result;
   $("analysis-report").hidden = false;
   const ready = result.status === "report_ready" && result.verified === true && result.file_id && result.merge_text && result.report_sha256;
+  // The server reports awaiting_segments for every report that uploads on its own, summary or not.
+  const submitted = result.summary_status === "caller_submitted", unattended = result.status === "awaiting_segments" && !submitted;
+  // Without Drive nothing will ever schedule an unattended report, so do not poll for it.
+  const waiting = result.status === "awaiting_segments" && (submitted || driveConfigured);
   const message = ready ? "A 已完成：A_server_analysis.md 已放進 Drive，可複製合併指令。"
-    : result.summary_status === "pending_chatgpt" ? "A 分析已完成，等待 ChatGPT 整理摘要後才會上傳 A_server_analysis.md。"
-    : isPending(result) ? "A 摘要已提交，報告排隊／上傳中；尚未確認 Drive 檔案。"
+    : waiting && submitted ? "A 摘要已提交，等待影片片段上傳與背景工作結束；尚未確認 Drive 報告。"
+    : waiting ? (result.evidence_scope === "speech_only"
+      ? "畫面分析失敗，但語音可靠：只含語音的 A_server_analysis.md 會在影片片段上傳完成後自動放進 Drive（不需摘要）。"
+      : "A 證據完整：A_server_analysis.md 會在影片片段上傳完成後自動放進 Drive（不需摘要）。")
+    : unattended ? "未設定 Google Drive：A_server_analysis.md 只保存在伺服器，可用下方連結下載。"
+    : isPending(result) ? (submitted ? "A 摘要已提交，報告排隊／上傳中；尚未確認 Drive 檔案。" : "A 報告排隊／上傳中；尚未確認 Drive 檔案。")
+    : result.status === "summary_pending" ? "A 分析已完成，證據不完整：等待 ChatGPT 整理摘要後才會上傳 A_server_analysis.md。"
     : "A 報告尚未確認上傳至 Drive，請核對下方狀態。";
   const error = result.error || result.operation?.error;
   $("report-state").textContent = message + `A 證據=${result.evidence_status || "未知"}；摘要=${result.summary_status || "未知"}（caller_submitted，未獨立驗證作者）；報告=${result.status}。` + (error ? " " + errorText(error) : "");
@@ -876,7 +900,9 @@ function applyReport(result, seconds = result?.operation?.retry_after_seconds) {
   $("report-link").hidden = !download; if (download) $("report-link").href = download;
   $("copy-merge").disabled = !ready;
   $("finalize-report").disabled = reportSubmitting || !result.analysis_sha256;
-  if (isPending(result) && result.operation?.operation_id) scheduleReportPoll(generation, seconds);
+  // ponytail: cap prerequisite snapshots at 60 reads; explicit refresh starts another wait.
+  if (waiting && remaining <= 0) status("等待 A 報告排程逾時；請按「重新取得狀態」。未重新提交摘要或上傳。");
+  else if (waiting || (isPending(result) && result.operation?.operation_id)) scheduleReportPoll(generation, seconds, remaining);
   return true;
 }
 async function submitReportSummary() {
@@ -897,12 +923,8 @@ async function submitReportSummary() {
 async function copyMerge() {
   if (!reportResult || reportResult.cache_signature !== analysisResult?.cache_signature || reportResult.status !== "report_ready"
       || reportResult.verified !== true || !reportResult.file_id || !reportResult.merge_text) return;
-  const version = generation, text = reportResult.merge_text;
-  try {
-    if (navigator.clipboard?.writeText) await navigator.clipboard.writeText(text);
-    else { $("merge-prompt").value = text; $("merge-prompt").focus(); $("merge-prompt").select(); if (!document.execCommand("copy")) throw new Error("請手動複製。"); }
-    checkCurrent(version); status("已複製已核對報告的合併指令；A/B 衝突與未知需明列。");
-  } catch (error) { if (current(version)) { $("merge-prompt").value = text; status("請手動複製合併指令。" + error.message); } }
+  const version = generation, copied = await copyText(reportResult.merge_text, $("merge-prompt"), version);
+  if (current(version)) status(copied ? "已複製已核對報告的合併指令；A/B 衝突與未知需明列。" : MANUAL_COPY);
 }
 $("finalize-report").addEventListener("click", submitReportSummary);
 $("copy-merge").addEventListener("click", copyMerge);
