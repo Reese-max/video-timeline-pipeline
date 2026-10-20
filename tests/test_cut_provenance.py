@@ -404,6 +404,28 @@ class PipelineSourceBindingTests(unittest.TestCase):
         self.assertEqual(manifest["status"], "failed")
         self.assertNotEqual(manifest["source_sha256"], pipeline.file_sha256(self.video))
 
+    def test_cli_keeps_transcript_when_video_cannot_reach_minimax(self):
+        self.args.local_only = False
+        transcript = {"provider": "groq", "language": "zh",
+                      "segments": [{"start": 0.0, "end": 0.5, "text": "保留的逐字稿"}]}
+        unavailable = pipeline.VideoMp4UnavailableError("video_mp4 無法交給 MiniMax 直接讀取（抽幀備援已移除）：fixture")
+        with mock.patch.dict(os.environ, {"GROQ_API_KEY": "offline-test-placeholder", "MINIMAX_SUBSCRIPTION_KEY": "offline-test-placeholder"}), \
+             mock.patch.object(pipeline, "minimax_endpoint", return_value="offline"), \
+             mock.patch.object(pipeline, "minimax_model", return_value="offline"), \
+             mock.patch.object(pipeline, "transcribe_all", return_value=(transcript, {"provider": "groq"})), \
+             mock.patch.object(pipeline, "analyze_video_mp4", side_effect=unavailable) as vision, \
+             mock.patch.object(pipeline, "create_summary", return_value={"status": "skipped", "reason": "test"}), \
+             mock.patch.object(pipeline, "request_json", side_effect=AssertionError("provider call")), \
+             mock.patch("urllib.request.urlopen", side_effect=AssertionError("network")):
+            path = pipeline.run_pipeline(self.args)
+        vision.assert_called_once()
+        job = path.parent
+        saved = json.loads((job / "transcript.json").read_text(encoding="utf-8"))
+        self.assertEqual([segment["text"] for segment in saved["segments"]], ["保留的逐字稿"])
+        visual = json.loads((job / "visual.json").read_text(encoding="utf-8"))
+        self.assertEqual(visual[0]["completion_status"], "incomplete")
+        self.assertEqual(visual[0]["finish_reason"], "video_unavailable")
+
     def test_legacy_or_stale_cloud_cache_refused_on_consecutive_retries_without_canonical_writes(self):
         self.args.local_only = False
         job = self.root / "jobs" / pipeline.job_key(str(self.video.resolve()))
@@ -418,7 +440,7 @@ class PipelineSourceBindingTests(unittest.TestCase):
                  mock.patch.object(pipeline, "minimax_endpoint", return_value="offline"), \
                  mock.patch.object(pipeline, "minimax_model", return_value="offline"), \
                  mock.patch.object(pipeline, "transcribe_all", side_effect=AssertionError("paid ASR")) as asr, \
-                 mock.patch.object(pipeline, "analyze_images", side_effect=AssertionError("paid vision")) as vision, \
+                 mock.patch.object(pipeline, "analyze_video_mp4", side_effect=AssertionError("paid vision")) as vision, \
                  mock.patch.object(pipeline, "create_summary", side_effect=AssertionError("paid summary")) as summary, \
                  mock.patch.object(pipeline, "request_json", side_effect=AssertionError("provider call")) as transport, \
                  mock.patch("urllib.request.urlopen", side_effect=AssertionError("network")) as network:

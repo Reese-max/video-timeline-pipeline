@@ -23,10 +23,10 @@ class VisualTimeReliabilitySearchTests(unittest.TestCase):
         self.manifest = {"status": "completed", "source": {"url": URL, "title": "測試影片"},
                          "video": {"duration_seconds": 100}}
         self.timeline = [
-            self.visual(5, "終端機錯誤甲", timestamp_reliable=False,
+            self.visual(5, "終端機錯誤甲", analysis_method="minimax_video", timestamp_reliable=False,
                         timestamp_issue="時間碼疑似被壓縮", timestamp_original="原始時間雜訊"),
             self.visual(6, "終端機錯誤乙", analysis_method="minimax_video"),
-            self.visual(90, "可靠畫面", timestamp_reliable=True),
+            self.visual(90, "可靠畫面", analysis_method="minimax_video", timestamp_reliable=True),
             self.visual(95, "抽幀畫面", analysis_method="minimax_video_fallback_frames"),
         ]
         self.summary = {"short_summary": "摘要", "chapters": [
@@ -115,15 +115,16 @@ class VisualTimeReliabilitySearchTests(unittest.TestCase):
         self.assertTrue(any("稍後" in line for line in lines))
 
     def test_index_null_times_preserves_kind_count_and_reliable_times(self):
-        self.assertEqual(pipeline.build_index(self.root)[1:], (1, 8))
+        self.assertEqual(pipeline.build_index(self.root)[1:], (1, 7))
         rows = self.rows()
         self.assertEqual([(stamp, kind) for stamp, kind, text in rows],
                          [(0, "title"), (None, "visual"), (None, "visual"),
-                          (90, "visual"), (95, "visual"), (0, "summary"),
+                          (90, "visual"), (0, "summary"),
                           (None, "chapter"), (90, "chapter")])
+        self.assertFalse(any("抽幀畫面" in text for stamp, kind, text in rows))
         self.timeline.append({"type": "speech", "timestamp": 5.9, "text": "可靠語音"})
         self.write_artifacts()
-        self.assertEqual(pipeline.build_index(self.root)[1:], (1, 9))
+        self.assertEqual(pipeline.build_index(self.root)[1:], (1, 8))
         self.assertEqual(next(stamp for stamp, kind, text in self.rows()
                               if kind == "chapter" and "不可靠章節" in text), 5)
 
@@ -141,7 +142,7 @@ class VisualTimeReliabilitySearchTests(unittest.TestCase):
         self.assertEqual(output.count("時間碼不可靠"), 2)
         self.assertNotIn("t=", output)
         self.assertNotIn(URL, output)
-        self.assertIn("&t=95s", self.cli("--search", "抽幀畫面"))
+        self.assertNotIn("&t=95s", self.cli("--search", "抽幀畫面"))
 
     def test_semantic_search_uses_null_time_and_shared_cli_output(self):
         pipeline.build_index(self.root)
@@ -192,14 +193,29 @@ class VisualTimeReliabilitySearchTests(unittest.TestCase):
             connection.execute("UPDATE events SET timestamp = 5.0 WHERE kind = 'visual'")
             connection.execute("INSERT INTO vectors VALUES ('unchanged', 'fake-model', 1, x'00')")
             connection.commit()
-        self.assertEqual(pipeline.build_index(self.root)[1:], (1, 8))
-        self.assertEqual([stamp for stamp, kind, text in self.rows() if kind == "visual"], [None, None, 90, 95])
+        self.assertEqual(pipeline.build_index(self.root)[1:], (1, 7))
+        self.assertEqual([stamp for stamp, kind, text in self.rows() if kind == "visual"], [None, None, 90])
         with contextlib.closing(pipeline.index_connection(self.root)) as connection:
             self.assertNotEqual(connection.execute("SELECT signature FROM index_state").fetchone()[0], old_signature)
             self.assertEqual(connection.execute("SELECT count(*) FROM vectors").fetchone()[0], 1)
             changes = connection.total_changes
-            self.assertEqual(pipeline.index_job(connection, self.job), 8)
+            self.assertEqual(pipeline.index_job(connection, self.job), 7)
             self.assertEqual(connection.total_changes, changes)
+
+    def test_pre_upgrade_library_drops_visual_rows_before_any_search(self):
+        pipeline.build_index(self.root)
+        with contextlib.closing(pipeline.index_connection(self.root)) as connection:
+            connection.execute("INSERT INTO events VALUES (?, ?, ?, ?)",
+                               (self.job.name, 95, "visual", "舊抽幀畫面殘留"))
+            connection.execute("PRAGMA user_version = 2")
+            connection.commit()
+        # No --index run: opening the library for search must already purge it.
+        self.assertEqual(pipeline.search_index(self.root, "舊抽幀畫面殘留", 10), [])
+        with contextlib.closing(pipeline.index_connection(self.root)) as connection:
+            self.assertEqual(connection.execute("SELECT count(*) FROM events WHERE kind = 'visual'").fetchone()[0], 0)
+            self.assertEqual(connection.execute("SELECT count(*) FROM index_state").fetchone()[0], 0)
+            self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], pipeline.LIBRARY_SCHEMA_VERSION)
+        self.assertEqual(pipeline.build_index(self.root)[1:], (1, 7))
 
     def test_index_bad_timeline_leaves_chapters_untainted(self):
         (self.job / "timeline.json").write_text("invalid JSON", encoding="utf-8")

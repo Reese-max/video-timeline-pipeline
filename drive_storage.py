@@ -2,6 +2,8 @@
 
 Credentials stay outside the repository. The MCP host may use a short-lived
 access token for development, or refresh-token OAuth for a long-running host.
+Drive also keeps a verified copy of the whole source video, so local media can be
+removed after analysis and downloaded again on demand.
 """
 
 from __future__ import annotations
@@ -9,6 +11,7 @@ from __future__ import annotations
 import hashlib
 import http.client
 import json
+import mimetypes
 import os
 import re
 import threading
@@ -19,6 +22,7 @@ import urllib.request
 from pathlib import Path
 from typing import Any
 
+import analysis_report
 from pipeline import write_json
 
 
@@ -29,6 +33,10 @@ FOLDER_MIME = "application/vnd.google-apps.folder"
 UPLOAD_CHUNK_BYTES = 1024 * 1024
 # ponytail: one MCP process; use a shared lease before adding multiple workers.
 UPLOAD_LOCK = threading.Lock()
+_DRIVE_ID = re.compile(r"[A-Za-z0-9_-]+")
+_SHA256 = re.compile(r"[0-9a-f]{64}")
+_SEGMENT_NAME = re.compile(r"segment_\d{3,}\.mp4")
+_SOURCE_NAME = re.compile(r"source\.[A-Za-z0-9]{1,8}")
 
 
 class DriveNotConfigured(RuntimeError):
@@ -133,7 +141,7 @@ def _api_json(
 
 def _get_file(token: str, file_id: str) -> dict[str, Any] | None:
     query = urllib.parse.urlencode({"supportsAllDrives": "true",
-        "fields": "id,name,mimeType,size,sha256Checksum,webViewLink,trashed,parents"})
+        "fields": "id,name,mimeType,size,sha256Checksum,webViewLink,trashed,parents,capabilities(canDownload)"})
     try:
         return _api_json("GET", f"{DRIVE_FILES_URL}/{urllib.parse.quote(file_id, safe='')}?{query}", token)
     except DriveAPIError as exc:
@@ -290,9 +298,21 @@ def _safe_name(value: str) -> str:
     return normalized[:96] or "video"
 
 
-def _matches_file(remote: dict | None, file_id: str, local: dict, folder_id: str) -> bool:
+def _source_mime(path: Path) -> str:
+    guessed, _ = mimetypes.guess_type(path.name)
+    return guessed if guessed and guessed.startswith("video/") else "video/mp4"
+
+
+def _local_source(path: Path) -> dict[str, Any]:
+    info = path.stat()
+    return {"filename": path.name, "size_bytes": info.st_size, "sha256": _sha256(path),
+            "mtime_ns": info.st_mtime_ns}
+
+
+def _matches_file(remote: dict | None, file_id: str, local: dict, folder_id: str,
+                  mime_type: str = "video/mp4") -> bool:
     return bool(remote and str(remote.get("id")) == file_id and not remote.get("trashed")
-                and remote.get("mimeType") == "video/mp4"
+                and remote.get("mimeType") == mime_type
                 and str(remote.get("size")) == str(local["size_bytes"])
                 and remote.get("sha256Checksum") == local["sha256"]
                 and folder_id in remote.get("parents", []) and remote.get("webViewLink"))
@@ -304,18 +324,19 @@ def upload_prepared_segments(
     title: str,
     source_fingerprint: str,
     segment_rows: list[dict[str, Any]],
+    source_path: Path | None = None,
 ) -> dict[str, Any]:
     if not UPLOAD_LOCK.acquire(blocking=False):
         raise RuntimeError("Google Drive 正在處理另一個上傳，請稍後重試。")
     try:
-        return _upload_prepared_segments(job_dir, job_id, title, source_fingerprint, segment_rows)
+        return _upload_prepared_segments(job_dir, job_id, title, source_fingerprint, segment_rows, source_path)
     finally:
         UPLOAD_LOCK.release()
 
 
 def _upload_prepared_segments(
     job_dir: Path, job_id: str, title: str, source_fingerprint: str,
-    segment_rows: list[dict[str, Any]],
+    segment_rows: list[dict[str, Any]], source_path: Path | None = None,
 ) -> dict[str, Any]:
     """Persist IDs before writes; recheck Drive before reusing any cached file."""
 
@@ -341,6 +362,12 @@ def _upload_prepared_segments(
             }
         )
 
+    local_source = None
+    if source_path is not None:
+        if source_path.parent != job_dir or not _SOURCE_NAME.fullmatch(source_path.name) or not source_path.is_file():
+            raise FileNotFoundError(f"找不到來源影片：{source_path.name}")
+        local_source = _local_source(source_path)
+
     try:
         cached = json.loads(cache_path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
@@ -352,6 +379,8 @@ def _upload_prepared_segments(
         and cached.get("source_fingerprint") == source_fingerprint
         and cached.get("local_segments") == local_rows
         and cached.get("parent_id", parent_id) == parent_id
+        # Manifests written before source backups existed stay reusable.
+        and cached.get("local_source") in (None, local_source)
     )
     state = cached if reusable else {
         "job_id": job_id, "parent_id": parent_id,
@@ -407,9 +436,179 @@ def _upload_prepared_segments(
         state["files"] = files + [previous[r["filename"]] for r in local_rows[len(files):]
                                   if r["filename"] in previous]
         write_json(cache_path, state)
+    state["files"] = files
+    if source_path is not None and local_source is not None:
+        _upload_source_backup(token, state, cache_path, source_path, local_source, folder_id)
     state.update(status="drive_ready", files=files)
     write_json(cache_path, state)
     return state
+
+
+def _upload_source_backup(token: str, state: dict, cache_path: Path, source_path: Path,
+                          local_source: dict, folder_id: str) -> None:
+    """Keep a verified copy of the whole source video; never overwrite a changed user file."""
+    mime_type = _source_mime(source_path)
+    saved = state.get("source_file") if isinstance(state.get("source_file"), dict) else {}
+    file_id = str(saved.get("file_id") or "")
+    remote = _get_file(token, file_id) if file_id else None
+    if not _matches_file(remote, file_id, local_source, folder_id, mime_type):
+        if remote or saved.get("verified") or saved.get("url"):
+            file_id = ""
+        file_id = file_id or _new_id(token)
+        state.update(local_source=local_source,
+                     source_file={"file_id": file_id, "file_name": local_source["filename"], "verified": False})
+        write_json(cache_path, state)
+        _upload_file(token, source_path, local_source["filename"], folder_id, mime_type, file_id=file_id)
+        remote = _get_file(token, file_id)
+        if not _matches_file(remote, file_id, local_source, folder_id, mime_type):
+            raise RuntimeError("Google Drive 原片上傳後的大小、SHA-256 或資料夾驗證失敗。")
+    state.update(local_source=local_source, source_file={
+        "file_id": file_id, "url": remote["webViewLink"], "file_name": local_source["filename"],
+        "mime_type": mime_type, "size_bytes": local_source["size_bytes"], "sha256": local_source["sha256"],
+        "mtime_ns": local_source["mtime_ns"], "verified": True})
+    write_json(cache_path, state)
+
+
+def backup_complete(state: Any, segment_rows: list[dict[str, Any]], source_fingerprint: str) -> bool:
+    """Local check that Drive holds verified copies of the source and of every segment."""
+    if not isinstance(state, dict) or state.get("status") != "drive_ready":
+        return False
+    if state.get("source_fingerprint") != source_fingerprint or not _DRIVE_ID.fullmatch(str(state.get("folder_id") or "")):
+        return False
+    source = state.get("source_file")
+    if not (isinstance(source, dict) and source.get("verified") is True
+            and _DRIVE_ID.fullmatch(str(source.get("file_id") or ""))
+            and _SOURCE_NAME.fullmatch(str(source.get("file_name") or ""))
+            and _SHA256.fullmatch(str(source.get("sha256") or ""))
+            and str(source.get("mime_type") or "").startswith("video/")
+            and type(source.get("size_bytes")) is int and source["size_bytes"] > 0
+            and type(source.get("mtime_ns")) is int
+            and f"{source['size_bytes']}:{source['mtime_ns']}" == source_fingerprint):
+        return False
+    names = [str(row.get("filename") or "") for row in segment_rows if isinstance(row, dict)]
+    local, files = state.get("local_segments"), state.get("files")
+    if (not names or len(names) != len(segment_rows) or not isinstance(local, list) or not isinstance(files, list)
+            or len(local) != len(names) or len(files) != len(names)):
+        return False
+    for name, row, saved in zip(names, local, files):
+        if (not isinstance(row, dict) or not isinstance(saved, dict) or not _SEGMENT_NAME.fullmatch(name)
+                or row.get("filename") != name or saved.get("file_name") != name
+                or saved.get("verified") is not True
+                or not _DRIVE_ID.fullmatch(str(saved.get("file_id") or ""))
+                or not _SHA256.fullmatch(str(row.get("sha256") or ""))
+                or type(row.get("size_bytes")) is not int or row["size_bytes"] <= 0):
+            return False
+    return True
+
+
+def _backup_targets(job_dir: Path, state: dict) -> list[tuple[Path, str, int, str]]:
+    """Segments first, source last: a restored source completes the prepared media set."""
+    targets = [(job_dir / "segments" / row["filename"], saved["file_id"], row["size_bytes"], row["sha256"])
+               for row, saved in zip(state["local_segments"], state["files"])]
+    source = state["source_file"]
+    targets.append((job_dir / source["file_name"], source["file_id"], source["size_bytes"], source["sha256"]))
+    return targets
+
+
+def backup_relative_paths(state: dict) -> set[str]:
+    """Job-relative paths of every file Drive holds a verified copy of."""
+    return ({"segments/" + row["filename"] for row in state["local_segments"]}
+            | {state["source_file"]["file_name"]})
+
+
+def local_matches_backup(job_dir: Path, state: dict) -> bool:
+    """Every local copy that still exists is byte-identical to its Drive backup."""
+    for path, _file_id, size, digest in _backup_targets(job_dir, state):
+        if path.is_symlink():
+            return False
+        if not path.exists():
+            continue
+        if not path.is_file() or path.stat().st_size != size or _sha256(path) != digest:
+            return False
+    return True
+
+
+def verify_remote_backup(state: dict) -> bool:
+    """Drive still holds every backed-up file untouched (not trashed, same bytes, same folder)."""
+    token = _access_token()
+    folder_id = str(state["folder_id"])
+    folder = _get_file(token, folder_id)
+    if not folder or folder.get("trashed") or folder.get("mimeType") != FOLDER_MIME:
+        return False
+
+    def usable(remote: dict | None, file_id: str, local: dict, mime_type: str = "video/mp4") -> bool:
+        capabilities = (remote or {}).get("capabilities") or {}
+        return (_matches_file(remote, file_id, local, folder_id, mime_type)
+                and capabilities.get("canDownload") is not False)
+
+    if not all(usable(_get_file(token, saved["file_id"]), saved["file_id"], row)
+               for row, saved in zip(state["local_segments"], state["files"])):
+        return False
+    # Source last: keep the gap between this check and deleting the local source short.
+    source = state["source_file"]
+    return usable(_get_file(token, source["file_id"]), source["file_id"], source, source["mime_type"])
+
+
+def _download_file(token: str, file_id: str, destination: Path, size: int, digest: str,
+                   mtime_ns: int | None = None) -> None:
+    query = urllib.parse.urlencode({"alt": "media", "supportsAllDrives": "true"})
+    request = urllib.request.Request(
+        f"{DRIVE_FILES_URL}/{urllib.parse.quote(file_id, safe='')}?{query}",
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    temporary = destination.with_name(destination.name + ".drive-restore.part")
+    hasher, written = hashlib.sha256(), 0
+    try:
+        with urllib.request.urlopen(request, timeout=120) as response, temporary.open("wb") as output:
+            while True:
+                chunk = response.read(UPLOAD_CHUNK_BYTES)
+                if not chunk:
+                    break
+                written += len(chunk)
+                if written > size:
+                    raise RuntimeError("Google Drive 取回的檔案比備份紀錄大。")
+                hasher.update(chunk)
+                output.write(chunk)
+            output.flush()
+            os.fsync(output.fileno())
+        if written != size or hasher.hexdigest() != digest:
+            raise RuntimeError("Google Drive 取回的檔案大小或 SHA-256 與備份紀錄不符。")
+        if mtime_ns is not None:
+            # Publish the source with its prepared fingerprint already in place.
+            os.utime(temporary, ns=(mtime_ns, mtime_ns))
+        os.replace(temporary, destination)
+    except urllib.error.HTTPError as exc:
+        raise DriveAPIError(exc.code) from exc
+    except (urllib.error.URLError, TimeoutError) as exc:
+        raise RuntimeError("Google Drive 取回影片無法連線。") from exc
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def restore_prepared_media(job_dir: Path, state: dict) -> list[str]:
+    """Download missing source/segments from a verified backup; returns restored names.
+
+    An existing file that differs from its backup may be newer, never-backed-up
+    media, so restore refuses instead of overwriting it.
+    """
+    token = _access_token()
+    (job_dir / "segments").mkdir(parents=True, exist_ok=True)
+    source = state["source_file"]
+    source_path = job_dir / source["file_name"]
+    restored = []
+    for path, file_id, size, digest in _backup_targets(job_dir, state):
+        if path.is_symlink():
+            raise RuntimeError("拒絕把 Drive 備份寫入符號連結。")
+        if path.exists():
+            if not path.is_file() or path.stat().st_size != size or _sha256(path) != digest:
+                raise RuntimeError(f"本機已有與 Drive 備份不同的 {path.name}，不覆寫。")
+            continue
+        _download_file(token, file_id, path, size, digest,
+                       source["mtime_ns"] if path == source_path else None)
+        restored.append(path.name)
+    # Same bytes as the backup: the prepared manifest fingerprints the source by size and mtime_ns.
+    os.utime(source_path, ns=(source["mtime_ns"], source["mtime_ns"]))
+    return restored
 
 
 def _matches_report(remote: dict | None, file_id: str, report: dict, folder_id: str) -> bool:
@@ -427,7 +626,7 @@ def upload_analysis_report(job_dir: Path, report: dict, segments: dict) -> dict:
     try:
         if not configured():
             raise DriveNotConfigured("Google Drive fallback 尚未設定；報告未上傳。")
-        if report.get("summary_status") != "caller_submitted" or segments.get("status") != "drive_ready":
+        if not analysis_report.uploadable(report) or segments.get("status") != "drive_ready":
             raise ValueError("Report or segments are not ready")
         if report.get("job_id") != segments.get("job_id") or report.get("source_fingerprint") != segments.get("source_fingerprint"):
             raise ValueError("Report and segment source differ")

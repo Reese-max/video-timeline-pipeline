@@ -4,7 +4,7 @@ Stores financial and usage records in operations.db.
 Guarantees:
 - Integer micro-USD storage ($1 = 1,000,000 micro-USD), prohibiting float drift in balances.
 - Atomic budget reservations with settled + outstanding + proposed upper bounds.
-- Status separation: HTTP outcome vs billing status (actual | estimated | confirmed_included | unknown).
+- Status separation: HTTP outcome vs billing status (actual | estimated | confirmed_included | unknown | zero_rejected).
 - Pure local read-only cost reporting without triggering external paid network requests.
 - `provider_cost_guard` wraps every enabled provider transport: reserve before the
   send, refuse the send when the budget is exhausted, settle afterwards.
@@ -28,7 +28,10 @@ from typing import Any, Iterator, Literal
 
 from notifications import get_operations_db
 
-CostStatus = Literal["actual", "estimated", "confirmed_included", "unknown", "zero_local"]
+CostStatus = Literal["actual", "estimated", "confirmed_included", "unknown", "zero_local", "zero_rejected"]
+# The provider answered and refused the request before doing any work (rate limited or
+# overloaded). Field test c9289f71a482 booked four MiniMax 529s at the full reservation.
+REJECTED_BEFORE_WORK_STATUS = {429, 529}
 UsageStatus = Literal["reserved", "sent", "succeeded", "failed", "unknown", "blocked_budget", "cache_hit"]
 ErrorTaxonomy = Literal[
     "auth",
@@ -451,6 +454,7 @@ def _finish_attempt(state: _ActiveAttempt, error: BaseException | None = None) -
         return
     category = None
     unresolved = False
+    rejected = False
     if error is not None:
         status_code = getattr(error, "status_code", getattr(error, "code", None))
         category = classify_error(error, status_code if isinstance(status_code, int) else None,
@@ -464,6 +468,7 @@ def _finish_attempt(state: _ActiveAttempt, error: BaseException | None = None) -
                       or getattr(error, "provider_outcome_unknown", False)
                       or (remote_trigger and isinstance(status_code, int)
                           and (status_code == 408 or status_code >= 500)))
+        rejected = not unresolved and isinstance(status_code, int) and status_code in REJECTED_BEFORE_WORK_STATUS
     _record_guard_attempt(
         state.root, state.outcome, model=state.model,
         status=("unknown" if unresolved else "failed") if error is not None else "succeeded",
@@ -471,7 +476,7 @@ def _finish_attempt(state: _ActiveAttempt, error: BaseException | None = None) -
         latency_ms=(time.monotonic() - state.started) * 1000.0,
         account_scope=state.account_scope, job=state.job, library_id=state.library_id,
         settle_reservation=not unresolved, logical_operation_id=state.logical_operation_id,
-        attempt_no=state.attempt_no,
+        attempt_no=state.attempt_no, provider_rejected=rejected,
     )
     state.recorded = True
 
@@ -537,6 +542,7 @@ def _record_guard_attempt(
     settle_reservation: bool,
     logical_operation_id: str | None = None,
     attempt_no: int = 1,
+    provider_rejected: bool = False,
 ) -> None:
     try:
         record_usage(
@@ -558,6 +564,7 @@ def _record_guard_attempt(
             settle_reservation=settle_reservation,
             logical_operation_id=logical_operation_id,
             attempt_no=attempt_no,
+            provider_rejected=provider_rejected,
         )
     except Exception as exc:  # telemetry must never break a paid attempt
         print(f"! 成本帳本寫入失敗（{outcome.provider}/{outcome.operation}）：{type(exc).__name__}")
@@ -688,6 +695,7 @@ def record_usage(
     settle_reservation: bool = True,
     logical_operation_id: str | None = None,
     attempt_no: int = 1,
+    provider_rejected: bool = False,
 ) -> str:
     """Record a completed or failed operation attempt and settle reservation."""
     with closing(get_operations_db(root)) as conn:
@@ -703,6 +711,10 @@ def record_usage(
         elif actual_micro_usd is not None:
             estimated_micro = int(actual_micro_usd)
             cost_status = "actual"
+        elif provider_rejected:
+            # 供應商明確拒絕（429／529）時沒有做任何工作；保留紀錄但不佔預算。已知實際費用仍以上一支為準。
+            estimated_micro = 0
+            cost_status = "zero_rejected"
         elif estimated_micro_usd is not None:
             estimated_micro = int(estimated_micro_usd)
             # C2: an operation without a verified price is unknown cost, never free.

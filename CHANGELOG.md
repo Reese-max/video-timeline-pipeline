@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- 改進 A／B 韌性（依 job c9289f71a482 實測：MiniMax 連續 4 次 HTTP 529）：語音可靠、畫面失敗的 partial 報告標 `evidence_scope=speech_only` 並免摘要自動上傳 Drive（報告開頭註明只含語音）；快照對所有可自動上傳的報告回 `awaiting_segments`，widget v16 自動追蹤、提示建議加跑 B（`quality.route_b_reasons`）、複製改三段備援；保留 v14／v15 widget URI 避免升版後「無法開啟應用程式」；HTTP 429／529 拒絕記 `zero_rejected` 不佔預算；MiniMax 同一影片 24 小時內重跑重用 `file_id`。
+
+- 改進 A／B 工作流（依 job e47517f85346 實測）：分析證據完整時，A 報告不必等 ChatGPT 摘要即自動上傳 Drive；B 交接內容改為一次貼上（先獨立輸出，再讀同資料夾 A 報告合併）；合併規則改為畫面文字採 B、A 不同讀法放附錄、語音採 A；逐字稿只有低信心片尾套語（如「ご視聴ありがとうございました」，avg_logprob < -0.3）、只有符號（♪）或沒有語音時，`quality` 標 `speech_reliable=false`、`recommend_route_b=true`。只有證據完整且 `quality.status=evidence_available` 才免摘要上傳；交接內容要求 B 先核對報告 job_id。widget 未改動（報告排程後需手動重新取得狀態）。
+
+- 修正 #58：v15 widget 在摘要已提交但 Drive 片段／worker 尚未完成（`awaiting_segments`）時，以唯讀快照追蹤至報告排程，再接續既有上傳工作輪詢。查詢核對 job、cache signature、分析與報告雜湊；最多 60 次，失敗或逾時停止並提示手動刷新，不重送摘要、分析或上傳。新增提交／通知／恢復、錯誤與綁定不符、等待上限及換影片／關閉的回歸測試；真實 Drive 與 ChatGPT 驗收仍待執行。
+
 - 新增 #59：v14 widget 提供可收合的 ChatGPT 檔案庫實驗，每個分段須明確點擊才 fetch／uploadFile；一般上傳亦須另行點擊。顯示上傳資訊、SHA-256 與完整遮蔽網址的錯誤；隔離連點、換 job 及實驗狀態保存失敗，模型讀取要求走既有訊息橋接與統一保存。新增獨立 Node 測試並納入離線檢查，固定既有 CSP／成功媒體 CORS 前提；檔案庫與模型可讀性仍需真實 ChatGPT 驗證。已知限制：上傳卡住時需重新載入介面。
 
 - 補強 #58：v14 widget 在 A 分析完成後自動讀取報告，明示摘要提交前尚未上傳；提交摘要後以 1–10 秒退避輪詢報告工作，驗證完成後顯示「A 已完成」並啟用合併複製。失敗保留完整錯誤，換 job／關閉停止輪詢。合併指令採 §4.3 原文，以「合併：」開頭並保留 file_id／SHA-256／未獨立驗證聲明；README 說明 paired worker 與 caller_submitted 上傳條件。UI URI 同步升為 `ui://video-timeline-pipeline/v14-<媒體網址 hash>.html`。

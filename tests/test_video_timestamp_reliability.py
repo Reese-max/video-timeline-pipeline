@@ -20,8 +20,10 @@ class VideoTimestampReliabilityTests(unittest.TestCase):
             video = root / "clip.mp4"
             video.write_bytes(b"fake-mp4")
             response = json.dumps({"events": [self.event(stamp) for stamp in stamps]})
+            # Gap filling has its own tests; these fixtures are sparse on purpose.
             with mock.patch.object(pipeline, "minimax_upload_video_understanding", return_value="file"), \
-                 mock.patch.object(pipeline, "minimax_chat", return_value=response) as chat:
+                 mock.patch.object(pipeline, "minimax_chat", return_value=response) as chat, \
+                 mock.patch.object(pipeline, "_fill_video_event_gaps", side_effect=lambda rows, **_: rows):
                 observations = pipeline.analyze_video_mp4(
                     video, "fake-key", "MiniMax-M3", duration=duration, work_dir=root / "work")
             self.assertEqual(chat.call_count, 1)
@@ -147,7 +149,7 @@ class VideoTimestampReliabilityTests(unittest.TestCase):
             upload.assert_not_called()
             self.assertEqual(cached, fresh)
 
-    def test_aggregate_mp4_cache_requires_validation_except_real_frames(self):
+    def test_aggregate_mp4_cache_requires_validation_and_rejects_frames(self):
         legacy = {**self.event(90), "analysis_method": "minimax_video"}
         self.assertFalse(pipeline.reusable_video_artifact([legacy]))
         self.assertFalse(pipeline.reusable_video_artifact([{**legacy, "analysis_method": "minimax_video_compressed"}]))
@@ -156,7 +158,7 @@ class VideoTimestampReliabilityTests(unittest.TestCase):
         self.assertTrue(pipeline.reusable_video_artifact([validated]))
         self.assertFalse(pipeline.reusable_video_artifact([validated, legacy]))
         self.assertFalse(pipeline.reusable_video_artifact([{**validated, "completion_status": "incomplete"}]))
-        self.assertTrue(pipeline.reusable_video_artifact([{**legacy, "analysis_method": "minimax_video_fallback_frames"}]))
+        self.assertFalse(pipeline.reusable_video_artifact([{**legacy, "analysis_method": "minimax_video_fallback_frames"}]))
 
     def test_markdown_unreliable_visual_time_has_no_jump_link(self):
         with tempfile.TemporaryDirectory() as temporary:

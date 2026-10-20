@@ -41,19 +41,26 @@ obey `VIDEO_PROCESS_TIMEOUT_SECONDS` (3600) and `VIDEO_API_TIMEOUT_SECONDS` (900
 bounded by the remaining job deadline. These time limits do not guarantee that
 an already accepted remote API request is unbilled or cancelled remotely.
 
+Whole-video MiniMax analysis (`ANALYZE_VISUAL_MODE=video_mp4`, the only mode) always
+sends `max_completion_tokens` (`ANALYZE_VIDEO_MAX_TOKENS`, default and ceiling
+524288); without it MiniMax applies a small server default and long videos end
+with `finish_reason=length`. The call waits up to `ANALYZE_VIDEO_TIMEOUT_SECONDS`
+(3600), still bounded by `VIDEO_API_TIMEOUT_SECONDS` and the job deadline, so long
+videos need those raised too. Long videos lower `fps` automatically so frame tokens
+stay under ~800k of the 1M context (floor 0.2 fps).
+
 ## Sampling and cache correctness
 
-The MCP visual stage uses at most 240 low-resolution probes across the full
-timeline, with time-window representatives and scene-change weighting. Only up
-to 40 selected full-resolution JPEGs are written. Frame timestamps come from
-FFmpeg PTS, including the last decodable frame. The returned `sampling` object
-reports actual counts and sparse sampling; a 40-frame budget cannot establish
-that every event in a long video was observed. This limits frame preparation and
-disk use; it does not promise a percentage reduction in provider charges.
+The MCP visual stage uploads the whole video to MiniMax; frame sampling and the
+frame fallback were removed, and `ANALYZE_VISUAL_MODE=frames` now raises. If the
+video cannot be uploaded (even after compression) or the answer is truncated,
+the visual stage is reported incomplete instead of switching to images. Visual
+events are the model's summary of the whole video, not a frame-by-frame record;
+the returned `sampling` object reports the fps, detail and output ceiling sent.
 
 `cache_signature` covers source SHA-256, code/prompt/schema versions, vision model
 and endpoint, ASR backend/model/language, local ASR settings, audio chunk length
-and sampling configuration. Credentials are excluded. A same-size source with
+and whole-video settings (fps, detail, output ceiling). Credentials are excluded. A same-size source with
 the same modification time but different bytes invalidates the cache. Partial
 results are saved and available for review; only complete matching results skip
 analysis. `get_prepared_video` never restores a completed analysis under a stale
@@ -89,6 +96,30 @@ submissions/status changes during deletion. New `analysis/runs/<hash>/` media ar
 covered without removing their evidence caches. Each affected job retains its
 `media-retention.json` receipt. Deleted media cannot be recovered locally; expired
 links require downloading the source again. No paid API is called by cleanup.
+
+### Drive-primary media
+
+When Drive is configured, Drive is the long-term copy. The Drive job uploads the
+whole source video next to the segments and verifies both by size and SHA-256
+(`drive-manifest.json` `source_file`). Submitting a background analysis also queues
+the Drive job, so the backup does not depend on the widget.
+
+A job with a complete, verified backup is cleaned by `media_retention.py` instead
+of waiting seven days, once all of these hold: an analysis result exists for the
+same source fingerprint (any status — Drive restores the source for re-analysis),
+no playback link is still valid (`link_until`, at most `MCP_MEDIA_TTL_SECONDS`),
+the job was not prepared or analyzed within `MCP_DRIVE_BACKED_GRACE_SECONDS`
+(default 3600), every local copy still matches its backup, and Drive confirms each
+file is untrashed with the same bytes in the job folder. Any doubt keeps the media.
+Run the timer hourly so cleanup follows analysis closely; the command loads `.env`
+for the Drive credentials.
+
+Cleaned media comes back automatically: preparing the same URL, analyzing, or
+uploading the report downloads the source and segments from Drive, verifies
+size/SHA-256, restores the source mtime so the prepared fingerprint and analysis
+cache still match, and regenerates previews. Without a complete backup the old
+path applies (download the source URL again). `get_prepared_video` reports
+`MEDIA_EXPIRED` with `drive_backup: true` while media is archived on Drive.
 
 Health reports `runtime_sha256`, `writer_busy` and the retention policy for rollout
 verification; healthy status alone is not proof of successful cleanup.

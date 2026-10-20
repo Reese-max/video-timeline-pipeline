@@ -43,20 +43,18 @@ class CompressionRuntimeTests(unittest.TestCase):
                 value = captured[captured.index(flag) + 1]
                 self.assertLessEqual(int(value.removesuffix("k")) * 1000, 2**31 - 1)
 
-    def test_generic_compression_failure_uses_frames(self):
+    def test_generic_compression_failure_raises_without_frames(self):
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw)
             source = root / "source.mp4"
             source.write_bytes(b"fixture")
-            observations = [{"timestamp": 0, "analysis_method": "minimax_video_fallback_frames"}]
             with mock.patch.object(pipeline, "choose_video_mp4_upload_strategy", return_value="compress_first"), \
                  mock.patch.object(pipeline, "compress_video_for_minimax_upload", side_effect=RuntimeError("Unable to choose an output format")) as compress, \
-                 mock.patch.object(pipeline, "analyze_video_mp4_frames_fallback", return_value=observations) as frames, \
                  mock.patch.object(pipeline, "minimax_upload_video_understanding") as upload:
-                result = pipeline.analyze_video_mp4(source, "synthetic-key", "MiniMax-M3", duration=1.0, work_dir=root / "work")
-            self.assertEqual(result, observations)
+                with self.assertRaises(RuntimeError) as ctx:
+                    pipeline.analyze_video_mp4(source, "synthetic-key", "MiniMax-M3", duration=1.0, work_dir=root / "work")
+            self.assertIn("抽幀備援已移除", str(ctx.exception))
             self.assertEqual(compress.call_count, 2)
-            frames.assert_called_once()
             upload.assert_not_called()
 
     def test_failed_encoder_cleans_partial_output(self):

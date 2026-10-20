@@ -17,12 +17,12 @@ class VideoTimestampSchemaRegressionTests(unittest.TestCase):
             with mock.patch.object(pipeline, "minimax_upload_video_understanding", return_value="owned-file") as upload, \
                  mock.patch.object(pipeline, "minimax_chat", return_value=response) as chat, \
                  mock.patch.object(pipeline, "compress_video_for_minimax_upload") as compress, \
-                 mock.patch.object(pipeline, "analyze_video_mp4_frames_fallback") as frames:
+                 mock.patch.object(pipeline, "_fill_video_event_gaps", side_effect=lambda rows, **_: rows):  # gap filling is tested separately
                 observations = pipeline.analyze_video_mp4(
                     video, "owned-not-a-credential", "MiniMax-M3", duration=166.6,
                     work_dir=root / "work", cache_dir=root / "cache")
                 cache_files = list((root / "cache").glob("*.json"))
-                return observations, upload.call_count, chat.call_count, compress.call_count, frames.call_count, cache_files
+                return observations, upload.call_count, chat.call_count, compress.call_count, cache_files
 
     @staticmethod
     def event(stamp):
@@ -30,10 +30,10 @@ class VideoTimestampSchemaRegressionTests(unittest.TestCase):
                 "visual_summary": "Synthetic frame", "important_details": [], "confidence": 0.9}
 
     def assert_incomplete(self, result):
-        observations, uploads, chats, compression, frames, cache = result
+        observations, uploads, chats, compression, cache = result
         self.assertEqual([x for x in observations if pipeline.usable_visual_observation(x)], [])
         self.assertEqual(observations[0]["finish_reason"], "timestamp_coverage")
-        self.assertEqual((uploads, chats, compression, frames), (1, 2, 0, 0))
+        self.assertEqual((uploads, chats, compression), (1, 2, 0))
         self.assertEqual(cache, [])
 
     def test_missing_timestamp_is_not_fabricated_beside_valid_endpoint(self):

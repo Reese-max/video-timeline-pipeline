@@ -133,6 +133,27 @@ class CategoryFilterTests(unittest.TestCase):
                     self.root, "query", "key", "test-model", 10, category="AI"
                 )
 
+    def test_semantic_category_without_vectors_is_not_a_category_miss(self) -> None:
+        self._seed_vectors()
+        with contextlib.closing(sqlite3.connect(self.root / "library.db")) as connection:
+            text = connection.execute("SELECT text FROM events WHERE job = 'job-ai-exact'").fetchone()[0]
+            connection.execute("DELETE FROM vectors WHERE text_hash = ?", (pipeline.text_hash(text),))
+            connection.commit()
+        with (
+            mock.patch.object(pipeline, "embed_texts", return_value=[[1.0, 0.0, 0.0, 0.0]]),
+            mock.patch.object(pipeline, "minimax_chat") as ask,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "先執行 `--embed`"):
+                pipeline.semantic_search(
+                    self.root, "query", "key", "test-model", 10, category="AI"
+                )
+            with self.assertRaisesRegex(RuntimeError, "先執行 `--embed`"):
+                pipeline.answer_question(
+                    self.root, "問題", "key", "model", 10,
+                    embed_model="test-model", embed_backend="local", category="AI",
+                )
+            ask.assert_not_called()
+
     def test_semantic_cli_category_miss_succeeds(self) -> None:
         self._seed_vectors()
         for action, expected in (("--search", "命中 0 筆"), ("--ask", "索引裡找不到相關片段。")):
