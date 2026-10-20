@@ -46,7 +46,7 @@ function harness({ output = job('first'), saved = {}, snapshot, respond, bridge 
     Promise.resolve().then(async () => {
       try {
         if (!bridge) throw Object.assign(new Error('Unsupported bridge'), { code: -32601 });
-        if (message.method === 'ui/initialize') { assert.equal(message.params.appInfo?.name, 'video-timeline-pipeline'); assert.equal(message.params.appInfo?.version, '16'); assert.equal(message.params.protocolVersion, '2026-01-26'); assert.equal(typeof message.params.appCapabilities, 'object'); }
+        if (message.method === 'ui/initialize') { assert.equal(message.params.appInfo?.name, 'video-timeline-pipeline'); assert.equal(message.params.appInfo?.version, '17'); assert.equal(message.params.protocolVersion, '2026-01-26'); assert.equal(typeof message.params.appCapabilities, 'object'); }
         if (message.method === 'ui/message') { assert.equal(message.params.role, 'user'); assert(Array.isArray(message.params.content)); }
         const result = message.method === 'tools/call' ? await callTool(message.params.name, message.params.arguments) : message.method === 'ui/message' ? await send(message.params.content[0].text) : {};
         notify({ id: message.id, result });
@@ -78,6 +78,7 @@ async function test(name, run) { try { await run(); count++; console.log('ok ' +
     assert.equal(h.elements.get('analysis-report').hidden,false);assert.match(h.elements.get('report-state').textContent,/pending_chatgpt/);
     assert.match(h.elements.get('report-state').textContent,/未獨立驗證/);assert.equal(h.elements.get('copy-merge').disabled,true);
     assert.deepEqual(h.calls.map(x=>x.name),['get_prepared_video']);assert.equal(h.prompts.length,0);
+    assert.deepEqual(h.fallbackCalls,[],'standard MCP bridge, not the window.openai fallback');
   });
   await test('only explicit summary+provenance submission sends exact current analysis binding', async () => {
     const h=setup(r(),(name,args)=>name==='get_prepared_video'?{prepared:job('first'),analysis:a(),report:r()}:({...r('queued'),summary_status:'caller_submitted'}));

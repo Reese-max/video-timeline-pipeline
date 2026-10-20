@@ -5,47 +5,134 @@
   <meta name="viewport" content="width=device-width,initial-scale=1">
   <title>影片時間軸與證據</title>
   <style>
-    :root { color-scheme: light dark; font-family: system-ui, sans-serif; line-height: 1.5; }
+    /* Light tokens by default; dark from the OS, or from ChatGPT's theme via data-theme (set in the script). */
+    :root {
+      color-scheme: light;
+      --bg: #ffffff; --surface: #f7f7f8; --card: #ffffff; --field: #ffffff;
+      --border: #e3e3e6; --border-strong: #8a8a90; --text: #0d0d0d; --muted: #5f6368;
+      --primary: #0d0d0d; --on-primary: #ffffff; --secondary: #f0f0f2; --secondary-hover: #e6e6e9;
+      --accent: #1764d1; --accent-soft: #e8f0fd;
+      --speech: #1764d1; --speech-soft: #e8f0fd; --visual: #7b3fd4; --visual-soft: #f1eafd;
+      --warn: #a15c00; --warn-soft: #fff6e5; --shadow: 0 1px 2px rgb(0 0 0 / 5%);
+      font-family: system-ui, -apple-system, "Segoe UI", "Noto Sans TC", "PingFang TC", "Microsoft JhengHei", sans-serif;
+      line-height: 1.55;
+    }
+    @media (prefers-color-scheme: dark) {
+      :root:not([data-theme="light"]) {
+        color-scheme: dark;
+        --bg: #212121; --surface: #2a2a2a; --card: #262626; --field: #303030;
+        --border: #3a3a3a; --border-strong: #808086; --text: #ececec; --muted: #a9a9ad;
+        --primary: #ececec; --on-primary: #0d0d0d; --secondary: #333336; --secondary-hover: #3d3d40;
+        --accent: #7cacf8; --accent-soft: #1d2a3f;
+        --speech: #7cacf8; --speech-soft: #1d2a3f; --visual: #c3a1f7; --visual-soft: #2c2340;
+        --warn: #f0b75a; --warn-soft: #3a2e17; --shadow: none;
+      }
+    }
+    :root[data-theme="dark"] {
+      color-scheme: dark;
+      --bg: #212121; --surface: #2a2a2a; --card: #262626; --field: #303030;
+      --border: #3a3a3a; --border-strong: #808086; --text: #ececec; --muted: #a9a9ad;
+      --primary: #ececec; --on-primary: #0d0d0d; --secondary: #333336; --secondary-hover: #3d3d40;
+      --accent: #7cacf8; --accent-soft: #1d2a3f;
+      --speech: #7cacf8; --speech-soft: #1d2a3f; --visual: #c3a1f7; --visual-soft: #2c2340;
+      --warn: #f0b75a; --warn-soft: #3a2e17; --shadow: none;
+    }
     * { box-sizing: border-box; }
-    body { margin: 0; padding: 16px; }
+    body { margin: 0; padding: 16px; background: var(--bg); color: var(--text); }
     main, section, .stack { display: grid; gap: 12px; min-width: 0; }
-    main { max-width: 900px; margin: auto; }
-    h1 { font-size: 1.35rem; } h2 { font-size: 1.1rem; }
+    main { max-width: 900px; margin: auto; gap: 14px; }
+    h1 { font-size: 1.3rem; font-weight: 700; letter-spacing: .01em; line-height: 1.35; }
+    h2 { font-size: 1rem; font-weight: 650; display: flex; align-items: center; gap: 8px; }
+    h2::before { content: ""; width: 4px; height: 1em; border-radius: 2px; background: var(--accent); flex: none; }
     h1, h2, p { margin: 0; }
-    .muted { opacity: .8; font-size: .9rem; }
+    .muted { color: var(--muted); font-size: .9rem; }
+    .eyebrow { font-size: .75rem; font-weight: 600; letter-spacing: .08em; text-transform: uppercase; color: var(--accent); }
+    .hero { display: grid; gap: 4px; }
     .actions { display: flex; gap: 8px; flex-wrap: wrap; }
     button, select, .external { min-height: 44px; font: inherit; }
-    button, select { border: 1px solid #858585; border-radius: 8px; padding: 9px 12px; }
-    select { width: 100%; min-width: 0; max-width: 100%; }
-    button { cursor: pointer; } button:disabled { cursor: default; opacity: .55; }
-    :focus-visible { outline: 3px solid #508bed; outline-offset: 3px; }
+    button { cursor: pointer; border: 1px solid transparent; border-radius: 10px; padding: 9px 16px;
+             background: var(--secondary); color: var(--text); font-weight: 550; transition: background-color .15s, opacity .15s; }
+    button:hover:not(:disabled) { background: var(--secondary-hover); }
+    button:disabled { cursor: default; opacity: .45; }
+    #ask { background: var(--primary); color: var(--on-primary); }
+    #ask:hover:not(:disabled) { opacity: .88; background: var(--primary); }
+    select { width: 100%; min-width: 0; max-width: 100%; border: 1px solid var(--border-strong); border-radius: 10px;
+             padding: 9px 40px 9px 12px; background: var(--field); color: var(--text); appearance: none;
+             background-image: linear-gradient(45deg, transparent 50%, var(--muted) 50%), linear-gradient(135deg, var(--muted) 50%, transparent 50%);
+             background-position: calc(100% - 20px) 50%, calc(100% - 15px) 50%; background-size: 5px 5px; background-repeat: no-repeat; }
+    label { font-size: .85rem; font-weight: 600; color: var(--muted); }
+    :focus-visible { outline: 3px solid var(--accent); outline-offset: 2px; }
     [hidden] { display: none !important; }
     a, p, li, label, h1, h2 { overflow-wrap: anywhere; }
+    a { color: var(--accent); }
     ol, ul { margin: 0; padding-left: 24px; }
-    #evidence { display: grid; gap: 12px; }
-    #evidence li, #library-list li { padding: 12px; border: 1px solid #858585; border-radius: 8px; }
+    /* Cards */
+    main > section, main > details, #analysis-report {
+      background: var(--card); border: 1px solid var(--border); border-radius: 16px; padding: 16px; box-shadow: var(--shadow); }
+    #analysis-report { display: grid; gap: 12px; max-width: 900px; margin: 14px auto 0; }
+    details > summary { cursor: pointer; font-weight: 600; min-height: 32px; display: flex; align-items: center; gap: 8px;
+                        list-style: none; color: var(--muted); font-size: .9rem; }
+    details > summary::-webkit-details-marker { display: none; }
+    details > summary::before { content: "▸"; transition: transform .15s; }
+    details[open] > summary::before { transform: rotate(90deg); }
+    details { display: grid; gap: 10px; }
+    main > details { background: transparent; border-style: dashed; box-shadow: none; padding: 8px 16px; }
+    #refresh { background: transparent; border-color: var(--border-strong); }
+    #refresh:hover:not(:disabled) { background: var(--secondary); }
+    /* Status lines */
+    .hint { font-size: .82rem; }
+    #status:not(:empty) { background: var(--accent-soft); color: var(--text); border-radius: 10px; padding: 10px 14px; font-size: .92rem; }
+    #quality:not(:empty) { font-weight: 600; }
+    #gaps:not(:empty) { list-style: none; padding: 10px 14px; margin: 0; display: grid; gap: 6px; background: var(--warn-soft);
+                        border-radius: 10px; font-size: .88rem; }
+    #gaps li::before { content: "⚠ "; color: var(--warn); }
+    /* Evidence timeline */
+    #evidence { display: grid; gap: 10px; list-style: none; padding: 0; }
+    #evidence li, #library-list li { padding: 12px 14px; border: 1px solid var(--border); border-radius: 12px; background: var(--surface); }
+    #evidence li > button:first-child, #evidence li > span:first-child {
+      min-height: 32px; padding: 4px 12px; border-radius: 999px; background: var(--accent-soft); color: var(--accent);
+      font-variant-numeric: tabular-nums; font-weight: 650; font-size: .88rem; display: inline-flex; align-items: center; }
+    #evidence li > button:first-child::before { content: "▶"; font-size: .65rem; margin-right: 6px; }
+    #evidence li > span:first-child { background: transparent; border: 1px dashed var(--border-strong); color: var(--muted); }
     #library-list { list-style: none; padding: 0; display: grid; gap: 12px; }
     #library-list p { white-space: pre-wrap; }
-    #evidence p { white-space: pre-wrap; margin-top: 6px; }
-    .badge { font-size: .85rem; margin-left: 8px; }
-    video { width: 100%; max-height: 360px; border-radius: 8px; background: #111; }
-    textarea { width: 100%; min-height: 180px; font: inherit; }
-    progress { width: 100%; height: 16px; }
-    .external { display: inline-flex; align-items: center; }
-    @media (max-width: 480px) { body { padding: 12px; } .actions > button { flex: 1 1 140px; } }
+    #evidence p { white-space: pre-wrap; margin-top: 8px; line-height: 1.6; }
+    #evidence p.muted { margin-top: 6px; font-size: .84rem; }
+    .badge { font-size: .78rem; font-weight: 650; margin-left: 8px; padding: 3px 10px; border-radius: 999px;
+             background: var(--speech-soft); color: var(--speech); vertical-align: middle; }
+    .badge.visual { background: var(--visual-soft); color: var(--visual); }
+    #more { width: 100%; }
+    /* Media */
+    video { width: 100%; max-height: 360px; border-radius: 12px; background: #000; }
+    .external { display: inline-flex; align-items: center; gap: 4px; font-weight: 550; text-decoration: none; min-height: 32px; }
+    .external::after { content: "↗"; font-size: .85em; }
+    .external:hover { text-decoration: underline; }
+    textarea { width: 100%; min-height: 160px; font: inherit; font-size: .88rem; color: var(--text); background: var(--field);
+               border: 1px solid var(--border-strong); border-radius: 10px; padding: 10px 12px; resize: vertical; }
+    progress { width: 100%; height: 8px; border: 0; border-radius: 999px; overflow: hidden; background: var(--secondary); accent-color: var(--accent); }
+    progress[value] { appearance: none; }
+    progress[value]::-webkit-progress-bar { background: var(--secondary); border-radius: 999px; }
+    progress[value]::-webkit-progress-value { background: var(--accent); border-radius: 999px; }
+    progress[value]::-moz-progress-bar { background: var(--accent); border-radius: 999px; }
+    #report-link { justify-self: start; }
+    @media (max-width: 480px) { body { padding: 12px; } .actions > button { flex: 1 1 140px; }
+      main > section, main > details, #analysis-report { padding: 14px; border-radius: 14px; } }
   </style>
 </head>
 <body>
 <main aria-labelledby="title">
-  <h1 id="title">影片時間軸</h1>
-  <p id="summary" class="muted">等待影片分段資料…</p>
+  <header class="hero">
+    <p class="eyebrow">Video Timeline</p>
+    <h1 id="title">影片時間軸</h1>
+    <p id="summary" class="muted">等待影片分段資料…</p>
+  </header>
   <div class="actions">
     <button id="analyze" type="button" disabled>開始分析</button>
     <button id="ask" type="button" disabled>交給 ChatGPT 整理</button>
     <button id="drive" type="button" disabled>上傳到我的 Drive（選用）</button>
     <button id="refresh" type="button">重新取得狀態</button>
   </div>
-  <p class="muted">準備完成後自動同時開始伺服器分析與 Drive 上傳（已設定時），兩者互不等待；重新開啟不會自動重跑或送出追問。</p>
+  <p class="muted hint">準備完成後自動同時開始伺服器分析與 Drive 上傳（已設定時），兩者互不等待；重新開啟不會自動重跑或送出追問。</p>
   <p id="status" role="status" aria-live="polite" aria-atomic="true"></p>
   <p id="persistence" class="muted" hidden></p>
   <section id="operation" aria-labelledby="operation-title" hidden>
@@ -96,8 +183,8 @@
   </details>
 </main>
 <section id="analysis-report" hidden aria-label="A summary and report">
-  <h2>A 摘要／報告（未独立驗證作者或原片）</h2><p id="report-state" role="status"></p>
-  <a id="report-link" hidden download="A_server_analysis.md">下載实际 A_server_analysis.md</a>
+  <h2>A 摘要／報告（未獨立驗證作者或原片）</h2><p id="report-state" role="status"></p>
+  <a id="report-link" hidden download="A_server_analysis.md">下載實際 A_server_analysis.md</a>
   <label>明確提交的摘要<textarea id="report-summary"></textarea></label>
   <label>來源／未知註記<textarea id="report-provenance"></textarea></label>
   <button id="finalize-report" type="button">保存 caller_submitted 摘要</button>
@@ -108,6 +195,13 @@
 "use strict";
 const $ = id => document.getElementById(id);
 const host = () => window.openai;
+// Follow ChatGPT's light/dark theme even when it differs from the OS setting.
+const applyTheme = () => {
+  const theme = host()?.theme, root = document.documentElement;
+  if (!root?.dataset) return;
+  if (theme === "light" || theme === "dark") root.dataset.theme = theme; else delete root.dataset.theme;  // fall back to the OS setting
+};
+applyTheme(); window.addEventListener?.("openai:set_globals", applyTheme);
 const normalize = value => value?.structuredContent || value || {};
 const pendingRequests = new Map();
 let nextRequestId = 1, bridgePromise, generation = 0, pollEpoch = 0, pollTimer, drivePollEpoch = 0, drivePollTimer;
@@ -191,7 +285,7 @@ function request(method, params) {
 function ensureBridge() {
   if (!bridgePromise) bridgePromise = request("ui/initialize", {
     protocolVersion: "2026-01-26", appCapabilities: {},
-    appInfo: { name: "video-timeline-pipeline", version: "16" },
+    appInfo: { name: "video-timeline-pipeline", version: "17" },
   }).then(result => {
     window.parent.postMessage({ jsonrpc: "2.0", method: "ui/notifications/initialized", params: {} }, "*");
     return result;
@@ -424,7 +518,7 @@ function renderEvidence() {
     const item = document.createElement("li"), time = document.createElement(canSeek ? "button" : "span");
     time.textContent = formatTime(row.timestamp) + (row.end !== null ? "–" + formatTime(row.end) : "") + (row.timestamp_reliable === false ? "（時間碼不可靠）" : "");
     if (canSeek) { time.type = "button"; time.setAttribute("aria-label", `核對原片 ${time.textContent}`); time.addEventListener("click", () => seekEvidence(row.timestamp)); }
-    const badge = document.createElement("span"); badge.className = "badge"; badge.textContent = row.type === "speech" ? "逐字稿" : "畫面觀察";
+    const badge = document.createElement("span"); badge.className = "badge " + row.type; badge.textContent = row.type === "speech" ? "逐字稿" : "畫面觀察";
     item.append(time, badge);
     const text = document.createElement("p"); text.textContent = row.text || "此筆沒有可顯示的內容。"; item.append(text);
     if (row.detail) { const detail = document.createElement("p"); detail.className = "muted"; detail.textContent = row.detail; item.append(detail); }

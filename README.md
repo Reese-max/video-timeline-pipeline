@@ -76,6 +76,10 @@ python pipeline.py --video 'D:\path\to\video.mp4' --dry-run --slide-extractor st
 
 `mcp_server.py` 是 ChatGPT Apps/MCP 入口：公開影片 URL → 既有下載器 → FFmpeg 分段 → Groq 語音辨識／MiniMax 整支影片畫面分析 → ChatGPT 根據工具證據整理時間軸。v14 widget 在準備完成後自動同時啟動伺服器分析（A）與 Drive 上傳（B，已設定時），兩者互不等待；再由「交給 ChatGPT 整理」送出整理要求；重新開啟不會自動重跑或重送。CLI 的 MiniMax 摘要流程不變；MCP 不另呼叫 MiniMax 產生摘要。影片放在 Git 忽略的 `mcp_jobs\`，工作佇列及簽章金鑰在私有 `.video-state/`。
 
+### v17：介面視覺更新
+
+widget 改為卡片式版面：標題區、主要動作按鈕（「交給 ChatGPT 整理」為主按鈕）、狀態提示框、缺漏提醒框，證據列的時間碼改為可點的標籤，逐字稿／畫面觀察以不同顏色區分；淺色、深色（依 ChatGPT 的 `window.openai.theme`，沒有時依系統設定）與 320px 手機寬度都可讀。元素 id、按鈕文字與證據列子元素順序不變，行為與 v16 相同。UI URI 升為 `ui://video-timeline-pipeline/v17-<媒體網址 hash>.html`，保留 v15、v16 URI 回傳目前的 widget。
+
 ### v16：MiniMax 不穩時仍一次到位、升版免重新整理工具
 
 依 job `c9289f71a482` 實測（MiniMax 連續 4 次 HTTP 529）：語音可靠、畫面失敗的 A 報告也免摘要自動上傳 Drive（見下方 v15 報告段的 `speech_only`），B 第二步因此讀得到 A 的語音。widget 對所有可自動上傳的報告持續追蹤狀態、在分析缺語音或缺畫面時提示「建議加跑 B」；複製交接內容或合併指令被宿主擋下時，改用 `execCommand` 複製，仍失敗就全選文字框請使用者按 Ctrl+C。
