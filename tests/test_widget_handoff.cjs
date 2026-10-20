@@ -20,7 +20,7 @@ class Element {
   addEventListener(event, listener) { this.listeners[event] = listener; }
   setAttribute(name, value) { this.attributes[name] = String(value); } getAttribute(name) { return this.attributes[name] ?? null; } removeAttribute(name) { delete this.attributes[name]; }
   set src(value) { this.attributes.src = value; } get src() { return this.attributes.src; }
-  focus() { this.focused = true; } load() { this.loads = (this.loads || 0) + 1; } fire(event) { return this.listeners[event]?.({ target: this }); }
+  focus() { this.focused = true; } select() { this.selected = true; } load() { this.loads = (this.loads || 0) + 1; } fire(event) { return this.listeners[event]?.({ target: this }); }
 }
 function harness({ output = job('first'), saved = {}, snapshot, respond, bridge = true, persistence = true, sendError, messageResult = {} } = {}) {
   const elements = new Map(), listeners = {}, calls = [], prompts = [], states = [], timers = new Map(), methods = [], fallbackCalls = [];
@@ -46,7 +46,7 @@ function harness({ output = job('first'), saved = {}, snapshot, respond, bridge 
     Promise.resolve().then(async () => {
       try {
         if (!bridge) throw Object.assign(new Error('Unsupported bridge'), { code: -32601 });
-        if (message.method === 'ui/initialize') { assert.equal(message.params.appInfo?.name, 'video-timeline-pipeline'); assert.equal(message.params.appInfo?.version, '14'); assert.equal(message.params.protocolVersion, '2026-01-26'); assert.equal(typeof message.params.appCapabilities, 'object'); }
+        if (message.method === 'ui/initialize') { assert.equal(message.params.appInfo?.name, 'video-timeline-pipeline'); assert.equal(message.params.appInfo?.version, '16'); assert.equal(message.params.protocolVersion, '2026-01-26'); assert.equal(typeof message.params.appCapabilities, 'object'); }
         if (message.method === 'ui/message') { assert.equal(message.params.role, 'user'); assert(Array.isArray(message.params.content)); }
         const result = message.method === 'tools/call' ? await callTool(message.params.name, message.params.arguments) : message.method === 'ui/message' ? await send(message.params.content[0].text) : {};
         notify({ id: message.id, result });
@@ -458,6 +458,36 @@ async function test(name, run) { await run(); count++; console.log('ok ' + count
     assert.match(h.elements.get('status').textContent, /手動選取/);
     await h.click('open-chat');
     assert.match(h.elements.get('status').textContent, /手動開啟/);
+  });
+  await test('handoff copy falls back to execCommand, then to a selected textarea', async () => {
+    // 10-20 field test: the clipboard API did not deliver the handoff inside the ChatGPT frame.
+    for (const exec of [() => true, () => false, undefined]) {
+      const h = harness({ snapshot: { prepared: job('first'), analysis: null, drive: drive('first') } });
+      await h.flush();
+      h.context.navigator = { clipboard: { writeText: async () => { throw new Error('NotAllowedError'); } } };
+      if (exec) h.context.document.execCommand = exec;
+      await h.click('copy-handoff');
+      const box = h.elements.get('drive-prompt');
+      assert(box.selected && box.focused, 'handoff text must be selected for a manual copy');
+      assert(box.value.includes('job_id=first'));
+      assert.match(h.elements.get('status').textContent, exec && exec() ? /交接內容已複製/ : /Ctrl\+C.*手動選取/);
+    }
+  });
+  await test('a clipboard refusal after switching videos leaves the new interface alone', async () => {
+    let reject;
+    const h = harness({ respond(name, args) {
+      if (name === 'get_prepared_video') return { prepared: job(args.job_id), analysis: null, drive: args.job_id === 'first' ? drive('first') : null };
+      throw new Error('Unexpected ' + name);
+    } });
+    await h.flush();
+    h.context.navigator = { clipboard: { writeText: () => new Promise((_, refuse) => { reject = refuse; }) } };
+    const click = h.elements.get('copy-handoff').fire('click');
+    await h.flush();
+    h.notifyTool(job('second')); await h.flush();
+    reject(new Error('NotAllowedError')); await click; await h.flush();
+    const box = h.elements.get('drive-prompt');
+    assert(!box.value.includes('job_id=first'), 'old handoff must not return after the switch');
+    assert(!box.selected);
   });
   await test('evidence filter and bounded pagination', async () => {
     const result = analysis('first'); result.transcript.segments = Array.from({ length: 85 }, (_, i) => ({ start: i / 2, text: 'line ' + i })); const h = harness({ snapshot: { prepared: job('first'), analysis: result } }); await h.flush(); assert.equal(h.elements.get('evidence').children.length, 60); await h.click('more'); assert.equal(h.elements.get('evidence').children.length, 86); h.elements.get('filter').value = 'visual'; h.elements.get('filter').fire('change'); await h.flush(); assert.equal(h.elements.get('evidence').children.length, 1); assert.equal(h.openai.widgetState.privateContent.filter, 'visual'); assert.match(html, /min-height: 44px/); assert.match(html, /:focus-visible/);
