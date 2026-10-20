@@ -115,6 +115,30 @@ async function test(name, run) { await run(); count++; console.log('ok ' + count
     let release; const h = harness({ respond(name) { if (name === 'get_prepared_video') return { prepared: job('first'), analysis: null, active_operation: pending() }; if (name === 'get_video_job') return new Promise(resolve => { release = () => resolve(completed(analysis('first'))); }); if (name === 'cancel_video_job') return { ...pending(), status: 'cancelled' }; throw new Error('Unexpected ' + name); } });
     await h.flush(); await h.poll(); await h.click('cancel'); release(); await h.flush(); assert.equal(h.elements.get('findings').hidden, true); assert.match(h.elements.get('status').textContent, /已取消/);
   });
+  for (const action of ['cancel', 'resume']) await test(action + ' analysis preserves independent Drive handoff polling', async () => {
+    const analysisOp = pending('analyze-1', 'analyze', action === 'cancel' ? 'running' : 'cancelled');
+    const driveOp = pending('drive-1', 'drive', 'running');
+    const h = harness({ respond(name, args) {
+      if (name === 'get_prepared_video') return { prepared: job('first'), analysis: null,
+        active_operation: action === 'cancel' ? analysisOp : driveOp, latest_operation: analysisOp,
+        pending_operations: [driveOp, ...(action === 'cancel' ? [analysisOp] : [])] };
+      if (name === action + '_video_job') return { ...analysisOp, status: action === 'cancel' ? 'cancelled' : 'running' };
+      if (name === 'get_video_job' && args.operation_id === 'drive-1') return completed(drive('first'), 'drive', 'drive-1');
+      if (name === 'get_video_job' && args.operation_id === 'analyze-1') return pending('analyze-1', 'analyze', 'running');
+      throw new Error('Unexpected ' + name);
+    } });
+    await h.flush();
+    assert.equal(h.elements.get('drive-handoff').hidden, true);
+    await h.click(action);
+    assert.equal(h.calls.at(-1).args.operation_id, 'analyze-1');
+    await h.poll();
+    assert.equal(h.calls.at(-1).args.operation_id, 'drive-1');
+    assert.equal(h.elements.get('drive-handoff').hidden, false);
+    assert.equal(h.elements.get('copy-handoff').disabled, false);
+    assert.equal(h.elements.get('open-chat').disabled, false);
+    assert.equal(h.elements.get('findings').hidden, true);
+    assert.equal(h.prompts.length, 0);
+  });
   for (const back of [false, true]) await test('old result ignored after switch' + (back ? ' A-B-A' : ''), async () => {
     let release, analyzeCalls = 0;
     const h = harness({ respond(name, args) {
