@@ -178,6 +178,15 @@ class VideoGapFillCallTests(unittest.TestCase):
         self.assertEqual(pipeline.video_event_gaps(rows, 120), [(30.0, 70.0), (70.0, 120.0)])
         self.assertEqual(list(cache.glob("*.json")), [])
 
+    def test_partially_filled_single_window_is_not_cached(self):
+        # One event inside the original 30.0–120.0 window still leaves a 60-second gap.
+        cache = self.root / "cache-partial-single-window"
+        rows, chat, _ = self.run_mp4([answer(0, 30), answer(60)], 120, cache_dir=cache)
+        self.assertEqual(chat.call_count, 2)
+        self.assertEqual([row["timestamp"] for row in rows], [0, 30, 60])
+        self.assertEqual(pipeline.video_event_gaps(rows, 120), [(60.0, 120.0)])
+        self.assertEqual(list(cache.glob("*.json")), [])
+
     def test_unanswered_windows_survive_visual_json_serialization(self):
         for fill in (RuntimeError("fill failed"), answer(30)):
             with self.subTest(fill=fill):

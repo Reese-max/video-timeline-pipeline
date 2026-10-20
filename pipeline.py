@@ -3189,7 +3189,6 @@ def _analyze_video_mp4_core(
     unanswered_windows: list[list[float]] = []
     if from_events:
         # After the first answer's own checks, so added events never dilute its warnings.
-        prefill_rows = observations
         prefill_gaps = video_event_gaps(observations, duration_hint)
         observations = _fill_video_event_gaps(
             observations,
@@ -3203,15 +3202,8 @@ def _analyze_video_mp4_core(
             max_completion_tokens=max_completion_tokens,
         )
         if prefill_gaps:
-            # Issue #105: a window counts as filled only when the second look added an
-            # event inside its closed range; unanswered windows must not be cached.
-            prefill_stamps = {float(row["timestamp"]) for row in prefill_rows}
-            added_stamps = {float(row["timestamp"]) for row in observations} - prefill_stamps
-            unanswered_windows = [
-                [start, end]
-                for start, end in prefill_gaps
-                if not any(start <= stamp <= end for stamp in added_stamps)
-            ]
+            # Issue #105: an event may split a gap and still leave an unfilled span.
+            unanswered_windows = [list(gap) for gap in video_event_gaps(observations, duration_hint)]
 
     _stamp_video_observations(
         observations,
