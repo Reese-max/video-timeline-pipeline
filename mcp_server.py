@@ -1286,6 +1286,7 @@ def refreshed_analysis(result: dict[str, Any]) -> dict[str, Any]:
 
 
 def cached_analysis(job_id: str, manifest: dict, video_path: Path | None = None) -> dict | None:
+    """Return validated stored evidence; refresh only display copies so report bindings stay exact."""
     job_dir = prepared_job_dir(job_id)
     video_path = video_path or pipeline.locate_source_video(job_dir)
     cached = pipeline.reuse_artifact(job_dir / "analysis" / "result.json")
@@ -1294,7 +1295,7 @@ def cached_analysis(job_id: str, manifest: dict, video_path: Path | None = None)
         # them as a finished analysis that disables the widget's retry action.
         if cached.get("status") == "complete" and not stored_analysis_evidence_complete(cached):
             return None
-        return refreshed_analysis(cached)
+        return cached
     return None
 
 
@@ -2147,7 +2148,7 @@ async def get_prepared_video(job_id: str) -> dict[str, Any]:
             operations["latest_operation"] = None
         elif latest.get("status") == "completed" and latest.get("result_kind") == "analysis":
             operations["latest_operation"] = {**latest, "result": refreshed_analysis(latest["result"])}
-        return {"prepared": tool_payload(manifest), "analysis": analysis,
+        return {"prepared": tool_payload(manifest), "analysis": refreshed_analysis(analysis) if analysis else None,
                 "analysis_invalidated": bool(invalidated),
                 "drive_configured": drive_storage.configured(),
                 "drive": completed_drive_state(job_dir, manifest),

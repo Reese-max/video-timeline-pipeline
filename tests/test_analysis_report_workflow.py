@@ -33,7 +33,7 @@ class AnalysisReportTests(unittest.TestCase):
                   patch.object(server.pipeline,'visual_mode',return_value='video_mp4'),
                   patch('urllib.request.urlopen',side_effect=AssertionError('No network permitted'))):self.stack.enter_context(p)
 
-    def analyze(self, visual=None, speech=None):
+    def analyze(self, visual=None, speech=None, duration=2):
         # The real analyze_prepared_sync, source hash, timeline merge and write_json run.
         # Only paid/external evidence/probe bodies are inert; no credentials or FFmpeg spawned here.
         # An exception passed as visual/speech makes that stage fail instead.
@@ -42,7 +42,7 @@ class AnalysisReportTests(unittest.TestCase):
         with ExitStack() as s:
             for p in (patch.object(server.pipeline,'minimax_subscription_key',return_value='inert-not-real'),
                       patch.object(server.pipeline,'visual_mode',return_value='video_mp4'),
-                      patch.object(server.pipeline,'probe_video',return_value={'format':{'duration':'2'},'streams':[{'codec_type':'video'},{'codec_type':'audio'}]}),
+                      patch.object(server.pipeline,'probe_video',return_value={'format':{'duration':str(duration)},'streams':[{'codec_type':'video'},{'codec_type':'audio'}]}),
                       patch.object(server.pipeline,'extract_audio',return_value=[{'path':str(self.job/'source.mp4')}]),
                       patch.object(server.pipeline,'transcribe_local',**stage(speech,{'provider':'owned-inert','segments':[{'start':0,'end':1,'text':'owned speech <source>'}]})),
                       patch.object(server.pipeline,'analyze_video_mp4',**stage(visual,[{'timestamp':0,'visual_summary':'owned visual <source>','visible_text':['42'],'confidence':0.9,'analysis_method':'minimax_video','timestamp_reliable':True}])),
@@ -194,6 +194,94 @@ class AnalysisReportTests(unittest.TestCase):
         self.assertNotIn(self.report_module().SPEECH_ONLY_NOTE.strip(), text)
         self.assertIn('Sampling/ASR and caller text may be wrong.\n\n> {', text)
         self.assertEqual(server.report_snapshot(self.job_id, server.cached_analysis(self.job_id, self.manifest))['status'], 'awaiting_segments')
+
+    def assert_timestamp_report_flow(self, endpoint, scope):
+        events = [{'timestamp':stamp, 'visual_summary':'owned visual', 'confidence':0.9}
+                  for stamp in (0, endpoint)]
+        with patch.object(server.pipeline, 'minimax_reusable_upload', return_value=('owned-file', False)), \
+             patch.object(server.pipeline, 'minimax_chat', return_value=json.dumps({'events':events})), \
+             patch.object(server.pipeline, '_fill_video_event_gaps', side_effect=lambda rows, **_: rows):
+            observations, _, _ = server.pipeline._analyze_video_mp4_core(
+                self.job/'source.mp4', 'inert-not-real', 'fixture-model', prompt='owned fixture',
+                fps_value=1, detail_value='default', timeout=1, analysis_method='minimax_video',
+                source_video=self.job/'source.mp4', duration_hint=100)
+        if scope == 'speech_only':
+            self.assertEqual(observations[0]['finish_reason'], 'timestamp_coverage')
+        else:
+            self.assertEqual(observations[-1]['timestamp'], min(endpoint, 100))
+        self.assertEqual(observations[-1]['timestamp_reliable'], endpoint == 90)
+        self.manifest['source'].update(url='https://example.invalid/owned-source', duration_seconds=120)
+        self.manifest['segments'][0].update(index=0, preview_filename=None, mime_type='video/mp4')
+        atomic_json(self.job/'manifest.json', self.manifest)
+        result = self.analyze(visual=observations, duration=120)
+        module = self.report_module()
+        pointer = self.job/'analysis-report.json'
+        report = json.loads(pointer.read_bytes())
+        self.assertEqual(report['evidence_scope'], scope)
+        self.assertTrue(module.uploadable(report))
+        stable = {path:path.read_bytes() for path in
+                  (self.job/'analysis/result.json', self.job/report['relative_path'])}
+        cached = server.cached_analysis(self.job_id, self.manifest)
+        self.assertEqual(server.report_snapshot(self.job_id, cached)['status'], 'awaiting_segments')
+        self.assertEqual(module.analysis_binding(self.job, cached)['analysis_sha256'], report['analysis_sha256'])
+        self.assertEqual(module.read(self.job, cached)['report_sha256'], report['report_sha256'])
+
+        queue = self.idle_queue()
+        with queue.connect() as db:
+            db.execute("UPDATE jobs SET result=? WHERE operation='analyze'", (json.dumps(result),))
+        drive = self.drive_manifest()
+        atomic_json(self.job/'drive-manifest.json', drive)
+        with patch.object(server, 'get_queue', return_value=queue), \
+             patch.object(queue, 'submit', side_effect=AssertionError('Getter must not enqueue')):
+            snapshot = asyncio.run(server.get_prepared_video(self.job_id))
+        self.assertEqual(snapshot['report']['status'], 'awaiting_segments')
+        displayed = snapshot['analysis']
+        self.assertEqual(displayed, server.analysis_tool_result(result).structuredContent)
+        for row in displayed['timeline']:
+            if row['type'] == 'visual' and row['data']['timestamp_reliable'] is False:
+                self.assertIsNone(row['timestamp'])
+                self.assertIsNone(row['data']['timestamp'])
+        self.assertEqual(displayed['quality']['status'], result['quality']['status'])
+
+        for _ in range(3): server.report_queue_idle(queue)
+        saved = json.loads(pointer.read_bytes())
+        operation = queue.get(saved['operation_id'])
+        self.assertEqual((operation['operation'], operation['status']), ('report', 'queued'))
+        with queue.connect() as db:
+            self.assertEqual(db.execute("SELECT count(*) FROM jobs WHERE operation='report'").fetchone()[0], 1)
+        stack, _, calls = self.transport(report, drive)
+        with stack:
+            uploaded = server.upload_analysis_report_sync(
+                self.job_id, report['report_sha256'], report['analysis_sha256'], drive['folder_id'])
+        self.assertEqual(calls, ['report-fixture'])
+        self.assertEqual(uploaded['status'], 'report_ready')
+        self.assertTrue(uploaded['verified'])
+        with patch.object(server, 'get_queue', return_value=queue):
+            finalized = server.finalize_analysis_report_sync(
+                self.job_id, report['cache_signature'], report['analysis_sha256'],
+                'explicit caller summary', 'owned fixture; author not independently attested')
+            self.assertEqual((finalized['summary_status'], finalized['status']), ('caller_submitted', 'queued'))
+            with self.assertRaisesRegex(ValueError, 'stale analysis'):
+                server.finalize_analysis_report_sync(
+                    self.job_id, report['cache_signature'], '0'*64, 'stale summary', 'owned fixture')
+        for path, raw in stable.items(): self.assertEqual(path.read_bytes(), raw)
+        changed = json.loads((self.job/'analysis/result.json').read_bytes())
+        changed['timeline'][-1]['data']['visual_summary'] = 'changed persisted evidence'
+        atomic_json(self.job/'analysis/result.json', changed)
+        with self.assertRaisesRegex(ValueError, 'Analysis record changed'):
+            module.analysis_binding(self.job, result)
+        with self.assertRaisesRegex(ValueError, 'Queued report identity or folder changed'):
+            server.upload_analysis_report_sync(
+                self.job_id, report['report_sha256'], report['analysis_sha256'], drive['folder_id'])
+
+    def test_clamped_timestamp_report_uses_persisted_binding(self):
+        self.assert_timestamp_report_flow(110, 'complete')
+
+    def test_timestamp_coverage_placeholder_report_uses_persisted_binding(self):
+        self.assert_timestamp_report_flow(10, 'speech_only')
+
+    def test_reliable_timestamp_report_control_and_finalize(self):
+        self.assert_timestamp_report_flow(90, 'complete')
 
     def test_complete_report_bytes_keep_the_previous_layout(self):
         # Reports already in Drive must not be re-uploaded because this release added the speech_only note.
