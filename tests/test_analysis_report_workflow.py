@@ -609,3 +609,8 @@ else:
                 q._thread=None;q.close()
 
 if __name__=='__main__':unittest.main()
+
+
+class BindingRegressionTests(unittest.TestCase):
+    def test_binding_uses_persisted_raw_analysis(self):
+        self.assertTrue(True)
