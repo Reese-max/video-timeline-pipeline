@@ -2859,12 +2859,23 @@ def video_event_gaps(
     duration: float | None,
     max_gap: float = VIDEO_EVENT_MAX_GAP_SECONDS,
 ) -> list[tuple[float, float]]:
-    """Spans longer than max_gap with no visual event, measured from 0 to the end of the video."""
+    """Spans longer than max_gap with no visual event, measured from 0 to the end of the video.
+
+    The fill prompt prints each span as a closed interval, so an event exactly at the
+    end of the video answers the final stretch instead of leaving it open (issue #105).
+    An opening event at 0 does not cover the stretch after it, and a tail event short
+    of the video end does not cover the rest.
+    """
     if duration is None or not math.isfinite(duration) or duration <= 0:
         return []
     stamps = sorted(max(0.0, min(float(row["timestamp"]), duration)) for row in observations)
     edges = [0.0, *stamps, float(duration)]
-    return [(start, end) for start, end in zip(edges, edges[1:]) if end - start > max_gap]
+    ending_covered = bool(stamps) and stamps[-1] == duration
+    return [
+        (start, end)
+        for start, end in zip(edges, edges[1:])
+        if end - start > max_gap and not (ending_covered and end == duration and start > 0.0)
+    ]
 
 
 def _fill_video_event_gaps(
@@ -2922,7 +2933,9 @@ def _fill_video_event_gaps(
     added: list[dict[str, Any]] = []
     for row in found:
         stamp = row["timestamp"]
-        if any(start < stamp < end for start, end in gaps) and all(
+        # Closed interval to match the prompt's 「start–end 秒」 wording (issue #105);
+        # the 1-second dedupe below still drops boundary events already listed.
+        if any(start <= stamp <= end for start, end in gaps) and all(
             abs(stamp - other) >= VIDEO_EVENT_DUPLICATE_SECONDS for other in taken
         ):
             taken.append(stamp)
@@ -2995,6 +3008,7 @@ def _analyze_video_mp4_core(
     duration_hint: float | None = None,
     max_completion_tokens: int | None = None,
     upload_record_dir: Path | None = None,
+    unanswered_windows: list[tuple[float, float]] | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, Any] | None, str | None]:
     """Upload once (or reuse a recent upload of the same bytes), then chat.
 
@@ -3166,6 +3180,8 @@ def _analyze_video_mp4_core(
                     observation["timestamp_issue"] = "時間碼疑似被壓縮，需覆核原片"
     if from_events:
         # After the first answer's own checks, so added events never dilute its warnings.
+        prefill_rows = observations
+        prefill_gaps = video_event_gaps(observations, duration_hint)
         observations = _fill_video_event_gaps(
             observations,
             file_id=file_id,
@@ -3177,6 +3193,16 @@ def _analyze_video_mp4_core(
             duration=duration_hint,
             max_completion_tokens=max_completion_tokens,
         )
+        if prefill_gaps and unanswered_windows is not None:
+            # Issue #105: a window counts as filled only when the second look added an
+            # event inside its closed range; unanswered windows must not be cached.
+            prefill_stamps = {float(row["timestamp"]) for row in prefill_rows}
+            added_stamps = {float(row["timestamp"]) for row in observations} - prefill_stamps
+            unanswered_windows.extend(
+                (start, end)
+                for start, end in prefill_gaps
+                if not any(start <= stamp <= end for stamp in added_stamps)
+            )
 
     _stamp_video_observations(
         observations,
@@ -3265,6 +3291,8 @@ def analyze_video_mp4(
         scratch = Path(owned_temp.name)
     else:
         scratch.mkdir(parents=True, exist_ok=True)
+    # Gap windows the second look never answered; the cache must not claim completeness (issue #105).
+    unanswered_gap_windows: list[tuple[float, float]] = []
 
     def run_core(
         path: Path,
@@ -3272,6 +3300,7 @@ def analyze_video_mp4(
         analysis_method: str,
         extra_meta: dict[str, Any] | None = None,
     ) -> tuple[list[dict[str, Any]], dict[str, Any] | None, str | None]:
+        unanswered_gap_windows.clear()
         return _analyze_video_mp4_core(
             path,
             api_key,
@@ -3287,11 +3316,15 @@ def analyze_video_mp4(
             max_completion_tokens=max_completion_tokens,
             # The visual cache holds only finished evidence; upload receipts live with the work files.
             upload_record_dir=work_dir,
+            unanswered_windows=unanswered_gap_windows,
         )
 
     def persist(observations: list[dict[str, Any]], parsed: dict[str, Any] | None, file_id: str | None) -> list[dict[str, Any]]:
-        if cache_path is not None and parsed is not None and all(
-            usable_visual_observation(item) for item in observations
+        if (
+            cache_path is not None
+            and parsed is not None
+            and all(usable_visual_observation(item) for item in observations)
+            and not unanswered_gap_windows
         ):
             write_json(
                 cache_path,
