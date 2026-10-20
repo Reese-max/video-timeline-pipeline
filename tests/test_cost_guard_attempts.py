@@ -284,6 +284,52 @@ class CostAttemptTests(unittest.TestCase):
         sleep.assert_called_once_with(7.0)
         self.assertEqual([row["safe_error"] for row in rows(self.root, "usage_costs")], ["rate_limit", None])
 
+    def test_overloaded_and_rate_limited_rejections_hold_no_budget(self):
+        # Field test c9289f71a482: four MiniMax 529s were each booked at the 0.63 USD reservation.
+        bodies = {529: b'{"type":"error","error":{"type":"overloaded_error","message":"busy"}}',
+                  429: b'{"error":{"code":"rate_limit"}}'}
+        for code, attempts in ((529, 1), (429, 4)):
+            with self.subTest(code=code), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                def reject(*_args, **_kwargs):
+                    raise urllib.error.HTTPError("https://api.minimax.io/v1/chat/completions", code,
+                        "Provider rejected", {"Retry-After": "0"}, io.BytesIO(bodies[code]))
+                with cost_tracker.cost_root_scope(root), \
+                        patch.object(urllib.request, "urlopen", side_effect=reject) as sender, \
+                        patch.object(pipeline.OperationBudget, "sleep", lambda *_: None):
+                    with self.assertRaises(pipeline.ApiRequestError):
+                        pipeline.minimax_chat([{"role": "user", "content": "test"}], "offline-placeholder",
+                                              "MiniMax-M3", max_completion_tokens=524288)
+                # 529 fails fast so the analysis falls back to speech-only; 429 keeps its bounded retries.
+                self.assertEqual(sender.call_count, attempts)
+                usage = rows(root, "usage_costs")
+                self.assertEqual([(row["status"], row["cost_status"], row["estimated_micro_usd"]) for row in usage],
+                                 [("failed", "zero_rejected", 0)] * attempts)
+                status = cost_tracker.get_budget_status(root)
+                self.assertEqual((status["spent_micro_usd"], status["outstanding_micro_usd"]), (0, 0))
+
+    def test_known_actual_cost_wins_over_a_rejection_flag(self):
+        cost_tracker.record_usage(self.root, provider="minimax", operation="chat.completions", status="failed",
+                                  actual_micro_usd=100_000, provider_rejected=True)
+        row = rows(self.root, "usage_costs")[0]
+        self.assertEqual((row["cost_status"], row["estimated_micro_usd"]), ("actual", 100_000))
+
+    def test_server_errors_keep_their_estimate(self):
+        def fail(*_args, **_kwargs):
+            raise urllib.error.HTTPError("https://api.minimax.io/v1/chat/completions", 500,
+                "Internal error", {"Retry-After": "0"}, io.BytesIO(b'{"error":"internal"}'))
+        with patch.object(urllib.request, "urlopen", side_effect=fail) as sender, \
+                patch.object(pipeline.OperationBudget, "sleep", lambda *_: None):
+            with self.assertRaises(pipeline.ApiRequestError):
+                pipeline.minimax_chat([{"role": "user", "content": "test"}], "offline-placeholder",
+                                      "MiniMax-M3", max_completion_tokens=524288)
+        usage = rows(self.root, "usage_costs")
+        self.assertEqual(sender.call_count, 4)
+        self.assertEqual({(row["status"], row["cost_status"]) for row in usage}, {("failed", "estimated")})
+        self.assertTrue(all(row["estimated_micro_usd"] > 0 for row in usage))
+        self.assertEqual(cost_tracker.get_budget_status(self.root)["spent_micro_usd"],
+                         sum(row["estimated_micro_usd"] for row in usage))
+
     def test_budget_status_exposes_outstanding_and_available_risk(self):
         os.environ.update(BUDGET_HARD_STOP="true", DAILY_BUDGET_USD="1")
         allowed, reservation, _ = cost_tracker.check_and_reserve_budget(self.root, "offline", 750_000)
