@@ -20,7 +20,7 @@ class Element {
   addEventListener(event, listener) { this.listeners[event] = listener; }
   setAttribute(name, value) { this.attributes[name] = String(value); } getAttribute(name) { return this.attributes[name] ?? null; } removeAttribute(name) { delete this.attributes[name]; }
   set src(value) { this.attributes.src = value; } get src() { return this.attributes.src; }
-  focus() { this.focused = true; } load() { this.loads = (this.loads || 0) + 1; } fire(event) { return this.listeners[event]?.({ target: this }); }
+  focus() { this.focused = true; } select() { this.selected = true; } load() { this.loads = (this.loads || 0) + 1; } fire(event) { return this.listeners[event]?.({ target: this }); }
 }
 function harness({ output = job('first'), saved = {}, snapshot, respond, bridge = true, persistence = true, sendError, messageResult = {} } = {}) {
   const elements = new Map(), listeners = {}, calls = [], prompts = [], states = [], timers = new Map(), methods = [], fallbackCalls = [];
@@ -46,7 +46,7 @@ function harness({ output = job('first'), saved = {}, snapshot, respond, bridge 
     Promise.resolve().then(async () => {
       try {
         if (!bridge) throw Object.assign(new Error('Unsupported bridge'), { code: -32601 });
-        if (message.method === 'ui/initialize') { assert.equal(message.params.appInfo?.name, 'video-timeline-pipeline'); assert.equal(message.params.appInfo?.version, '15'); assert.equal(message.params.protocolVersion, '2026-01-26'); assert.equal(typeof message.params.appCapabilities, 'object'); }
+        if (message.method === 'ui/initialize') { assert.equal(message.params.appInfo?.name, 'video-timeline-pipeline'); assert.equal(message.params.appInfo?.version, '16'); assert.equal(message.params.protocolVersion, '2026-01-26'); assert.equal(typeof message.params.appCapabilities, 'object'); }
         if (message.method === 'ui/message') { assert.equal(message.params.role, 'user'); assert(Array.isArray(message.params.content)); }
         const result = message.method === 'tools/call' ? await callTool(message.params.name, message.params.arguments) : message.method === 'ui/message' ? await send(message.params.content[0].text) : {};
         notify({ id: message.id, result });
@@ -258,6 +258,54 @@ async function test(name, run) { try { await run(); count++; console.log('ok ' +
     await h.flush();assert.equal([...h.timers.values()].filter(x=>x.ms<=10000).length,1);
     await h.poll();assert.equal(h.calls.filter(x=>x.name==='get_video_job').length,1);
     assert.equal([...h.timers.values()].filter(x=>x.ms<=10000).length,1);
+  });
+  for(const scope of ['speech_only','complete']) await test(scope+' evidence report uploads on its own and the widget follows it without a summary', async () => {
+    // Field test c9289f71a482: the widget told the user to wait for a ChatGPT summary that was never needed.
+    const auto=(status='awaiting_segments',extra={})=>({...r(status),evidence_status:scope==='complete'?'complete':'partial',evidence_scope:scope,...extra});
+    let reads=0;
+    const h=setup(auto(),name=> {
+      if(name==='get_prepared_video') return {prepared:job('first'),analysis:a(),report:++reads===1?auto():auto('queued',{operation:pending('report-1','report','queued')})};
+      if(name==='get_video_job') return reportCompleted({...readyReport(),summary_status:'pending_chatgpt',evidence_scope:scope});
+      throw new Error('Unexpected '+name);
+    });
+    await h.flush();
+    const text=h.elements.get('report-state').textContent;
+    assert.match(text,scope==='speech_only'?/只含語音.*自動放進 Drive（不需摘要）/:/A 證據完整.*自動放進 Drive（不需摘要）/);
+    assert(!text.includes('等待 ChatGPT 整理摘要'));
+    await h.poll();assert.match(h.elements.get('report-state').textContent,/A 報告排隊／上傳中/);
+    await h.poll();assert.equal(h.elements.get('copy-merge').disabled,false);assert.match(h.elements.get('report-state').textContent,/A 已完成/);
+    assert.equal(h.calls.filter(x=>x.name==='finalize_analysis_report').length,0);assert.equal(h.prompts.length,0);
+  });
+  await test('unattended report without Drive explains instead of polling forever', async () => {
+    const h=harness({snapshot:{prepared:job('first'),analysis:a(),report:{...r('awaiting_segments'),evidence_scope:'complete'},drive_configured:false}});
+    await h.flush();
+    assert.match(h.elements.get('report-state').textContent,/未設定 Google Drive/);
+    assert(![...h.timers.values()].some(x=>x.ms<=10000));assert.deepEqual(h.calls.map(x=>x.name),['get_prepared_video']);
+  });
+  await test('failed unattended upload reports the failure instead of asking for a summary', async () => {
+    const failed={...r('failed'),evidence_status:'partial',evidence_scope:'speech_only',operation:{...pending('report-1','report','failed'),error:{message:'REPORT_UPLOAD: 完整錯誤'}}};
+    const h=setup(failed);await h.flush();
+    const text=h.elements.get('report-state').textContent;
+    assert(!text.includes('等待 ChatGPT 整理摘要'));assert.match(text,/尚未確認上傳至 Drive/);assert(text.includes('REPORT_UPLOAD: 完整錯誤'));
+    assert(![...h.timers.values()].some(x=>x.ms<=10000));
+  });
+  await test('analysis that lacks a half recommends route B with the reason', async () => {
+    const lacking={...a(),status:'partial',quality:{...a().quality,status:'needs_review',recommend_route_b:true,route_b_reasons:['伺服器畫面分析失敗或不完整']}};
+    const h=harness({snapshot:{prepared:job('first'),analysis:lacking,report:null}});await h.flush();
+    assert.match(h.elements.get('quality').textContent,/建議加跑 B（伺服器畫面分析失敗或不完整）/);
+    const fine=harness({snapshot:{prepared:job('first'),analysis:a(),report:null}});await fine.flush();
+    assert(!fine.elements.get('quality').textContent.includes('建議加跑 B'));
+  });
+  await test('merge copy falls back to a selected textarea when the host refuses the clipboard', async () => {
+    const merge='合併：讀取同資料夾的 A_server_analysis.md。';
+    for(const exec of [undefined,()=>true]) {
+      const h=setup({...r('report_ready'),verified:true,file_id:'fixture-report',merge_text:merge});await h.flush();
+      h.context.navigator={clipboard:{writeText:async()=>{throw new Error('NotAllowedError');}}};
+      if(exec) h.context.document.execCommand=exec;
+      await h.click('copy-merge');
+      const box=h.elements.get('merge-prompt');assert.equal(box.value,merge);assert(box.selected);
+      assert.match(h.elements.get('status').textContent,exec?/已複製已核對報告的合併指令/:/Ctrl\+C/);
+    }
   });
   if(failures) throw new Error(failures+' widget report scenarios failed');
   console.log('PASS: '+count+' A report inert widget controls; no actual ChatGPT/Google/provider acceptance.');

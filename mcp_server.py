@@ -66,7 +66,17 @@ MCP_PUBLIC_BASE_URL = (
 MCP_MEDIA_BASE_URL = (
     os.getenv("MCP_MEDIA_BASE_URL", "") or MCP_PUBLIC_BASE_URL
 ).rstrip("/")
-UI_URI = f"ui://video-timeline-pipeline/v15-{hashlib.sha256(MCP_MEDIA_BASE_URL.encode()).hexdigest()[:12]}.html"
+WIDGET_VERSION = 16
+
+
+def ui_uri(version: int) -> str:
+    return f"ui://video-timeline-pipeline/v{version}-{hashlib.sha256(MCP_MEDIA_BASE_URL.encode()).hexdigest()[:12]}.html"
+
+
+UI_URI = ui_uri(WIDGET_VERSION)
+# ChatGPT keeps the outputTemplate from its last tool refresh; after an upgrade it still
+# reads the previous URI, and an unknown one shows "無法開啟應用程式" (10-20 deploy log).
+LEGACY_UI_URIS = tuple(ui_uri(version) for version in (WIDGET_VERSION - 2, WIDGET_VERSION - 1))
 PUBLIC_URL = urlsplit(MCP_PUBLIC_BASE_URL)
 MEDIA_URL = urlsplit(MCP_MEDIA_BASE_URL)
 UI_ORIGIN = f"{PUBLIC_URL.scheme}://{PUBLIC_URL.netloc}"
@@ -244,6 +254,7 @@ class AnalysisQuality(BaseModel):
     speech_segments: int
     speech_reliable: bool | None = None
     recommend_route_b: bool = False
+    route_b_reasons: list[str] = []
     limitation: str
 
 
@@ -1158,17 +1169,24 @@ def analysis_quality(result: dict[str, Any]) -> dict[str, Any]:
     unreliable = sum(row.get("timestamp_reliable") is False for row in usable)
     if unreliable:
         warnings.append(f"{unreliable} 筆畫面時間碼不可靠，未提供跳轉。")
-    if result.get("visual_status") != "complete" or not usable or len(usable) != len(frames):
+    visual_missing = result.get("visual_status") != "complete" or not usable or len(usable) != len(frames)
+    if visual_missing:
         reasons.append("缺少可用畫面觀察，或部分畫面回應不完整。")
     # ponytail: model confidence is an uncalibrated warning, not proof of correctness.
     if any(not isinstance(row.get("confidence"), (int, float))
            or isinstance(row.get("confidence"), bool)
            or not 0.5 < row["confidence"] <= 1 for row in usable):
         reasons.append("部分畫面信心不足或缺少信心資訊。")
+    # B reads the original MP4, so it covers whichever half the server could not deliver.
+    route_b_reasons = ((["伺服器沒有可信的語音內容"] if not speech_reliable
+                        else ["伺服器語音辨識未完成"] if result.get("audio_status") not in {"complete", "skipped"}
+                        else ["伺服器逐字稿補轉失敗，可能漏字"] if backfill_errors else [])
+                       + (["伺服器畫面分析失敗或不完整"] if visual_missing else []))
     return {"status": "needs_review" if reasons else "evidence_available", "reasons": reasons,
             "warnings": warnings,
             "visual_frames": len(usable), "speech_segments": len(speech),
-            "speech_reliable": speech_reliable, "recommend_route_b": not speech_reliable,
+            "speech_reliable": speech_reliable, "recommend_route_b": bool(route_b_reasons),
+            "route_b_reasons": route_b_reasons,
             "limitation": "僅檢查證據完整性與模型自報信心，不保證語意正確；畫面事件由 MiniMax 讀完整支影片後摘要，非逐幀檢視。"}
 
 
@@ -1502,8 +1520,14 @@ def analysis_tool_result(result: dict[str, Any]) -> types.CallToolResult:
         text += "\n注意：" + "；".join(quality["warnings"])
         text += "不可靠的時間碼不可作為精確時間軸，也不可自行推算或比例縮放。"
     if quality.get("recommend_route_b"):
-        text += ("\n建議加跑 B：伺服器沒有可信的語音內容，畫面文字與數字要靠原片核對。"
+        text += ("\n建議加跑 B（" + "；".join(quality.get("route_b_reasons") or ["伺服器證據不足"])
+                 + "）：缺的部分要靠 B 讀原片核對。"
                  "請提醒使用者把 widget 的 Drive 交接內容貼到一般對話；交接內容已含合併步驟。")
+    scope = analysis_report.evidence_scope(result)
+    if scope == "speech_only" or (scope == "complete" and quality["status"] == "evidence_available"):
+        text += (f"\n{'語音可靠，' if scope == 'speech_only' else ''}不必先提交摘要：已設定 Drive 時，"
+                 f"{analysis_report.NAME} 會在影片片段上傳完成後自動放進同一資料夾；"
+                 "只有使用者要求整理摘要時才呼叫 finalize_analysis_report。")
     text += "\n這是伺服器分析，不是 ChatGPT 直接讀取 MP4。"
     text += ("證據不足，請停止摘要，使用 widget 的 Drive 交接入口轉一般對話讀取原片。"
              if quality["status"] == "needs_review"
@@ -1723,6 +1747,17 @@ def video_timeline_widget() -> str:
     return WIDGET_HTML
 
 
+for legacy_uri in LEGACY_UI_URIS:
+    mcp.resource(
+        legacy_uri,
+        name="video_timeline_widget_" + legacy_uri.rsplit("/", 1)[-1].split("-", 1)[0],
+        title="Video timeline analysis (previous URI)",
+        description="Serves the current widget to hosts that still hold the previous tool definitions.",
+        mime_type="text/html;profile=mcp-app",
+        meta=UI_META,
+    )(video_timeline_widget)
+
+
 @mcp.tool(
     name="prepare_video_for_chatgpt",
     title="Prepare video for ChatGPT",
@@ -1867,7 +1902,8 @@ def _report_snapshot_checked(job_id: str, analysis: dict | None, queue=None) -> 
         return None
     expires = int(time.time()) + MCP_MEDIA_TTL
     signature = media_signer().sign(job_id, report["relative_path"], expires)
-    result = {**report, "status": "summary_pending" if report["summary_status"] != "caller_submitted" else "awaiting_segments",
+    # Evidence that uploads without a summary waits on Drive like a submitted one, so the widget keeps polling.
+    result = {**report, "status": "awaiting_segments" if analysis_report.uploadable(report) else "summary_pending",
               "download_url": f"{MCP_MEDIA_BASE_URL}/media/{job_id}/{report['relative_path']}?expires={expires}&sig={signature}"}
     queue_id = report.get("operation_id")
     if queue_id and queue is not None:
@@ -2199,7 +2235,7 @@ async def ingest_video_segments(
 @mcp.custom_route("/health", methods=["GET"], include_in_schema=False)
 async def health(_: Request) -> JSONResponse:
     queue = get_queue()
-    return JSONResponse({"status": "ok", "service": "video-timeline-pipeline", "version": 15,
+    return JSONResponse({"status": "ok", "service": "video-timeline-pipeline", "version": WIDGET_VERSION,
                          "jobs": queue.stats(), "media_links": "signed", "legacy_media_until": MCP_LEGACY_MEDIA_UNTIL,
                          "writer_busy": JOB_LOCK.locked(), "runtime_sha256": RUNTIME_SHA256,
                          "commit_sha": RELEASE_SHA or None,
