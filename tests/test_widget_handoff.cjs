@@ -355,7 +355,8 @@ async function test(name, run) { await run(); count++; console.log('ok ' + count
     h.context.navigator = { clipboard: { writeText(value) { copied = value; return Promise.resolve(); } } };
     await h.click('copy-handoff'); assert.equal(copied, text);
     h.context.window.open = url => { opened = url; return {}; };
-    await h.click('open-chat'); assert.equal(opened, 'https://chatgpt.com/');
+    copied = null;
+    await h.click('open-chat'); assert.equal(copied, text, 'one click copies the handoff'); assert.equal(opened, 'https://chatgpt.com/');
     assert.equal(h.elements.get('findings').hidden, true);
     assert.equal(h.elements.get('drive').disabled, true);
     assert.equal(h.elements.get('analyze').disabled, true);
@@ -432,8 +433,18 @@ async function test(name, run) { await run(); count++; console.log('ok ' + count
     assert.equal(h.elements.get('copy-handoff').disabled, false);
     await h.click('copy-handoff');
     assert.match(h.elements.get('status').textContent, /手動選取/);
+    let opened = null;
+    h.context.window.open = url => { opened = url; return null; };
     await h.click('open-chat');
-    assert.match(h.elements.get('status').textContent, /手動開啟/);
+    assert.equal(opened, null, 'no new chat before the handoff is copied');
+    assert.match(h.elements.get('status').textContent, /手動選取.*下方連結/);
+    assert.equal(h.elements.get('open-chat-link').hidden, false);
+    h.elements.get('open-chat-link').hidden = true;
+    h.context.navigator = { clipboard: { writeText: () => Promise.resolve() } };
+    await h.click('open-chat');
+    assert.equal(opened, 'https://chatgpt.com/');
+    assert.match(h.elements.get('status').textContent, /已複製.*下方連結/);
+    assert.equal(h.elements.get('open-chat-link').hidden, false, 'a blocked popup still leaves a real link to click');
   });
   await test('handoff copy falls back to execCommand, then to a selected textarea', async () => {
     // 10-20 field test: the clipboard API did not deliver the handoff inside the ChatGPT frame.

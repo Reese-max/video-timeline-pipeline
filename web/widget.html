@@ -54,8 +54,8 @@
              background: var(--secondary); color: var(--text); font-weight: 550; transition: background-color .15s, opacity .15s; }
     button:hover:not(:disabled) { background: var(--secondary-hover); }
     button:disabled { cursor: default; opacity: .45; }
-    #ask { background: var(--primary); color: var(--on-primary); }
-    #ask:hover:not(:disabled) { opacity: .88; background: var(--primary); }
+    #ask, #open-chat { background: var(--primary); color: var(--on-primary); }
+    #ask:hover:not(:disabled), #open-chat:hover:not(:disabled) { opacity: .88; background: var(--primary); }
     select { width: 100%; min-width: 0; max-width: 100%; border: 1px solid var(--border-strong); border-radius: 10px;
              padding: 9px 40px 9px 12px; background: var(--field); color: var(--text); appearance: none;
              background-image: linear-gradient(45deg, transparent 50%, var(--muted) 50%), linear-gradient(135deg, var(--muted) 50%, transparent 50%);
@@ -77,8 +77,8 @@
     details[open] > summary::before { transform: rotate(90deg); }
     details { display: grid; gap: 10px; }
     main > details { background: transparent; border-style: dashed; box-shadow: none; padding: 8px 16px; }
-    #refresh { background: transparent; border-color: var(--border-strong); }
-    #refresh:hover:not(:disabled) { background: var(--secondary); }
+    #refresh, #copy-handoff { background: transparent; border-color: var(--border-strong); }
+    #refresh:hover:not(:disabled), #copy-handoff:hover:not(:disabled) { background: var(--secondary); }
     /* Status lines */
     .hint { font-size: .82rem; }
     #status:not(:empty) { background: var(--accent-soft); color: var(--text); border-radius: 10px; padding: 10px 14px; font-size: .92rem; }
@@ -164,12 +164,12 @@
   </section>
   <section id="drive-handoff" aria-labelledby="drive-title" hidden>
     <h2 id="drive-title">Drive 原片交接</h2>
-    <p>已上傳不代表 ChatGPT 已讀取原片。若目前對話無法使用官方 Google Drive，請開啟一般對話、選擇 Google Drive，再貼上以下內容。</p>
+    <p>已上傳不代表 ChatGPT 已讀取原片。按「複製並開新一般對話」會先複製以下內容，再嘗試開新對話（沒開啟就按隨後出現的連結）；在新對話選擇 Google Drive 後貼上即可。</p>
     <label for="drive-prompt">交接內容（可選取並複製）</label>
     <textarea id="drive-prompt" readonly></textarea>
     <div class="actions">
-      <button id="copy-handoff" type="button" disabled>一鍵複製交接內容</button>
-      <button id="open-chat" type="button" disabled>開新一般對話</button>
+      <button id="open-chat" type="button" disabled>複製並開新一般對話</button>
+      <button id="copy-handoff" type="button" disabled>只複製</button>
     </div>
     <a id="open-chat-link" class="external" href="https://chatgpt.com/" target="_blank" rel="noopener noreferrer" hidden>開啟 ChatGPT，建立一般對話</a>
   </section>
@@ -846,17 +846,22 @@ async function copyHandoff() {
   if (current(version)) status(copied ? "交接內容已複製。請在一般對話貼上，讓 ChatGPT 開始分析（B）。" : MANUAL_COPY);
 }
 function openNewChat() {
-  const url = "https://chatgpt.com/";
-  let opened = null;
-  try { if (typeof window.open === "function") opened = window.open(url, "_blank", "noopener"); }
-  catch { opened = null; }
-  if (opened) {
-    status("已開啟新對話入口；請確認是不含 developer MCP 的一般對話，再貼上交接內容。");
-    return;
-  }
-  const link = $("open-chat-link");
-  if (link && typeof link.click === "function") link.click();
-  else status("已準備交接內容；請手動開啟 https://chatgpt.com/ 建立一般對話（不要啟用 developer MCP），再貼上交接內容。");
+  // window.open with "noopener" returns null even when the tab opens, and the click's activation may have
+  // expired while the clipboard answered; always show the real link instead of guessing or clicking it twice.
+  $("open-chat-link").hidden = false;
+  status("交接內容已複製；若沒有自動開啟新分頁，請按下方連結開新一般對話（不要啟用 developer MCP），選擇 Google Drive 後貼上。");
+  try { if (typeof window.open === "function") window.open("https://chatgpt.com/", "_blank", "noopener"); }
+  catch {}
+}
+// Copy first: opening a tab moves focus away and the clipboard needs a focused page.
+async function copyAndOpenChat() {
+  const text = $("drive-prompt").value, version = generation;
+  if (!text) { status("目前沒有可複製的交接內容。"); return; }
+  const copied = await copyText(text, $("drive-prompt"), version);
+  if (copied === null || !current(version)) return;
+  if (copied) { openNewChat(); return; }
+  $("open-chat-link").hidden = false;
+  status(MANUAL_COPY + " 複製後按下方連結開新一般對話。");
 }
 async function askChatGPT() {
   const key = followUpKey();
@@ -1026,7 +1031,7 @@ $("copy-merge").addEventListener("click", copyMerge);
 $("analyze").addEventListener("click", () => startOperation("analyze"));
 $("drive").addEventListener("click", () => startOperation("drive"));
 $("copy-handoff").addEventListener("click", copyHandoff);
-$("open-chat").addEventListener("click", openNewChat);
+$("open-chat").addEventListener("click", copyAndOpenChat);
 $("ask").addEventListener("click", askChatGPT);
 $("library-ask").addEventListener("click", askAboutLibraryFile);
 $("cancel").addEventListener("click", () => changeOperation("cancel"));

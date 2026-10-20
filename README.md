@@ -78,7 +78,7 @@ python pipeline.py --video 'D:\path\to\video.mp4' --dry-run --slide-extractor st
 
 ### v17：介面視覺更新
 
-widget 改為卡片式版面：標題區、主要動作按鈕（「交給 ChatGPT 整理」為主按鈕）、狀態提示框、缺漏提醒框，證據列的時間碼改為可點的標籤，逐字稿／畫面觀察以不同顏色區分；淺色、深色（依 ChatGPT 的 `window.openai.theme`，沒有時依系統設定）與 320px 手機寬度都可讀。元素 id、按鈕文字與證據列子元素順序不變，行為與 v16 相同。UI URI 升為 `ui://video-timeline-pipeline/v17-<媒體網址 hash>.html`，保留 v15、v16 URI 回傳目前的 widget。
+widget 改為卡片式版面：標題區、主要動作按鈕（「交給 ChatGPT 整理」為主按鈕）、狀態提示框、缺漏提醒框，證據列的時間碼改為可點的標籤，逐字稿／畫面觀察以不同顏色區分；淺色、深色（依 ChatGPT 的 `window.openai.theme`，沒有時依系統設定）與 320px 手機寬度都可讀。Drive 原片交接區把「一鍵複製」與「開新一般對話」合成主按鈕「複製並開新一般對話」：先複製，再嘗試開新分頁並顯示開新對話連結（瀏覽器擋下分頁時按連結）；複製失敗時不開分頁，改全選交接內容並顯示同一個連結；保留次要的「只複製」。其餘元素 id、按鈕文字與證據列子元素順序不變，行為與 v16 相同。UI URI 升為 `ui://video-timeline-pipeline/v17-<媒體網址 hash>.html`，保留 v15、v16 URI 回傳目前的 widget。
 
 ### v16：MiniMax 不穩時仍一次到位、升版免重新整理工具
 
