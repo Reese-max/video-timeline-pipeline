@@ -245,18 +245,28 @@ Apify Token 一律放在 `Authorization` header，不放 URL、輸出或 Git。A
 排程刷新（沒加 `--allow-batch-cloud` 的 `--rss-refresh`）預設不跑任何付費盤點。`RSS_PAID_DISCOVERY` 以逗號列出排程可自行使用的供應商（`apify`、`brightdata`），例如 `RSS_PAID_DISCOVERY=brightdata` 即可讓 Facebook Bright Data 與 Instagram 作者訂閱自動刷新，不必在排程加 `--allow-batch-cloud`；`RSS_PAID_DISCOVERY=apify` 則只放行 Apify。每次 Apify run 仍以 `APIFY_MAX_TOTAL_CHARGE_USD` 封頂，供應商方案的每月上限才是最終上限。
 `RSS_PAID_DISCOVERY_MIN_HOURS`（小時，預設 0＝不限）讓這類排程自行放行的付費盤點每個訂閱至少間隔指定時間：例如排程每天跑 3 次時設 `20`，正常排程下每個 Apify 粉專約每天盤點一次（這是最短間隔、不是日曆日：停機後補跑可能同一天兩次；也是每個訂閱各自計算，不是帳戶總額上限）；未到間隔的訂閱記為 `deferred`、不算失敗，免費的 RSS／YouTube 照常每次刷新。間隔從每次付費嘗試起算，且在送出前就先存檔（失敗或中途被中斷的 run 也可能已計費）；明確加 `--allow-batch-cloud` 不受限，但仍會重設起算時間。
 
-公開 Facebook Page 也可用 Bright Data Reels by profile URL（dataset `gd_lyclm3ey2q6rww027t`）：
+公開 Facebook Page 也可用 Bright Data，支援 Reels by profile URL（dataset `gd_lyclm3ey2q6rww027t`）與 Pages Posts by profile URL（dataset `gd_lkaxegm826bjpoo9m5`）兩種模式：
 
 ```powershell
 python pipeline.py --facebook-author '<PUBLIC_PAGE>' --facebook-provider brightdata --facebook-max-items 20 --facebook-since 365d --allow-batch-cloud
 python pipeline.py --rss-update '<SUBSCRIPTION_ID>' --facebook-max-items 10
+python pipeline.py --rss-update '<SUBSCRIPTION_ID>' --facebook-brightdata-mode posts
+python pipeline.py --facebook-author '<PUBLIC_PAGE>' --facebook-provider brightdata --facebook-brightdata-mode posts --facebook-max-items 2 --facebook-discover-only --allow-batch-cloud
 ```
+
+`--facebook-brightdata-mode {auto,reels,posts}` 只適用於 Bright Data 的 Facebook 作者新增／盤點及訂閱更新，存為 `facebook_brightdata_mode`，OPML 以 `vidbeeFacebookBrightdataMode` 保留。預設 `auto`（舊訂閱缺欄位亦同）先用 Reels；只有整份 Reels 結果全部為 error record、且每筆 `error_code` 都是 `dead_page` 時，同一次執行才會再預留一次額度並送出 posts trigger。其他錯誤、部分錯誤或空結果都不切換；明確指定 `reels` 也不切換。兩種模式使用分開的回執，重試沿用各自的 snapshot。
+
+既有訂閱刷新時一旦觀察到上述 `dead_page`，會在送出 posts 前保存為 `posts`，之後刷新直接使用 Pages Posts；即使 posts 失敗或額度不足也保留此模式。新增（含 OPML 匯入）只有整次成功才建立訂閱並保存 posts 模式，失敗不留訂閱；重試沿用 Reels 與 posts 各自的回執，不重送已提交的 trigger。`--facebook-discover-only` 沒有訂閱，只在當次執行切換並在輸出標示；可用訂閱更新改回 `auto` 或固定 `reels`。
+
+Pages Posts 會採集所有貼文類型，**非影片貼文也計費**，沒有只抓影片的供應商參數；本機只把 `post_type` 為 Reel／Video、或 attachment 為 Video／帶 `video_url` 的項目加入影片佇列，不把會過期的 CDN `video_url` 當影片來源網址。首次自動切換的 Reels 錯誤結果也會計費，posts 另計。盤點輸出顯示實際模式、切換及原始／影片／非影片／錯誤筆數。
+
+posts 成功盤點並保存訂閱狀態後，所有有效 `post_id`（含非影片及本機日期篩選排除的貼文）合併進 `facebook_seen_post_ids`，去重保留最近觀察的 500 筆；下次與既有影片 entry ID 一起傳入 `posts_to_not_include`，避免照片等非影片重複採集計費。超過保留上限而被移除的 ID 仍可能再被採集；沒有有效 ID 的貼文無法用這個欄位排除。Reels 模式仍只排除既有影片 ID。
 
 `--facebook-max-items` 是 Bright Data 必填的正整數結果預算，存為 `facebook_max_items`，並隨 OPML 匯出／匯入；`--facebook-discover-only` 可只盤點。只用 collect_by_url，傳送作者 URL、`num_of_posts` 與已知 ID 的 `posts_to_not_include`，不送 `type`、`discover_by` 或日期欄位。`--facebook-since` 依 `date_posted` 在本機篩選；缺日期的影片保留並回報 `missing_date_count`，不宣稱回溯範圍完整。成功存檔後才推進 `facebook_last_snapshot_id`。
 
 `RSS_FACEBOOK_FALLBACK_PROVIDER` 預設空值；可設 `apify`（其他值會拒絕）。只有 Bright Data 帳本在送出前拒絕額度，且 Apify 另經 `RSS_PAID_DISCOVERY=apify,brightdata` 或明確 `--allow-batch-cloud` 放行時，才使用 Apify 備援。結果會記錄 `provider=apify`、`fallback_from=brightdata`；Bright Data 送出後的失敗、逾時或回應不明不啟動備援，避免雙重計費。
 
-Facebook／Instagram 的 Bright Data 作者盤點會照實結算所有 record（含錯誤），以 `error_count`／`errors` 回報錯誤（最多 3 筆、訊息各前 200 字），CLI 顯示原始／有效／錯誤筆數；全部為錯誤時盤點與刷新失敗並保留原因及原回執，重試沿用 snapshot、不新增計費 trigger，部分錯誤則保留正常項目。
+Facebook／Instagram 的 Bright Data 作者盤點會照實結算所有 record（含錯誤），以 `error_count`／`errors` 回報錯誤（最多 3 筆、訊息各前 200 字），CLI 顯示原始／有效／錯誤筆數；除 Facebook auto 的全 `dead_page` 切換外，全部為錯誤時盤點與刷新失敗並保留原因及原回執，重試沿用 snapshot、不新增計費 trigger，部分錯誤則保留正常項目。
 
 ### Bright Data 共用免費月額度
 
