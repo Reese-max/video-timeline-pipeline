@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- 新增：`RSS_PAID_DISCOVERY_MIN_HOURS` 限制排程自行放行的付費盤點（如 Apify 粉專）每個訂閱的最短間隔；未到間隔記為 `deferred`，明確 `--allow-batch-cloud` 不受限。
 - 修正：Apify 粉專盤點成功後寫快照時因 `max_total_charge_usd` 是 Decimal 而崩潰（10-21 A1 實測：run 已計費、結果卻沒存下）；改存字串並加回歸測試。
 - 新增：`RSS_PAID_DISCOVERY`（如 `apify`）讓排程刷新只對列出的付費盤點供應商自行放行，其他供應商仍須 `--allow-batch-cloud`。
 - 新增：RSS 處理完成的影片把 `knowledge.md` 存到 Drive「RSS 自動摘要」資料夾（ID 先存檔、同內容沿用、不覆寫被改動的檔案；Drive 失敗只記錄不讓影片失敗；`RSS_DRIVE_UPLOAD=false` 可關閉）；完成通知加上前 300 字摘要與 Drive 連結。
