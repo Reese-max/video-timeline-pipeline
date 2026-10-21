@@ -3,6 +3,8 @@ import concurrent.futures
 import datetime as dt
 import os
 import tempfile
+import threading
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -31,6 +33,19 @@ class CreditLedgerTests(unittest.TestCase):
         self.assertEqual(credits.usage()["used"], 3)
         self.assertEqual(credits.usage()["reserved"], 0)
         self.assertEqual(credits.usage()["remaining"], 7)
+
+    def test_release_only_removes_unsettled_reservation(self):
+        pending = credits.reserve(5, daily_post=True, reservation_id="pending")
+        settled = credits.reserve(2, reservation_id="settled")
+        credits.settle(settled, 1)
+        credits.release(pending)
+        credits.release(settled)
+        credits.release("missing")
+        state = credits.usage()
+        self.assertEqual((state["reserved"], state["used"], state["daily_posts_used"]), (0, 1, 0))
+        with self.assertRaisesRegex(RuntimeError, "禁止重送"):
+            credits.reserve(1, reservation_id=settled)
+        credits.reserve(5, reservation_id=pending)
 
     def test_unknown_remains_charged_and_actual_can_exceed_reservation(self):
         credits.reserve(4)
@@ -74,13 +89,23 @@ class CreditLedgerTests(unittest.TestCase):
         self.assertEqual(credits.usage(now=today + dt.timedelta(days=1))["daily_posts_used"], 0)
 
     def test_two_connections_cannot_overreserve(self):
+        credits.usage()  # Create the schema before racing the two independent connections.
+        start = threading.Barrier(2)
+        original_usage = credits._usage
+
+        def slow_usage(*args):
+            state = original_usage(*args)
+            time.sleep(0.3)  # Without BEGIN IMMEDIATE, both readers see zero before either writes.
+            return state
+
         def reserve():
+            start.wait(timeout=5)
             try:
                 credits.reserve(6)
                 return True
             except credits.BrightDataQuotaError:
                 return False
-        with concurrent.futures.ThreadPoolExecutor(2) as pool:
+        with patch.object(credits, "_usage", side_effect=slow_usage), concurrent.futures.ThreadPoolExecutor(2) as pool:
             self.assertEqual(sorted(pool.map(lambda _: reserve(), range(2))), [False, True])
         self.assertEqual(credits.usage()["reserved"], 6)
 

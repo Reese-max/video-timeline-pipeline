@@ -5430,7 +5430,7 @@ def fetch_facebook_author(
         try:
             return fetch_facebook_author_brightdata(
                 author, since, max_items=max_items, exclude_ids=exclude_ids,
-                allow_paid=paid_discovery_allowed("brightdata", allow_paid), root=root,
+                allow_paid=allow_paid, root=root,
                 previous_snapshot_id=previous_snapshot_id)
         except brightdata_credits.BrightDataQuotaError:
             # Scheduling permission for Bright Data must not silently authorize Apify too.
@@ -5692,18 +5692,20 @@ def submit_brightdata_once(folder: Path, url: str, headers: dict[str, str], body
             raise RuntimeError(f"上次送出狀態不明，禁止再次計費採集；請核對 {folder} 與 Bright Data。")
         # 預留在寫 .submitted 標記之前：被拒絕時代表完全沒送出，不該留下
         # 「送出狀態不明」的回執擋住後續對帳。
+        inputs = receipt["input"]
+        inputs = inputs.get("input") if isinstance(inputs, dict) else inputs
+        credit_count = sum(item.get("num_of_posts", 1) for item in inputs)
+        reservation_id = hashlib.sha256(
+            f"{folder.resolve()}:{url}:{fingerprint}".encode("utf-8")).hexdigest()
+        receipt["credit_reservation_id"] = brightdata_credits.reserve(
+            credit_count, daily_post=daily_post, reservation_id=reservation_id)
+        marker_created = False
         try:
             with cost_guard("brightdata", "datasets.trigger") as guard_outcome:
-                inputs = receipt["input"]
-                inputs = inputs.get("input") if isinstance(inputs, dict) else inputs
-                credit_count = sum(item.get("num_of_posts", 1) for item in inputs)
-                reservation_id = hashlib.sha256(
-                    f"{folder.resolve()}:{url}:{fingerprint}".encode("utf-8")).hexdigest()
-                receipt["credit_reservation_id"] = brightdata_credits.reserve(
-                    credit_count, daily_post=daily_post, reservation_id=reservation_id)
                 # ponytail: uncertain submissions stay blocked; provider-side reconciliation is manual.
                 try:
                     with marker_path.open("x", encoding="utf-8") as marker:
+                        marker_created = True
                         json.dump(receipt, marker, ensure_ascii=False)
                         marker.flush()
                         os.fsync(marker.fileno())
@@ -5729,6 +5731,10 @@ def submit_brightdata_once(folder: Path, url: str, headers: dict[str, str], body
                 guard_outcome.provider_operation_id = snapshot_hint
         except SubmissionUncertainError:
             pass
+        except BaseException:
+            if not marker_created and not marker_path.exists():
+                brightdata_credits.release(reservation_id)
+            raise
         receipt["received_at"] = rss_now()
         receipt = json.loads(redact_values(json.dumps(receipt, ensure_ascii=False),
                                           {json.dumps(token, ensure_ascii=False)[1:-1]}))
@@ -8673,6 +8679,11 @@ def run_pipeline(args: argparse.Namespace) -> Path:
 def main() -> int:
     args = parse_args()
     if args.brightdata_usage:
+        root = args.root.resolve()
+        project_env = Path(__file__).resolve().parent / ".env"
+        load_dotenv(project_env)
+        if (root / ".env").resolve() != project_env.resolve():
+            load_dotenv(root / ".env")
         print(json.dumps(brightdata_credits.usage(), ensure_ascii=False))
         return 0
     # 成本守衛要綁到這次執行的專案根目錄，否則 strict 模式會拒絕所有付費傳輸。

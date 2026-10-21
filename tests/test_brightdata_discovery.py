@@ -7,10 +7,15 @@ import os
 import tempfile
 import unittest
 import urllib.parse
+from contextlib import closing, nullcontext
 from pathlib import Path
 from unittest.mock import patch
 
 import pipeline
+import cost_tracker
+from notifications import get_operations_db
+
+REAL_LOAD_DOTENV = pipeline.load_dotenv
 with patch.object(pipeline, "load_dotenv"):
     import mcp_server as server
 
@@ -42,6 +47,122 @@ class BrightDataDiscoveryTests(unittest.TestCase):
     def facebook(self, **kwargs):
         return pipeline.fetch_facebook_author("example", "2026-01-01", "brightdata",
             max_items=5, allow_paid=True, root=self.root, **kwargs)
+
+    def test_facebook_manual_paths_require_explicit_permission_despite_env(self):
+        opml = self.root / "subscriptions.opml"
+        opml.write_text('<opml><body><outline xmlUrl="https://facebook.com/example" '
+                        'vidbeeKind="facebook-author" vidbeeFacebookProvider="brightdata" '
+                        'vidbeeFacebookMaxItems="5" /></body></opml>', encoding="utf-8")
+        with patch.dict(os.environ, {"RSS_PAID_DISCOVERY": "brightdata"}), \
+                patch.object(pipeline, "secure_rss_directory", return_value=self.root / "rss"), \
+                patch.object(pipeline, "rss_writer_lock", side_effect=lambda root: nullcontext()), \
+                patch.object(pipeline.brightdata_credits, "reserve", wraps=pipeline.brightdata_credits.reserve) as reserve:
+            with self.subTest(path="cli"), patch.object(pipeline.sys, "argv", ["pipeline.py",
+                    "--facebook-author", "example", "--facebook-provider", "brightdata",
+                    "--facebook-max-items", "5", "--facebook-discover-only", "--root", str(self.root)]):
+                with self.assertRaisesRegex(RuntimeError, "--allow-batch-cloud"):
+                    pipeline.run_rss_command(pipeline.parse_args())
+            with self.subTest(path="subscription"):
+                with self.assertRaisesRegex(RuntimeError, "--allow-batch-cloud"):
+                    pipeline.add_facebook_subscription(self.root, "example", provider="brightdata",
+                                                       max_items=5, allow_paid=False)
+            with self.subTest(path="opml"):
+                self.assertEqual(pipeline.import_rss_opml(self.root / "imported", opml, allow_paid=False),
+                                 {"added": 0, "existing": 0, "failed": 1})
+            reserve.assert_not_called()
+        self.submit.assert_not_called()
+        self.read.assert_not_called()
+        self.assertEqual(self.usage()["reserved"], 0)
+        self.assertEqual(list(self.root.rglob(".submitted")), [])
+
+    def test_facebook_refresh_env_permission_reaches_transport(self):
+        state = {"subscriptions": [{"id": "fb", "kind": "facebook-author",
+                 "url": "https://facebook.com/example", "facebook_page_id": "example",
+                 "facebook_provider": "brightdata", "facebook_max_items": 5}], "items": []}
+        with patch.dict(os.environ, {"RSS_PAID_DISCOVERY": "brightdata"}), \
+                patch.object(pipeline, "load_rss_state", return_value=state), \
+                patch.object(pipeline, "save_rss_state"), \
+                patch.object(pipeline, "secure_rss_directory", return_value=self.root / "rss"), \
+                patch.object(pipeline, "write_facebook_discovery", return_value=self.root / "latest.json"):
+            self.assertEqual(pipeline.refresh_rss(self.root)["failed"], 0)
+        self.submit.assert_called_once()
+        self.assertEqual(state["subscriptions"][0]["facebook_last_snapshot_id"], "sd_test")
+
+    def test_usage_cli_loads_only_temporary_project_then_root_env(self):
+        project = self.root / "project"
+        project.mkdir()
+        project_ledger = project / "credits.sqlite3"
+        (project / ".env").write_text(
+            f"BRIGHTDATA_CREDIT_LEDGER={project_ledger}\nBRIGHTDATA_MONTHLY_CREDIT_LIMIT=17\n"
+            "BRIGHTDATA_POST_DAILY_LIMIT=4\n", encoding="utf-8")
+        other_root = self.root / "output"
+        other_root.mkdir()
+        root_ledger = other_root / "credits.sqlite3"
+        (other_root / ".env").write_text(
+            f"BRIGHTDATA_CREDIT_LEDGER={root_ledger}\nBRIGHTDATA_MONTHLY_CREDIT_LIMIT=23\n"
+            "BRIGHTDATA_POST_DAILY_LIMIT=6\n", encoding="utf-8")
+        for root, ledger, limit, daily, paths in (
+                (project, project_ledger, 17, 4, [project / ".env"]),
+                (other_root, root_ledger, 23, 6, [project / ".env", other_root / ".env"])):
+            with self.subTest(root=root), patch.object(pipeline, "__file__", str(project / "pipeline.py")), \
+                    patch.object(pipeline, "load_dotenv", wraps=REAL_LOAD_DOTENV) as load, \
+                    patch.object(pipeline.sys, "argv", ["pipeline.py", "--brightdata-usage", "--root", str(root)]), \
+                    patch("sys.stdout", new_callable=io.StringIO) as stdout:
+                self.assertEqual(pipeline.main(), 0)
+                result = json.loads(stdout.getvalue())
+                self.assertEqual((result["limit"], result["daily_post_limit"]), (limit, daily))
+                self.assertEqual(pipeline.brightdata_credits.ledger_path(), ledger)
+                self.assertTrue(ledger.is_file())
+                self.assertEqual([call.args[0].resolve() for call in load.call_args_list],
+                                 [path.resolve() for path in paths])
+        self.submit.assert_not_called()
+        self.read.assert_not_called()
+
+    def test_credit_rejection_does_not_enter_usd_ledger(self):
+        cost_tracker.get_cost_report(self.root)
+        with cost_tracker.cost_root_scope(self.root), \
+                patch.dict(os.environ, {"BRIGHTDATA_MONTHLY_CREDIT_LIMIT": "0"}):
+            with self.assertRaises(pipeline.brightdata_credits.BrightDataQuotaError):
+                pipeline.submit_brightdata_once(self.root / "trigger", "https://offline.invalid/trigger",
+                                               {}, b'[{"url":"https://instagram.com/p/ABC"}]')
+        with closing(get_operations_db(self.root)) as connection:
+            self.assertEqual(connection.execute("SELECT COUNT(*) FROM usage_costs").fetchone()[0], 0)
+            self.assertEqual(connection.execute("SELECT COUNT(*) FROM budget_reservations").fetchone()[0], 0)
+        self.submit.assert_not_called()
+        self.assertEqual(list(self.root.rglob(".submitted")), [])
+
+    def test_usd_strict_rejection_releases_credit_and_allows_safe_retry(self):
+        pipeline.brightdata_credits.reserve(3)
+        folder = self.root / "trigger"
+        body = b'[{"url":"https://instagram.com/p/ABC"}]'
+        with cost_tracker.cost_root_scope(self.root), \
+                patch.dict(os.environ, {"DAILY_BUDGET_USD": "1", "BUDGET_HARD_STOP": "true"}), \
+                patch.object(pipeline.brightdata_credits, "reserve", wraps=pipeline.brightdata_credits.reserve) as reserve:
+            with self.assertRaises(cost_tracker.BudgetBlockedError):
+                pipeline.submit_brightdata_once(folder, "https://offline.invalid/trigger", {}, body, daily_post=True)
+            reserve.assert_called_once()
+        self.assertEqual(self.usage()["reserved"], 3)
+        self.assertEqual(self.usage()["daily_posts_used"], 0)
+        self.submit.assert_not_called()
+        self.assertFalse((folder / ".submitted").exists())
+        self.assertFalse((folder / "submission.json").exists())
+        with cost_tracker.cost_root_scope(None):
+            self.assertEqual(pipeline.submit_brightdata_once(
+                folder, "https://offline.invalid/trigger", {}, body, daily_post=True), "sd_test")
+        self.assertEqual(self.usage()["reserved"], 4)
+        self.assertEqual(self.usage()["daily_posts_used"], 1)
+
+    def test_transport_failure_after_marker_keeps_credit_reservation(self):
+        folder = self.root / "trigger"
+        self.submit.side_effect = cost_tracker.BudgetBlockedError("transport failed after marker")
+        with cost_tracker.cost_root_scope(None):
+            with self.assertRaises(RuntimeError):
+                pipeline.submit_brightdata_once(folder, "https://offline.invalid/trigger", {}, b'[{}]')
+            with self.assertRaises(RuntimeError):
+                pipeline.submit_brightdata_once(folder, "https://offline.invalid/trigger", {}, b'[{}]')
+        self.assertTrue((folder / ".submitted").exists())
+        self.assertEqual(self.usage()["reserved"], 1)
+        self.submit.assert_called_once()
 
     def test_quota_rejection_no_http_or_submitted_marker(self):
         with patch.dict(os.environ, {"BRIGHTDATA_MONTHLY_CREDIT_LIMIT": "0"}):

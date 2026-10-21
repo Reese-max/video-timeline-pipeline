@@ -103,6 +103,13 @@ def reserve(credits: int, *, daily_post: bool = False, now: dt.datetime | None =
     return reservation_id
 
 
+def release(reservation_id: str) -> None:
+    """Release only an unsettled reservation for a trigger known not to have been sent."""
+    with closing(_connect()) as connection, connection:
+        connection.execute("BEGIN IMMEDIATE")
+        connection.execute("DELETE FROM reservations WHERE id=? AND actual IS NULL", (reservation_id,))
+
+
 def settle(reservation_id: str, actual: int) -> None:
     if isinstance(actual, bool) or not isinstance(actual, int) or actual < 0:
         raise ValueError("Bright Data 實際 credit 數必須是非負整數。")
