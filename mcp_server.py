@@ -757,51 +757,128 @@ def restore_before_download(job_dir: Path) -> Path | None:
         return None
 
 
-def split_video(video_path: Path, segment_dir: Path, segment_seconds: int) -> list[tuple[Path, float, float]]:
-    segment_dir.mkdir(parents=True, exist_ok=True)
-    for stale in segment_dir.glob("segment_*.mp4"):
-        stale.unlink()
-    pipeline.run_external(
-        [
-            pipeline.require_tool("ffmpeg"),
-            "-y",
-            "-hide_banner",
-            "-loglevel",
-            "error",
-            "-i",
-            str(video_path),
-            "-map",
-            "0:v:0",
-            "-map",
-            "0:a:0?",
-            "-c:v",
-            "libx264",
-            "-preset",
-            "veryfast",
-            "-crf",
-            "28",
-            "-c:a",
-            "aac",
-            "-b:a",
-            "96k",
-            "-force_key_frames",
-            f"expr:gte(t,n_forced*{segment_seconds})",
-            "-f",
-            "segment",
-            "-segment_time",
-            str(segment_seconds),
-            "-segment_list",
-            str(segment_dir / "segments.csv"),
-            "-segment_list_type",
-            "csv",
-            "-avoid_negative_ts",
-            "disabled",
-            "-reset_timestamps",
-            "1",
-            str(segment_dir / "segment_%03d.mp4"),
-        ],
-        stream=True,
+SPLIT_PROGRESS_BASE = 45
+SPLIT_PROGRESS_LIMIT = 64  # 下一階段 previews 從 65 開始
+
+
+def split_encoder_args() -> list[str]:
+    # 回傳值會寫進 segments/.split-params.json；之後改這裡的參數會讓舊分段整批失效重切。
+    return [
+        "-map",
+        "0:v:0",
+        "-map",
+        "0:a:0?",
+        "-c:v",
+        "libx264",
+        "-preset",
+        "veryfast",
+        "-crf",
+        "28",
+        "-c:a",
+        "aac",
+        "-b:a",
+        "96k",
+    ]
+
+
+def _split_params(video_path: Path, segment_seconds: int) -> dict:
+    return {
+        "version": 1,
+        "source": pipeline.file_fingerprint(video_path),
+        "segment_seconds": segment_seconds,
+        "encoder_args": split_encoder_args(),
+    }
+
+
+def _read_segment_csv(path: Path) -> list[list[str]]:
+    try:
+        text = path.read_text(encoding="utf-8-sig")
+    except OSError:
+        return []
+    return [row for row in csv.reader(text.splitlines()) if row]
+
+
+def _write_segment_csv(path: Path, rows: list[tuple[str, float, float]]) -> None:
+    pipeline.write_text(path, "".join(f"{name},{start},{end}\n" for name, start, end in rows))
+
+
+def _count_segment_list_rows(path: Path) -> int:
+    return sum(1 for row in _read_segment_csv(path) if len(row) >= 3)
+
+
+def _completed_segment_rows(
+    segment_dir: Path, rows: list[list[str]], first_index: int = 0,
+    min_start: float = 0.0, max_start: float = 1.0
+) -> list[tuple[str, float, float]]:
+    """csv 中編號連續、檔案存在且時間連續的最長前綴。"""
+    completed: list[tuple[str, float, float]] = []
+    previous_end = 0.0
+    for offset, row in enumerate(rows):
+        filename = f"segment_{first_index + offset:03d}.mp4"
+        if len(row) != 3 or Path(row[0]).name != filename or not (segment_dir / filename).is_file():
+            break
+        try:
+            start, end = float(row[1]), float(row[2])
+        except ValueError:
+            break
+        if offset == 0:
+            continuous = min_start - 0.001 <= start <= max_start
+        else:
+            continuous = start >= previous_end - 0.001
+        if not (math.isfinite(start) and math.isfinite(end) and start < end and continuous):
+            break
+        completed.append((filename, start, end))
+        previous_end = end
+    return completed
+
+
+def _merge_offset_rows(
+    completed: list[tuple[str, float, float]], rows: list[tuple[str, float, float]], offset: float
+) -> None:
+    """暫存清單的時間以 -ss 定位點為零，加回偏移並對齊前段結尾，避免重疊。"""
+    previous_end = completed[-1][2] if completed else 0.0
+    for name, start, end in rows:
+        merged_start = max(start + offset, previous_end)
+        merged_end = end + offset
+        if merged_end <= merged_start:
+            continue
+        completed.append((name, merged_start, merged_end))
+        previous_end = merged_end
+
+
+def _split_progress_value(done: int, expected: int | None, made: int, elapsed: float) -> tuple[int, str]:
+    if not expected:
+        return SPLIT_PROGRESS_BASE, f"切割影片分段 {done} 段"
+    shown = min(done, expected)
+    current = min(
+        SPLIT_PROGRESS_LIMIT,
+        SPLIT_PROGRESS_BASE + int((SPLIT_PROGRESS_LIMIT - SPLIT_PROGRESS_BASE) * shown / expected),
     )
+    message = f"切割影片分段 {shown}/{expected}"
+    remaining = expected - shown
+    if made > 0 and remaining > 0 and elapsed > 0:
+        eta = elapsed / made * remaining
+        message += f"（預估剩餘約 {max(1, math.ceil(eta / 60))} 分鐘）"
+    return current, message
+
+
+def _report_split_progress(
+    stop: threading.Event, count_done, expected: int | None, baseline: int, started: float
+) -> None:
+    while True:
+        try:
+            done = count_done()
+            current, message = _split_progress_value(
+                done, expected, max(0, done - baseline), time.monotonic() - started
+            )
+            report_progress("split", current, message)
+        except Exception:
+            pass
+        if stop.wait(5.0):
+            return
+
+
+def _validated_segments(segment_dir: Path, duration: float | None) -> list[tuple[Path, float, float]]:
     segments = sorted(segment_dir.glob("segment_*.mp4"), key=lambda p: int(p.stem.split("_")[-1]))
     if not segments:
         raise RuntimeError("FFmpeg 沒有產生影片片段。")
@@ -819,6 +896,121 @@ def split_video(video_path: Path, segment_dir: Path, segment_seconds: int) -> li
             raise RuntimeError("FFmpeg 影片分段時間無效或重疊。")
         result.append((path, start, end))
         previous_end = end
+    if duration is not None and math.isfinite(duration) and duration > 0 \
+            and abs(result[-1][2] - duration) > 1.0:
+        raise RuntimeError("FFmpeg 影片分段結束時間與影片長度不符。")
+    return result
+
+
+def split_video(video_path: Path, segment_dir: Path, segment_seconds: int,
+                duration: float | None = None) -> list[tuple[Path, float, float]]:
+    segment_dir.mkdir(parents=True, exist_ok=True)
+    list_path = segment_dir / "segments.csv"
+    resume_path = segment_dir / "segments.resume.csv"
+    marker_path = segment_dir / ".split-params.json"
+    params = _split_params(video_path, segment_seconds)
+    try:
+        saved = json.loads(marker_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        saved = None
+    completed: list[tuple[str, float, float]] = []
+    if saved == params:
+        # 參數一致：以 segments.csv 為準保留已完成分段，上次續切留下的暫存清單先救回，
+        # 其餘未列入 csv 的 segment_*.mp4 都是中斷半成品，一律刪除。
+        completed = _completed_segment_rows(segment_dir, _read_segment_csv(list_path))
+        if resume_path.is_file():
+            # 上次續切用的定位點是 completed[-1][2] - 0.001（見下方 seek 計算），
+            # 救回暫存清單時要用同一個偏移才能把相對時間對回主時間軸。
+            _merge_offset_rows(
+                completed,
+                _completed_segment_rows(segment_dir, _read_segment_csv(resume_path),
+                                        first_index=len(completed), min_start=-0.5,
+                                        max_start=segment_seconds + 1.0),
+                max(0.0, completed[-1][2] - 0.001) if completed else 0.0,
+            )
+            resume_path.unlink(missing_ok=True)
+        _write_segment_csv(list_path, completed)
+        keep = {name for name, _, _ in completed}
+        for stale in segment_dir.glob("segment_*.mp4"):
+            if stale.name not in keep:
+                stale.unlink()
+    else:
+        # 先清舊分段再寫標記：若寫完標記才刪，中斷會讓下輪把舊參數的分段誤認成可續用。
+        for stale in segment_dir.glob("segment_*.mp4"):
+            stale.unlink()
+        list_path.unlink(missing_ok=True)
+        resume_path.unlink(missing_ok=True)
+        pipeline.write_json(marker_path, params)
+
+    expected = (math.ceil(duration / segment_seconds)
+                if duration and math.isfinite(duration) and duration > 0 else None)
+    finished = (bool(completed) and duration is not None and math.isfinite(duration)
+                and duration > 0 and completed[-1][2] >= duration - 1.0)
+    if not finished:
+        offset = completed[-1][2] if completed else 0.0
+        # 定位點往前 1ms：csv 記錄的邊界經過 %.6f 捨入，直接以記錄值 seek 可能
+        # 把邊界影格丟掉；1ms 遠小於任何影格間隔，不會多收前段內容。
+        seek = max(0.0, offset - 0.001)
+        index = len(completed)
+        active_list = list_path if index == 0 else resume_path
+        command = [
+            pipeline.require_tool("ffmpeg"),
+            "-y",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+        ]
+        if seek > 0:
+            command += ["-ss", f"{seek:.6f}"]
+        command += ["-i", str(video_path)]
+        command += split_encoder_args()
+        command += [
+            "-force_key_frames",
+            f"expr:gte(t,n_forced*{segment_seconds})",
+            "-f",
+            "segment",
+            "-segment_time",
+            str(segment_seconds),
+            "-segment_list",
+            str(active_list),
+            "-segment_list_type",
+            "csv",
+            "-segment_start_number",
+            str(index),
+            "-avoid_negative_ts",
+            "disabled",
+            "-reset_timestamps",
+            "1",
+            str(segment_dir / "segment_%03d.mp4"),
+        ]
+        stop = threading.Event()
+        started = time.monotonic()
+        progress = threading.Thread(
+            target=_report_split_progress,
+            args=(stop, lambda: index + _count_segment_list_rows(active_list),
+                  expected, index, started),
+            daemon=True,
+        )
+        progress.start()
+        try:
+            pipeline.run_external(command, stream=True)
+        finally:
+            stop.set()
+            progress.join()
+        if index:
+            _merge_offset_rows(
+                completed,
+                _completed_segment_rows(segment_dir, _read_segment_csv(resume_path),
+                                        first_index=index, min_start=-0.5,
+                                        max_start=segment_seconds + 1.0),
+                seek,
+            )
+            _write_segment_csv(list_path, completed)
+            resume_path.unlink(missing_ok=True)
+    result = _validated_segments(segment_dir, duration)
+    total = expected or len(result)
+    current, message = _split_progress_value(len(result), total, len(result), 0.0)
+    report_progress("split", current, message)
     return result
 
 
@@ -909,7 +1101,7 @@ def prepare_video_sync(url: str, segment_seconds: int, max_segments: int | None)
     require_disk_space(video_path.stat().st_size)
     report_progress("split", 45, "切割影片分段")
     pipeline.write_json(job_dir / "manifest.json", {"version": 2, "status": "preparing", "job_id": job_id})
-    segments = split_video(video_path, job_dir / "segments", segment_seconds)
+    segments = split_video(video_path, job_dir / "segments", segment_seconds, duration)
     if max_segments is not None and len(segments) > max_segments:
         raise RuntimeError(f"FFmpeg 產生 {len(segments)} 段，超過 max_segments={max_segments}。")
     previews_dir = job_dir / "previews"
