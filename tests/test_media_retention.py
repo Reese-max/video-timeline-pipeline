@@ -73,6 +73,57 @@ class RetentionTests(unittest.TestCase):
                 os.utime(result, (self.now - 8 * 86400,) * 2)
                 self.assertEqual(retention.cleanup(root, now=self.now)["selected_files"], expected)
 
+    def test_chunk_segments_left_by_a_failed_run_are_cleaned(self):
+        # A chunked analysis that failed before its merge leaves the segment
+        # files behind; the retention rules have to be able to remove them.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve() / "mcp_jobs"
+            job = self.make_job(root)
+            run = "analysis/runs/" + ("a" * 64)
+            chunk_dir = job / run / "vision-video-work/minimax-chunks"
+            chunk_dir.mkdir(parents=True, exist_ok=True)
+            (chunk_dir / "chunk-0000.mp4").write_bytes(b"segment")
+            (chunk_dir / "chunk-0001.mp4").write_bytes(b"segment")
+            (chunk_dir / "chunks.csv").write_text("keep", encoding="utf-8")
+            work_dir = chunk_dir / "chunk-0000-work"
+            work_dir.mkdir(parents=True, exist_ok=True)
+            (work_dir / "minimax-compressed.mp4").write_bytes(b"compressed")
+            (work_dir / "minimax-upload-abc.json").write_text("keep", encoding="utf-8")
+            for path in job.rglob("*"):
+                if path.is_file():
+                    os.utime(path, (self.now - 8 * 86400,) * 2)
+            relative = (run + "/vision-video-work/minimax-chunks/chunk-0000.mp4")
+            self.assertTrue(retention.MEDIA.fullmatch(relative))
+            self.assertTrue(retention.DERIVED.fullmatch(relative))
+            report = retention.cleanup(root, now=self.now)
+            # The six media files of the job plus the three segment files.
+            self.assertEqual(report["selected_files"], 9)
+            report = retention.cleanup(root, apply=True, now=self.now)
+            self.assertEqual(report["deleted_files"], 9)
+            self.assertEqual(report["errors"], [])
+            self.assertFalse((chunk_dir / "chunk-0000.mp4").exists())
+            self.assertFalse((chunk_dir / "chunk-0001.mp4").exists())
+            self.assertFalse((work_dir / "minimax-compressed.mp4").exists())
+            # Records stay: the segment list and the upload receipt.
+            self.assertTrue((chunk_dir / "chunks.csv").exists())
+            self.assertTrue((work_dir / "minimax-upload-abc.json").exists())
+
+    def test_chunk_pattern_does_not_take_other_files(self):
+        run = "analysis/runs/" + ("a" * 64)
+        kept = [
+            run + "/vision-video-work/minimax-chunks/chunks.csv",
+            run + "/vision-video-work/minimax-chunks/chunk-0000-work/minimax-upload-abc.json",
+            run + "/vision-video-work/minimax-chunks/notes.mp4",
+            run + "/vision-video-work/minimax-chunks/chunk-abc.mp4",
+            "analysis/runs/not-a-hash/vision-video-work/minimax-chunks/chunk-0000.mp4",
+            "minimax-chunks/chunk-0000.mp4",
+            run + "/vision-video-work/minimax-chunks/chunk-0000-work/other.mp4",
+        ]
+        for relative in kept:
+            with self.subTest(relative=relative):
+                self.assertIsNone(retention.MEDIA.fullmatch(relative))
+                self.assertIsNone(retention.DERIVED.fullmatch(relative))
+
     def test_ineligible_jobs_are_untouched(self):
         for reason in ["exactly_7_days", "recent_write", "partial", "needs_review", "drive", "manual_hold", "invalid", "source_changed", "unfinished", "frame_era"]:
             with self.subTest(reason=reason), tempfile.TemporaryDirectory() as directory:

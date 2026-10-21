@@ -93,12 +93,33 @@ class VideoMp4OutputCeilingTests(unittest.TestCase):
         self.assertEqual(video_part["fps"], 1.0)
 
     def test_long_video_fps_drops_to_fit_context(self) -> None:
-        _, chat = self._run(7200.0)
+        # Chunking off: the long video is downsampled to stay inside the budget.
+        _, chat = self._run(7200.0, {"MINIMAX_VIDEO_CHUNKING": "off"})
         fps = chat.call_args.args[0][0]["content"][1]["video_url"]["fps"]
         self.assertLess(fps, 1.0)
         self.assertLessEqual(
             fps * 7200.0 * pipeline.MINIMAX_VIDEO_TOKENS_PER_FRAME,
             pipeline.MINIMAX_VIDEO_CONTEXT_TOKEN_BUDGET,
+        )
+
+    def test_long_video_is_chunked_instead_of_downsampled(self) -> None:
+        # Chunking on (the default): every segment keeps the requested fps.
+        root = Path(tempfile.mkdtemp(prefix="video-ceiling-"))
+        video = root / "clip.mp4"
+        video.write_bytes(b"fake-mp4-bytes")
+        chunk = pipeline.VideoMp4Chunk(video, 0.0, 1140.0)
+        with mock.patch.dict(os.environ, {"MINIMAX_VIDEO_CHUNKING": "on"}, clear=False), \
+             mock.patch.object(pipeline, "split_video_mp4_into_chunks", return_value=[chunk]), \
+             mock.patch.object(pipeline, "minimax_upload_video_understanding", return_value="fid"), \
+             mock.patch.object(pipeline, "minimax_chat", return_value=_spread_response(1140.0)) as chat:
+            pipeline.analyze_video_mp4(
+                video, "key", "MiniMax-M3", duration=7200.0, work_dir=root / "work"
+            )
+        video_part = chat.call_args.args[0][0]["content"][1]["video_url"]
+        self.assertEqual(video_part["fps"], 1.0)
+        self.assertEqual(
+            chat.call_args.kwargs["max_completion_tokens"],
+            pipeline.MINIMAX_VIDEO_MAX_COMPLETION_TOKENS,
         )
 
     def test_fps_floor(self) -> None:

@@ -22,12 +22,19 @@ import pipeline
 from media_lifecycle import StoragePolicy
 
 
+# Segments left behind by a chunked MiniMax analysis that failed before its
+# merge; a successful run deletes them together with the whole directory.
+CHUNK_MEDIA = (
+    r"analysis/runs/[a-f0-9]{64}/vision-video-work/minimax-chunks/"
+    r"(?:chunk-\d+\.mp4|chunk-\d+-work/minimax-compressed\.mp4)"
+)
 MEDIA = re.compile(
     r"(?:source\.(?:mp4|mkv|webm|mov|avi|m4v)|threads_media_\d+\.mp4|"
     r"segments/segment_\d+\.mp4|previews/preview_\d+\.jpg|"
     r"analysis/(?:runs/[a-f0-9]{64}/)?(?:frames|budgeted-frames)/frame_\d+\.jpg|"
     r"analysis/(?:runs/[a-f0-9]{64}/)?audio/audio_\d+\.mp3|"
-    r"analysis/runs/[a-f0-9]{64}/vision-video-work/minimax-compressed\.mp4)", re.I)
+    r"analysis/runs/[a-f0-9]{64}/vision-video-work/minimax-compressed\.mp4|"
+    + CHUNK_MEDIA + r")", re.I)
 AUDIT = "media-retention.json"
 # Media rebuilt from the source (previews, analysis frames/audio, compression output).
 DERIVED = re.compile(
@@ -35,6 +42,7 @@ DERIVED = re.compile(
     r"analysis/(?:runs/[a-f0-9]{64}/)?(?:frames|budgeted-frames)/frame_\d+\.jpg|"
     r"analysis/(?:runs/[a-f0-9]{64}/)?audio/audio_\d+\.mp3|"
     r"analysis/runs/[a-f0-9]{64}/vision-video-work/minimax-compressed\.mp4|"
+    + CHUNK_MEDIA + r"|"
     r"threads_media_\d+\.mp4)", re.I)
 
 

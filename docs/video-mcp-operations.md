@@ -46,21 +46,54 @@ sends `max_completion_tokens` (`ANALYZE_VIDEO_MAX_TOKENS`, default and ceiling
 524288); without it MiniMax applies a small server default and long videos end
 with `finish_reason=length`. The call waits up to `ANALYZE_VIDEO_TIMEOUT_SECONDS`
 (3600), still bounded by `VIDEO_API_TIMEOUT_SECONDS` and the job deadline, so long
-videos need those raised too. Long videos lower `fps` automatically so frame tokens
-stay under ~800k of the 1M context (floor 0.2 fps).
+videos need those raised too.
+
+Long videos are analysed in segments instead of being downsampled. The trigger is
+the requested frame rate (the `ANALYZE_VIDEO_FPS` value, clamped to 0.2-5) times the
+video duration times the measured cost of one frame at the requested detail
+(`detail=high` ~616 tokens, `default`/`low` ~179) exceeding the ~800k token budget.
+When it triggers, the video is cut with an ffmpeg stream copy (no re-encode) and
+each segment is uploaded and analysed on its own with the requested fps and detail,
+which is never lowered for a segment. Segment length is
+`floor(budget * 0.9 / (tokens per frame * fps) / 60) * 60` seconds (at least 60;
+about 1140 s for `high` at 1 fps) and can be shortened with
+`MINIMAX_VIDEO_CHUNK_SECONDS` (positive seconds, at least 60 and at most the
+budget-derived limit). An illegal `MINIMAX_VIDEO_CHUNK_SECONDS` is rejected before any
+call, even for a video short enough to be analysed in one piece.
+`MINIMAX_VIDEO_CHUNKING=off` restores the old behaviour: lower the fps first, and
+fall back to `detail=default` when even 0.2 fps does not fit (the note then says
+plainly that the budget is still exceeded).
+
+Every segment costs at least one upload and one chat call; a retry for an
+insufficient time coverage or an event gap fill can add one or two more calls, so both
+the price and the wall clock grow with the number of segments; the job deadline and
+`ANALYZE_VIDEO_TIMEOUT_SECONDS` must cover the whole run. Segments are analysed in
+order, and cancellation, deadlines and budget blocks still travel upwards; a
+cancelled or expired job is noticed before the next segment is uploaded.
+Segment results are cached per segment (the key carries the source fingerprint and
+the segment bounds), so a failed run only resends the segments that did not finish;
+the merged result is cached under a key that carries `chunked` and `chunk_seconds`.
+Once the merge succeeds the whole `minimax-chunks/` directory is deleted - the
+segments are worthless for a rerun, which cuts them again - so only a failed run
+leaves them behind; `media_retention.py` also knows how to remove those leftovers.
 
 ## Sampling and cache correctness
 
-The MCP visual stage uploads the whole video to MiniMax; frame sampling and the
+The MCP visual stage uploads the whole video to MiniMax, or its segments when the
+video is analysed in chunks; frame sampling and the
 frame fallback were removed, and `ANALYZE_VISUAL_MODE=frames` now raises. If the
 video cannot be uploaded (even after compression) or the answer is truncated,
 the visual stage is reported incomplete instead of switching to images. Visual
 events are the model's summary of the whole video, not a frame-by-frame record;
-the returned `sampling` object reports the fps, detail and output ceiling sent.
+the returned `sampling` object reports the fps, detail and output ceiling sent,
+plus `chunked`, `chunk_seconds` and `chunk_count` when the video is analysed in
+segments (the chunk count is the estimate from the planned segment length; the
+real count depends on the keyframes ffmpeg cuts on).
 
 `cache_signature` covers source SHA-256, code/prompt/schema versions, vision model
 and endpoint, ASR backend/model/language, local ASR settings, audio chunk length
-and whole-video settings (fps, detail, output ceiling). Credentials are excluded. A same-size source with
+and whole-video settings (fps, detail, output ceiling, chunking mode and chunk
+seconds). Credentials are excluded. A same-size source with
 the same modification time but different bytes invalidates the cache. Partial
 results are saved and available for review; only complete matching results skip
 analysis. `get_prepared_video` never restores a completed analysis under a stale

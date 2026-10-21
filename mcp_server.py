@@ -1636,6 +1636,10 @@ def analysis_cache_signature(video_path: Path, manifest: dict) -> str:
         "video_fps": float(os.getenv("ANALYZE_VIDEO_FPS", "1") or 1),
         "video_detail": os.getenv("ANALYZE_VIDEO_DETAIL", "default").strip().lower() or "default",
         "video_max_tokens": pipeline.video_mp4_max_completion_tokens(),
+        # Chunking changes how the same video is analysed, so it belongs in the
+        # signature: switching it on/off must not reuse the other mode's result.
+        "video_chunking": os.getenv("MINIMAX_VIDEO_CHUNKING", "on").strip().lower() or "on",
+        "video_chunk_seconds": os.getenv("MINIMAX_VIDEO_CHUNK_SECONDS", "").strip(),
     }
     return hashlib.sha256(json.dumps(configuration, sort_keys=True).encode()).hexdigest()
 
@@ -1739,8 +1743,9 @@ def analyze_prepared_sync(job_id: str) -> dict[str, Any]:
         report_progress("upload", 20, "上傳整支影片給 MiniMax 直接理解")
         # The same resolution the pipeline applies, so the recorded fps/detail
         # match the request that is really sent (detail=high is ~3.4x the cost
-        # of default and a too-long video falls back to default).
-        sampling = pipeline.resolve_video_mp4_sampling(
+        # of default; a too-long video is analysed in segments instead of
+        # being downsampled, and only falls back to default when chunking is off).
+        plan = pipeline.plan_video_mp4_analysis(
             max(pipeline.VIDEO_MP4_MIN_FPS,
                 min(5.0, float(os.getenv("ANALYZE_VIDEO_FPS", "1") or 1))),
             duration,
@@ -1748,13 +1753,22 @@ def analyze_prepared_sync(job_id: str) -> dict[str, Any]:
         )
         sampling_stats.update({
             "mode": "video_mp4",
-            "fps": sampling.fps,
+            "fps": plan.fps,
             "max_completion_tokens": pipeline.video_mp4_max_completion_tokens(),
-            "detail": sampling.detail,
-            "detail_requested": sampling.detail_requested,
+            "detail": plan.detail,
+            "detail_requested": plan.detail_requested,
             "source_bytes": video_path.stat().st_size,
+            "chunked": plan.chunked,
+            "chunk_seconds": plan.chunk_seconds,
+            "chunk_count": plan.chunk_count,
         })
-        check_job_capacity(job_id)
+        # The segments are cut next to the source and live there until the
+        # merge: one more copy of the video on top of the room reserved above.
+        # Both checks are stateless, so each one asks for the whole amount.
+        chunk_bytes = video_path.stat().st_size if plan.chunked else 0
+        check_job_capacity(job_id, 2 * chunk_bytes)
+        if plan.chunked:
+            require_disk_space(2 * chunk_bytes)
         report_progress("evidence", 40, "MiniMax 直接讀取 mp4")
         observations = pipeline.analyze_video_mp4(
             video_path,
@@ -1765,11 +1779,25 @@ def analyze_prepared_sync(job_id: str) -> dict[str, Any]:
             work_dir=analysis_dir / "vision-video-work",
         )
         if observations:
-            method = observations[0].get("analysis_method")
+            methods = sorted({
+                str(row.get("analysis_method")) for row in observations if row.get("analysis_method")
+            })
+            method = methods[0] if len(methods) == 1 else ("mixed" if methods else None)
             if method and method != "minimax_video":
                 sampling_stats["analysis_method"] = method
-                if observations[0].get("compressed_bytes") is not None:
-                    sampling_stats["compressed_bytes"] = observations[0]["compressed_bytes"]
+            if plan.chunked and methods:
+                # Every segment can take its own path (one of them may have to
+                # be compressed), so the per-segment methods are listed.
+                sampling_stats["analysis_methods"] = methods
+            compressed = [
+                int(row["compressed_bytes"]) for row in observations
+                if isinstance(row.get("compressed_bytes"), int)
+                and not isinstance(row.get("compressed_bytes"), bool)
+            ]
+            if compressed:
+                sampling_stats["compressed_bytes"] = max(compressed)
+                if plan.chunked:
+                    sampling_stats["chunk_compressed"] = True
         return observations
 
     def transcript_stage() -> dict[str, Any]:
