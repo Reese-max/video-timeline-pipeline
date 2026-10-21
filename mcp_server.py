@@ -1737,12 +1737,21 @@ def analyze_prepared_sync(job_id: str) -> dict[str, Any]:
     def visual_stage() -> list[dict[str, Any]]:
         pipeline.visual_mode()  # rejects the removed frame-sampling mode
         report_progress("upload", 20, "上傳整支影片給 MiniMax 直接理解")
+        # The same resolution the pipeline applies, so the recorded fps/detail
+        # match the request that is really sent (detail=high is ~3.4x the cost
+        # of default and a too-long video falls back to default).
+        sampling = pipeline.resolve_video_mp4_sampling(
+            max(pipeline.VIDEO_MP4_MIN_FPS,
+                min(5.0, float(os.getenv("ANALYZE_VIDEO_FPS", "1") or 1))),
+            duration,
+            os.getenv("ANALYZE_VIDEO_DETAIL", "default").strip().lower() or "default",
+        )
         sampling_stats.update({
             "mode": "video_mp4",
-            "fps": pipeline.video_mp4_fps_for_duration(
-                max(0.2, min(5.0, float(os.getenv("ANALYZE_VIDEO_FPS", "1") or 1))), duration),
+            "fps": sampling.fps,
             "max_completion_tokens": pipeline.video_mp4_max_completion_tokens(),
-            "detail": os.getenv("ANALYZE_VIDEO_DETAIL", "default").strip().lower() or "default",
+            "detail": sampling.detail,
+            "detail_requested": sampling.detail_requested,
             "source_bytes": video_path.stat().st_size,
         })
         check_job_capacity(job_id)

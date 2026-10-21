@@ -34,7 +34,7 @@ import urllib.request
 import uuid
 import xml.etree.ElementTree as ET
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, NamedTuple
 
 from execution_control import DeadlineExceeded, ExecutionCancelled, OperationBudget, read_response
 import brightdata_credits
@@ -2466,8 +2466,20 @@ MINIMAX_VIDEO_COMPRESS_RETRY_BYTES = 350 * 1024 * 1024
 MINIMAX_VIDEO_MAX_COMPLETION_TOKENS = 524288
 # 1M context minus headroom for the prompt and reasoning.
 MINIMAX_VIDEO_CONTEXT_TOKEN_BUDGET = 800_000
-# Measured: 552s at fps=1, detail=default -> 95,839 prompt tokens (~174/frame).
-MINIMAX_VIDEO_TOKENS_PER_FRAME = 175
+# Lowest frame rate the whole-video sampler may fall back to.
+VIDEO_MP4_MIN_FPS = 0.2
+# Prompt tokens one frame costs, measured 2026-10-22 on A1 with one 59.2s
+# video (fps=1, MiniMax-M3): detail=default -> 10,567 prompt tokens (~179/frame)
+# and detail=high -> 36,367 prompt tokens (~616/frame, 3.44x).
+# An earlier 552s run with detail=default measured 95,839 tokens (~174/frame).
+# detail=low was never measured, so it conservatively reuses the default cost.
+MINIMAX_VIDEO_TOKENS_PER_FRAME = 179
+MINIMAX_VIDEO_TOKENS_PER_FRAME_BY_DETAIL = {
+    "low": 179,
+    "default": 179,
+    "high": 616,
+}
+VIDEO_DETAIL_ERROR = "ANALYZE_VIDEO_DETAIL 只能是 low、default 或 high。"
 
 
 def video_mp4_max_completion_tokens() -> int:
@@ -2481,12 +2493,69 @@ def video_mp4_timeout_seconds() -> int:
     return max(60, int(raw) if raw else 3600)
 
 
-def video_mp4_fps_for_duration(fps: float, duration: float | None) -> float:
-    """Lower fps for long videos so the frame tokens stay inside the context window."""
+def minimax_video_tokens_per_frame(detail: str) -> int:
+    """Prompt tokens a single frame costs at the given video detail level."""
+    key = (detail or "").strip().lower()
+    return MINIMAX_VIDEO_TOKENS_PER_FRAME_BY_DETAIL.get(key, MINIMAX_VIDEO_TOKENS_PER_FRAME)
+
+
+def video_mp4_fps_for_duration(
+    fps: float,
+    duration: float | None,
+    detail: str = "default",
+) -> float:
+    """Lower fps for long videos so the frame tokens stay inside the context window.
+
+    detail=high costs ~616 tokens per frame (measured 2026-10-22) against ~179
+    for default, so the ceiling has to follow the detail actually requested.
+    """
     if duration is None or duration <= 0:
         return fps
-    ceiling = MINIMAX_VIDEO_CONTEXT_TOKEN_BUDGET / (MINIMAX_VIDEO_TOKENS_PER_FRAME * duration)
-    return max(0.2, min(fps, math.floor(ceiling * 1000) / 1000))
+    per_frame = minimax_video_tokens_per_frame(detail)
+    ceiling = MINIMAX_VIDEO_CONTEXT_TOKEN_BUDGET / (per_frame * duration)
+    return max(VIDEO_MP4_MIN_FPS, min(fps, math.floor(ceiling * 1000) / 1000))
+
+
+class VideoMp4Sampling(NamedTuple):
+    """The frame rate and detail level a whole-video analysis really uses."""
+
+    detail: str  # the detail level sent to MiniMax
+    detail_requested: str  # what the caller asked for
+    fps: float
+    downgraded: bool
+    note: str | None
+
+
+def resolve_video_mp4_sampling(
+    fps: float,
+    duration: float | None,
+    detail: str,
+) -> VideoMp4Sampling:
+    """Pick the detail level and fps that fit MiniMax's context window.
+
+    A video that still exceeds the budget at the 0.2 fps floor (detail=high
+    needs about 108 minutes) falls back to detail=default; the note explains
+    the change. detail=low is only a conservative estimate of the default
+    cost, so a downgrade there would free no budget and is not applied.
+    """
+    requested = (detail or "default").strip().lower()
+    if requested not in MINIMAX_VIDEO_TOKENS_PER_FRAME_BY_DETAIL:
+        raise RuntimeError(VIDEO_DETAIL_ERROR)
+    value = video_mp4_fps_for_duration(fps, duration, requested)
+    if duration is None or duration <= 0:
+        return VideoMp4Sampling(requested, requested, value, False, None)
+    per_frame = minimax_video_tokens_per_frame(requested)
+    if value * duration * per_frame <= MINIMAX_VIDEO_CONTEXT_TOKEN_BUDGET:
+        return VideoMp4Sampling(requested, requested, value, False, None)
+    if per_frame <= minimax_video_tokens_per_frame("default"):
+        # default costs the same per frame, so falling back frees nothing.
+        return VideoMp4Sampling(requested, requested, value, False, None)
+    fallback_fps = video_mp4_fps_for_duration(fps, duration, "default")
+    note = (
+        f"影片過長（{duration:.0f} 秒），畫面分析由 {requested} 降為 default "
+        "以免超過 MiniMax 上限"
+    )
+    return VideoMp4Sampling("default", requested, fallback_fps, True, note)
 
 
 def choose_video_mp4_upload_strategy(
@@ -3212,12 +3281,17 @@ def analyze_video_mp4(
     if cache_dir is not None:
         cache_dir.mkdir(parents=True, exist_ok=True)
     fps_value = float(os.getenv("ANALYZE_VIDEO_FPS", "1") if fps is None else fps)
-    fps_value = video_mp4_fps_for_duration(max(0.2, min(5.0, fps_value)), duration)
+    detail_value = (detail or os.getenv("ANALYZE_VIDEO_DETAIL", "default")).strip().lower()
+    if detail_value not in MINIMAX_VIDEO_TOKENS_PER_FRAME_BY_DETAIL:
+        raise RuntimeError(VIDEO_DETAIL_ERROR)
+    # The detail decides how many tokens a frame costs, so it has to be known
+    # before the fps ceiling is computed (detail=high is ~3.4x the default).
+    sampling = resolve_video_mp4_sampling(
+        max(VIDEO_MP4_MIN_FPS, min(5.0, fps_value)), duration, detail_value)
+    detail_value = sampling.detail
+    fps_value = sampling.fps
     timeout = video_mp4_timeout_seconds() if timeout is None else timeout
     max_completion_tokens = video_mp4_max_completion_tokens()
-    detail_value = (detail or os.getenv("ANALYZE_VIDEO_DETAIL", "default")).strip().lower()
-    if detail_value not in {"low", "default", "high"}:
-        raise RuntimeError("ANALYZE_VIDEO_DETAIL 只能是 low、default 或 high。")
     prompt = (
         "請完整觀看這支影片，只輸出 JSON object，不要 Markdown。"
         "欄位必須包含 events（陣列）與 overall_summary（字串）。"
@@ -3255,6 +3329,9 @@ def analyze_video_mp4(
         if isinstance(cached, dict) and isinstance(cached.get("observations"), list):
             if reusable_video_artifact(cached["observations"]):
                 return cached["observations"]
+    if sampling.note:
+        # Printed only when a request is really sent (a cache hit sends none).
+        print(f"! {sampling.note}")
 
     source_size = video_path.stat().st_size
     strategy = choose_video_mp4_upload_strategy(source_size)
