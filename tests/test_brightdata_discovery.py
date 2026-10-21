@@ -90,10 +90,11 @@ class BrightDataDiscoveryTests(unittest.TestCase):
         for platform in ("facebook", "instagram"):
             valid = {"url": f"https://{platform}.com/reel/123", "post_id": "123",
                      "date_posted": "2026-02-01", "content": "valid"}
-            records = [valid, {**valid, "error": "offline-token " + "錯" * 250,
-                                "error_code": "bad_input"},
+            records = [{**valid, "error": None, "error_code": ""},
+                       {**valid, "error": "offline-token " + "錯" * 250,
+                        "error_code": "bad_input"},
                        {**valid, "error_code": "offline-token"},
-                       {"error": ""}, {"error_code": ""}, None]
+                       {**valid, "error": "", "error_code": ""}, None]
             self.author_records(records)
             with self.subTest(platform=platform), patch.object(
                 pipeline, "secure_rss_directory", side_effect=self.rss_directory
@@ -102,17 +103,17 @@ class BrightDataDiscoveryTests(unittest.TestCase):
                 parser = "brightdata_facebook_item" if platform == "facebook" else "instagram_feed_item"
                 with patch.object(pipeline, parser, wraps=getattr(pipeline, parser)) as parse:
                     feed = self.author(platform)
-                self.assertEqual(parse.call_count, 1)
+                self.assertEqual(parse.call_count, 2)
                 self.assertEqual(len(feed["items"]), 1)
                 self.assertEqual(feed["items"][0]["url"], valid["url"])
                 meta = feed[platform]
-                self.assertEqual(meta["raw_count"], 6)
-                self.assertEqual(meta["error_count"], 4)
-                self.assertEqual(len(meta["errors"]), 3)
+                self.assertEqual(meta["raw_count"], 5)
+                self.assertEqual(meta["error_count"], 2)
+                self.assertEqual(len(meta["errors"]), 2)
                 self.assertEqual(set(meta["errors"][0]), {"error_code", "error"})
                 self.assertEqual(len(meta["errors"][0]["error"]), 200)
                 self.assertNotIn("offline-token", json.dumps(meta))
-                self.assertEqual(self.usage()["used"], used + 6)
+                self.assertEqual(self.usage()["used"], used + 5)
                 self.assertEqual(self.usage()["reserved"], 0)
 
     def test_author_empty_snapshots_have_zero_errors(self):

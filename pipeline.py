@@ -5593,9 +5593,13 @@ def social_post_target(url: str) -> tuple[str, str, str, str]:
     raise ValueError("僅支援公開 IG／Threads／Facebook 單篇貼文；FB 不接受首頁、社團、留言或 reel/watch 網址。")
 
 
+def brightdata_error_record(row: dict[str, Any]) -> bool:
+    return bool(row.get("error") or row.get("error_code"))
+
+
 def normalize_social_post(record: dict[str, Any], url: str) -> dict[str, Any]:
     platform, post_id, canonical, _ = social_post_target(url)
-    if record.get("error") or record.get("error_code") or record.get("is_private"):
+    if brightdata_error_record(record) or record.get("is_private"):
         raise RuntimeError("供應商無法取得公開貼文；可能需要登入、已刪除或無法存取。")
     if social_post_target(str(record.get("url") or ""))[:2] != (platform, post_id):
         raise RuntimeError("供應商回傳了不同的貼文，停止交接。")
@@ -5824,8 +5828,7 @@ def brightdata_author_snapshot(folder: Path, trigger_url: str, headers: dict[str
         if not isinstance(rows, list):
             raise RuntimeError("Bright Data snapshot 回應不是 JSON 陣列。")
         settle_brightdata_receipt(folder, len(rows))
-        error_records = [row for row in rows if isinstance(row, dict)
-                         and ("error" in row or "error_code" in row)]
+        error_records = [row for row in rows if isinstance(row, dict) and brightdata_error_record(row)]
         errors = [{"error_code": str(row.get("error_code") or "").replace(token, "<redacted>"),
                    "error": str(row.get("error") or "").replace(token, "<redacted>")[:200]}
                   for row in error_records[:3]]
@@ -5897,7 +5900,7 @@ def fetch_facebook_author_brightdata(
     by_id = {}
     missing_dates = 0
     for record in raw_items:
-        if "error" in record or "error_code" in record:
+        if brightdata_error_record(record):
             continue
         item = brightdata_facebook_item(record)
         if item is None:
@@ -5979,7 +5982,7 @@ def fetch_instagram_author(
     by_id: dict[str, dict[str, str]] = {}
     missing_dates = 0
     for record in raw_items:
-        if "error" in record or "error_code" in record:
+        if brightdata_error_record(record):
             continue
         item = instagram_feed_item(record)
         if item is None:
