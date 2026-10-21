@@ -63,7 +63,7 @@ class TransportBlockedTestCase(unittest.TestCase):
     def setUp(self) -> None:
         self.tmp_dir = tempfile.TemporaryDirectory()
         self.root = Path(self.tmp_dir.name)
-        self.env = patch.dict(os.environ, BLOCKED_ENV)
+        self.env = patch.dict(os.environ, {**BLOCKED_ENV, "BRIGHTDATA_CREDIT_LEDGER": str(self.root / "brightdata-credits.sqlite3")})
         self.env.start()
         self.scope = cost_tracker.cost_root_scope(self.root)
         self.scope.__enter__()
@@ -405,8 +405,11 @@ class GuardModeTests(unittest.TestCase):
     def setUp(self) -> None:
         self.tmp_dir = tempfile.TemporaryDirectory()
         self.root = Path(self.tmp_dir.name)
+        self.env = patch.dict(os.environ, {"BRIGHTDATA_CREDIT_LEDGER": str(self.root / "brightdata-credits.sqlite3")})
+        self.env.start()
 
     def tearDown(self) -> None:
+        self.env.stop()
         self.tmp_dir.cleanup()
 
     def test_strict_mode_rejects_estimates_without_provider_enforced_bound(self) -> None:
@@ -566,6 +569,25 @@ class GuardModeTests(unittest.TestCase):
         self.assertTrue(cost_id)
         row = rows(self.root, "usage_costs")[0]
         self.assertEqual(row["cost_status"], "unknown")
+
+
+class BrightDataLedgerIsolationTests(unittest.TestCase):
+    def test_every_transport_test_class_uses_its_own_temporary_ledger(self):
+        with tempfile.TemporaryDirectory() as home, patch.dict(
+            os.environ, {"HOME": home, "USERPROFILE": home}, clear=True
+        ):
+            for case_type in (TransportBlockedTestCase, GuardAccountingTests,
+                              UncertainSubmissionTests, UnidentifiedSubmissionTests,
+                              GuardModeTests):
+                with self.subTest(case=case_type.__name__):
+                    case = case_type()
+                    case.setUp()
+                    try:
+                        self.assertEqual(pipeline.brightdata_credits.ledger_path(),
+                                         case.root / "brightdata-credits.sqlite3")
+                    finally:
+                        case.tearDown()
+            self.assertFalse((Path(home) / ".local/state/video-timeline-pipeline").exists())
 
 
 if __name__ == "__main__":
