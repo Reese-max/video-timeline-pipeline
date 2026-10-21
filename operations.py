@@ -303,6 +303,13 @@ def _hash(value: Any) -> str:
                                     separators=(",", ":"), allow_nan=False).encode("utf-8")).hexdigest()
 
 
+def _valid_timestamp(value: Any) -> bool:
+    try:
+        return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value) and value >= 0
+    except OverflowError:
+        return False
+
+
 def completion_snapshot(root: Path, job_dir: Path, manifest: dict[str, Any]) -> tuple[str, dict[str, str]]:
     """Validate declared local evidence; raw hashes audit bytes, revision binds content."""
     if manifest.get("status") != "completed":
@@ -340,20 +347,31 @@ def completion_snapshot(root: Path, job_dir: Path, manifest: dict[str, Any]) -> 
     for segment in transcript["segments"]:
         if (not isinstance(segment, dict)
                 or not isinstance(segment.get("text"), str) or not segment["text"].strip()
-                or not all(isinstance(segment.get(key), (int, float)) and not isinstance(segment[key], bool)
-                           and math.isfinite(segment[key]) for key in ("start", "end"))
-                or not 0 <= segment["start"] <= segment["end"]):
+                or not all(_valid_timestamp(segment.get(key)) for key in ("start", "end"))
+                or segment["start"] > segment["end"]):
             raise ValueError("Invalid transcript segment")
     visual = data.get("visual", [])
     if not isinstance(visual, list):
         raise ValueError("Invalid visual artifact")
+    from pipeline import usable_visual_observation, whole_video_observation
+
     if visual:
-        from pipeline import usable_visual_observation, whole_video_observation
         if not all(usable_visual_observation(row) and whole_video_observation(row) for row in visual):
             raise ValueError("Incomplete visual evidence")
     elif (manifest.get("models") or {}).get("visual") or any(
             stream.get("codec_type") == "video" for stream in (manifest.get("video") or {}).get("streams", [])):
         raise ValueError("Missing visual evidence")
+    for event in timeline:
+        if not _valid_timestamp(event.get("timestamp")):
+            raise ValueError("Invalid timeline timestamp")
+        if event.get("type") == "speech":
+            if (not isinstance(event.get("text"), str) or not event["text"].strip()
+                    or (event.get("end") is not None and
+                        (not _valid_timestamp(event["end"]) or event["end"] < event["timestamp"]))):
+                raise ValueError("Invalid timeline speech")
+        elif event.get("type") != "visual" or not (
+                usable_visual_observation(event.get("data")) and whole_video_observation(event["data"])):
+            raise ValueError("Invalid timeline visual evidence")
     data["visual"] = visual  # Missing and empty visual evidence are identical for audio/captions jobs.
     revision = _hash({"format": REVISION_FORMAT, "schema_version": manifest.get("schema_version"),
                       "models": {key: value for key, value in (manifest.get("models") or {}).items() if value is not None},

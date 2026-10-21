@@ -97,7 +97,8 @@ def collect_digest_candidates(
 
         try:
             manifest = json.loads(manifest_file.read_text(encoding="utf-8"))
-            summary = json.loads(summary_file.read_text(encoding="utf-8"))
+            summary_bytes = summary_file.read_bytes()
+            summary = json.loads(summary_bytes)
         except Exception:
             continue
 
@@ -109,8 +110,10 @@ def collect_digest_candidates(
         revision = manifest.get("analysis_revision", "1")
         if (root / "operations.db").exists():
             try:
-                revision, _ = completion_snapshot(root, job_path, manifest)
+                revision, artifact_hashes = completion_snapshot(root, job_path, manifest)
             except (OSError, ValueError, TypeError, AttributeError):
+                continue
+            if hashlib.sha256(summary_bytes).hexdigest() != artifact_hashes["summary"]:
                 continue
             eligible_str = eligibility.get((job_path.name, revision))
         else:
@@ -137,7 +140,7 @@ def collect_digest_candidates(
                 "title": source.get("title") or manifest.get("video", {}).get("title") or job_path.name,
                 "url": source.get("url") or source.get("webpage_url") or "",
                 "minutes": round(float(source.get("duration", 0)) / 60.0, 1),
-                "summary": summary.get("brief") or summary.get("summary") or "",
+                "summary": summary.get("brief") or summary.get("summary") or summary.get("short_summary") or "",
                 "terms": summary.get("terms", []),
                 "chapters": chapters,
                 "eligible_at": eligible_dt.isoformat(),

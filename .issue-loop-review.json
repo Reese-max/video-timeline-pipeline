@@ -1,0 +1,44 @@
+{
+  "pr": 94,
+  "head": "0bfad6818bdec31c3022254af78fc4c30a6e155e",
+  "findings": [
+    {
+      "severity": "high",
+      "file": "notifications.py",
+      "line": 363,
+      "issue": "The new delivery_id claim filter is applied only to the pipeline completion hook. The sibling digest and connectivity-test senders (also line 469) still claim an arbitrary pending delivery, then send their new payload to that delivery's recipient and mark the wrong event accepted. Seed an unrelated pending webhook to reproduce; both senders must claim the delivery they just enqueued."
+    },
+    {
+      "severity": "med",
+      "file": "digests.py",
+      "line": 112,
+      "issue": "The revision gate validates manifest-declared artifacts, but the rendered summary was separately read from summary.json. A different declaration or concurrent rewrite lets unregistered summary bytes be rendered under a registered revision. Compare the rendered bytes with the summary hash returned by the verified snapshot."
+    },
+    {
+      "severity": "med",
+      "file": "operations.py",
+      "line": 333,
+      "issue": "A timeline containing only [{}], invalid timestamps, missing speech text, or invalid visual data passes verified completion because only dictionary membership is checked. It can register a processed revision and trigger notification dispatch. Validate the timeline event shape before any ledger write."
+    },
+    {
+      "severity": "low",
+      "file": "operations.py",
+      "line": 343,
+      "issue": "math.isfinite() raises OverflowError on a legal JSON integer such as 10**400 in transcript timestamps and in visual confidence validation (pipeline.py:2443). Digest selection and reconciliation do not catch it, so one malformed artifact aborts the entire scan. Reject overflowing timestamps and check the confidence range before converting it to float."
+    },
+    {
+      "severity": "med",
+      "file": "digests.py",
+      "line": 140,
+      "issue": "The new completion gate accepts the pipeline's canonical short_summary field, but digest rendering only reads brief/summary. Real create_summary() output therefore produces an empty digest summary. Preserve legacy fields and add the canonical field fallback. This is a pre-existing integration defect exposed by the new foundation flow."
+    },
+    {
+      "severity": "med",
+      "file": "notifications.py",
+      "line": 419,
+      "issue": "The digest_items INSERT contains a Python conditional expression inside SQL. A nonempty digest sends successfully and then raises sqlite3.OperationalError near 'if', leaving its item audit missing. Bind the calculated disposition as a SQL parameter. This pre-existing defect was reproduced by the new end-to-end foundation regression."
+    }
+  ],
+  "fixed": true,
+  "summary": "Fixed all six reproducible findings: unrelated-delivery claims, rendered-summary revision mismatch, invalid timeline acceptance, numeric overflow, canonical summary omission, and digest item SQL failure. Seven regression tests preserve pre-fix failures; Git Bash passed all 25 foundation tests, and the complete offline check passed 622 Python tests with 24 skips plus 94 Node tests (exit 0). The declared F0.1/F0.2 scope is preserved; documented future release gates remain pending."
+}

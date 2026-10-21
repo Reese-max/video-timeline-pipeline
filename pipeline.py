@@ -2440,8 +2440,8 @@ def usable_visual_observation(observation: Any) -> bool:
     return (
         isinstance(confidence, (int, float))
         and not isinstance(confidence, bool)
-        and math.isfinite(confidence)
         and 0 <= confidence <= 1
+        and math.isfinite(confidence)
     )
 
 

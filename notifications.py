@@ -360,7 +360,7 @@ def run_digest_send(
 
         # Claim and send
         worker_id = f"worker_{os.getpid()}"
-        claimed = claim_pending_deliveries(conn, worker_id=worker_id, limit=1)
+        claimed = claim_pending_deliveries(conn, worker_id=worker_id, limit=1, delivery_id=delivery_id)
         if not claimed:
             return {"status": "already_claimed_or_sent", "delivery_id": delivery_id}
 
@@ -416,9 +416,10 @@ def run_digest_send(
                     """
                     INSERT OR REPLACE INTO digest_items (
                         digest_id, job, analysis_revision, rank, reason, disposition
-                    ) VALUES (?, ?, ?, ?, 'selected_by_time', 'delivered' if ? == 'accepted' else 'pending')
+                    ) VALUES (?, ?, ?, ?, 'selected_by_time', ?)
                     """,
-                    (digest_id, item["job"], item.get("analysis_revision", "1"), rank, result.status),
+                    (digest_id, item["job"], item.get("analysis_revision", "1"), rank,
+                     "delivered" if result.status == "accepted" else "pending"),
                 )
 
         return {
@@ -466,7 +467,7 @@ def run_notify_test(root: Path, provider: BaseProvider | None = None) -> dict[st
             payload_hash=hashlib.sha256(text.encode()).hexdigest(),
         )
 
-        claimed = claim_pending_deliveries(conn, worker_id=f"test_{os.getpid()}", limit=1)
+        claimed = claim_pending_deliveries(conn, worker_id=f"test_{os.getpid()}", limit=1, delivery_id=delivery_id)
         if not claimed:
             return {"status": "claim_failed", "delivery_id": delivery_id}
 

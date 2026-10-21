@@ -267,6 +267,117 @@ class OperationsTests(unittest.TestCase):
         self.assertIsNone(notifications.record_pipeline_completed_event(self.root, job, manifest))
         self.assertFalse((self.root / "operations.db").exists())
 
+    def test_invalid_timeline_cannot_register_or_send(self):
+        job, manifest = self.job()
+        for timeline in ([{}], [{"timestamp": True, "type": "speech", "text": "bad"}],
+                         [{"timestamp": -1, "type": "speech", "text": "bad"}],
+                         [{"timestamp": 10**400, "type": "speech", "text": "bad"}],
+                         [{"timestamp": 0, "type": "speech"}],
+                         [{"timestamp": 0, "type": "visual", "data": {}}]):
+            with self.subTest(timeline=timeline), \
+                 patch.dict(os.environ, {"DISCORD_WEBHOOK_URL": "https://example.test/webhook"}), \
+                 patch("notifications.get_configured_provider") as provider:
+                pipeline.write_json(job / "timeline.json", timeline)
+                self.assertIsNone(notifications.record_pipeline_completed_event(self.root, job, manifest))
+                provider.assert_not_called()
+                self.assertFalse((self.root / "operations.db").exists())
+
+    def test_invalid_timestamp_does_not_abort_digest_or_reconciliation(self):
+        import operations as ops
+        job, manifest = self.job()
+        notifications.record_pipeline_completed_event(self.root, job, manifest)
+        self.job("job_b")
+        pipeline.write_json(job / "transcript.json",
+                            {"segments": [{"start": 0, "end": 10**400, "text": "bad"}]})
+        now = datetime.datetime.now(datetime.timezone.utc)
+        with self.subTest(reader="digest"):
+            self.assertEqual(digests.collect_digest_candidates(self.root, now - datetime.timedelta(days=1),
+                                                               now + datetime.timedelta(days=1)), [])
+        with self.subTest(reader="reconcile"):
+            self.assertEqual(ops.reconcile_processed_revisions(self.root),
+                             {"scanned": 2, "registered": 1, "skipped": 1})
+
+    def test_overflowing_visual_confidence_is_invalid(self):
+        visual = {"screen_type": "影片", "visual_summary": "screen", "visible_text": [],
+                  "important_details": [], "confidence": 10**400}
+        self.assertFalse(pipeline.usable_visual_observation(visual))
+
+    def test_digest_does_not_render_summary_outside_verified_snapshot(self):
+        import operations as ops
+        job, manifest = self.job()
+        notifications.record_pipeline_completed_event(self.root, job, manifest)
+        now = datetime.datetime.now(datetime.timezone.utc)
+        start, end = now - datetime.timedelta(days=1), now + datetime.timedelta(days=1)
+        original = (job / "summary.json").read_bytes()
+        declared = job / "verified-summary.json"
+        declared.write_bytes(original)
+        manifest["artifacts"]["summary"] = str(declared.relative_to(self.root))
+        pipeline.write_json(job / "manifest.json", manifest)
+        pipeline.write_json(job / "summary.json", {"brief": "unregistered content"})
+        with self.subTest(case="different declared artifact"):
+            self.assertEqual(digests.collect_digest_candidates(self.root, start, end), [])
+
+        manifest["artifacts"]["summary"] = str((job / "summary.json").relative_to(self.root))
+        pipeline.write_json(job / "manifest.json", manifest)
+
+        def restore_before_validation(*args, **kwargs):
+            (job / "summary.json").write_bytes(original)
+            return ops.completion_snapshot(*args, **kwargs)
+
+        with self.subTest(case="concurrent rewrite"), \
+             patch("digests.completion_snapshot", side_effect=restore_before_validation):
+            self.assertEqual(digests.collect_digest_candidates(self.root, start, end), [])
+
+    def test_digest_renders_pipeline_short_summary(self):
+        job, manifest = self.job()
+        pipeline.write_json(job / "summary.json", {"short_summary": "pipeline summary"})
+        notifications.record_pipeline_completed_event(self.root, job, manifest)
+        now = datetime.datetime.now(datetime.timezone.utc)
+        candidates = digests.collect_digest_candidates(self.root, now - datetime.timedelta(days=1),
+                                                       now + datetime.timedelta(days=1))
+        self.assertEqual([item["summary"] for item in candidates], ["pipeline summary"])
+
+    def test_immediate_notification_senders_claim_only_their_own_delivery(self):
+        import email_providers
+        original_root = self.root
+        for sender in (notifications.run_digest_send, notifications.run_notify_test):
+            with self.subTest(sender=sender.__name__):
+                self.root = original_root / sender.__name__
+                job, manifest = self.job()
+                with patch("notifications._utc_now_iso", return_value="2026-09-05T10:00:00+00:00"):
+                    notifications.record_pipeline_completed_event(self.root, job, manifest)
+                with closing(notifications.get_operations_db(self.root)) as conn:
+                    event = notifications.record_event(conn, "fixture", None, None, None, {}, sender.__name__)
+                    unrelated = notifications.enqueue_delivery(
+                        conn, event, "webhook", "https://example.test/unrelated", "WebhookProvider", "hash")
+                provider = email_providers.FakeProvider(mode="accepted")
+                real_send = provider.send
+
+                def assert_recipient(**kwargs):
+                    self.assertEqual(kwargs["recipient"], "intended@example.test")
+                    return real_send(**kwargs)
+
+                with patch.dict(os.environ, {"EMAIL_TO": "intended@example.test", "NOTIFY_EMAIL_ENABLED": "true"}), \
+                     patch.object(provider, "send", side_effect=assert_recipient):
+                    options = {"date_str": "2026-09-05"} if sender is notifications.run_digest_send else {}
+                    result = sender(self.root, provider=provider, **options)
+                self.assertEqual(result["status"], "accepted")
+                self.assertEqual([item["recipient"] for item in provider.history], ["intended@example.test"])
+                deliveries = {row["delivery_id"]: row for row in self.rows("notification_deliveries")}
+                self.assertEqual(deliveries[unrelated]["status"], "pending")
+                self.assertEqual(deliveries[result["delivery_id"]]["status"], "accepted")
+
+    def test_digest_send_records_item_disposition(self):
+        import email_providers
+        job, manifest = self.job()
+        with patch("notifications._utc_now_iso", return_value="2026-09-05T10:00:00+00:00"):
+            notifications.record_pipeline_completed_event(self.root, job, manifest)
+        with patch.dict(os.environ, {"EMAIL_TO": "intended@example.test", "NOTIFY_EMAIL_ENABLED": "true"}):
+            result = notifications.run_digest_send(self.root, date_str="2026-09-05",
+                                                   provider=email_providers.FakeProvider(mode="accepted"))
+        self.assertEqual(result["status"], "accepted")
+        self.assertEqual([item["disposition"] for item in self.rows("digest_items")], ["delivered"])
+
     def test_reconciliation_backfills_unknown_time_and_outbox_without_sending(self):
         import operations as ops
         job, manifest = self.job()

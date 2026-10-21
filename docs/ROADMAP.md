@@ -12,19 +12,19 @@
 | 既有資料相容 | 採 `CREATE IF NOT EXISTS` 與具名欄位；既有成本資料、缺少 reservation link 的 schema 原地升級，不替換 audit rows |
 | 真正只讀介面 | 所有 operations 報告、評分解釋使用 `mode=ro`；未初始化為 unavailable，舊版／未來版為 migration_required；測試 DB 不存在與 bytes 不變 |
 | 穩定資料集身分 | `library_meta` 持久 UUID，並行建立一致，搬移 DB 保留、新空資料集不同 |
-| 穩定內容版本 | 驗證 transcript／timeline／summary 與已宣告視覺產物；內容、來源 SHA-256 與模型版本參與身分，執行時間、分類、快取統計、絕對媒體路徑排除 |
+| 穩定內容版本 | 驗證 transcript／timeline／summary 與已宣告視覺產物，拒絕無效事件、時間戳與溢位數值；內容、來源 SHA-256 與模型版本參與身分，執行時間、分類、快取統計、絕對媒體路徑排除 |
 | 完成登記＋outbox 同交易 | `processed_revisions` 與既有 `notification_events` 同一 SQLite 交易；deterministic event key 含 library／job／revision；測試強制 outbox 失敗後兩邊都無資料 |
 | 重跑不成為新影片 | `(library_id, job, analysis_revision)` 主鍵保留首次時間；並行重跑只產生一個版本與事件；歷史補登暫時失敗後，相同內容仍不具通知資格，真正變更仍可登記 |
 | 保守 reconciliation | `--ops-reconcile` 補登遺漏版本及事件，backfill 的 first_completed_at／eligible_at 均 NULL，不呼叫寄送 adapter；可重跑 |
-| Digest 不誤寄歷史 | 核對現有產物的精確 revision，拒絕未登記修改與不可讀帳本；無 created_at／mtime fallback |
+| Digest 不誤寄歷史 | 核對現有產物的精確 revision 及實際渲染摘要的原始 bytes 雜湊，拒絕未登記修改與不可讀帳本；支援管線的 short_summary，無 created_at／mtime fallback |
 | 搜尋與永久帳本分離 | 搜尋重建不碰 operations，保留 `(text_hash, model)` 向量快取；videos INSERT 改具名欄位以容納相容擴充 |
-| 舊 CLI 與 owner | 原旗標語意、RSS JSON／single writer、Notification service、成本 guard 與評分入口保留；新補登命令不委派付費或寄送 |
+| 舊 CLI 與 owner | 原旗標語意、RSS JSON／single writer、Notification service、成本 guard 與評分入口保留；即時寄送僅領取自己的 delivery，Digest item 狀態以參數寫入；新補登命令不委派付費或寄送 |
 
 驗證入口：`python -X utf8 -B scripts/check_offline.py`（專案依賴已安裝時），涵蓋完整 Python 與四組 Node widget 測試；`tests/test_operations.py` 提供 F0 合成資料回歸，不讀正式影音或憑證。
 
 目前沒有設定獨立 lint、coverage ratchet、CRAP 或 mutation gate；本次不新增工具或門檻。Windows 的 Git Bash 下，既有清空環境的子程序測試會觸發 `WinError 87`；完整檢查以原生 PowerShell 執行，driver 的 F0 驗證命令另以 Git Bash 實跑。
 
-本機驗證：`uv run --no-project --with-requirements requirements.txt python -X utf8 -B scripts/check_offline.py` 結束碼 0；Python 由 621 項增至 639 項（615 通過、24 略過），四組 Node 共 94 項通過，`git diff --check` 通過。evidence 的 Git Bash 命令另有 18 項 F0 回歸全數通過；略過的既有平台／外部驗收不算通過。
+本機驗證：`uv run --no-project --with-requirements requirements.txt python -X utf8 -B scripts/check_offline.py` 結束碼 0；PR 自我審查新增 7 項回歸，Python 由審查前 639 項增至 646 項（622 通過、24 略過），四組 Node 共 94 項通過，`git diff --check` 通過。evidence 的 Git Bash 命令另有 25 項 F0 回歸全數通過，並保留修正前的失敗證據；通知測試固定日期，不依賴當天截止時間。略過的既有平台／外部驗收不算通過。
 
 ## 儲存責任
 
