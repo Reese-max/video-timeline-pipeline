@@ -256,7 +256,7 @@ python pipeline.py --facebook-author '<PUBLIC_PAGE>' --facebook-provider brightd
 
 `--facebook-brightdata-mode {auto,reels,posts}` 只適用於 Bright Data 的 Facebook 作者新增／盤點及訂閱更新，存為 `facebook_brightdata_mode`，OPML 以 `vidbeeFacebookBrightdataMode` 保留。預設 `auto`（舊訂閱缺欄位亦同）先用 Reels；只有整份 Reels 結果全部為 error record、且每筆 `error_code` 都是 `dead_page` 時，同一次執行才會再預留一次額度並送出 posts trigger。其他錯誤、部分錯誤或空結果都不切換；明確指定 `reels` 也不切換。兩種模式使用分開的回執，重試沿用各自的 snapshot。
 
-訂閱一旦觀察到上述 `dead_page`，會在送出 posts 前保存為 `posts`，之後刷新直接使用 Pages Posts；即使 posts 失敗或額度不足也保留此模式。新增時若已切換但 posts 失敗，訂閱仍會保留模式及錯誤，可用 `--rss-refresh` 續查。`--facebook-discover-only` 沒有訂閱，只在當次執行切換並在輸出標示；可用訂閱更新改回 `auto` 或固定 `reels`。
+既有訂閱刷新時一旦觀察到上述 `dead_page`，會在送出 posts 前保存為 `posts`，之後刷新直接使用 Pages Posts；即使 posts 失敗或額度不足也保留此模式。新增（含 OPML 匯入）只有整次成功才建立訂閱並保存 posts 模式，失敗不留訂閱；重試沿用 Reels 與 posts 各自的回執，不重送已提交的 trigger。`--facebook-discover-only` 沒有訂閱，只在當次執行切換並在輸出標示；可用訂閱更新改回 `auto` 或固定 `reels`。
 
 Pages Posts 會採集所有貼文類型，**非影片貼文也計費**，沒有只抓影片的供應商參數；本機只把 `post_type` 為 Reel／Video、或 attachment 為 Video／帶 `video_url` 的項目加入影片佇列，不把會過期的 CDN `video_url` 當影片來源網址。首次自動切換的 Reels 錯誤結果也會計費，posts 另計。盤點輸出顯示實際模式、切換及原始／影片／非影片／錯誤筆數。
 

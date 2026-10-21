@@ -2,7 +2,7 @@
 
 ## Unreleased
 
-- 新增：Bright Data Facebook `--facebook-brightdata-mode {auto,reels,posts}` 與訂閱／OPML 模式保存；Reels（`gd_lyclm3ey2q6rww027t`）在 auto 且全為 `dead_page` 時，當次切換 Pages Posts（`gd_lkaxegm826bjpoo9m5`），送出前先保存 posts 模式，即使後續失敗也不再先試 Reels。兩次 trigger 獨立預留／結算、分開回執；只有送出前額度拒絕可依既有授權走 Apify 備援。
+- 新增：Bright Data Facebook `--facebook-brightdata-mode {auto,reels,posts}` 與訂閱／OPML 模式保存；Reels（`gd_lyclm3ey2q6rww027t`）在 auto 且全為 `dead_page` 時，當次切換 Pages Posts（`gd_lkaxegm826bjpoo9m5`），既有訂閱刷新會在送出前先保存 posts 模式，即使後續失敗也不再先試 Reels；新增（含 OPML 匯入）僅於整次成功時建立訂閱，失敗不留半成品，重試沿用回執。兩次 trigger 獨立預留／結算、分開回執；只有送出前額度拒絕可依既有授權走 Apify 備援。
 - 新增：posts 本機篩選影片及日期，使用 Facebook 貼文／影片網址而非 CDN；非影片貼文同樣計費。成功保存後以 `facebook_seen_post_ids` 記住含非影片的有效貼文 ID，去重保留最近 500 筆，下次與影片 ID 一起排除，減少重複計費。
 
 - 修正：Facebook／Instagram Bright Data 作者盤點先結算含錯誤的全部 record，再以 `error_count`／`errors` 回報；全部錯誤時 CLI 非零結束、RSS 記錄失敗且不推進 snapshot，部分錯誤保留正常項目，重試沿用回執不重送計費 trigger。

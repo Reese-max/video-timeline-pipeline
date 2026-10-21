@@ -209,6 +209,41 @@ class FacebookPostsModeTests(unittest.TestCase):
             "url": "https://mbasic.facebook.com/watch/?v=123&token=secret#fragment"}]))
         self.assertEqual(item["url"], "https://mbasic.facebook.com/watch/?v=123")
 
+    def test_watch_attachment_requires_numeric_video_id_after_cleaning(self):
+        for query in ("", "?ref=embed", "?v=abc", "?v=123abc", "?v=123&ref=embed"):
+            with self.subTest(query=query):
+                base = record(attachments=[{"type": "Video",
+                    "url": "https://www.facebook.com/watch/" + query}])
+                item = pipeline.brightdata_facebook_post_item(base)
+                expected = "https://www.facebook.com/watch/?v=123" if query.startswith("?v=123&") else base["url"]
+                self.assertEqual(item["url"], expected)
+
+    def test_video_counts_exclude_invalid_urls_in_both_modes(self):
+        for mode, dataset in (("posts", POSTS), ("reels", REELS)):
+            with self.subTest(mode=mode):
+                self.results[dataset] = [record("valid", url="https://facebook.com/reel/123/"),
+                    record("invalid", url="https://cdn.test/reel/456/"),
+                    record("photo", post_type="Post")]
+                meta = self.fetch(brightdata_mode=mode)["facebook"]
+                self.assertEqual(meta["video_count"], 1)
+                self.assertEqual(meta["invalid_video_count"], 1)
+                self.assertEqual(meta["non_video_count"], 1)
+                self.assertIn("無效影片 1 筆", pipeline.facebook_discovery_detail(meta))
+
+    def test_reels_video_type_with_unusable_url_counts_invalid(self):
+        self.results[REELS] = [record(url="https://cdn.test/expired")]
+        meta = self.fetch(brightdata_mode="reels")["facebook"]
+        self.assertEqual(meta["invalid_video_count"], 1)
+        self.assertEqual(meta["non_video_count"], 0)
+
+    def test_whitespace_post_id_falls_back_to_trimmed_shortcode_in_both_parsers(self):
+        for parse in (pipeline.brightdata_facebook_post_item, pipeline.brightdata_facebook_item):
+            for post_id, shortcode, expected in (("  ", " short ", "short"), (" id ", "short", "id"),
+                                                   ("  ", " \t ", None)):
+                with self.subTest(parser=parse.__name__, post_id=post_id, shortcode=shortcode):
+                    item = parse(record(post_id, shortcode=shortcode, url="https://facebook.com/reel/123/"))
+                    self.assertEqual(item["id"], expected or pipeline.job_key(item["url"]))
+
     def test_auto_refresh_switches_settles_twice_then_only_posts(self):
         self.seed()
         self.assertEqual(pipeline.refresh_rss(self.root, allow_paid=True)["failed"], 0)
@@ -272,6 +307,17 @@ class FacebookPostsModeTests(unittest.TestCase):
         self.assertEqual(self.datasets(), [REELS])
         self.assertNotIn("offline-token", str(raised.exception))
 
+    def test_switch_meta_and_detail_include_all_billed_reels_errors(self):
+        self.results[REELS] = [DEAD, DEAD]
+        meta = self.fetch()["facebook"]
+        self.assertEqual(meta["reels_billed"], 2)
+        self.assertIn("模式 reels → posts（自動切換；reels dead_page 已計費 2 筆）",
+                      pipeline.facebook_discovery_detail(meta))
+
+    def test_legacy_brightdata_detail_defaults_to_reels(self):
+        meta = {"provider": "brightdata", "raw_count": 3, "error_count": 1}
+        self.assertIn("模式 reels", pipeline.facebook_discovery_detail(meta))
+
     def test_posts_quota_fallback_requires_separate_apify_permission(self):
         self.seed()
         with patch.dict(os.environ, {"BRIGHTDATA_MONTHLY_CREDIT_LIMIT": "5",
@@ -301,6 +347,23 @@ class FacebookPostsModeTests(unittest.TestCase):
         pipeline.refresh_rss(self.root, allow_paid=True)
         self.assertEqual(set(json.loads(self.submit.call_args.kwargs["body"])[0]["posts_to_not_include"]), set(ids))
 
+    def test_seen_ids_reject_non_lists_and_filter_mixed_elements_before_fetch_and_save(self):
+        for index, (stored, expected) in enumerate((("photo", []), (42, []),
+                ([" old ", 7, True, False, None, {}, [], " ", "7"], ["old", "7"]))):
+            with self.subTest(stored=stored):
+                state = self.seed(facebook_brightdata_mode="posts", facebook_seen_post_ids=stored,
+                                  facebook_last_snapshot_id=f"sd_case{index}")
+                state["items"] = []
+                pipeline.save_rss_state(self.root, state)
+                self.assertEqual(pipeline.refresh_rss(self.root, allow_paid=True)["failed"], 0)
+                payload = json.loads(self.submit.call_args.kwargs["body"])[0]
+                self.assertEqual(set(payload.get("posts_to_not_include", [])), set(expected))
+                self.assertEqual(set(self.saved()["facebook_seen_post_ids"]), {*expected, "video", "photo"})
+
+    def test_direct_fetch_seen_ids_also_rejects_string(self):
+        self.fetch(brightdata_mode="posts", seen_post_ids="photo")
+        self.assertNotIn("posts_to_not_include", json.loads(self.submit.call_args.kwargs["body"])[0])
+
     def test_failed_state_save_does_not_advance_seen_ids_or_resubmit_receipt(self):
         self.seed(facebook_brightdata_mode="posts", facebook_seen_post_ids=["old"])
         with patch.object(pipeline, "save_rss_state", side_effect=OSError("disk full")):
@@ -311,19 +374,74 @@ class FacebookPostsModeTests(unittest.TestCase):
         self.submit.assert_called_once()
         self.assertEqual(set(self.saved()["facebook_seen_post_ids"]), {"old", "video", "photo"})
 
-    def test_add_switch_success_and_failure_both_persist_posts(self):
+    def test_add_switch_success_persists_posts(self):
         subscription, _, _ = pipeline.add_facebook_subscription(self.root, "NASA", since="2026-01-01",
             provider="brightdata", max_items=5, allow_paid=True)
         self.assertEqual(subscription["facebook_brightdata_mode"], "posts")
         self.assertEqual(set(subscription["facebook_seen_post_ids"]), {"video", "photo"})
+        meta = json.loads((self.root / "rss" / subscription["facebook_last_discovery"]).read_text(encoding="utf-8"))["facebook"]
+        self.assertEqual(meta["switched_from"], "reels")
+
+    def test_add_switch_failure_leaves_no_subscription_and_retry_reuses_both_receipts(self):
         self.results[POSTS] = RuntimeError("posts failed")
-        other = self.root / "other"
+        with patch.object(pipeline, "save_rss_state", wraps=pipeline.save_rss_state) as save:
+            with self.assertRaisesRegex(RuntimeError, "posts failed"):
+                pipeline.add_facebook_subscription(self.root, "NASA", provider="brightdata", max_items=5, allow_paid=True)
+            self.assertEqual(pipeline.load_rss_state(self.root)["subscriptions"], [])
+            save.assert_not_called()
+        self.assertEqual(self.datasets(), [REELS, POSTS])
+        self.assertEqual(len(list(self.root.rglob("submission.json"))), 2)
+        with closing(sqlite3.connect(self.root / "credits.sqlite3")) as connection:
+            before = connection.execute("SELECT rowid, credits, actual FROM reservations ORDER BY rowid").fetchall()
+        self.assertEqual([row[1:] for row in before], [(5, 1), (5, None)])
+        self.snapshots["sd_1"] = [record(), record("photo", post_type="Post")]
+        subscription, _, _ = pipeline.add_facebook_subscription(self.root, "NASA",
+            provider="brightdata", max_items=5, allow_paid=True)
+        self.assertEqual(subscription["facebook_brightdata_mode"], "posts")
+        self.assertTrue(subscription["facebook_last_discovery"])
+        self.assertEqual(self.datasets(), [REELS, POSTS])
+        with closing(sqlite3.connect(self.root / "credits.sqlite3")) as connection:
+            after = connection.execute("SELECT rowid, credits, actual FROM reservations ORDER BY rowid").fetchall()
+        self.assertEqual(after, [(before[0][0], 5, 1), (before[1][0], 5, 2)])
+        self.assertEqual(pipeline.brightdata_credits.usage()["reserved"], 0)
+
+    def test_cli_add_switch_failure_leaves_no_subscription(self):
+        self.results[POSTS] = RuntimeError("posts failed")
         with self.assertRaisesRegex(RuntimeError, "posts failed"):
-            pipeline.add_facebook_subscription(other, "NASA", provider="brightdata", max_items=5, allow_paid=True)
-        saved = pipeline.load_rss_state(other)["subscriptions"][0]
-        self.assertEqual(saved["facebook_brightdata_mode"], "posts")
-        self.assertFalse(saved.get("facebook_last_snapshot_id"))
-        self.assertIn("posts failed", saved["last_error"])
+            self.command("--facebook-author", "NASA", "--facebook-provider", "brightdata",
+                         "--facebook-max-items", "5", "--allow-batch-cloud")
+        self.assertEqual(pipeline.load_rss_state(self.root)["subscriptions"], [])
+
+    def opml(self, mode="auto"):
+        source = self.root / "subscriptions.opml"
+        source.write_text('<opml version="2.0"><body><outline xmlUrl="https://www.facebook.com/NASA" '
+            'vidbeeKind="facebook-author" vidbeeFacebookProvider="brightdata" vidbeeFacebookMaxItems="5" '
+            f'vidbeeFacebookBrightdataMode="{mode}" vidbeeEnabled="false" /></body></opml>', encoding="utf-8")
+        return source
+
+    def test_disabled_opml_switch_failure_leaves_no_subscription_then_retry_stays_disabled(self):
+        self.results[POSTS] = RuntimeError("posts failed")
+        source = self.opml()
+        self.assertEqual(pipeline.import_rss_opml(self.root, source, allow_paid=True),
+                         {"added": 0, "existing": 0, "failed": 1})
+        self.assertEqual(pipeline.load_rss_state(self.root)["subscriptions"], [])
+        with patch.dict(os.environ, {"RSS_PAID_DISCOVERY": "brightdata"}):
+            with self.assertRaisesRegex(RuntimeError, "尚未加入 RSS 訂閱"):
+                pipeline.refresh_rss(self.root)
+        self.assertEqual(self.datasets(), [REELS, POSTS])
+        self.snapshots["sd_1"] = [record()]
+        self.assertEqual(pipeline.import_rss_opml(self.root, source, allow_paid=True),
+                         {"added": 1, "existing": 0, "failed": 0})
+        self.assertEqual(self.saved()["facebook_brightdata_mode"], "posts")
+        self.assertFalse(self.saved()["enabled"])
+        with patch.dict(os.environ, {"RSS_PAID_DISCOVERY": "brightdata"}):
+            pipeline.refresh_rss(self.root)
+        self.assertEqual(self.datasets(), [REELS, POSTS])
+
+    def test_disabled_opml_successful_switch_stays_disabled(self):
+        self.assertEqual(pipeline.import_rss_opml(self.root, self.opml(), allow_paid=True)["added"], 1)
+        self.assertEqual(self.saved()["facebook_brightdata_mode"], "posts")
+        self.assertFalse(self.saved()["enabled"])
 
     def test_manual_posts_and_auto_still_require_allow_batch_cloud(self):
         with patch.dict(os.environ, {"RSS_PAID_DISCOVERY": "brightdata"}):
@@ -338,7 +456,8 @@ class FacebookPostsModeTests(unittest.TestCase):
             self.assertEqual(self.command("--facebook-author", "NASA", "--facebook-provider", "brightdata",
                 "--facebook-max-items", "5", "--facebook-discover-only", "--allow-batch-cloud"), 0)
         output = stdout.getvalue()
-        for expected in ("posts", "reels", "原始 2 筆", "影片 1 筆", "非影片 1 筆", "錯誤 0 筆"):
+        for expected in ("模式 reels → posts（自動切換；reels dead_page 已計費 1 筆）",
+                         "原始 2 筆", "影片 1 筆", "非影片 1 筆", "錯誤 0 筆"):
             self.assertIn(expected, output)
         self.assertEqual(pipeline.load_rss_state(self.root)["subscriptions"], [])
 
@@ -407,12 +526,21 @@ class FacebookPostsModeTests(unittest.TestCase):
         self.assertEqual(self.datasets(), [POSTS])
 
     def test_cli_mode_rejects_non_brightdata_and_non_facebook_updates(self):
-        for fields in ({"facebook_provider": "apify"}, {"kind": "rss"}, {"kind": "instagram-author"}):
+        for fields in ({"facebook_provider": "apify"}, {"facebook_provider": "meta"},
+                       {"kind": "rss"}, {"kind": "instagram-author"}):
             self.seed(**fields)
+            before = pipeline.load_rss_state(self.root)
             with self.subTest(fields=fields), self.assertRaises(ValueError):
                 self.command("--rss-update", "fb", "--facebook-brightdata-mode", "posts")
+            self.assertEqual(pipeline.load_rss_state(self.root), before)
         with self.assertRaises(ValueError):
             self.command("--facebook-author", "NASA", "--facebook-provider", "meta", "--facebook-brightdata-mode", "auto")
+        self.submit.assert_not_called()
+
+    def test_opml_invalid_brightdata_mode_counts_failed_without_subscription(self):
+        self.assertEqual(pipeline.import_rss_opml(self.root, self.opml("invalid"), allow_paid=True),
+                         {"added": 0, "existing": 0, "failed": 1})
+        self.assertEqual(pipeline.load_rss_state(self.root)["subscriptions"], [])
         self.submit.assert_not_called()
 
 

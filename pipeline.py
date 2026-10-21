@@ -5434,7 +5434,7 @@ def fetch_facebook_author(
         raise ValueError("RSS_FACEBOOK_FALLBACK_PROVIDER 只接受空值或 apify。")
     if provider == "brightdata":
         mode = "posts" if brightdata_mode == "posts" else "reels"
-        post_excludes = [*(exclude_ids or []), *(seen_post_ids or [])]
+        post_excludes = [*(exclude_ids or []), *valid_facebook_seen_post_ids(seen_post_ids)]
         switch_meta = {}
         try:
             try:
@@ -5447,7 +5447,8 @@ def fetch_facebook_author(
                     raise
                 if on_mode_switch is not None:
                     on_mode_switch()
-                switch_meta = {"switched_from": "reels", "reels_error_codes": exc.codes}
+                switch_meta = {"switched_from": "reels", "reels_error_codes": exc.codes,
+                               "reels_billed": len(exc.codes)}
                 feed = fetch_facebook_author_brightdata(
                     author, since, max_items=max_items, exclude_ids=post_excludes,
                     allow_paid=allow_paid, root=root, mode="posts",
@@ -5528,12 +5529,15 @@ def facebook_discovery_detail(meta: dict[str, Any]) -> str:
         return f"{meta['pages']} 個 API 分頁"
     if meta.get("provider") != "brightdata":
         return f"{meta.get('raw_count', 0)} 筆公開貼文"
-    mode = meta["mode"]
+    mode = meta.get("mode", "reels")
     if meta.get("switched_from"):
-        mode = f"{meta['switched_from']} → {mode}（自動切換）"
+        mode = (f"{meta['switched_from']} → {mode}（自動切換；"
+                f"reels {', '.join(dict.fromkeys(meta.get('reels_error_codes', [])))} "
+                f"已計費 {meta.get('reels_billed', 0)} 筆）")
+    invalid = f"、無效影片 {meta['invalid_video_count']} 筆" if meta.get("invalid_video_count") else ""
     return (f"模式 {mode}；原始 {meta['raw_count']} 筆、"
             f"有效 {meta['raw_count'] - meta['error_count']} 筆、錯誤 {meta['error_count']} 筆、"
-            f"影片 {meta['video_count']} 筆、非影片 {meta['non_video_count']} 筆")
+            f"影片 {meta.get('video_count', 0)} 筆、非影片 {meta.get('non_video_count', 0)} 筆{invalid}")
 
 
 def instagram_username(value: str) -> str:
@@ -5899,7 +5903,8 @@ def brightdata_facebook_item(record: dict[str, Any]) -> dict[str, str] | None:
     } or (not record.get("video_url") and "/reel/" not in parsed.path):
         return None
     url = public_url(raw_url)
-    post_id = str(record.get("post_id") or record.get("shortcode") or "").strip() or job_key(url)
+    post_id = (str(record.get("post_id") or "").strip()
+               or str(record.get("shortcode") or "").strip() or job_key(url))
     return {"id": post_id, "title": str(record.get("content") or "")[:160] or f"Facebook Reel {post_id}",
             "url": url, "source_url": url, "published": str(record.get("date_posted") or "")}
 
@@ -5937,15 +5942,25 @@ def brightdata_facebook_post_item(record: dict[str, Any]) -> dict[str, str] | No
             ):
                 continue
             candidate = facebook_url(attachment.get("url"))
-            path = urllib.parse.urlsplit(candidate).path
-            if candidate and (re.search(r"/(?:reel|videos)/", path) or path.rstrip("/") == "/watch"):
+            parsed = urllib.parse.urlsplit(candidate)
+            video_ids = urllib.parse.parse_qs(parsed.query).get("v") or []
+            if candidate and (re.search(r"/(?:reel|videos)/", parsed.path) or (
+                    parsed.path.rstrip("/") == "/watch" and video_ids and re.fullmatch(r"\d+", video_ids[0]))):
                 url = candidate
                 break
     if not url:
         return None
-    post_id = str(record.get("post_id") or record.get("shortcode") or "").strip() or job_key(url)
+    post_id = (str(record.get("post_id") or "").strip()
+               or str(record.get("shortcode") or "").strip() or job_key(url))
     return {"id": post_id, "title": str(record.get("content") or "")[:160] or f"Facebook video {post_id}",
             "url": url, "source_url": url, "published": str(record.get("date_posted") or "")}
+
+
+def valid_facebook_seen_post_ids(value: Any) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    return [str(item).strip() for item in value
+            if isinstance(item, (str, int)) and not isinstance(item, bool) and str(item).strip()]
 
 
 def remember_facebook_posts(subscription: dict[str, Any], feed: dict[str, Any]) -> None:
@@ -5955,7 +5970,7 @@ def remember_facebook_posts(subscription: dict[str, Any], feed: dict[str, Any]) 
            if not brightdata_error_record(row) and not isinstance(row.get("post_id"), bool)
            and isinstance(row.get("post_id"), (str, int)) and str(row["post_id"]).strip()]
     # Keep the most recently observed IDs, including non-video posts that were also billed.
-    combined = [*(subscription.get("facebook_seen_post_ids") or []), *ids]
+    combined = [*valid_facebook_seen_post_ids(subscription.get("facebook_seen_post_ids")), *ids]
     subscription["facebook_seen_post_ids"] = list(dict.fromkeys(reversed(combined)))[::-1][-500:]
 
 
@@ -6007,24 +6022,24 @@ def fetch_facebook_author_brightdata(
     raw_items = [item for item in rows if isinstance(item, dict)]
     by_id = {}
     missing_dates = 0
-    video_count = non_video_count = 0
+    video_count = non_video_count = invalid_video_count = 0
     for record in raw_items:
         if brightdata_error_record(record):
             continue
         if mode == "posts":
-            if facebook_post_is_video(record):
-                video_count += 1
-            else:
-                non_video_count += 1
+            is_video = facebook_post_is_video(record)
             item = brightdata_facebook_post_item(record)
         else:
+            is_video = (facebook_post_is_video(record) or bool(record.get("video_url"))
+                        or "/reel/" in str(record.get("url") or ""))
             item = brightdata_facebook_item(record)
-            if item is not None:
-                video_count += 1
+        if item is None:
+            if is_video:
+                invalid_video_count += 1
             else:
                 non_video_count += 1
-        if item is None:
             continue
+        video_count += 1
         published = feed_timestamp(item["published"])
         if not published:
             missing_dates += 1
@@ -6038,6 +6053,7 @@ def fetch_facebook_author_brightdata(
                          "since": since, "max_items": max_items, "snapshot_id": snapshot_id,
                          "mode": mode, "dataset_id": dataset_id, **record_meta,
                          "video_count": video_count, "non_video_count": non_video_count,
+                         "invalid_video_count": invalid_video_count,
                          "missing_date_count": missing_dates, "date_filter_complete": missing_dates == 0,
                          "fetched_at": rss_now()}}
 
@@ -6297,26 +6313,14 @@ def add_facebook_subscription(
         "last_checked": rss_now(),
         "last_error": "",
     }
-    state["subscriptions"].append(subscription)
-    switched = False
-
-    def persist_posts_mode() -> None:
-        nonlocal switched
+    def select_posts_mode() -> None:
         subscription["facebook_brightdata_mode"] = "posts"
-        save_rss_state(root, state)
-        switched = True
 
-    try:
-        feed = fetch_facebook_author(page_id, since, provider, allow_paid=allow_paid,
-            brightdata_mode=brightdata_mode,
-            **({"max_items": max_items, "root": root, "on_mode_switch": persist_posts_mode}
-               if provider == "brightdata" else {}))
-        snapshot = write_facebook_discovery(root, feed)
-    except Exception as exc:
-        if switched:
-            subscription["last_error"] = sanitize_public_urls(str(exc))
-            save_rss_state(root, state)
-        raise
+    feed = fetch_facebook_author(page_id, since, provider, allow_paid=allow_paid,
+        brightdata_mode=brightdata_mode,
+        **({"max_items": max_items, "root": root, "on_mode_switch": select_posts_mode}
+           if provider == "brightdata" else {}))
+    snapshot = write_facebook_discovery(root, feed)
     subscription.update({
         "url": str(feed["facebook"]["author_url"]),
         "name": name.strip() or str(feed["title"]),
@@ -6325,6 +6329,7 @@ def add_facebook_subscription(
         "facebook_last_discovery": snapshot.name,
     })
     remember_facebook_posts(subscription, feed)
+    state["subscriptions"].append(subscription)
     counts = queue_rss_items(state, subscription, list(feed["items"]))
     save_rss_state(root, state)
     return subscription, counts, snapshot
