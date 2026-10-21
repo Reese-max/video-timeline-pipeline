@@ -2,6 +2,7 @@ import asyncio
 import copy
 import csv
 import json
+import os
 import shutil
 import tempfile
 import unittest
@@ -276,7 +277,9 @@ class ReliabilityTests(unittest.TestCase):
                 server.pipeline.require_tool("ffmpeg"), "-v", "error", "-f", "lavfi", "-i",
                 "testsrc2=size=64x64:rate=7/2:duration=31", "-f", "lavfi", "-i",
                 "sine=frequency=880:duration=31", "-c:v", "libx264", "-c:a", "aac", str(source)])
-            parts = server.split_video(source, root / "segments", 15)
+            # 邊界取自 muxer 的實際關鍵畫面，需要重新編碼模式（copy 不強制關鍵畫面）。
+            with patch.dict(os.environ, {"MCP_SEGMENT_MODE": "transcode"}):
+                parts = server.split_video(source, root / "segments", 15)
             rows = list(csv.reader((root / "segments" / "segments.csv").read_text().splitlines()))
             self.assertEqual(len(parts), 3)
             self.assertNotEqual(float(rows[1][1]), 15.0)

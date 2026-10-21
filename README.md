@@ -162,7 +162,21 @@ Drive 上傳以 1 MiB 分塊；遇到斷線、HTTP 429／5xx，最多退避重�
 
 跨呼叫重試也保留進度：採 [Google Drive 預先配置 ID](https://developers.google.com/workspace/drive/api/guides/manage-uploads#use_a_pre-generated_id_to_upload_files)，先原子保存 ID 再建立資料夾／影片。每次重用都重新讀取 Drive，確認未進垃圾桶、大小、SHA-256 與父資料夾；403／網路錯誤會停止，不把它當成不存在。已刪除或被修改的檔案會建立新 ID，不覆寫原檔。只有全部驗證成功才標示 `drive_ready`。舊版未記錄的孤立上傳不會自動刪除。此實作使用單程序鎖與 JSON checkpoint；多程序部署需先換成共享鎖，大量分段若 checkpoint 寫入成為瓶頸，再改成增量日誌。
 
-可用環境變數：`MCP_MAX_SOURCE_MB`（預設 512）、`MCP_MAX_SEGMENT_SECONDS`（預設 600）、`MCP_MAX_SEGMENTS`（預設 0，不限段數；設為正整數後，省略 `max_segments` 也不會繞過伺服器上限）、`MCP_MIN_FREE_MB`（預設保留 1024 MiB）、`MCP_ROOT`（預設 repo 根目錄）、`TRANSCRIBE_BACKEND`（`groq` 或 `local`）、`GROQ_ASR_MODEL`、`MINIMAX_MODEL`。工具的 `max_segments` 預設仍不設上限。
+可用環境變數：`MCP_MAX_SOURCE_MB`（預設 512）、`MCP_MAX_SEGMENT_SECONDS`（預設 600）、`MCP_MAX_SEGMENTS`（預設 0，不限段數；設為正整數後，省略 `max_segments` 也不會繞過伺服器上限）、`MCP_MIN_FREE_MB`（預設保留 1024 MiB）、`MCP_ROOT`（預設 repo 根目錄）、`MCP_SEGMENT_MODE`（預設 `copy`，見下）、`MCP_SEGMENT_MAX_LONG_SIDE`（預設 1280）、`MCP_SEGMENT_X264_PRESET`（預設 `veryfast`）、`TRANSCRIBE_BACKEND`（`groq` 或 `local`）、`GROQ_ASR_MODEL`、`MINIMAX_MODEL`。工具的 `max_segments` 預設仍不設上限。
+
+### 分段模式：預設直接剪開（stream copy）
+
+切割預設改成**直接剪開**：ffmpeg 用 `-c copy` 直接把原影片剪成分段，不重新編碼。分段只用於 Drive 分段備份、ChatGPT 面板播放與偶爾的一般對話讀取；MiniMax 畫面分析與 Groq 語音轉文字都直接讀原片（`video_path`），不讀分段，所以分段不需要為了 AI 分析而重編碼。
+
+- `MCP_SEGMENT_MODE`：`copy`（預設）或 `transcode`。非法值直接報錯（ValueError），不會呼叫 ffmpeg。
+- `MCP_SEGMENT_MAX_LONG_SIDE`：重新編碼時的長邊上限（預設 1280）；`0` = 不縮放；非 0 時必須 ≥ 240 且為偶數。只縮小不放大、維持比例、寬高皆偶數，直式／橫式都正確。手機影片的旋轉 metadata 由 ffmpeg 預設先自動旋轉再套濾鏡，縮放運算式依 `iw`／`ih` 判斷長邊，不依賴 probe 寬高。
+- `MCP_SEGMENT_X264_PRESET`：重新編碼時的 x264 preset（預設 `veryfast`）；只接受 `superfast`、`veryfast`、`faster`、`fast`、`medium`。
+
+**退回條件**：copy 的 ffmpeg 失敗，或 copy 產生的分段沒通過既有驗證（列數、檔名、時間連續、最後一段接近影片長度）時，同一次呼叫內自動清掉 copy 的分段與清單、改用重新編碼，並在 stdout 印出一行繁中原因。取消（`ExecutionCancelled`）與逾時（`DeadlineExceeded`）一律照常往上拋，不會退回重新編碼。只有上述兩種失敗才會退回；來源指紋、寫標記等前置錯誤直接往上拋，不會白跑一次重新編碼。
+
+**A1 主機（2 OCPU）實測**（25.5 分鐘 VP9 1080x1920 影片）：重新編碼（veryfast、crf 28）需約 14–15 分鐘；**stream copy（`-c copy -f segment -segment_time 120`）只要 1.1 秒**，13 段、邊界在 120 秒倍數，VP9 分段可正常產生預覽圖。若必須重新編碼：長邊縮到 1280 為 2.63 倍速、檔案小 39%（現行 1080p 為 1.82 倍速）；`ultrafast` 沒有更快且檔案大 3 倍。
+
+**注意**：copy 的分段維持原編碼（例如 VP9），部分瀏覽器與 iOS 無法播放；分段時間以 `segments.csv` 的實際值為準（copy 不能強制關鍵畫面，切點落在下一個關鍵畫面）。copy 與 transcode 都用 `-avoid_negative_ts disabled`，分段沿用來源時間軸、切點與播放時間軸一致，同樣以 `segments.csv` 的實際值為準。**需要到處都能播放的 H.264 分段：設 `MCP_SEGMENT_MODE=transcode`**。copy 模式不做續跑（重切只要幾秒；`-ss` 會對齊到關鍵畫面，偏移合併不可靠），遇到中斷殘留一律清空重切；transcode 模式保留中斷續切。模式或設定改變時，舊分段會全部重切（參數記在 `segments/.split-params.json`）。
 
 容量保護是事前檢查：下載前預留來源上限，切割／分析前至少再預留一份來源大小與最低剩餘空間；轉碼大小不固定，這不是磁碟配額保證。準備、分析、Drive 上傳共用單程序工作鎖；忙碌時立即回傳可重試錯誤，不讓背景執行緒無限排隊。仍採同步處理；持久化長片佇列、Drive 配額管理、定期刪除未實作。沒有保留天數授權時不刪除任何既有影片。
 
