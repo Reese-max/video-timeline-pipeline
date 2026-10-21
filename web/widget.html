@@ -941,7 +941,9 @@ $("cancel").addEventListener("click", () => changeOperation("cancel"));
 $("resume").addEventListener("click", () => changeOperation("resume"));
 $("refresh").addEventListener("click", () => {
   stopPolling();
-  return uncertainStart || (data && !isPending(activeOperation)) || !activeOperation?.operation_id ? restoreJob() : pollOperation();
+  if (uncertainStart || (data && !isPending(activeOperation)) || !activeOperation?.operation_id) return restoreJob();
+  stopDrivePolling();
+  return Promise.all([pollOperation(), isPending(driveOperation) ? pollDriveOperation() : null]);
 });
 $("segment").addEventListener("change", () => selectSegment(Number($("segment").value)));
 $("player").addEventListener("loadedmetadata", () => { if (pendingSeek !== null) { $("player").currentTime = pendingSeek; pendingSeek = null; } });

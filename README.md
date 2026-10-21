@@ -88,7 +88,7 @@ UI URI 升為 `ui://video-timeline-pipeline/v16-<媒體網址 hash>.html`，並�
 
 準備／分析／Drive 工具支援 `background=true`；可用 `get_video_job` 查進度，`cancel_video_job` 取消，`resume_video_job` 續跑，`get_prepared_video` 恢復結果及更新下載網址。新介面使用背景模式，舊客戶端的同步預設仍相容。準備完成後 widget 自動同時送出分析與 Drive 背景工作（Drive 先送；paired worker 允許同一 job 的分析與 Drive 片段上傳並行，最多兩個 worker；其他工作依佇列排程）；未設定 Drive 時只自動跑分析。兩路互不等待、失敗隔離；手動按鈕保留重試入口。交接內容只放檔案 ID／網址／大小與原片分段時間，不含任何 A 的結果，並提供「一鍵複製」與「開新一般對話」。
 
-取消或續跑其中一路時，另一條路線仍會繼續查詢進度；Drive 上傳完成後，交接內容與「一鍵複製」「開新一般對話」仍會立即可用。
+取消或續跑其中一路時，另一條路線仍會繼續查詢進度；Drive 上傳完成後，交接內容與「一鍵複製」「開新一般對話」仍會立即可用。任一路查詢失敗時，按「重新取得狀態」會同時恢復兩路尚未完成工作的輪詢，不會重新送出分析或上傳。
 
 A 分析完成時，本機產生 `A_server_analysis.md`（逐字稿、畫面時間軸、品質與待整理摘要），widget 自動取得報告快照並提示等待 ChatGPT 整理摘要。「交給 ChatGPT 整理」要求 ChatGPT 先讀取目前證據與報告綁定，再呼叫 `finalize_analysis_report` 提交摘要及來源註記；也可在 widget 明確填寫後提交。影片片段已在 Drive 且兩路 worker 已停止時，排入獨立的報告上傳工作，放進同一個 Drive 資料夾：分析證據完整且不需覆核（`evidence_status=complete`、`quality.status=evidence_available`）時不必等摘要，直接上傳純證據版；畫面分析失敗但語音完整可靠（`visual_status=error`、`audio_status=complete`、`speech_reliable=true`、逐字稿無缺口）時標 `evidence_scope=speech_only`，報告開頭註明只含語音，同樣免摘要上傳；其餘情況仍要先有 `summary_status=caller_submitted`。之後再提交摘要會另外上傳一份同名新版（只差摘要段）。B 交接內容已含第二步：B 先獨立輸出，再自行讀取同資料夾的 A 報告合併；A 尚未就緒才需要貼合併指令。合併規則：畫面文字與數字採 B，A 的不同讀法放附錄；講話內容採 A，A 的 `quality.speech_reliable=false`（逐字稿只有低信心的片尾套語〔avg_logprob < -0.3〕、只有符號或沒有語音）時寫「沒有可信的語音內容」、A 的語音文字只列附錄，並在分析結果提示建議加跑 B（`quality.route_b_reasons` 列出缺少的是語音、逐字稿或畫面）。可免摘要上傳的報告在快照中顯示 `awaiting_segments`，widget 會自動追蹤到上傳完成。widget 追蹤 queued／running 報告；`report_ready` 且 `verified` 時顯示「A 已完成」並啟用「複製合併指令」。指令以「合併：」開頭，保留 file_id、SHA-256 與未獨立驗證聲明。
 

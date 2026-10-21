@@ -139,6 +139,55 @@ async function test(name, run) { await run(); count++; console.log('ok ' + count
     assert.equal(h.elements.get('findings').hidden, true);
     assert.equal(h.prompts.length, 0);
   });
+  await test('refresh recovers Drive polling errors while analysis keeps running', async () => {
+    const analysisOp = pending('analyze-1', 'analyze', 'running');
+    const driveOp = pending('drive-1', 'drive', 'running');
+    let driveReads = 0;
+    const h = harness({ respond(name, args) {
+      if (name === 'get_prepared_video') return { prepared: job('first'), analysis: null,
+        active_operation: analysisOp, latest_operation: analysisOp, pending_operations: [driveOp, analysisOp] };
+      if (name === 'get_video_job' && args.operation_id === 'analyze-1') return analysisOp;
+      if (name === 'get_video_job' && args.operation_id === 'drive-1') {
+        if (++driveReads === 1) throw new Error('Drive status timeout');
+        return completed(drive('first'), 'drive', 'drive-1');
+      }
+      throw new Error('Unexpected ' + name);
+    } });
+    await h.flush(); await h.poll();
+    assert.match(h.elements.get('status').textContent, /無法取得 Drive 上傳狀態/);
+    await h.click('refresh');
+    assert.equal(driveReads, 2, 'refresh must retry Drive while analysis is pending');
+    assert.equal(h.elements.get('drive-handoff').hidden, false);
+    assert.equal(h.elements.get('copy-handoff').disabled, false);
+    assert.equal(h.elements.get('open-chat').disabled, false);
+    assert.equal(h.elements.get('findings').hidden, true);
+    assert.equal(h.elements.get('cancel').disabled, false);
+    assert(h.calls.every(call => ['get_prepared_video', 'get_video_job'].includes(call.name)));
+    assert.deepEqual(h.fallbackCalls, []);
+    assert.equal(h.prompts.length, 0);
+  });
+  await test('failed refresh snapshot preserves healthy Drive polling after analysis stops', async () => {
+    const analysisOp = pending('analyze-1', 'analyze', 'failed');
+    const driveOp = pending('drive-1', 'drive', 'running');
+    let snapshots = 0;
+    const h = harness({ respond(name, args) {
+      if (name === 'get_prepared_video') {
+        if (++snapshots > 1) throw new Error('snapshot timeout');
+        return { prepared: job('first'), analysis: null,
+          active_operation: driveOp, latest_operation: analysisOp, pending_operations: [driveOp] };
+      }
+      if (name === 'get_video_job' && args.operation_id === 'drive-1') return completed(drive('first'), 'drive', 'drive-1');
+      throw new Error('Unexpected ' + name);
+    } });
+    await h.flush(); await h.click('refresh');
+    assert.match(h.elements.get('status').textContent, /無法恢復工作狀態.*snapshot timeout/);
+    await h.poll();
+    assert.equal(h.elements.get('drive-handoff').hidden, false);
+    assert.equal(h.elements.get('copy-handoff').disabled, false);
+    assert.equal(h.elements.get('open-chat').disabled, false);
+    assert(h.calls.every(call => ['get_prepared_video', 'get_video_job'].includes(call.name)));
+    assert.equal(h.prompts.length, 0);
+  });
   for (const back of [false, true]) await test('old result ignored after switch' + (back ? ' A-B-A' : ''), async () => {
     let release, analyzeCalls = 0;
     const h = harness({ respond(name, args) {

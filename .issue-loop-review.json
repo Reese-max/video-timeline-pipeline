@@ -1,0 +1,14 @@
+{
+  "pr": 90,
+  "head": "fe8fa5dc814d736246321d2348aab622de498008",
+  "findings": [
+    {
+      "severity": "med",
+      "file": "web/widget.html",
+      "line": 944,
+      "issue": "Existing issue #57 failure-isolation gap, also reproduced on the PR base: after a Drive status poll fails, its timer stops and the UI asks for refresh, but refresh only polls A while A is pending. A completed Drive upload therefore cannot expose the handoff until A finishes or the widget is reopened. Refresh must recover both pending polling routes without resubmitting work."
+    }
+  ],
+  "fixed": true,
+  "summary": "Fixed one medium-severity, pre-existing issue #57 failure-isolation gap: refresh now recovers both pending polling routes after a Drive status failure while A is still running, without resubmitting work or stopping healthy Drive polling if a restore snapshot fails. Both regressions were demonstrated red before their fixes; Git Bash passed all 113 widget scenarios, and the native full offline check passed with 624 Python tests, 24 skips and 113 widget scenarios (exit 0). needs-human: real-media timing, real Drive delivery and actual ChatGPT copy/new-chat acceptance remain unverified; this review does not close #57."
+}
