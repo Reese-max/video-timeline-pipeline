@@ -759,35 +759,103 @@ def restore_before_download(job_dir: Path) -> Path | None:
 
 SPLIT_PROGRESS_BASE = 45
 SPLIT_PROGRESS_LIMIT = 64  # 下一階段 previews 從 65 開始
+SPLIT_MODES = ("copy", "transcode")
+SPLIT_X264_PRESETS = ("superfast", "veryfast", "faster", "fast", "medium")
+SPLIT_DEFAULT_MAX_LONG_SIDE = 1280
+SPLIT_MIN_LONG_SIDE = 240
+
+
+def split_mode() -> str:
+    """MCP_SEGMENT_MODE：copy=直接剪開（不重編碼），transcode=重新編碼。"""
+    value = (os.getenv("MCP_SEGMENT_MODE") or "copy").strip().lower()
+    if value not in SPLIT_MODES:
+        raise ValueError(f"MCP_SEGMENT_MODE 只能是 {' 或 '.join(SPLIT_MODES)}。")
+    return value
+
+
+def split_max_long_side() -> int:
+    """MCP_SEGMENT_MAX_LONG_SIDE：重新編碼時的長邊上限；0 表示不縮放。"""
+    raw = (os.getenv("MCP_SEGMENT_MAX_LONG_SIDE") or "").strip()
+    if not raw:
+        return SPLIT_DEFAULT_MAX_LONG_SIDE
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise ValueError("MCP_SEGMENT_MAX_LONG_SIDE 必須是非負整數。") from exc
+    if value < 0:
+        raise ValueError("MCP_SEGMENT_MAX_LONG_SIDE 必須是非負整數。")
+    if value and (value < SPLIT_MIN_LONG_SIDE or value % 2):
+        raise ValueError(
+            f"MCP_SEGMENT_MAX_LONG_SIDE 非 0 時必須 >= {SPLIT_MIN_LONG_SIDE} 且為偶數。")
+    return value
+
+
+def split_x264_preset() -> str:
+    """MCP_SEGMENT_X264_PRESET：重新編碼時的 x264 preset。"""
+    value = (os.getenv("MCP_SEGMENT_X264_PRESET") or "veryfast").strip().lower()
+    if value not in SPLIT_X264_PRESETS:
+        raise ValueError(
+            f"MCP_SEGMENT_X264_PRESET 只接受 {'、'.join(SPLIT_X264_PRESETS)}。")
+    return value
+
+
+def split_scale_filter(long_side: int) -> str:
+    """長邊縮到 long_side（不放大），維持比例且寬高皆為偶數。
+
+    以 iw/ih 判斷長邊，不依賴 probe 寬高：ffmpeg 預設會先自動套用旋轉 metadata，
+    濾鏡看到的 iw/ih 已是顯示方向（直式手機影片因此不會被橫著縮）。
+    """
+    return (f"scale='if(gt(iw,ih),min({long_side},iw),-2)'"
+            f":'if(gt(iw,ih),-2,min({long_side},ih))'")
+
+
+def _copy_encoder_args() -> list[str]:
+    # 直接剪開：保留原編碼（例如 VP9），不重編碼、不縮放。
+    return ["-map", "0:v:0", "-map", "0:a:0?", "-c", "copy"]
+
+
+def _transcode_encoder_args(long_side: int, preset: str) -> list[str]:
+    args = ["-map", "0:v:0", "-map", "0:a:0?"]
+    if long_side:
+        args += ["-vf", split_scale_filter(long_side)]
+    args += [
+        "-c:v", "libx264",
+        "-preset", preset,
+        "-crf", "28",
+        "-c:a", "aac",
+        "-b:a", "96k",
+    ]
+    return args
 
 
 def split_encoder_args() -> list[str]:
-    # 回傳值會寫進 segments/.split-params.json；之後改這裡的參數會讓舊分段整批失效重切。
-    return [
-        "-map",
-        "0:v:0",
-        "-map",
-        "0:a:0?",
-        "-c:v",
-        "libx264",
-        "-preset",
-        "veryfast",
-        "-crf",
-        "28",
-        "-c:a",
-        "aac",
-        "-b:a",
-        "96k",
-    ]
+    """依 MCP_SEGMENT_MODE 產生 ffmpeg 編碼參數。
+
+    回傳值會寫進 segments/.split-params.json；之後改這裡的參數或模式會讓舊分段整批失效重切。
+    """
+    if split_mode() == "copy":
+        return _copy_encoder_args()
+    return _transcode_encoder_args(split_max_long_side(), split_x264_preset())
 
 
-def _split_params(video_path: Path, segment_seconds: int) -> dict:
+def _split_params(video_path: Path, segment_seconds: int, mode: str,
+                  encoder_args: list[str], settings: dict) -> dict:
     return {
-        "version": 1,
+        "version": 2,
         "source": pipeline.file_fingerprint(video_path),
         "segment_seconds": segment_seconds,
-        "encoder_args": split_encoder_args(),
+        "mode": mode,
+        "encoder_args": list(encoder_args),
+        "settings": dict(settings),
     }
+
+
+def _clear_split_artifacts(segment_dir: Path) -> None:
+    """清掉既有分段與清單；重切或退回重新編碼前一律呼叫。"""
+    for stale in segment_dir.glob("segment_*.mp4"):
+        stale.unlink()
+    (segment_dir / "segments.csv").unlink(missing_ok=True)
+    (segment_dir / "segments.resume.csv").unlink(missing_ok=True)
 
 
 def _read_segment_csv(path: Path) -> list[list[str]]:
@@ -846,15 +914,17 @@ def _merge_offset_rows(
         previous_end = merged_end
 
 
-def _split_progress_value(done: int, expected: int | None, made: int, elapsed: float) -> tuple[int, str]:
+def _split_progress_value(done: int, expected: int | None, made: int, elapsed: float,
+                          label: str = "") -> tuple[int, str]:
+    suffix = f"（{label}）" if label else ""
     if not expected:
-        return SPLIT_PROGRESS_BASE, f"切割影片分段 {done} 段"
+        return SPLIT_PROGRESS_BASE, f"切割影片分段 {done} 段{suffix}"
     shown = min(done, expected)
     current = min(
         SPLIT_PROGRESS_LIMIT,
         SPLIT_PROGRESS_BASE + int((SPLIT_PROGRESS_LIMIT - SPLIT_PROGRESS_BASE) * shown / expected),
     )
-    message = f"切割影片分段 {shown}/{expected}"
+    message = f"切割影片分段 {shown}/{expected}{suffix}"
     remaining = expected - shown
     if made > 0 and remaining > 0 and elapsed > 0:
         eta = elapsed / made * remaining
@@ -863,13 +933,14 @@ def _split_progress_value(done: int, expected: int | None, made: int, elapsed: f
 
 
 def _report_split_progress(
-    stop: threading.Event, count_done, expected: int | None, baseline: int, started: float
+    stop: threading.Event, count_done, expected: int | None, baseline: int, started: float,
+    label: str = ""
 ) -> None:
     while True:
         try:
             done = count_done()
             current, message = _split_progress_value(
-                done, expected, max(0, done - baseline), time.monotonic() - started
+                done, expected, max(0, done - baseline), time.monotonic() - started, label
             )
             report_progress("split", current, message)
         except Exception:
@@ -904,17 +975,50 @@ def _validated_segments(segment_dir: Path, duration: float | None) -> list[tuple
 
 def split_video(video_path: Path, segment_dir: Path, segment_seconds: int,
                 duration: float | None = None) -> list[tuple[Path, float, float]]:
+    """把影片切成固定長度分段。
+
+    預設 copy：直接剪開（stream copy），不重新編碼；失敗時在同一次呼叫內退回重新編碼。
+    transcode：重新編碼成 H.264（可縮放到長邊上限），沿用中斷續切。
+    """
+    mode = split_mode()
+    long_side = split_max_long_side()
+    preset = split_x264_preset()
+    settings = {"max_long_side": long_side, "x264_preset": preset}
     segment_dir.mkdir(parents=True, exist_ok=True)
+    if mode == "transcode":
+        return _split_with_encoder(video_path, segment_dir, segment_seconds, duration,
+                                   split_encoder_args(), "transcode",
+                                   settings, resume=True, label="重新編碼")
+    try:
+        return _split_with_encoder(video_path, segment_dir, segment_seconds, duration,
+                                   split_encoder_args(), "copy", settings,
+                                   resume=False, label="直接剪開")
+    except (DeadlineExceeded, ExecutionCancelled):
+        # 取消與逾時是硬性中止，不能默默改用重新編碼。
+        raise
+    except (RuntimeError, OSError) as error:
+        # 直接剪開失敗（ffmpeg 失敗或分段沒通過驗證）：清掉半成品，改用重新編碼。
+        print(f"! 直接剪開失敗，改用重新編碼切分段：{error}")
+        _clear_split_artifacts(segment_dir)
+        return _split_with_encoder(video_path, segment_dir, segment_seconds, duration,
+                                   _transcode_encoder_args(long_side, preset), "transcode",
+                                   settings, resume=True, label="重新編碼")
+
+
+def _split_with_encoder(video_path: Path, segment_dir: Path, segment_seconds: int,
+                        duration: float | None, encoder_args: list[str], mode: str,
+                        settings: dict, resume: bool, label: str
+                        ) -> list[tuple[Path, float, float]]:
     list_path = segment_dir / "segments.csv"
     resume_path = segment_dir / "segments.resume.csv"
     marker_path = segment_dir / ".split-params.json"
-    params = _split_params(video_path, segment_seconds)
+    params = _split_params(video_path, segment_seconds, mode, encoder_args, settings)
     try:
         saved = json.loads(marker_path.read_text(encoding="utf-8"))
     except (OSError, ValueError):
         saved = None
     completed: list[tuple[str, float, float]] = []
-    if saved == params:
+    if resume and saved == params:
         # 參數一致：以 segments.csv 為準保留已完成分段，上次續切留下的暫存清單先救回，
         # 其餘未列入 csv 的 segment_*.mp4 都是中斷半成品，一律刪除。
         completed = _completed_segment_rows(segment_dir, _read_segment_csv(list_path))
@@ -936,14 +1040,15 @@ def split_video(video_path: Path, segment_dir: Path, segment_seconds: int,
                 stale.unlink()
     else:
         # 先清舊分段再寫標記：若寫完標記才刪，中斷會讓下輪把舊參數的分段誤認成可續用。
-        for stale in segment_dir.glob("segment_*.mp4"):
-            stale.unlink()
-        list_path.unlink(missing_ok=True)
-        resume_path.unlink(missing_ok=True)
+        # copy 模式不做續跑（-ss 會對齊關鍵畫面，偏移合併不可靠），一律清空重切。
+        _clear_split_artifacts(segment_dir)
         pipeline.write_json(marker_path, params)
 
     expected = (math.ceil(duration / segment_seconds)
                 if duration and math.isfinite(duration) and duration > 0 else None)
+    if mode == "copy":
+        # 直接剪開的切點落在下一個關鍵畫面，段數事先推不準，不顯示預估值。
+        expected = None
     finished = (bool(completed) and duration is not None and math.isfinite(duration)
                 and duration > 0 and completed[-1][2] >= duration - 1.0)
     if not finished:
@@ -963,10 +1068,14 @@ def split_video(video_path: Path, segment_dir: Path, segment_seconds: int,
         if seek > 0:
             command += ["-ss", f"{seek:.6f}"]
         command += ["-i", str(video_path)]
-        command += split_encoder_args()
+        command += encoder_args
+        if mode == "transcode":
+            # copy 不能強制關鍵畫面，切點只能落在來源既有的關鍵畫面。
+            command += [
+                "-force_key_frames",
+                f"expr:gte(t,n_forced*{segment_seconds})",
+            ]
         command += [
-            "-force_key_frames",
-            f"expr:gte(t,n_forced*{segment_seconds})",
             "-f",
             "segment",
             "-segment_time",
@@ -988,7 +1097,7 @@ def split_video(video_path: Path, segment_dir: Path, segment_seconds: int,
         progress = threading.Thread(
             target=_report_split_progress,
             args=(stop, lambda: index + _count_segment_list_rows(active_list),
-                  expected, index, started),
+                  expected, index, started, label),
             daemon=True,
         )
         progress.start()
@@ -1008,8 +1117,8 @@ def split_video(video_path: Path, segment_dir: Path, segment_seconds: int,
             _write_segment_csv(list_path, completed)
             resume_path.unlink(missing_ok=True)
     result = _validated_segments(segment_dir, duration)
-    total = expected or len(result)
-    current, message = _split_progress_value(len(result), total, len(result), 0.0)
+    total = len(result) if mode == "copy" else (expected or len(result))
+    current, message = _split_progress_value(len(result), total, len(result), 0.0, label)
     report_progress("split", current, message)
     return result
 
@@ -1051,6 +1160,19 @@ def extract_preview(segment_path: Path, preview_path: Path) -> bool:
     except RuntimeError:
         return False
     return preview_path.is_file()
+
+
+def _segment_codec(segment_path: Path) -> str | None:
+    """分段實際使用的影像編碼；copy 模式可能是 vp9 等非 H.264。"""
+    try:
+        probe = pipeline.probe_video(segment_path)
+    except (RuntimeError, OSError, ValueError):
+        return None
+    for stream in probe.get("streams", []):
+        if stream.get("codec_type") == "video":
+            codec = stream.get("codec_name")
+            return str(codec) if codec else None
+    return None
 
 
 def prepare_video_sync(url: str, segment_seconds: int, max_segments: int | None) -> dict:
@@ -1111,17 +1233,19 @@ def prepare_video_sync(url: str, segment_seconds: int, max_segments: int | None)
         preview_name = f"preview_{index:03d}.jpg"
         preview_path = previews_dir / preview_name
         has_preview = extract_preview(segment_path, preview_path)
-        segment_rows.append(
-            {
-                "index": index,
-                "filename": segment_path.name,
-                "preview_filename": preview_name if has_preview else None,
-                "start_seconds": round(start, 3),
-                "end_seconds": round(end, 3),
-                "size_bytes": segment_path.stat().st_size,
-                "mime_type": "video/mp4",
-            }
-        )
+        row = {
+            "index": index,
+            "filename": segment_path.name,
+            "preview_filename": preview_name if has_preview else None,
+            "start_seconds": round(start, 3),
+            "end_seconds": round(end, 3),
+            "size_bytes": segment_path.stat().st_size,
+            "mime_type": "video/mp4",
+        }
+        codec = _segment_codec(segment_path)
+        if codec:
+            row["codec"] = codec
+        segment_rows.append(row)
 
     manifest = {
         "version": 2,

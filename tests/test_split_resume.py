@@ -20,6 +20,10 @@ class SplitProgressResumeTests(unittest.TestCase):
     SEGMENT_SECONDS = 2
 
     def setUp(self):
+        # 續切只適用重新編碼模式：copy 模式重切只要幾秒，不做續跑。
+        self.env = patch.dict(os.environ, {"MCP_SEGMENT_MODE": "transcode"})
+        self.env.start()
+        self.addCleanup(self.env.stop)
         self.temporary = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary.cleanup)
         self.root = Path(self.temporary.name)

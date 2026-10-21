@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- 改進：影片分段預設改成「直接剪開」（`MCP_SEGMENT_MODE=copy`，stream copy），不再整支重新編碼；copy 失敗（ffmpeg 失敗或分段沒通過既有驗證：列數、檔名、時間連續、最後一段接近影片長度）時，同一次呼叫內自動清掉半成品並退回重新編碼，stdout 印出一行繁中原因；取消與逾時照常往上拋，不退回。A1 主機（2 OCPU）實測 25.5 分鐘 VP9 1080x1920：重新編碼（veryfast crf 28）約 14–15 分鐘，stream copy 只要 1.1 秒（13 段、邊界在 120 秒倍數，VP9 分段可正常產生預覽圖）；若必須重新編碼，長邊縮到 1280 為 2.63 倍速、檔案小 39%（現行 1080p 為 1.82 倍速），`ultrafast` 沒有更快且檔案大 3 倍。新增 `MCP_SEGMENT_MAX_LONG_SIDE`（預設 1280，0 = 不縮放；非 0 時必須 ≥ 240 且為偶數，只縮小不放大、維持比例、寬高皆偶數，直式／橫式與手機影片旋轉 metadata 都正確）與 `MCP_SEGMENT_X264_PRESET`（預設 `veryfast`，只接受 `superfast`／`veryfast`／`faster`／`fast`／`medium`）；非法環境變數直接報錯且不呼叫 ffmpeg。copy 模式不做續跑（重切只要幾秒），transcode 模式保留中斷續切；模式或設定改變時舊分段全部重切（記在 `segments/.split-params.json`）。分段可能維持原編碼（例如 VP9，部分瀏覽器／iOS 無法播放）；需要到處都能播放的 H.264 分段請設 `MCP_SEGMENT_MODE=transcode`。
+
 - 新增：Bright Data Facebook `--facebook-brightdata-mode {auto,reels,posts}` 與訂閱／OPML 模式保存；Reels（`gd_lyclm3ey2q6rww027t`）在 auto 且全為 `dead_page` 時，當次切換 Pages Posts（`gd_lkaxegm826bjpoo9m5`），既有訂閱刷新會在送出前先保存 posts 模式，即使後續失敗也不再先試 Reels；新增（含 OPML 匯入）僅於整次成功時建立訂閱，失敗不留半成品，重試沿用回執。兩次 trigger 獨立預留／結算、分開回執；只有送出前額度拒絕可依既有授權走 Apify 備援。
 - 新增：posts 本機篩選影片及日期，使用 Facebook 貼文／影片網址而非 CDN；非影片貼文同樣計費。成功保存後以 `facebook_seen_post_ids` 記住含非影片的有效貼文 ID，去重保留最近 500 筆，下次與影片 ID 一起排除，減少重複計費。
 
