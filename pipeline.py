@@ -37,6 +37,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from execution_control import DeadlineExceeded, ExecutionCancelled, OperationBudget, read_response
+import brightdata_credits
 
 
 __version__ = "0.2.1"
@@ -5417,14 +5418,35 @@ def fetch_facebook_author_apify(author: str, since: str) -> dict[str, Any]:
 
 
 def fetch_facebook_author(
-    author: str, since: str = "365d", provider: str = "meta", *, allow_paid: bool = False
+    author: str, since: str = "365d", provider: str = "meta", *, allow_paid: bool = False,
+    max_items: int | None = None, exclude_ids: list[str] | None = None,
+    root: Path | None = None, previous_snapshot_id: str = "",
+    fallback_allow_paid: bool | None = None,
 ) -> dict[str, Any]:
+    fallback = os.getenv("RSS_FACEBOOK_FALLBACK_PROVIDER", "").strip()
+    if fallback not in {"", "apify"}:
+        raise ValueError("RSS_FACEBOOK_FALLBACK_PROVIDER 只接受空值或 apify。")
+    if provider == "brightdata":
+        try:
+            return fetch_facebook_author_brightdata(
+                author, since, max_items=max_items, exclude_ids=exclude_ids,
+                allow_paid=allow_paid, root=root,
+                previous_snapshot_id=previous_snapshot_id)
+        except brightdata_credits.BrightDataQuotaError:
+            # Scheduling permission for Bright Data must not silently authorize Apify too.
+            if fallback != "apify" or not paid_discovery_allowed(
+                "apify", allow_paid if fallback_allow_paid is None else fallback_allow_paid
+            ):
+                raise
+            feed = fetch_facebook_author_apify(author, since)
+            feed["facebook"]["fallback_from"] = "brightdata"
+            return feed
     if provider == "apify":
         if not allow_paid:
             raise RuntimeError("Apify Actor 可能計費；確認額度與支出上限後加上 --allow-batch-cloud。")
         return fetch_facebook_author_apify(author, since)
     if provider != "meta":
-        raise ValueError("Facebook provider 必須是 meta 或 apify。")
+        raise ValueError("Facebook provider 必須是 meta、apify 或 brightdata。")
     page_id = facebook_page_identifier(author)
     token = os.getenv("FACEBOOK_PAGE_ACCESS_TOKEN", "").strip()
     if not token:
@@ -5647,7 +5669,8 @@ class SubmissionUncertainError(RuntimeError):
         self.response_body = response_body
 
 
-def submit_brightdata_once(folder: Path, url: str, headers: dict[str, str], body: bytes) -> str:
+def submit_brightdata_once(folder: Path, url: str, headers: dict[str, str], body: bytes,
+                          *, daily_post: bool = False) -> str:
     """Persist a billable submission receipt before interpreting it; never retry the POST."""
     folder.mkdir(parents=True, exist_ok=True, mode=0o700)
     receipt_path = folder / "submission.json"
@@ -5669,11 +5692,20 @@ def submit_brightdata_once(folder: Path, url: str, headers: dict[str, str], body
             raise RuntimeError(f"上次送出狀態不明，禁止再次計費採集；請核對 {folder} 與 Bright Data。")
         # 預留在寫 .submitted 標記之前：被拒絕時代表完全沒送出，不該留下
         # 「送出狀態不明」的回執擋住後續對帳。
+        inputs = receipt["input"]
+        inputs = inputs.get("input") if isinstance(inputs, dict) else inputs
+        credit_count = sum(item.get("num_of_posts", 1) for item in inputs)
+        reservation_id = hashlib.sha256(
+            f"{folder.resolve()}:{url}:{fingerprint}".encode("utf-8")).hexdigest()
+        receipt["credit_reservation_id"] = brightdata_credits.reserve(
+            credit_count, daily_post=daily_post, reservation_id=reservation_id)
+        marker_created = False
         try:
             with cost_guard("brightdata", "datasets.trigger") as guard_outcome:
                 # ponytail: uncertain submissions stay blocked; provider-side reconciliation is manual.
                 try:
                     with marker_path.open("x", encoding="utf-8") as marker:
+                        marker_created = True
                         json.dump(receipt, marker, ensure_ascii=False)
                         marker.flush()
                         os.fsync(marker.fileno())
@@ -5688,7 +5720,7 @@ def submit_brightdata_once(folder: Path, url: str, headers: dict[str, str], body
                         status_code=getattr(exc, "status_code", None),
                         response_body=getattr(exc, "response_body", ""),
                     ) from exc
-                snapshot_hint = receipt["response"].get("snapshot_id")
+                snapshot_hint = receipt["response"].get("snapshot_id") if isinstance(receipt["response"], dict) else None
                 if not (isinstance(snapshot_hint, str) and re.fullmatch(r"sd?_[A-Za-z0-9_-]+", snapshot_hint)):
                     # 供應商可能已接受這筆計費工作，卻沒給可對帳的 snapshot：
                     # 記成 unknown 並保留預留，不能當成成功結清。
@@ -5699,6 +5731,10 @@ def submit_brightdata_once(folder: Path, url: str, headers: dict[str, str], body
                 guard_outcome.provider_operation_id = snapshot_hint
         except SubmissionUncertainError:
             pass
+        except BaseException:
+            if not marker_created and not marker_path.exists():
+                brightdata_credits.release(reservation_id)
+            raise
         receipt["received_at"] = rss_now()
         receipt = json.loads(redact_values(json.dumps(receipt, ensure_ascii=False),
                                           {json.dumps(token, ensure_ascii=False)[1:-1]}))
@@ -5710,6 +5746,12 @@ def submit_brightdata_once(folder: Path, url: str, headers: dict[str, str], body
     return snapshot
 
 
+def settle_brightdata_receipt(folder: Path, count: int) -> None:
+    receipt = json.loads((folder / "submission.json").read_text(encoding="utf-8"))
+    if receipt.get("credit_reservation_id"):
+        brightdata_credits.settle(receipt["credit_reservation_id"], count)
+
+
 def fetch_social_post(url: str, cache_root: Path, *, allow_paid: bool = False) -> dict[str, Any]:
     platform, post_id, canonical, dataset = social_post_target(url)
     if not allow_paid:
@@ -5719,6 +5761,7 @@ def fetch_social_post(url: str, cache_root: Path, *, allow_paid: bool = False) -
     state = reuse_artifact(checkpoint)
     if state and state.get("status") == "ready":
         return state
+    brightdata_credits.limits()
     token = os.getenv("BRIGHTDATA_API_TOKEN", "").strip()
     if not token:
         raise RuntimeError("缺少 BRIGHTDATA_API_TOKEN；請在主機安全設定，不要貼到對話。")
@@ -5728,9 +5771,11 @@ def fetch_social_post(url: str, cache_root: Path, *, allow_paid: bool = False) -
             query = urllib.parse.urlencode({"dataset_id": dataset, "include_errors": "true", "format": "json"})
             snapshot = submit_brightdata_once(
                 folder, f"{BRIGHTDATA_API_ROOT}/trigger?{query}", headers,
-                json.dumps([{"url": canonical}]).encode())
+                json.dumps([{"url": canonical}]).encode(), daily_post=True)
+            receipt = json.loads((folder / "submission.json").read_text(encoding="utf-8"))
             state = {"status": "pending", "url": canonical, "snapshot_id": snapshot,
-                     "dataset_id": dataset, "provider": "brightdata"}
+                     "dataset_id": dataset, "provider": "brightdata",
+                     "credit_reservation_id": receipt.get("credit_reservation_id")}
             write_json(checkpoint, state)
         snapshot = state["snapshot_id"]
         if not re.fullmatch(r"sd?_[A-Za-z0-9_-]+", snapshot):
@@ -5744,6 +5789,8 @@ def fetch_social_post(url: str, cache_root: Path, *, allow_paid: bool = False) -
         rows = get_json(f"{BRIGHTDATA_API_ROOT}/snapshot/{snapshot}?format=json", headers)
         if isinstance(rows, dict):
             rows = rows.get("data")
+        if isinstance(rows, list):
+            settle_brightdata_receipt(folder, len(rows))
         if not isinstance(rows, list) or len(rows) != 1 or not isinstance(rows[0], dict):
             raise RuntimeError("預期單篇貼文結果；收到空白或多筆資料，停止交接。")
         result = {**state, **normalize_social_post(rows[0], canonical), "fetched_at": rss_now()}
@@ -5753,6 +5800,112 @@ def fetch_social_post(url: str, cache_root: Path, *, allow_paid: bool = False) -
         raise
     except Exception as exc:
         raise RuntimeError(str(exc).replace(token, "<redacted>")) from None
+
+
+def brightdata_author_snapshot(folder: Path, trigger_url: str, headers: dict[str, str],
+                              body: bytes, timeout_seconds: int) -> tuple[str, list]:
+    brightdata_credits.limits()
+    token = headers["Authorization"].removeprefix("Bearer ")
+    try:
+        snapshot_id = submit_brightdata_once(folder, trigger_url, headers, body)
+        deadline = time.monotonic() + timeout_seconds
+        while True:
+            progress = get_json(f"{BRIGHTDATA_API_ROOT}/progress/{snapshot_id}", headers)
+            status = str(progress.get("status") or "").lower() if isinstance(progress, dict) else ""
+            if status == "failed":
+                raise RuntimeError(f"Bright Data snapshot {snapshot_id} 執行失敗。")
+            if status == "ready":
+                break
+            if time.monotonic() >= deadline:
+                raise RuntimeError(f"Bright Data snapshot {snapshot_id} 等待逾時；遠端工作可能仍在執行。")
+            time.sleep(min(10.0, max(0.1, deadline - time.monotonic())))
+        result = get_json(f"{BRIGHTDATA_API_ROOT}/snapshot/{snapshot_id}?format=json", headers)
+        rows = result.get("data") if isinstance(result, dict) else result
+        if not isinstance(rows, list):
+            raise RuntimeError("Bright Data snapshot 回應不是 JSON 陣列。")
+        settle_brightdata_receipt(folder, len(rows))
+        return snapshot_id, rows
+    except budget_blocked_error():
+        raise
+    except Exception as exc:
+        raise RuntimeError(str(exc).replace(token, "<redacted>")) from None
+
+
+def brightdata_facebook_item(record: dict[str, Any]) -> dict[str, str] | None:
+    raw_url = str(record.get("url") or "").strip()
+    try:
+        parsed = urllib.parse.urlsplit(require_http_url(raw_url, "Facebook Reel URL"))
+    except ValueError:
+        return None
+    if (parsed.hostname or "").lower() not in {
+        "facebook.com", "www.facebook.com", "web.facebook.com", "m.facebook.com",
+    } or (not record.get("video_url") and "/reel/" not in parsed.path):
+        return None
+    url = public_url(raw_url)
+    post_id = str(record.get("post_id") or record.get("shortcode") or "").strip() or job_key(url)
+    return {"id": post_id, "title": str(record.get("content") or "")[:160] or f"Facebook Reel {post_id}",
+            "url": url, "source_url": url, "published": str(record.get("date_posted") or "")}
+
+
+def fetch_facebook_author_brightdata(
+    author: str, since: str = "365d", *, max_items: int | None = None,
+    exclude_ids: list[str] | None = None, allow_paid: bool = False,
+    root: Path | None = None, previous_snapshot_id: str = "",
+) -> dict[str, Any]:
+    if not allow_paid:
+        raise RuntimeError("Bright Data 可能計費；確認帳戶額度後加上 --allow-batch-cloud。")
+    if max_items is None:
+        raise ValueError("Facebook/Bright Data 付費盤點需要有限的結果預算：請用 --facebook-max-items 指定正整數；"
+                         "--facebook-since 只是在本機依發佈時間篩選，不會限制供應商計費範圍。")
+    if isinstance(max_items, bool) or not isinstance(max_items, int) or max_items <= 0:
+        raise ValueError("--facebook-max-items 必須是正整數。")
+    token = os.getenv("BRIGHTDATA_API_TOKEN", "").strip()
+    if not token:
+        raise RuntimeError("缺少 BRIGHTDATA_API_TOKEN；請在專案 .env 本機填入。")
+    try:
+        timeout_seconds = int(os.getenv("BRIGHTDATA_RUN_TIMEOUT_SECONDS", "1800"))
+    except ValueError as exc:
+        raise ValueError("BRIGHTDATA_RUN_TIMEOUT_SECONDS 必須是整數。") from exc
+    if timeout_seconds <= 0:
+        raise ValueError("BRIGHTDATA_RUN_TIMEOUT_SECONDS 必須大於 0。")
+    if previous_snapshot_id and not re.fullmatch(r"sd?_[A-Za-z0-9_-]+", previous_snapshot_id):
+        raise ValueError("上次已儲存的 snapshot_id 無效。")
+    page_id = facebook_page_identifier(author)
+    author_url = facebook_author_url(author)
+    since_timestamp = parse_facebook_since(since)
+    discovery_input = {"url": author_url, "num_of_posts": max_items}
+    excluded = sorted({str(item).strip() for item in (exclude_ids or []) if str(item).strip()})
+    if excluded:
+        discovery_input["posts_to_not_include"] = excluded
+    dataset_id = "gd_lyclm3ey2q6rww027t"
+    query = urllib.parse.urlencode({"dataset_id": dataset_id, "include_errors": "true", "format": "json"})
+    headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+    body = json.dumps([discovery_input], sort_keys=True).encode("utf-8")
+    folder = secure_rss_directory(root or Path(__file__).resolve().parent) / "brightdata" / job_key(
+        f"facebook:{page_id}:{since}:{previous_snapshot_id}", body.decode("utf-8"))
+    snapshot_id, rows = brightdata_author_snapshot(
+        folder, f"{BRIGHTDATA_API_ROOT}/trigger?{query}", headers, body, timeout_seconds)
+    raw_items = [item for item in rows if isinstance(item, dict)]
+    by_id = {}
+    missing_dates = 0
+    for record in raw_items:
+        item = brightdata_facebook_item(record)
+        if item is None:
+            continue
+        published = feed_timestamp(item["published"])
+        if not published:
+            missing_dates += 1
+        elif since_timestamp is not None and published < since_timestamp:
+            continue
+        by_id[item["id"]] = item
+    return {"title": f"Facebook {page_id}",
+            "items": sorted(by_id.values(), key=lambda item: feed_timestamp(item["published"]), reverse=True),
+            "raw_items": raw_items, "not_modified": False,
+            "facebook": {"provider": "brightdata", "page_id": page_id, "author_url": author_url,
+                         "since": since, "max_items": max_items, "snapshot_id": snapshot_id,
+                         "dataset_id": dataset_id, "raw_count": len(raw_items),
+                         "missing_date_count": missing_dates, "date_filter_complete": missing_dates == 0,
+                         "fetched_at": rss_now()}}
 
 
 def fetch_instagram_author(
@@ -5810,36 +5963,8 @@ def fetch_instagram_author(
     # Only the caller's persisted success advances the cycle, including empty discoveries.
     folder = secure_rss_directory(root or Path(__file__).resolve().parent) / "brightdata" / job_key(
         f"instagram:{username}:{since}:{previous_snapshot_id}", body.decode("utf-8"))
-    try:
-        snapshot_id = submit_brightdata_once(folder, trigger_url, headers, body)
-        deadline = time.monotonic() + timeout_seconds
-        status = ""
-        while status != "ready":
-            progress_url = f"{BRIGHTDATA_API_ROOT}/progress/{urllib.parse.quote(snapshot_id, safe='')}"
-            progress = get_json(progress_url, headers)
-            status = str(progress.get("status") or "").lower() if isinstance(progress, dict) else ""
-            if status == "failed":
-                raise RuntimeError(f"Bright Data snapshot {snapshot_id} 執行失敗。")
-            if status == "ready":
-                break
-            if time.monotonic() >= deadline:
-                raise RuntimeError(f"Bright Data snapshot {snapshot_id} 等待逾時；遠端工作可能仍在執行。")
-            time.sleep(min(10.0, max(0.1, deadline - time.monotonic())))
-        snapshot_url = (
-            f"{BRIGHTDATA_API_ROOT}/snapshot/{urllib.parse.quote(snapshot_id, safe='')}?format=json"
-        )
-        result = get_json(snapshot_url, headers)
-    except budget_blocked_error():
-        raise
-    except Exception as exc:
-        raise RuntimeError(str(exc).replace(token, "<redacted>")) from None
-
-    if isinstance(result, list):
-        raw_items = [item for item in result if isinstance(item, dict)]
-    elif isinstance(result, dict) and isinstance(result.get("data"), list):
-        raw_items = [item for item in result["data"] if isinstance(item, dict)]
-    else:
-        raise RuntimeError("Bright Data snapshot 回應不是 JSON 陣列。")
+    snapshot_id, rows = brightdata_author_snapshot(folder, trigger_url, headers, body, timeout_seconds)
+    raw_items = [item for item in rows if isinstance(item, dict)]
 
     by_id: dict[str, dict[str, str]] = {}
     missing_dates = 0
@@ -6000,6 +6125,7 @@ def add_facebook_subscription(
     *,
     since: str = "365d",
     provider: str = "meta",
+    max_items: int | None = None,
     allow_paid: bool = False,
     name: str = "",
     keywords: list[str] | None = None,
@@ -6015,7 +6141,8 @@ def add_facebook_subscription(
         for item in state["subscriptions"]
     ):
         raise RuntimeError("這個 Facebook 作者已經訂閱。")
-    feed = fetch_facebook_author(page_id, since, provider, allow_paid=allow_paid)
+    feed = fetch_facebook_author(page_id, since, provider, allow_paid=allow_paid,
+                                 **({"max_items": max_items, "root": root} if provider == "brightdata" else {}))
     newest = next((item["published"] for item in feed["items"] if item.get("published")), "")
     snapshot = write_facebook_discovery(root, feed)
     subscription = {
@@ -6025,6 +6152,8 @@ def add_facebook_subscription(
         "facebook_page_id": page_id,
         "facebook_since": since,
         "facebook_provider": provider,
+        "facebook_max_items": max_items,
+        "facebook_last_snapshot_id": str(feed["facebook"].get("snapshot_id") or ""),
         "facebook_last_published": newest,
         "facebook_last_discovery": snapshot.name,
         "name": name.strip() or str(feed["title"]),
@@ -6101,8 +6230,9 @@ def paid_discovery_allowed(provider: str, allow_paid: bool) -> bool:
 
 def paid_discovery_provider(subscription: dict[str, Any]) -> str:
     kind = str(subscription.get("kind") or "rss")
-    if kind == "facebook-author" and str(subscription.get("facebook_provider") or "meta") == "apify":
-        return "apify"
+    if kind == "facebook-author":
+        provider = str(subscription.get("facebook_provider") or "meta")
+        return provider if provider in {"apify", "brightdata"} else ""
     return "brightdata" if kind == "instagram-author" else ""
 
 
@@ -6173,11 +6303,22 @@ def refresh_rss(root: Path, workers: int = 4, allow_paid: bool = False) -> dict[
                     or "365d"
                 )
                 provider = str(subscription.get("facebook_provider") or "meta")
+                discovery_options = {}
+                if provider == "brightdata":
+                    discovery_options = {
+                        "max_items": subscription.get("facebook_max_items"),
+                        "exclude_ids": [str(item["entry_id"]) for item in state["items"]
+                                        if item.get("subscription_id") == subscription.get("id") and item.get("entry_id")],
+                        "root": root,
+                        "previous_snapshot_id": str(subscription.get("facebook_last_snapshot_id") or ""),
+                        "fallback_allow_paid": allow_paid,
+                    }
                 return fetch_facebook_author(
                     str(subscription.get("facebook_page_id") or subscription["url"]),
                     since,
                     provider,
                     allow_paid=paid_discovery_allowed(provider, allow_paid),
+                    **discovery_options,
                 ), None
             if kind == "instagram-author":
                 since = str(
@@ -6227,6 +6368,8 @@ def refresh_rss(root: Path, workers: int = 4, allow_paid: bool = False) -> dict[
                 if kind == "facebook-author":
                     snapshot = write_facebook_discovery(root, feed)
                     subscription["facebook_last_discovery"] = snapshot.name
+                    if feed["facebook"].get("snapshot_id"):
+                        subscription["facebook_last_snapshot_id"] = feed["facebook"]["snapshot_id"]
                     newest = next((item["published"] for item in feed["items"] if item.get("published")), "")
                     if newest:
                         subscription["facebook_last_published"] = newest
@@ -6270,11 +6413,18 @@ def update_rss_subscription(
     latest_only: bool | None = None,
     enabled: bool | None = None,
     instagram_max_items: int | None = None,
+    facebook_max_items: int | None = None,
 ) -> dict[str, Any]:
     state = load_rss_state(root)
     subscription = next((item for item in state["subscriptions"] if item.get("id") == subscription_id), None)
     if subscription is None:
         raise RuntimeError(f"找不到 RSS 訂閱：{subscription_id}")
+    if facebook_max_items is not None:
+        if str(subscription.get("kind") or "rss") != "facebook-author":
+            raise ValueError("--facebook-max-items 只能用於 Facebook 作者訂閱。")
+        if isinstance(facebook_max_items, bool) or not isinstance(facebook_max_items, int) or facebook_max_items <= 0:
+            raise ValueError("--facebook-max-items 必須是正整數。")
+        subscription["facebook_max_items"] = facebook_max_items
     if instagram_max_items is not None:
         if str(subscription.get("kind") or "rss") != "instagram-author":
             raise ValueError("--instagram-max-items 只能用於 Instagram 作者訂閱。")
@@ -6402,6 +6552,8 @@ def export_rss_opml(root: Path, output: Path) -> int:
             attributes["vidbeeFacebookPageId"] = str(subscription.get("facebook_page_id") or "")
             attributes["vidbeeFacebookSince"] = str(subscription.get("facebook_since") or "365d")
             attributes["vidbeeFacebookProvider"] = str(subscription.get("facebook_provider") or "meta")
+            if subscription.get("facebook_max_items") is not None:
+                attributes["vidbeeFacebookMaxItems"] = str(subscription["facebook_max_items"])
         elif kind == "instagram-author":
             attributes["vidbeeInstagramUsername"] = str(subscription.get("instagram_username") or "")
             attributes["vidbeeInstagramSince"] = str(subscription.get("instagram_since") or "365d")
@@ -6444,11 +6596,13 @@ def import_rss_opml(root: Path, source: Path, allow_paid: bool = False) -> dict[
             }
             kind = str(outline.attrib.get("vidbeeKind") or "rss")
             if kind == "facebook-author":
+                raw_max_items = str(outline.attrib.get("vidbeeFacebookMaxItems") or "").strip()
                 subscription, _, _ = add_facebook_subscription(
                     root,
                     str(outline.attrib.get("vidbeeFacebookPageId") or url),
                     since=str(outline.attrib.get("vidbeeFacebookSince") or "365d"),
                     provider=str(outline.attrib.get("vidbeeFacebookProvider") or "meta"),
+                    max_items=int(raw_max_items) if raw_max_items else None,
                     allow_paid=allow_paid,
                     **options,
                 )
@@ -6762,6 +6916,7 @@ def rss_requested(args: argparse.Namespace) -> bool:
         or args.facebook_author
         or args.facebook_since is not None
         or args.facebook_provider is not None
+        or args.facebook_max_items is not None
         or args.facebook_discover_only
         or args.instagram_author
         or args.instagram_since is not None
@@ -6777,6 +6932,13 @@ def run_rss_command(args: argparse.Namespace) -> int:
         raise ValueError("--rss-add、--facebook-author 與 --instagram-author 一次只能使用一個。")
     if (args.facebook_since is not None or args.facebook_provider is not None or args.facebook_discover_only) and not args.facebook_author:
         raise ValueError("--facebook-since／--facebook-provider／--facebook-discover-only 必須搭配 --facebook-author。")
+    if args.facebook_max_items is not None:
+        if not (args.facebook_author or args.rss_update):
+            raise ValueError("--facebook-max-items 必須搭配 --facebook-author 或 --rss-update。")
+        if isinstance(args.facebook_max_items, bool) or not isinstance(args.facebook_max_items, int) or args.facebook_max_items <= 0:
+            raise ValueError("--facebook-max-items 必須是正整數。")
+    if args.facebook_author and args.facebook_provider == "brightdata" and args.facebook_max_items is None:
+        raise ValueError("Facebook/Bright Data 付費盤點需要 --facebook-max-items 指定正整數結果預算。")
     instagram_budget_update = (
         args.rss_update
         and args.instagram_max_items is not None
@@ -6801,7 +6963,7 @@ def run_rss_command(args: argparse.Namespace) -> int:
             "指定正整數（例如 20）；--allow-batch-cloud 只代表允許雲端花費，不代表花費上限。"
             "--instagram-since 只是在本機依發佈時間篩選，不會限制供應商計費範圍。"
         )
-    edits = any(value is not None for value in (args.rss_name, args.rss_keywords, args.rss_tags, args.rss_latest_only, args.instagram_max_items))
+    edits = any(value is not None for value in (args.rss_name, args.rss_keywords, args.rss_tags, args.rss_latest_only, args.instagram_max_items, args.facebook_max_items))
     if edits and not (args.rss_add or args.rss_update or args.facebook_author or args.instagram_author):
         raise ValueError("名稱／關鍵字／標籤／latest-only／Instagram 結果預算設定只可搭配新增或更新訂閱。")
     if args.rss_update and not edits:
@@ -6846,17 +7008,22 @@ def run_rss_command(args: argparse.Namespace) -> int:
         since = args.facebook_since or "365d"
         provider = args.facebook_provider or "meta"
         if args.facebook_discover_only:
-            feed = fetch_facebook_author(
-                args.facebook_author, since, provider, allow_paid=bool(args.allow_batch_cloud)
-            )
-            snapshot = write_facebook_discovery(root, feed)
+            with rss_writer_lock(root):
+                page_id = facebook_page_identifier(args.facebook_author)
+                previous = reuse_artifact(root / "rss" / f"facebook-{job_key(page_id)}-latest.json") or {}
+                feed = fetch_facebook_author(
+                    args.facebook_author, since, provider, allow_paid=bool(args.allow_batch_cloud),
+                    **({"max_items": args.facebook_max_items, "root": root,
+                        "previous_snapshot_id": str(previous.get("facebook", {}).get("snapshot_id") or "")}
+                       if provider == "brightdata" else {}))
+                snapshot = write_facebook_discovery(root, feed)
             detail = (
                 f"{feed['facebook']['pages']} 個 API 分頁"
                 if provider == "meta"
                 else f"{feed['facebook']['raw_count']} 筆公開貼文"
             )
             print(
-                f"Facebook/{provider} 盤點：{feed['facebook']['page_id']}，找到 {len(feed['items'])} 支影片；"
+                f"Facebook/{feed['facebook']['provider']} 盤點：{feed['facebook']['page_id']}，找到 {len(feed['items'])} 支影片；"
                 f"{detail} → {snapshot}"
             )
         else:
@@ -6866,6 +7033,7 @@ def run_rss_command(args: argparse.Namespace) -> int:
                     args.facebook_author,
                     since=since,
                     provider=provider,
+                    max_items=args.facebook_max_items,
                     allow_paid=bool(args.allow_batch_cloud),
                     name=args.rss_name or "",
                     keywords=csv_values(args.rss_keywords or ""),
@@ -6935,6 +7103,7 @@ def run_rss_command(args: argparse.Namespace) -> int:
                 tags=csv_values(args.rss_tags) if args.rss_tags is not None else None,
                 latest_only=args.rss_latest_only,
                 instagram_max_items=args.instagram_max_items,
+                facebook_max_items=args.facebook_max_items,
             )
         print(f"已更新 RSS：{subscription['name']}（ID {subscription['id']}）")
     for subscription_id, enabled in ((args.rss_enable, True), (args.rss_disable, False)):
@@ -7811,10 +7980,12 @@ def parse_args() -> argparse.Namespace:
     )
     rss.add_argument(
         "--facebook-provider",
-        choices=("meta", "apify"),
+        choices=("meta", "apify", "brightdata"),
         default=None,
-        help="作者發現方式；預設 meta，非自管公開 Page 可選 apify（可能計費）",
+        help="作者發現方式；預設 meta，公開 Page 可選 brightdata 或 apify（可能計費）",
     )
+    rss.add_argument("--facebook-max-items", type=int, default=None,
+                     help="Bright Data 結果預算（num_of_posts，正整數，必填）；也可用 --rss-update 修改")
     rss.add_argument(
         "--facebook-since",
         metavar="WHEN",
@@ -7956,6 +8127,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--score-report", default=None, help="統計並印出影片評分與排名摘要（可傳 daily 或 all）")
     parser.add_argument("--cost-report", choices=("daily", "monthly"), default=None, help="統計並印出 API 費用與 Token 用量報表")
     parser.add_argument("--budget-status", action="store_true", help="檢視目前已用預算與配額上限狀態")
+    parser.add_argument("--brightdata-usage", action="store_true", help="以 JSON 查詢共用 Bright Data UTC 月額度與每日貼文用量")
     parser.add_argument("--provider-health", action="store_true", help="檢查各供應商成功率與延遲統計")
     parser.add_argument("--failed-list", action="store_true", help="列出近期失敗或遭預算阻斷的操作紀錄")
     parser.add_argument("--self-test", action="store_true")
@@ -8506,6 +8678,14 @@ def run_pipeline(args: argparse.Namespace) -> Path:
 
 def main() -> int:
     args = parse_args()
+    if args.brightdata_usage:
+        root = args.root.resolve()
+        project_env = Path(__file__).resolve().parent / ".env"
+        load_dotenv(project_env)
+        if (root / ".env").resolve() != project_env.resolve():
+            load_dotenv(root / ".env")
+        print(json.dumps(brightdata_credits.usage(), ensure_ascii=False))
+        return 0
     # 成本守衛要綁到這次執行的專案根目錄，否則 strict 模式會拒絕所有付費傳輸。
     bind_cost_root(args.root.resolve())
     if args.self_test:

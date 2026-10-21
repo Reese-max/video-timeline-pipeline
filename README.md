@@ -242,8 +242,42 @@ python pipeline.py --facebook-author 'https://www.facebook.com/<PUBLIC_PAGE>/' -
 
 Apify Token 一律放在 `Authorization` header，不放 URL、輸出或 Git。Actor 只負責發現公開貼文，`captionText=false`，實際影音仍由 yt-dlp 下載並交給 Groq 轉錄、MiniMax 整理。官方目前的輸入 schema 明載此 Actor 只支援公開 Page、不支援 personal profile，因此個人帳號仍列為未保證支援；私人／登入限定內容不處理。`APIFY_FACEBOOK_RESULTS_LIMIT` 是 Actor 必填的單次結果預算，本工具取回資料集時會持續分頁、不另行截斷；Actor 的結果完整性仍受 Facebook 可見性與供應商能力限制。請參考 [Actor 輸入](https://apify.com/apify/facebook-posts-scraper/input-schema)、[API](https://apify.com/apify/facebook-posts-scraper/api) 與 [計價](https://apify.com/apify/facebook-posts-scraper/pricing)。
 
-排程刷新（沒加 `--allow-batch-cloud` 的 `--rss-refresh`）預設不跑任何付費盤點。`RSS_PAID_DISCOVERY` 以逗號列出排程可自行使用的供應商（`apify`、`brightdata`），例如 `RSS_PAID_DISCOVERY=apify` 讓 Apify 粉專訂閱自動刷新，Instagram 作者（Bright Data）仍要明確加 `--allow-batch-cloud`；每次 Apify run 仍以 `APIFY_MAX_TOTAL_CHARGE_USD` 封頂，供應商方案的每月上限才是最終上限。
+排程刷新（沒加 `--allow-batch-cloud` 的 `--rss-refresh`）預設不跑任何付費盤點。`RSS_PAID_DISCOVERY` 以逗號列出排程可自行使用的供應商（`apify`、`brightdata`），例如 `RSS_PAID_DISCOVERY=brightdata` 即可讓 Facebook Bright Data 與 Instagram 作者訂閱自動刷新，不必在排程加 `--allow-batch-cloud`；`RSS_PAID_DISCOVERY=apify` 則只放行 Apify。每次 Apify run 仍以 `APIFY_MAX_TOTAL_CHARGE_USD` 封頂，供應商方案的每月上限才是最終上限。
 `RSS_PAID_DISCOVERY_MIN_HOURS`（小時，預設 0＝不限）讓這類排程自行放行的付費盤點每個訂閱至少間隔指定時間：例如排程每天跑 3 次時設 `20`，正常排程下每個 Apify 粉專約每天盤點一次（這是最短間隔、不是日曆日：停機後補跑可能同一天兩次；也是每個訂閱各自計算，不是帳戶總額上限）；未到間隔的訂閱記為 `deferred`、不算失敗，免費的 RSS／YouTube 照常每次刷新。間隔從每次付費嘗試起算，且在送出前就先存檔（失敗或中途被中斷的 run 也可能已計費）；明確加 `--allow-batch-cloud` 不受限，但仍會重設起算時間。
+
+公開 Facebook Page 也可用 Bright Data Reels by profile URL（dataset `gd_lyclm3ey2q6rww027t`）：
+
+```powershell
+python pipeline.py --facebook-author '<PUBLIC_PAGE>' --facebook-provider brightdata --facebook-max-items 20 --facebook-since 365d --allow-batch-cloud
+python pipeline.py --rss-update '<SUBSCRIPTION_ID>' --facebook-max-items 10
+```
+
+`--facebook-max-items` 是 Bright Data 必填的正整數結果預算，存為 `facebook_max_items`，並隨 OPML 匯出／匯入；`--facebook-discover-only` 可只盤點。只用 collect_by_url，傳送作者 URL、`num_of_posts` 與已知 ID 的 `posts_to_not_include`，不送 `type`、`discover_by` 或日期欄位。`--facebook-since` 依 `date_posted` 在本機篩選；缺日期的影片保留並回報 `missing_date_count`，不宣稱回溯範圍完整。成功存檔後才推進 `facebook_last_snapshot_id`。
+
+`RSS_FACEBOOK_FALLBACK_PROVIDER` 預設空值；可設 `apify`（其他值會拒絕）。只有 Bright Data 帳本在送出前拒絕額度，且 Apify 另經 `RSS_PAID_DISCOVERY=apify,brightdata` 或明確 `--allow-batch-cloud` 放行時，才使用 Apify 備援。結果會記錄 `provider=apify`、`fallback_from=brightdata`；Bright Data 送出後的失敗、逾時或回應不明不啟動備援，避免雙重計費。
+
+### Bright Data 共用免費月額度
+
+依 2026-10-21 已查證的方案，免費層每月 5,000 credits，由 Web Scraper API、SERP、Unlocker 與 Browser API 共用，**每月 1 日 UTC 重置**且不累積。Scraper API 每交付一筆 record 扣 1 credit，輸入錯誤造成的 error record 也計費；帳戶沒有儲值時用完即 hard stop。
+
+Facebook／Instagram 作者盤點與 MCP 單篇貼文共用 SQLite 帳本，與既有 USD 預算分開，兩者都必須通過：
+
+```dotenv
+BRIGHTDATA_MONTHLY_CREDIT_LIMIT=4500
+BRIGHTDATA_CREDIT_LEDGER=
+BRIGHTDATA_POST_DAILY_LIMIT=20
+RSS_FACEBOOK_FALLBACK_PROVIDER=
+```
+
+月上限預設 4500 credits，保留 500 credits 空間；0 禁止新的 trigger。每日單篇採集預設 20 次，0 禁止新的單篇 trigger；兩個上限都只接受非負整數，格式錯誤會停止請求。日期依 UTC 計算。`BRIGHTDATA_CREDIT_LEDGER` 留白時使用 `Path.home()/".local/state/video-timeline-pipeline/brightdata-credits.sqlite3"`，新目錄以 0700 建立；MCP 與排程即使使用不同 `--root` 仍共用它。不同作業系統使用者須明確設定同一個可存取的絕對路徑，不能各建一份。
+
+每次新 trigger 先以單篇 1 credit／作者 `num_of_posts` 原子預留；已用加預留加本次超過上限就不送出，也不建立 `.submitted`。讀到 ready 資料後按完整交付筆數結算，包含 error records、被本機篩掉的資料；實際多於預留仍照實入帳。逾時、斷線、failed 或缺 snapshot ID 保留整筆預留並持續占額度，不自動釋放。續查既有 snapshot 與 ready 快取不再預留、不計每日新貼文數。
+
+```powershell
+python pipeline.py --brightdata-usage
+```
+
+輸出 JSON：`month`、`limit`、`used`、`reserved`、`remaining`、`daily_posts_used`、`daily_post_limit`，不含金鑰。此本機帳本只涵蓋經過本工具的新 trigger；主控台、其他 API／工具與啟用帳本前的採集不會自動入帳，請依實際共用量降低月上限；帳戶儲值與供應商支出限制仍須自行管理。
 
 ### Instagram 作者 Reel 追蹤
 
@@ -284,7 +318,7 @@ python pipeline.py --rss-update '<SUBSCRIPTION_ID>' --instagram-max-items 20
 python pipeline.py --url 'https://www.instagram.com/reel/<SHORTCODE>/'
 ```
 
-此 CLI 作者盤點流程的 Bright Data 只負責內容發現；實際下載仍由 yt-dlp 完成，之後才是 Groq 時間戳轉錄與 MiniMax 摘要。免費額度與餘額續用行為依帳戶主控台為準，程式無法保證不扣款，因此所有 Bright Data 盤點都要求明確加上 `--allow-batch-cloud`，且作者盤點另須以 `--instagram-max-items` 給出有限的供應商結果預算。
+此 CLI 作者盤點流程的 Bright Data 只負責內容發現；實際下載仍由 yt-dlp 完成，之後才是 Groq 時間戳轉錄與 MiniMax 摘要。免費額度與餘額續用行為依帳戶主控台為準，程式無法保證不扣款，手動新增 IG 訂閱或盤點須加上 `--allow-batch-cloud`，排程刷新則可由 `RSS_PAID_DISCOVERY=brightdata` 放行，仍受共用月額度與每訂閱最短間隔限制；作者盤點另須以 `--instagram-max-items` 給出有限的供應商結果預算。
 
 ### MCP 公開 IG／Threads／Facebook 單篇貼文
 
@@ -294,11 +328,11 @@ Facebook 支援 `/<作者>/posts/<數字 ID 或 pfbid>`、`story.php`／`permali
 
 FB 回應的 `content` 是貼文文字；`attachments` 的照片與影片分開回傳，影片縮圖不當成 MP4。只有通過 HTTPS／Meta CDN 網域檢查的媒體網址會保留。這些網址仍未被下載、辨識或轉錄；互動數為供應商回傳的快照，不代表即時或完整留言。
 
-此工具預設拒絕計費採集。管理員須在主機安全設定 `BRIGHTDATA_API_TOKEN`，並將人工核准的單篇網址放入 `BRIGHTDATA_ALLOWED_POST_URLS`（逗號分隔）；呼叫者另須取得使用者明確同意才設定 `allow_paid=true`。網址核准清單不等於呼叫者身分驗證，也不是金額上限，仍須在供應商設定支出控制。本版不改 MCP 登入設定；憑證不要貼到對話或提交 Git。
+此工具預設拒絕計費採集。管理員須在主機安全設定 `BRIGHTDATA_API_TOKEN`，並將人工核准的單篇網址放入 `BRIGHTDATA_ALLOWED_POST_URLS`（逗號分隔）；清單中任一項為 `*`（例如 `BRIGHTDATA_ALLOWED_POST_URLS=*`）即可允許任何通過既有網址驗證的公開單篇貼文，首頁、FB 留言與 reel/watch 等原有拒絕範圍不變。呼叫者仍須取得使用者明確同意才設定 `allow_paid=true`。新的 trigger 受 `BRIGHTDATA_POST_DAILY_LIMIT` 與共用免費月額度限制；超額回傳 `status=quota_exhausted`、`error_code=BRIGHTDATA_QUOTA`、繁中 `error` 與 ISO UTC `resets_at`，到期前不要重試或換網址繞過。網址核准清單不等於呼叫者身分驗證，也不是金額上限，仍須在供應商設定支出控制。本版不改 MCP 登入設定；憑證不要貼到對話或提交 Git。
 
 回傳 `pending` 時依 `retry_after_seconds` 等待，再以相同網址呼叫，會沿用同一 snapshot；`ready` 後重用本機快取。首次送出僅嘗試一次，回應遺失或供應商失敗時不自動重建計費工作，須人工到 Bright Data 核對。狀態保存在 Git 忽略的 `mcp_jobs/social-posts/`，不要為了重試直接刪除；CDN 網址可能過期，工具不自動付費刷新。
 
-兩條 Bright Data 路徑共用提交保護：送出前在 `.submitted` 寫入時間、請求 URL／輸入與 SHA-256，送出後先存 `submission.json` 的回應或錯誤診斷，再解析 snapshot。回執不保存請求 headers，並遮蔽 API token；有效 snapshot 可在 checkpoint 寫入失敗後恢復。未知格式、損壞回執、舊版空白 `.submitted` 或回執未寫成時一律禁止重送，請依該目錄資料與供應商紀錄人工核對，不要刪除標記。
+三條 Bright Data 路徑共用提交保護：送出前在 `.submitted` 寫入時間、請求 URL／輸入與 SHA-256，送出後先存 `submission.json` 的回應或錯誤診斷，再解析 snapshot。回執不保存請求 headers，並遮蔽 API token；有效 snapshot 可在 checkpoint 寫入失敗後恢復。未知格式、損壞回執、舊版空白 `.submitted` 或回執未寫成時一律禁止重送，請依該目錄資料與供應商紀錄人工核對，不要刪除標記。
 
 貼文文字可交給 ChatGPT 整理；`image_urls`／`video_urls` 只是媒體參照，`media_analyzed=false`，不能宣稱已看過畫面。ChatGPT 可再將 `video_urls` 逐支交給既有 `prepare_video_for_chatgpt` → Groq／MiniMax 分析 → ChatGPT 整理，並保留原始貼文網址作為來源；這不是 `download_video` 裡的隱式付費 fallback。圖片尚未自動送入視覺模型，Drive 仍為選用儲存。
 

@@ -25,6 +25,14 @@ def _ready(*, snapshot_id="sd_budget"):
 
 
 class InstagramBudgetTests(unittest.TestCase):
+    def setUp(self):
+        directory = self.enterContext(tempfile.TemporaryDirectory())
+        self.enterContext(mock.patch.dict(pipeline.os.environ, {
+            "BRIGHTDATA_CREDIT_LEDGER": str(Path(directory) / "credits.sqlite3"),
+            "BRIGHTDATA_MONTHLY_CREDIT_LIMIT": "4500", "BRIGHTDATA_POST_DAILY_LIMIT": "20",
+        }))
+        self.enterContext(mock.patch.object(pipeline, "load_dotenv"))
+
     def test_missing_budget_fails_before_any_provider_call(self) -> None:
         environment = {
             "BRIGHTDATA_API_TOKEN": "test-brightdata-token",

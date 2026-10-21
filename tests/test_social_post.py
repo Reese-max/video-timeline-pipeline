@@ -5,10 +5,19 @@ from pathlib import Path
 from unittest.mock import patch
 
 import pipeline
-import mcp_server as server
+with patch.object(pipeline, "load_dotenv"):
+    import mcp_server as server
 
 
 class SocialPostTests(unittest.TestCase):
+    def setUp(self):
+        directory = self.enterContext(tempfile.TemporaryDirectory())
+        self.enterContext(patch.dict(pipeline.os.environ, {
+            "BRIGHTDATA_CREDIT_LEDGER": str(Path(directory) / "credits.sqlite3"),
+            "BRIGHTDATA_MONTHLY_CREDIT_LIMIT": "4500", "BRIGHTDATA_POST_DAILY_LIMIT": "20",
+        }))
+        self.enterContext(patch.object(pipeline, "load_dotenv"))
+
     def test_url_scope_and_canonicalization(self):
         self.assertEqual(pipeline.social_post_target("https://instagram.com/author/reels/ABC/?tracking=x")[:3],
                          ("instagram", "ABC", "https://www.instagram.com/reel/ABC/"))

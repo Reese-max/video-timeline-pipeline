@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- 新增：Facebook 粉專 Reels 可用 `--facebook-provider brightdata --facebook-max-items N`，結果預算支援訂閱更新與 OPML；與 IG 共用單次提交／snapshot 續查、本機日期篩選及 RSS 付費盤點間隔。`RSS_FACEBOOK_FALLBACK_PROVIDER=apify` 僅在帳本送出前拒絕且 Apify 另獲放行時備援，送出後失敗不另開計費工作。
+- 新增：`BRIGHTDATA_MONTHLY_CREDIT_LIMIT`（4500）、`BRIGHTDATA_CREDIT_LEDGER`（預設使用者共用 SQLite）、`BRIGHTDATA_POST_DAILY_LIMIT`（20），原子預留最壞結果筆數、依實際交付含 error records 結算，未知結果保留預留；`--brightdata-usage` 輸出月／日用量 JSON。免費層每月 5,000 credits，由 Scraper／SERP／Unlocker／Browser 共用，每月 1 日 UTC 重置且不累積，無儲值用完即停止。
+- 新增：`BRIGHTDATA_ALLOWED_POST_URLS=*` 允許既有驗證範圍內任何公開單篇貼文，仍需 `allow_paid=true`；共用月額度或每日上限擋下時回 `quota_exhausted`／`BRIGHTDATA_QUOTA` 與 `resets_at`，到期前禁止重試或換網址繞過。`RSS_PAID_DISCOVERY=brightdata` 可放行 FB／IG 排程刷新。
 - 新增：`RSS_PAID_DISCOVERY_MIN_HOURS` 限制排程自行放行的付費盤點（如 Apify 粉專）每個訂閱的最短間隔；未到間隔記為 `deferred`，明確 `--allow-batch-cloud` 不受限。
 - 修正：Apify 粉專盤點成功後寫快照時因 `max_total_charge_usd` 是 Decimal 而崩潰（10-21 A1 實測：run 已計費、結果卻沒存下）；改存字串並加回歸測試。
 - 新增：`RSS_PAID_DISCOVERY`（如 `apify`）讓排程刷新只對列出的付費盤點供應商自行放行，其他供應商仍須 `--allow-batch-cloud`。
