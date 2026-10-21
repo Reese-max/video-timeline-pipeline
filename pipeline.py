@@ -2612,6 +2612,12 @@ def video_mp4_chunk_seconds(fps: float, detail: str) -> int:
         raise RuntimeError(f"{MINIMAX_VIDEO_CHUNK_SECONDS_ENV} 必須是正整數秒。") from None
     if value <= 0:
         raise RuntimeError(f"{MINIMAX_VIDEO_CHUNK_SECONDS_ENV} 必須是正整數秒。")
+    if value < VIDEO_MP4_MIN_CHUNK_SECONDS:
+        # A shorter segment only buys more uploads and more calls.
+        raise RuntimeError(
+            f"{MINIMAX_VIDEO_CHUNK_SECONDS_ENV}={value} 不得短於 {VIDEO_MP4_MIN_CHUNK_SECONDS} 秒："
+            "太短的分段只會增加上傳與呼叫次數。"
+        )
     if value > limit:
         raise RuntimeError(
             f"{MINIMAX_VIDEO_CHUNK_SECONDS_ENV}={value} 超過依預算算出的上限 {limit} 秒："
@@ -3490,31 +3496,35 @@ def _analyze_video_mp4_single(
     work_dir: Path | None,
     max_completion_tokens: int,
     note: str | None = None,
+    cache_identity: dict[str, Any] | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, Any] | None, str | None]:
     """Analyse one video file: cache lookup, upload, chat, gap fill.
 
     Returns (observations, parsed answer, file id) so a chunked run can keep
     every segment's own summary.
+
+    `cache_identity` replaces the file's own SHA-256 in the cache key; a
+    segment is identified by the source it was cut from and by its own bounds.
     """
     if cache_dir is not None:
         cache_dir.mkdir(parents=True, exist_ok=True)
     prompt = _video_mp4_prompt(duration)
     cache_path: Path | None = None
     if cache_dir is not None:
-        cache_path = _video_mp4_cache_path(
-            cache_dir,
-            {
-                "version": 2,
-                "mode": "video_mp4",
-                "max_event_gap_seconds": VIDEO_EVENT_MAX_GAP_SECONDS,
-                "model": model,
-                "prompt": prompt,
-                "fps": fps_value,
-                "detail": detail_value,
-                "max_completion_tokens": max_completion_tokens,
-                "video_sha256": file_sha256(video_path),
-            },
-        )
+        identity = dict(cache_identity or {})
+        material = {
+            "version": 2,
+            "mode": "video_mp4",
+            "max_event_gap_seconds": VIDEO_EVENT_MAX_GAP_SECONDS,
+            "model": model,
+            "prompt": prompt,
+            "fps": fps_value,
+            "detail": detail_value,
+            "max_completion_tokens": max_completion_tokens,
+            "video_sha256": identity.pop("video_sha256", None) or file_sha256(video_path),
+        }
+        material.update(identity)
+        cache_path = _video_mp4_cache_path(cache_dir, material)
         cached = reuse_artifact(cache_path)
         if isinstance(cached, dict) and isinstance(cached.get("observations"), list):
             if reusable_video_artifact(cached["observations"]):
@@ -3786,16 +3796,19 @@ def split_video_mp4_into_chunks(
 
 
 def offset_chunk_timestamps(observations: list[dict[str, Any]], offset: float) -> None:
-    """Move a chunk's timestamps onto the original video timeline."""
+    """Move a chunk's timestamps onto the original video timeline.
+
+    `timestamp_original` keeps the model's own answer: it belongs to the
+    segment, and `chunk_start` already says where that segment began, so the
+    original value stays comparable with the raw segment answer.
+    """
     if not offset:
         return
     for observation in observations:
         _offset_timestamp_field(observation, "timestamp", offset)
-        _offset_timestamp_field(observation, "timestamp_original", offset)
         data = observation.get("data")
         if isinstance(data, dict):
             _offset_timestamp_field(data, "timestamp", offset)
-            _offset_timestamp_field(data, "timestamp_original", offset)
 
 
 def _offset_timestamp_field(container: dict[str, Any], key: str, offset: float) -> None:
@@ -3810,6 +3823,16 @@ def _observation_sort_key(observation: dict[str, Any]) -> float:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return 0.0
     return float(value)
+
+
+def check_video_mp4_chunk_budget(label: str) -> None:
+    """Fail fast when the job was cancelled or its deadline already passed.
+
+    Without this check the next segment is still uploaded and paid for before
+    anything notices the cancellation, so a cancelled job would cost one more
+    segment for nothing.
+    """
+    OperationBudget(label, 900, "VIDEO_API_TIMEOUT_SECONDS").check()
 
 
 def _analyze_video_mp4_chunked(
@@ -3834,6 +3857,7 @@ def _analyze_video_mp4_chunked(
     travelling upwards.
     """
     prompt = _video_mp4_prompt(duration)
+    source_sha256 = file_sha256(video_path)
     cache_path: Path | None = None
     if cache_dir is not None:
         cache_dir.mkdir(parents=True, exist_ok=True)
@@ -3848,7 +3872,7 @@ def _analyze_video_mp4_chunked(
                 "fps": fps_value,
                 "detail": detail_value,
                 "max_completion_tokens": max_completion_tokens,
-                "video_sha256": file_sha256(video_path),
+                "video_sha256": source_sha256,
                 "chunked": True,
                 "chunk_seconds": plan.chunk_seconds,
             },
@@ -3870,8 +3894,8 @@ def _analyze_video_mp4_chunked(
         scratch = Path(owned_temp.name)
     else:
         scratch.mkdir(parents=True, exist_ok=True)
+    chunk_dir = scratch / VIDEO_MP4_CHUNK_DIRNAME
     try:
-        chunk_dir = scratch / VIDEO_MP4_CHUNK_DIRNAME
         chunks = split_video_mp4_into_chunks(
             video_path, chunk_dir, plan.chunk_seconds, duration=duration
         )
@@ -3886,6 +3910,8 @@ def _analyze_video_mp4_chunked(
                     f"MiniMax 預算 {MINIMAX_VIDEO_CONTEXT_TOKEN_BUDGET}：關鍵畫面間隔太久，"
                     f"請把 {MINIMAX_VIDEO_CHUNK_SECONDS_ENV} 設得更小。"
                 )
+            # A cancelled or expired job must not pay for another segment.
+            check_video_mp4_chunk_budget(f"MiniMax 分段 {index}/{len(chunks)}")
             print(
                 f"· MiniMax 分段分析 {index}/{len(chunks)}"
                 f"（{format_media_clock(chunk.start)}–{format_media_clock(chunk.end)}）"
@@ -3903,11 +3929,25 @@ def _analyze_video_mp4_chunked(
                 timeout=timeout,
                 work_dir=chunk_work,
                 max_completion_tokens=max_completion_tokens,
+                # The segment is identified by the source it came from and by
+                # where it starts and ends, not by the bytes of the cut file:
+                # a rerun then hits the cache even when a different ffmpeg
+                # writes the very same segment with different bytes.
+                cache_identity={
+                    "video_sha256": source_sha256,
+                    "chunk_start": round(chunk.start, 3),
+                    "chunk_end": round(chunk.end, 3),
+                },
             )
             offset_chunk_timestamps(observations, chunk.start)
             for observation in observations:
                 observation["chunk_index"] = index
                 observation["chunk_start"] = chunk.start
+                # The segment file is deleted once the merge is done, so the
+                # evidence points at the original video; the segment name stays
+                # for tracing.
+                observation["source_video"] = str(video_path)
+                observation["chunk_source"] = chunk.path.name
             merged.extend(observations)
             summary = (parsed or {}).get("overall_summary")
             if isinstance(summary, str) and summary.strip():
@@ -3929,6 +3969,9 @@ def _analyze_video_mp4_chunked(
                     "chunk_seconds": plan.chunk_seconds,
                 },
             )
+        # The merged answer is all that is left of the segments, and a rerun
+        # cuts them again, so they go instead of lingering next to the source.
+        shutil.rmtree(chunk_dir, ignore_errors=True)
         return merged
     finally:
         if owned_temp is not None:

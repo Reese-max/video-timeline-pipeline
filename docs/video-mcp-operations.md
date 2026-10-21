@@ -57,18 +57,25 @@ each segment is uploaded and analysed on its own with the requested fps and deta
 which is never lowered for a segment. Segment length is
 `floor(budget * 0.9 / (tokens per frame * fps) / 60) * 60` seconds (at least 60;
 about 1140 s for `high` at 1 fps) and can be shortened with
-`MINIMAX_VIDEO_CHUNK_SECONDS` (positive seconds, at most the budget-derived limit).
+`MINIMAX_VIDEO_CHUNK_SECONDS` (positive seconds, at least 60 and at most the
+budget-derived limit). An illegal `MINIMAX_VIDEO_CHUNK_SECONDS` is rejected before any
+call, even for a video short enough to be analysed in one piece.
 `MINIMAX_VIDEO_CHUNKING=off` restores the old behaviour: lower the fps first, and
 fall back to `detail=default` when even 0.2 fps does not fit (the note then says
 plainly that the budget is still exceeded).
 
-Every segment costs one upload and one chat call, so both the price and the wall
-clock grow with the number of segments; the job deadline and
+Every segment costs at least one upload and one chat call; a retry for an
+insufficient time coverage or an event gap fill can add one or two more calls, so both
+the price and the wall clock grow with the number of segments; the job deadline and
 `ANALYZE_VIDEO_TIMEOUT_SECONDS` must cover the whole run. Segments are analysed in
-order, and cancellation, deadlines and budget blocks still travel upwards.
-Segment results are cached per segment content, so a failed run only resends the
-segments that did not finish; the merged result is cached under a key that carries
-`chunked` and `chunk_seconds`.
+order, and cancellation, deadlines and budget blocks still travel upwards; a
+cancelled or expired job is noticed before the next segment is uploaded.
+Segment results are cached per segment (the key carries the source fingerprint and
+the segment bounds), so a failed run only resends the segments that did not finish;
+the merged result is cached under a key that carries `chunked` and `chunk_seconds`.
+Once the merge succeeds the whole `minimax-chunks/` directory is deleted - the
+segments are worthless for a rerun, which cuts them again - so only a failed run
+leaves them behind; `media_retention.py` also knows how to remove those leftovers.
 
 ## Sampling and cache correctness
 

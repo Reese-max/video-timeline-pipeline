@@ -265,6 +265,28 @@ class McpSamplingStatsTests(unittest.TestCase):
         self.assertEqual(sampling["fps"], video["fps"])
         self.assertEqual(sampling["detail"], video["detail"])
 
+    def test_chunked_analysis_reserves_room_for_the_segments(self) -> None:
+        patcher = mock.patch.object(mcp_server, "require_disk_space")
+        disk = patcher.start()
+        self.addCleanup(patcher.stop)
+        size = self.source.stat().st_size
+        self._run(1800.0, "high", chunked=True)
+        # The segments are one more copy of the source, on top of the room the
+        # analysis already reserved for one copy before the probe.
+        self.assertIn(mock.call(2 * size), disk.call_args_list)
+        capacity = mcp_server.check_job_capacity.call_args_list
+        self.assertIn(mock.call(self.JOB_ID, 2 * size), capacity)
+
+    def test_single_pass_analysis_reserves_no_room_for_segments(self) -> None:
+        patcher = mock.patch.object(mcp_server, "require_disk_space")
+        disk = patcher.start()
+        self.addCleanup(patcher.stop)
+        size = self.source.stat().st_size
+        self._run(60.0, "high")
+        self.assertNotIn(mock.call(2 * size), disk.call_args_list)
+        capacity = mcp_server.check_job_capacity.call_args_list
+        self.assertNotIn(mock.call(self.JOB_ID, 2 * size), capacity)
+
     def test_sampling_stats_record_the_downgrade_of_a_very_long_video(self) -> None:
         result, chat = self._run(10800.0, "high", env={"MINIMAX_VIDEO_CHUNKING": "off"})
         sampling = result["sampling"]
