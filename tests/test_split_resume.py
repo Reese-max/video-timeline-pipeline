@@ -44,21 +44,23 @@ class SplitProgressResumeTests(unittest.TestCase):
 
     def test_progress_reports_counts_and_stops_with_split(self):
         calls = []
-        saw_split_report = threading.Event()
+        saw_segment_done = threading.Event()
         original = server.pipeline.run_external
 
         def report(*args):
             calls.append(args)
-            if args[0] == "split":
-                saw_split_report.set()
+            if args[0] == "split" and len(args) >= 3 \
+                    and re.search(r"切割影片分段 [1-9]\d*/", args[2]):
+                saw_segment_done.set()
 
         def spy(command, **kwargs):
+            result = original(command, **kwargs)
             if "segment_%03d.mp4" in " ".join(str(part) for part in command):
-                # 等到切割進度執行緒在 ffmpeg 執行期間至少回報一次才放行，
-                # 避免只靠 split 結束後的最終回報就滿足「至少一次」的斷言。
-                self.assertTrue(saw_split_report.wait(5.0),
-                                "ffmpeg 執行期間必須已有切割進度回報")
-            return original(command, **kwargs)
+                # ffmpeg 跑完時 split_video 還沒進 finally，進度執行緒仍在跑；
+                # 只在開頭回報一次 0 段的錯誤實作，等不到「至少一段完成」的回報。
+                self.assertTrue(saw_segment_done.wait(5.0),
+                                "ffmpeg 執行期間必須回報過至少一段已完成")
+            return result
 
         with patch.object(server, "SPLIT_PROGRESS_POLL_SECONDS", 0.05), \
                 patch.object(server, "report_progress", side_effect=report), \

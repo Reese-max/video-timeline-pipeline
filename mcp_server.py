@@ -971,6 +971,26 @@ def _report_split_progress(
             return
 
 
+def _clamp_copy_first_segment_start(segment_dir: Path) -> None:
+    """copy 第一段起始時間在 [-0.5, 0) 時校正為 0 並寫回 segments.csv。
+
+    -avoid_negative_ts disabled 沿用來源時間軸：B-frame、音訊 priming 或非零
+    start_time 的來源，第一段在清單裡可能是小的負值；小於 -0.5 仍交給驗證失敗。
+    """
+    rows = _read_segment_csv(segment_dir / "segments.csv")
+    if not rows or len(rows[0]) != 3:
+        return
+    try:
+        start = float(rows[0][1])
+    except ValueError:
+        return
+    if not -0.5 <= start < 0:
+        return
+    rows[0][1] = "0"
+    pipeline.write_text(segment_dir / "segments.csv",
+                        "".join(",".join(row) + "\n" for row in rows))
+
+
 def _validated_segments(segment_dir: Path, duration: float | None,
                         tail_tolerance: float = SPLIT_TAIL_TOLERANCE_COPY
                         ) -> list[tuple[Path, float, float]]:
@@ -1161,6 +1181,8 @@ def _split_with_encoder(video_path: Path, segment_dir: Path, segment_seconds: in
             _write_segment_csv(list_path, completed)
             resume_path.unlink(missing_ok=True)
     try:
+        if mode == "copy":
+            _clamp_copy_first_segment_start(segment_dir)
         result = _validated_segments(segment_dir, duration, tail_tolerance)
     except (RuntimeError, ValueError, OSError) as error:
         # 驗證階段的失敗（含 csv 時間不是數字造成的 ValueError）統一視為可退回的錯誤。

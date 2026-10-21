@@ -515,6 +515,65 @@ class SplitModeTests(unittest.TestCase):
         marker = json.loads((self.segments_dir / ".split-params.json").read_text(encoding="utf-8"))
         self.assertEqual(marker["mode"], "transcode")
 
+    def rewrite_first_segment_start(self, start: float) -> None:
+        """把 segments.csv 第一列的起始時間改成指定值。"""
+        csv_path = self.segments_dir / "segments.csv"
+        rows = list(csv.reader(csv_path.read_text(encoding="utf-8-sig").splitlines()))
+        self.assertTrue(rows)
+        rows[0][1] = str(start)
+        csv_path.write_text("".join(",".join(row) + "\n" for row in rows),
+                            encoding="utf-8")
+
+    # M2：copy 第一段起始時間在 [-0.5, 0) 校正為 0（B-frame／priming／非零
+    # start_time 的來源），不退回重新編碼；小於 -0.5 仍是驗證失敗。
+    def test_copy_small_negative_first_start_is_clamped_to_zero(self):
+        source = self.make_source(size="640x360", duration=7, gop=21)
+        calls = []
+        original = server.pipeline.run_external
+
+        def spy(command, **kwargs):
+            calls.append(command)
+            result = original(command, **kwargs)
+            if "-c" in command and command[command.index("-c") + 1] == "copy":
+                self.rewrite_first_segment_start(-0.02)
+            return result
+
+        with self.env(MCP_SEGMENT_MODE="copy"), \
+                patch.object(server.pipeline, "run_external", side_effect=spy):
+            parts = self.split(source)
+
+        commands = self.segment_commands(calls)
+        self.assertEqual(len(commands), 1, "小幅負起始時間不得退回重新編碼")
+        self.assertEqual(parts[0][1], 0.0, "回傳的第一段起始時間必須校正為 0")
+        rows = list(csv.reader((self.segments_dir / "segments.csv")
+                               .read_text(encoding="utf-8-sig").splitlines()))
+        self.assertEqual(float(rows[0][1]), 0.0,
+                         "segments.csv 第一列的起始時間也必須寫回 0")
+
+    def test_copy_large_negative_first_start_falls_back_to_transcode(self):
+        source = self.make_source(size="640x360", duration=7, gop=21)
+        calls = []
+        original = server.pipeline.run_external
+
+        def spy(command, **kwargs):
+            calls.append(command)
+            result = original(command, **kwargs)
+            if "-c" in command and command[command.index("-c") + 1] == "copy":
+                self.rewrite_first_segment_start(-0.8)
+            return result
+
+        with self.env(MCP_SEGMENT_MODE="copy", MCP_SEGMENT_MAX_LONG_SIDE="320"), \
+                patch.object(server.pipeline, "run_external", side_effect=spy):
+            parts = self.split(source)
+
+        commands = self.segment_commands(calls)
+        self.assertEqual(len(commands), 2, "起始時間 < -0.5 仍要退回重新編碼")
+        self.assertIn("libx264", commands[1])
+        for path, _, _ in parts:
+            self.assertEqual(probe_codec(path), "h264")
+        marker = json.loads((self.segments_dir / ".split-params.json").read_text(encoding="utf-8"))
+        self.assertEqual(marker["mode"], "transcode")
+
     # L1：只有 ffmpeg 執行失敗與分段驗證失敗才退回；前置／收尾錯誤直接往上拋。
     def test_pre_split_errors_are_not_swallowed_by_the_fallback(self):
         source = self.make_source(size="640x360", duration=7, gop=21)
