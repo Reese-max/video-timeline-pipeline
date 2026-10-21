@@ -1,26 +1,12 @@
 {
   "repo": "Reese-max/video-timeline-pipeline",
-  "issue": 6,
-  "base_sha": "42d225936ba704cf70b93cac7bdf84da85ac86b8",
-  "red_proof": "Before implementation: python -X utf8 -B -m unittest discover -s tests -p test_webapp.py -v exited 1: ImportError: Failed to import test module: test_webapp; ModuleNotFoundError: No module named 'web_services'; Ran 1 test in 0.000s; FAILED (errors=1). Subsequent behavioral red checks before their fixes: test_uncertain_post_is_one_transport_and_stays_unknown: AssertionError: 2 != 1; test_frozen_digest_retry_preserves_wire_content_and_provider: Expected get_configured_provider('fake'), Actual get_configured_provider(); test_rss_cooldown_is_rechecked_after_waiting_in_the_task_queue: AssertionError: 'succeeded' != 'blocked'. Browser regression red: node tests/test_dashboard_ui.cjs exited 1 with AssertionError [ERR_ASSERTION]: Got unwanted rejection. Actual message: Cannot set properties of null (setting 'disabled').",
+  "issue": 97,
+  "base_sha": "e980711321fe4f3ca8e1d18ffecf9dda34920807",
+  "red_proof": "修正前執行 python -X utf8 -B -m unittest discover -s tests -p test_webapp.py -v -k cancellation_stops -k pending_web -k immediate_notification -k uncertain_http -k corrupt_frozen，exit 1：Ran 5 tests; FAILED (failures=10)。重現取消後 task 為 failed 而非 cancelled、pending 摘要被其他寄送者傳輸、408/500/503 未保留 unknown，以及損壞或被改寫的 snapshot 仍被寄出；同組的 immediate_notification 案例原先即通過。補上成本預留斷言後，500/503 的 usage_costs 出現 failed 而非 unknown，exit 1；補上 idempotency key 損壞子案例後，重試仍傳輸替代內容，exit 1。最後的時序回歸 python -X utf8 -B -m unittest discover -s tests -p test_webapp.py -v -k frozen_dispatch_rechecks -k frozen_retry_rechecks，修正前 exit 1：Ran 2 tests; FAILED (failures=4)，涵蓋 snapshot 驗證期間取消／lease 過期及重試驗證／provider 初始化期間取消；移動 fence 後全部通過。",
   "test_command": "python -X utf8 -B -m unittest discover -s tests -p \"test_*.py\" -v && node tests/test_widget_handoff.cjs && node tests/test_parallel_submission.cjs && node tests/test_widget_analysis_report.cjs && node tests/test_widget_library_experiment.cjs && node tests/test_dashboard_ui.cjs && git diff --check",
   "test_exit": 0,
-  "tests_passed": 725,
+  "tests_passed": 775,
   "tests_failed": 0,
-  "summary": "實作 W0–W11 的選用本機優先 Dashboard，重用既有搜尋、評分、成本、RSS 與 Digest service，提供共用精確篩選、安全唯讀查詢及有界證據頁。加入 SQLite durable tasks、授權與預算界線、lease fencing、取消與 unknown 防重播，以及凍結摘要確認和內容不變的寄送重試。Git Bash 完整驗證 exit 0：651 個 Python 測試方法中 630 完整通過、2 個部分子案例略過、19 個整項略過，另有 95 個 Node 檢查通過，tests_passed 計完整通過的 630+95；真實 Chromium 操作、320/360px 窄畫面及 1k/10k 合成資料效能驗證也通過。",
-  "not_done": "未 push、未建立 PR、未部署遠端服務，沒有使用真實付費 API 或寄送真實郵件；未驗證實體手機、真實 TLS/proxy、供應商 delivery/bounce 或自動 reconciliation。Windows 平台共 25 次略過事件（19 個整項、涉及 2 個方法的 6 個子案例），包括 symlink 權限及既有 POSIX 專屬檢查；尚無跨平台 CI 收據。此機 Git Bash 經 scripts/check_offline.py 二次啟動 Python 時有兩項既有 CreateProcess WinError 87，根因未定位；evidence 的命令直接執行相同完整 Python/Node 套件且已通過。專案沒有既有 coverage ratchet、CRAP 或 mutation gate，本次未導入。",
-  "merged_evidence": [
-    {
-      "repo": "Reese-max/video-timeline-pipeline",
-      "issue": 58,
-      "base_sha": "42d225936ba704cf70b93cac7bdf84da85ac86b8",
-      "red_proof": "Before implementation: node tests/test_widget_analysis_report.cjs (exit 1)\nFAIL - submission follows a submitted report while its Drive prerequisites finish AssertionError [ERR_ASSERTION]: No poll timer\nFAIL - notification follows a submitted report while its Drive prerequisites finish AssertionError [ERR_ASSERTION]: No poll timer\nFAIL - restore follows a submitted report while its Drive prerequisites finish AssertionError [ERR_ASSERTION]: No poll timer\nFAIL - waiting report snapshot errors and mismatched bindings stop without resubmission AssertionError [ERR_ASSERTION]: No poll timer\nFAIL - waiting snapshot polling is bounded and explicit refresh can start a new read-only wait AssertionError [ERR_ASSERTION]: The input did not match the regular expression /重新取得狀態/. Input:\nError: 5 widget report scenarios failed",
-      "test_command": "env -u _ /c/Users/Administrator/.venvs/vtp-test/Scripts/python.exe -X utf8 -B scripts/check_offline.py",
-      "test_exit": 0,
-      "tests_passed": 698,
-      "tests_failed": 0,
-      "summary": "修正 #58 在摘要早於 Drive 片段上傳／兩路 worker 結束前提交時，widget 停在 awaiting_segments 的缺口，改以唯讀快照接續既有報告工作輪詢。查詢核對 job、cache signature、分析與報告雜湊，最多等待 60 次，錯誤、換影片及關閉均停止，僅既有 verified 報告可顯示「A 已完成」並複製合併指令。沿用既有含摘要／逐字稿／畫面時間軸的同資料夾上傳與 caller_submitted 來源聲明，UI URI／bridge／health 同步升為 v15；報告情境由 16 增至 23。完整離線檢查共 597 個 Python 與 101 個 Node 測試通過，另有 24 個 Windows 平台略過。",
-      "not_done": "未執行 §4.5 指定 Facebook 真實媒體、真實 Drive 同資料夾上傳與 ChatGPT 小工具／B 對話的合併品質驗收，故不能據本機測試關閉 #58；未部署、未 push、未建立 PR，未變更其他分支。未重跑遠端 CI／Linux；專案沒有 lint、coverage ratchet、CRAP 或 mutation gates，本次未新增。"
-    }
-  ]
+  "summary": "修正摘要 pending 搶領、取消與完成寫回競態，並在 snapshot 驗證及 provider 初始化後緊貼傳輸前核對 task fence；凍結重試核對確認雜湊、原 task、收件者、provider、subject／text／HTML 與 idempotency key。Resend 408／5xx 保留 unknown 與未結清成本預留，不排重送；同步更新 Dashboard 文件。最終 Git Bash 完整命令 exit 0：Ran 686 tests in 272.090s; OK (skipped=25)，其中 665 個 Python 方法完整通過、2 個方法有略過子案例、19 個整項略過；Node 46+2+29+32+1=110 項檢查通過，tests_passed 計 665+110=775，git diff --check 通過；Ruff 對 email_providers.py、notifications.py、web_services.py、tests/test_webapp.py 通過。",
+  "not_done": "未 push、未切換或建立分支、未部署、未呼叫真實付費 API 或寄出郵件，未取得遠端 CI／供應商 delivery／真實 ChatGPT 瀏覽器驗收收據。Windows 共 25 次略過事件（19 個整項、2 個方法中的 6 個子案例），涉及 symlink 權限及 POSIX／Linux 專屬檢查。較早一次完整命令 exit 1：paired_queue_execution 兩個真實 inert worker 啟動測試超過原 10 秒上限；隔離重跑時兩項通過，但取消 drive 的 companion 曾回傳 failed，加入 worker 診斷後三項均通過（約 1.2 秒啟動），最後同一完整命令亦通過；未改斷言、未修改這些佇列檔案，尚未定位該間歇失敗根因。cost_tracker.py 的 Ruff F841（line 222，unused m）在原 HEAD 已存在，本次未修正；模板版本改變後的既有凍結摘要會拒絕重試，需重新預覽確認。"
 }

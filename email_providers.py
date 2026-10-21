@@ -200,12 +200,11 @@ class ResendProvider(BaseProvider):
                     safe_error=mask_sensitive(f"Resend HTTP 429 rate limit: {err_body}"),
                     retry_after_seconds=retry_after,
                 )
-            # 5xx: Transient server error
-            if exc.code >= 500:
+            # A timed-out/server-error response does not establish whether the send was accepted.
+            if exc.code == 408 or exc.code >= 500:
                 return DeliveryResult(
-                    status="retryable_not_accepted",
+                    status="unknown",
                     safe_error=mask_sensitive(f"Resend HTTP {exc.code}: {err_body}"),
-                    retry_after_seconds=60,
                 )
             # 401/403/422/400: Permanent configuration or validation failure
             return DeliveryResult(

@@ -3,7 +3,6 @@ from __future__ import annotations
 
 from contextlib import closing
 import datetime as dt
-import hashlib
 import json
 import os
 from pathlib import Path
@@ -73,7 +72,7 @@ def _db(root: Path, *, write=False):
 
 
 def _hash(value):
-    return hashlib.sha256(json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+    return notifications._json_hash(value)
 
 
 def _job(value):
@@ -475,9 +474,14 @@ def checkpoint_task(root, task_id, token, checkpoint):
 def finish_task(root, task_id, token, status, result):
     if status not in {"succeeded", "failed", "blocked", "unknown", "cancelled"}:
         raise ValueError("Invalid terminal status")
-    reason = result.get("state")
-    safe_error = reason if reason in {"budget_blocked", "disabled", "migration_required", "confirmation_or_state_changed", "unknown", "error"} else status
     with closing(_db(root, write=True)) as db, db:
+        db.execute("BEGIN IMMEDIATE")
+        task = db.execute("SELECT type,status FROM operation_tasks WHERE task_id=?", (task_id,)).fetchone()
+        if (task and task["type"] == "digest.send" and task["status"] == "cancel_requested"
+                and result.get("status") == "retryable_not_accepted"):
+            status, result = "cancelled", {**result, "status": "cancelled"}
+        reason = result.get("state")
+        safe_error = reason if reason in {"budget_blocked", "disabled", "migration_required", "confirmation_or_state_changed", "unknown", "error"} else status
         return db.execute("UPDATE operation_tasks SET status=?,result=?,finished_at=?,lease_token=NULL,safe_error=?,remote_operation_id=? WHERE task_id=? AND lease_token=? AND status IN ('running','cancel_requested') AND lease_expires_at>?",
                           (status, json.dumps(result, ensure_ascii=False), time.time(), safe_error if status in {"failed", "blocked", "unknown"} else None, result.get("remote_operation_id"),
                            task_id, token, time.time())).rowcount == 1
@@ -486,7 +490,13 @@ def finish_task(root, task_id, token, status, result):
 def cancel_task(root, task_id):
     get_task(root, task_id)
     with closing(_db(root, write=True)) as db, db:
-        db.execute("UPDATE operation_tasks SET status=CASE WHEN status='queued' THEN 'cancelled' ELSE 'cancel_requested' END WHERE task_id=? AND status IN ('queued','running')", (task_id,))
+        db.execute("BEGIN IMMEDIATE")
+        task = db.execute("SELECT type,safe_payload FROM operation_tasks WHERE task_id=?", (task_id,)).fetchone()
+        db.execute("UPDATE operation_tasks SET status=CASE WHEN status='running' THEN 'cancel_requested' ELSE 'cancelled' END WHERE task_id=? AND (status IN ('queued','running') OR (type='digest.send' AND status='failed'))", (task_id,))
+        if task["type"] == "digest.send":
+            payload = json.loads(task["safe_payload"])
+            identity = f"web-digest:{payload['digest_id']}:{payload['revision']}:{payload['payload_hash']}"
+            db.execute("UPDATE notification_deliveries SET status='cancelled',lease_owner=NULL,lease_token=NULL,lease_expires_at=NULL WHERE provider_idempotency_key=? AND status IN ('pending','retry_wait')", (identity,))
     return get_task(root, task_id)
 
 

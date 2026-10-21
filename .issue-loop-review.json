@@ -1,0 +1,26 @@
+{
+  "pr": 97,
+  "head": "e980711321fe4f3ca8e1d18ffecf9dda34920807",
+  "findings": [
+    {
+      "severity": "high",
+      "file": "notifications.py",
+      "line": 378,
+      "issue": "凍結摘要進入共用 pending／retry outbox 後，其他寄送者可在 before_send 前搶領；重試未核對原 task 的取消狀態，取消期間收到已知拒絕回應也會留下 retry_wait，造成取消後仍可寄送。"
+    },
+    {
+      "severity": "high",
+      "file": "notifications.py",
+      "line": 392,
+      "issue": "Digest 直接呼叫 ResendProvider.send，繞過 request_json 的 durable transport 政策；HTTP 5xx 被分類為 retryable_not_accepted、408 被分類為 permanent_failure，未保留 unknown 與未結清成本預留，可能重送接受狀態不明的提交。"
+    },
+    {
+      "severity": "med",
+      "file": "notifications.py",
+      "line": 647,
+      "issue": "凍結重試內容未與已確認 snapshot 核對；損壞 JSON、缺欄位或錯誤型別會退回寄送替代文字，合法 JSON 中被改寫的內容也可沿用原 idempotency key 寄出。"
+    }
+  ],
+  "fixed": true,
+  "summary": "發現並修正 3 項 outbox 缺陷（2 high、1 med）：取消／lease fence 可被繞過、不確定的 Resend 提交可重送，以及凍結重試內容缺少驗證。已補回歸測試、更新文件，最終 Git Bash 完整驗證 exit 0。既有佇列測試曾出現間歇失敗，最後完整重跑通過，詳見證據檔。"
+}

@@ -20,7 +20,7 @@ from unittest.mock import patch
 import pipeline
 import digests
 import web_services as services
-from email_providers import FakeProvider
+from email_providers import FakeProvider, ResendProvider
 import notifications
 
 WEB_INSTALLED = all(importlib.util.find_spec(name) for name in ("fastapi", "httpx", "jinja2"))
@@ -322,6 +322,178 @@ class DurableTaskTests(Dataset):
             with patch.object(notifications, "get_configured_provider", return_value=provider) as select:
                 self.assertEqual(notifications.run_notification_retry(self.root)["accepted"], 1)
             select.assert_called_once_with()
+
+    def test_digest_cancellation_stops_outbox_retries(self):
+        with patch.dict(os.environ, {"EMAIL_TO": "reader@example.test", "EMAIL_PROVIDER": "fake"}):
+            draft = services.preview_digest(self.root, persist=True)
+            confirmation = {key: draft[key] for key in ("digest_id", "revision", "payload_hash")}
+            task = services.enqueue_task(self.root, "digest.send", confirmation, "cancel-digest")
+            provider = FakeProvider(mode="retryable_not_accepted", retry_after=0)
+            send = provider.send
+
+            def cancel_during_send(**kwargs):
+                services.cancel_task(self.root, task["task_id"])
+                return send(**kwargs)
+
+            with patch.object(provider, "send", side_effect=cancel_during_send):
+                receipt = services.run_worker_once(self.root, provider=provider)
+            self.assertEqual(receipt["status"], "cancelled")
+            provider.mode = "accepted"
+            self.assertEqual(notifications.run_notification_retry(self.root, provider)["accepted"], 0)
+            self.assertEqual(len(provider.history), 1)
+            with closing(services._db(self.root)) as db:
+                self.assertEqual(db.execute("SELECT status FROM notification_deliveries").fetchone()[0], "cancelled")
+
+    def test_pending_web_digest_cannot_bypass_the_task_fence(self):
+        with patch.dict(os.environ, {"EMAIL_TO": "reader@example.test", "EMAIL_PROVIDER": "fake"}):
+            draft = services.preview_digest(self.root, persist=True)
+            confirmation = {key: draft[key] for key in ("digest_id", "revision", "payload_hash")}
+            task = services.enqueue_task(self.root, "digest.send", confirmation, "pending-digest")
+            intruder, owner = FakeProvider(), FakeProvider()
+            enqueue = notifications.enqueue_delivery
+
+            def concurrent_retry(*args, **kwargs):
+                delivery_id = enqueue(*args, **kwargs)
+                services.cancel_task(self.root, task["task_id"])
+                notifications.run_notification_retry(self.root, intruder)
+                return delivery_id
+
+            with patch.object(notifications, "enqueue_delivery", side_effect=concurrent_retry):
+                receipt = services.run_worker_once(self.root, provider=owner)
+            self.assertEqual(intruder.history, [])
+            self.assertEqual(owner.history, [])
+            self.assertEqual(receipt["status"], "cancelled")
+
+    def test_cancel_after_outbox_update_cannot_be_overwritten_by_task_finish(self):
+        with patch.dict(os.environ, {"EMAIL_TO": "reader@example.test", "EMAIL_PROVIDER": "fake"}):
+            draft = services.preview_digest(self.root, persist=True)
+            confirmation = {key: draft[key] for key in ("digest_id", "revision", "payload_hash")}
+            task = services.enqueue_task(self.root, "digest.send", confirmation, "late-cancel")
+            update = notifications.update_delivery_status
+            intruder = FakeProvider()
+
+            def cancel_after_update(*args, **kwargs):
+                status = update(*args, **kwargs)
+                notifications.run_notification_retry(self.root, intruder)
+                services.cancel_task(self.root, task["task_id"])
+                return status
+
+            with patch.object(notifications, "update_delivery_status", side_effect=cancel_after_update):
+                receipt = services.run_worker_once(self.root, provider=FakeProvider(mode="retryable_not_accepted", retry_after=0))
+            self.assertEqual(intruder.history, [])
+            self.assertEqual(receipt["status"], "cancelled")
+            self.assertEqual(notifications.run_notification_retry(self.root, intruder)["claimed"], 0)
+
+    def test_frozen_dispatch_rechecks_fence_after_validation(self):
+        with patch.dict(os.environ, {"EMAIL_TO": "reader@example.test", "EMAIL_PROVIDER": "fake"}):
+            for expire in (False, True):
+                with self.subTest(expire=expire):
+                    draft = services.preview_digest(self.root, persist=True, new_revision=True)
+                    confirmation = {key: draft[key] for key in ("digest_id", "revision", "payload_hash")}
+                    task = services.enqueue_task(self.root, "digest.send", confirmation, f"validate-fence-{expire}")
+                    validate = notifications._frozen_delivery
+
+                    def stop_after_validation(*args):
+                        result = validate(*args)
+                        if expire:
+                            with closing(services._db(self.root, write=True)) as db, db:
+                                db.execute("UPDATE operation_tasks SET lease_expires_at=0 WHERE task_id=?", (task["task_id"],))
+                            services.claim_task(self.root, "replacement")
+                        else:
+                            services.cancel_task(self.root, task["task_id"])
+                        return result
+
+                    provider = FakeProvider()
+                    with patch.object(notifications, "_frozen_delivery", side_effect=stop_after_validation):
+                        receipt = services.run_worker_once(self.root, provider=provider)
+                    self.assertEqual(provider.history, [])
+                    self.assertEqual(receipt["status"], "unknown" if expire else "cancelled")
+
+    def test_frozen_retry_rechecks_cancellation_before_transport(self):
+        with patch.dict(os.environ, {"EMAIL_TO": "reader@example.test", "EMAIL_PROVIDER": "fake"}):
+            for stage in ("validation", "provider"):
+                with self.subTest(stage=stage):
+                    draft = services.preview_digest(self.root, persist=True, new_revision=True)
+                    confirmation = {key: draft[key] for key in ("digest_id", "revision", "payload_hash")}
+                    task = services.enqueue_task(self.root, "digest.send", confirmation, f"retry-fence-{stage}")
+                    services.run_worker_once(self.root, provider=FakeProvider(mode="retryable_not_accepted", retry_after=0))
+                    provider = FakeProvider()
+                    validate = notifications._frozen_delivery
+
+                    def cancel_before_transport(*args):
+                        result = validate(*args) if stage == "validation" else provider
+                        services.cancel_task(self.root, task["task_id"])
+                        return result
+
+                    with patch.object(notifications, "_frozen_delivery" if stage == "validation" else "get_configured_provider",
+                                      side_effect=cancel_before_transport):
+                        receipt = notifications.run_notification_retry(self.root, provider if stage == "validation" else None)
+                    self.assertEqual(provider.history, [])
+                    self.assertEqual(receipt["accepted"], 0)
+                    self.assertEqual(services.get_task(self.root, task["task_id"])["status"], "cancelled")
+
+    def test_immediate_notification_does_not_steal_a_frozen_retry(self):
+        with patch.dict(os.environ, {"EMAIL_TO": "reader@example.test", "EMAIL_PROVIDER": "fake"}):
+            draft = services.preview_digest(self.root, persist=True)
+            confirmation = {key: draft[key] for key in ("digest_id", "revision", "payload_hash")}
+            services.enqueue_task(self.root, "digest.send", confirmation, "retry-isolation")
+            receipt = services.run_worker_once(self.root, provider=FakeProvider(mode="retryable_not_accepted", retry_after=0))
+            notifications.run_notify_test(self.root, FakeProvider())
+            with closing(services._db(self.root)) as db:
+                status = db.execute("SELECT status FROM notification_deliveries WHERE delivery_id=?",
+                                    (receipt["result"]["delivery_id"],)).fetchone()[0]
+            self.assertEqual(status, "retry_wait")
+
+    def test_digest_uncertain_http_response_is_never_retried(self):
+        with patch.dict(os.environ, {"EMAIL_TO": "reader@example.test", "EMAIL_PROVIDER": "resend",
+                                    "DAILY_BUDGET_USD": "0", "BUDGET_HARD_STOP": "false"}):
+            for index, code in enumerate((408, 500, 503), 1):
+                with self.subTest(code=code):
+                    draft = services.preview_digest(self.root, persist=True, new_revision=True)
+                    confirmation = {key: draft[key] for key in ("digest_id", "revision", "payload_hash")}
+                    services.enqueue_task(self.root, "digest.send", confirmation, f"digest-http-{code}")
+                    error = urllib.error.HTTPError("https://api.resend.com/emails", code, "uncertain", {}, io.BytesIO(b"{}"))
+                    with patch("urllib.request.urlopen", side_effect=error) as transport:
+                        receipt = services.run_worker_once(self.root, provider=ResendProvider(api_key="fake-test-key"))
+                        self.assertEqual(receipt["status"], "unknown")
+                        with closing(services._db(self.root)) as db:
+                            self.assertEqual([row[0] for row in db.execute("SELECT status FROM usage_costs WHERE provider='resend'")], ["unknown"] * index)
+                            self.assertEqual([row[0] for row in db.execute("SELECT status FROM budget_reservations")], ["reserved"] * index)
+                        with closing(services._db(self.root, write=True)) as db, db:
+                            db.execute("UPDATE notification_deliveries SET next_attempt_at=NULL")
+                        self.assertEqual(notifications.run_notification_retry(self.root, ResendProvider(api_key="fake-test-key"))["claimed"], 0)
+                    self.assertEqual(transport.call_count, 1)
+
+    def test_corrupt_frozen_retry_never_sends_replacement_content(self):
+        with patch.dict(os.environ, {"EMAIL_TO": "reader@example.test", "EMAIL_PROVIDER": "fake"}):
+            for corruption in ("json", "missing", "field", "type", "changed", "key"):
+                with self.subTest(corruption=corruption):
+                    draft = services.preview_digest(self.root, persist=True, new_revision=True)
+                    confirmation = {key: draft[key] for key in ("digest_id", "revision", "payload_hash")}
+                    services.enqueue_task(self.root, "digest.send", confirmation, f"corrupt-{corruption}")
+                    receipt = services.run_worker_once(self.root, provider=FakeProvider(mode="retryable_not_accepted", retry_after=0))
+                    delivery_id = receipt["result"]["delivery_id"]
+                    with closing(services._db(self.root, write=True)) as db, db:
+                        row = db.execute("SELECT e.event_id,e.payload_json FROM notification_events e JOIN notification_deliveries d USING(event_id) WHERE d.delivery_id=?", (delivery_id,)).fetchone()
+                        payload = json.loads(row["payload_json"])
+                        if corruption == "missing":
+                            payload.pop("_web_frozen_email")
+                        elif corruption == "field":
+                            payload["_web_frozen_email"].pop("subject")
+                        elif corruption == "type":
+                            payload["_web_frozen_email"]["text_body"] = {"unsafe": "not text"}
+                        elif corruption == "changed":
+                            payload["_web_frozen_email"]["text_body"] = "unconfirmed replacement"
+                        elif corruption == "key":
+                            db.execute("UPDATE notification_deliveries SET provider_idempotency_key='changed-key' WHERE delivery_id=?", (delivery_id,))
+                        db.execute("UPDATE notification_events SET payload_json=? WHERE event_id=?",
+                                   ("{broken" if corruption == "json" else json.dumps(payload), row["event_id"]))
+                    provider = FakeProvider()
+                    result = notifications.run_notification_retry(self.root, provider)
+                    self.assertEqual(provider.history, [])
+                    self.assertEqual(result["accepted"], 0)
+                    with closing(services._db(self.root)) as db:
+                        self.assertEqual(db.execute("SELECT status FROM notification_deliveries WHERE delivery_id=?", (delivery_id,)).fetchone()[0], "dead")
 
     def test_no_evidence_ask_does_not_call_llm(self):
         task = self.enqueue(payload={"query": "no matching evidence", "limit": 5})

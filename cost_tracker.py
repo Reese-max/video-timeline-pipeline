@@ -462,7 +462,7 @@ def _finish_attempt(state: _ActiveAttempt, error: BaseException | None = None) -
         # A failed trigger response does not prove that a remote job was never
         # accepted. Keep the same risk as an uncertain POST timeout.
         remote_trigger = (state.outcome.provider, state.outcome.operation) in {
-            ("apify", "actor.run.start"), ("brightdata", "datasets.trigger")
+            ("apify", "actor.run.start"), ("brightdata", "datasets.trigger"), ("resend", "email.send")
         }
         unresolved = (category in ("timeout", "network", "unknown")
                       or getattr(error, "provider_outcome_unknown", False)

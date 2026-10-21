@@ -146,6 +146,10 @@ def _utc_now_iso() -> str:
     return datetime.datetime.now(datetime.timezone.utc).isoformat()
 
 
+def _json_hash(value: Any) -> str:
+    return hashlib.sha256(json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+
+
 def record_event(
     conn: sqlite3.Connection,
     event_type: str,
@@ -236,9 +240,11 @@ def claim_pending_deliveries(
               AND (d.next_attempt_at IS NULL OR d.next_attempt_at <= ?)
               AND (d.lease_expires_at IS NULL OR d.lease_expires_at <= ?)
               AND (? IS NULL OR d.delivery_id = ?)
+              AND (d.status != 'pending' OR e.dedup_key NOT LIKE 'web-digest:%'
+                   OR d.delivery_id = ?)
             LIMIT ?
             """,
-            (now_iso, now_iso, delivery_id, delivery_id, limit),
+            (now_iso, now_iso, delivery_id, delivery_id, delivery_id, limit),
         )
         rows = cur.fetchall()
         if not rows:
@@ -263,7 +269,7 @@ def claim_pending_deliveries(
     cur = conn.cursor()
     cur.execute(
         f"""
-        SELECT d.*, e.event_type, e.payload_json
+        SELECT d.*, e.event_type, e.payload_json, e.dedup_key AS event_dedup_key
         FROM notification_deliveries d
         JOIN notification_events e ON d.event_id = e.event_id
         WHERE d.delivery_id IN ({placeholders}) AND d.lease_token = ?
@@ -280,7 +286,8 @@ def update_delivery_status(
     result: DeliveryResult,
     attempt_no: int,
     started_at: str,
-) -> None:
+    *, task_id: str | None = None,
+) -> str:
     """Record attempt outcome and transition status machine."""
     now_iso = _utc_now_iso()
     attempt_id = str(uuid.uuid4())
@@ -295,6 +302,13 @@ def update_delivery_status(
             """,
             (attempt_id, delivery_id, attempt_no, result.provider_message_id, started_at, now_iso, result.status, result.safe_error),
         )
+
+        if result.status == "retryable_not_accepted" and task_id is not None:
+            task = conn.execute("SELECT status FROM operation_tasks WHERE task_id=?", (task_id,)).fetchone()
+            if task is None or task["status"] in {"cancel_requested", "cancelled"}:
+                conn.execute("UPDATE notification_deliveries SET status='cancelled',attempt_count=attempt_count+1,lease_owner=NULL,lease_token=NULL,lease_expires_at=NULL WHERE delivery_id=? AND lease_token=?",
+                             (delivery_id, lease_token))
+                return "cancelled"
 
         if result.status == "accepted":
             conn.execute(
@@ -357,9 +371,35 @@ def update_delivery_status(
                 """,
                 (result.safe_error, delivery_id, lease_token),
             )
+    return result.status
 
 
 # ── CLI Actions ─────────────────────────────────────────────────────────────
+
+
+def _frozen_delivery(conn: sqlite3.Connection, item: sqlite3.Row) -> tuple[dict[str, str], sqlite3.Row]:
+    """Validate the stored wire content and find its original durable task."""
+    _, digest_id, revision, payload_hash = item["event_dedup_key"].split(":")
+    draft = conn.execute("SELECT * FROM web_digest_drafts WHERE digest_id=?", (digest_id,)).fetchone()
+    if not draft or draft["revision"] != int(revision) or draft["payload_hash"] != payload_hash:
+        raise ValueError("Invalid frozen confirmation")
+    payload = json.loads(draft["payload"])
+    if (item["provider_idempotency_key"] != item["event_dedup_key"]
+            or item["payload_hash"] != payload_hash or item["recipient_id"] != draft["recipient"]
+            or item["provider"] != draft["provider"] or payload_hash != _json_hash({"payload": payload,
+                "recipient": draft["recipient"], "provider": draft["provider"], "evidence": draft["evidence_hash"]})):
+        raise ValueError("Frozen confirmation changed")
+    # ponytail: a template change requires a new preview; persist a wire hash for cross-version retries.
+    text, html = render_digest_email(payload)
+    frozen = {"subject": f"【影片知識庫】{payload['window_label']}", "text_body": text, "html_body": html}
+    if json.loads(item["payload_json"]) != {**payload, "_web_frozen_email": frozen}:
+        raise ValueError("Frozen wire content changed")
+    confirmation = {"digest_id": digest_id, "revision": int(revision), "payload_hash": payload_hash}
+    task = conn.execute("SELECT task_id,status FROM operation_tasks WHERE dedup_key=? AND type='digest.send'",
+                        (_json_hash({"type": "digest.send", "payload": confirmation}),)).fetchone()
+    if task is None:
+        raise ValueError("Frozen task missing")
+    return frozen, task
 
 
 def send_frozen_digest(root: Path, draft: dict[str, Any], *, provider: BaseProvider | None = None, before_send=None) -> dict[str, Any]:
@@ -379,26 +419,33 @@ def send_frozen_digest(root: Path, draft: dict[str, Any], *, provider: BaseProvi
         claimed = claim_pending_deliveries(conn, f"web-{os.getpid()}", limit=1, delivery_id=delivery_id)
         if not claimed:
             row = conn.execute("SELECT status FROM notification_deliveries WHERE delivery_id=?", (delivery_id,)).fetchone()
-            return {"status": row[0] if row[0] in {"accepted", "unknown", "dead"} else "unknown", "delivery_id": delivery_id}
+            return {"status": row[0] if row[0] in {"accepted", "unknown", "dead", "cancelled"} else "unknown", "delivery_id": delivery_id}
         target = claimed[0]
         started = _utc_now_iso()
-        if before_send is not None and not before_send():
-            with conn:
-                conn.execute("UPDATE notification_deliveries SET status='cancelled',lease_token=NULL,lease_expires_at=NULL WHERE delivery_id=? AND lease_token=?",
-                             (delivery_id, target["lease_token"]))
-            return {"status": "cancelled", "delivery_id": delivery_id}
+        task_id = None
         try:
-            frozen = json.loads(target["payload_json"])["_web_frozen_email"]
-            outcome = active.send(recipient=target["recipient_id"], **frozen,
-                idempotency_key=target["provider_idempotency_key"])
-        except Exception:
-            outcome = DeliveryResult(status="unknown", safe_error="reconcile_remote_before_retry")
-        update_delivery_status(conn, delivery_id, target["lease_token"], outcome, int(target["attempt_count"]) + 1, started)
+            frozen, task = _frozen_delivery(conn, target)
+            task_id = task["task_id"]
+        except (ValueError, KeyError, TypeError, sqlite3.Error):
+            outcome = DeliveryResult(status="permanent_failure", safe_error="invalid_frozen_snapshot")
+        else:
+            if before_send is not None and not before_send():
+                with conn:
+                    conn.execute("UPDATE notification_deliveries SET status='cancelled',lease_token=NULL,lease_expires_at=NULL WHERE delivery_id=? AND lease_token=?",
+                                 (delivery_id, target["lease_token"]))
+                return {"status": "cancelled", "delivery_id": delivery_id}
+            try:
+                outcome = active.send(recipient=target["recipient_id"], **frozen,
+                    idempotency_key=target["provider_idempotency_key"])
+            except Exception:
+                outcome = DeliveryResult(status="unknown", safe_error="reconcile_remote_before_retry")
+        status = update_delivery_status(conn, delivery_id, target["lease_token"], outcome,
+                                        int(target["attempt_count"]) + 1, started, task_id=task_id)
         with conn:
             conn.execute("UPDATE web_digest_drafts SET status=? WHERE digest_id=? AND revision=?",
-                         (outcome.status, draft["digest_id"], draft["revision"]))
+                         (status, draft["digest_id"], draft["revision"]))
         blocked = bool(outcome.safe_error and outcome.safe_error.startswith("Budget blocked:"))
-        return {"status": "blocked" if blocked else outcome.status, "delivery_id": delivery_id,
+        return {"status": "blocked" if blocked else status, "delivery_id": delivery_id,
                 "remote_operation_id": outcome.provider_message_id,
                 "selected_count": payload["selected_count"], "deferred_count": payload["deferred_count"]}
 
@@ -492,7 +539,7 @@ def run_digest_send(
 
         # Claim and send
         worker_id = f"worker_{os.getpid()}"
-        claimed = claim_pending_deliveries(conn, worker_id=worker_id, limit=1)
+        claimed = claim_pending_deliveries(conn, worker_id=worker_id, limit=1, delivery_id=delivery_id)
         if not claimed:
             return {"status": "already_claimed_or_sent", "delivery_id": delivery_id}
 
@@ -598,7 +645,7 @@ def run_notify_test(root: Path, provider: BaseProvider | None = None) -> dict[st
             payload_hash=hashlib.sha256(text.encode()).hexdigest(),
         )
 
-        claimed = claim_pending_deliveries(conn, worker_id=f"test_{os.getpid()}", limit=1)
+        claimed = claim_pending_deliveries(conn, worker_id=f"test_{os.getpid()}", limit=1, delivery_id=delivery_id)
         if not claimed:
             return {"status": "claim_failed", "delivery_id": delivery_id}
 
@@ -640,16 +687,24 @@ def run_notification_retry(root: Path, provider: BaseProvider | None = None) -> 
         accepted_count = 0
 
         for item in claimed:
-            retried_count += 1
             started = _utc_now_iso()
+            task_id = None
+            web_frozen = item["event_dedup_key"].startswith("web-digest:")
+            if web_frozen:
+                try:
+                    frozen, task = _frozen_delivery(conn, item)
+                    task_id = task["task_id"]
+                except (ValueError, KeyError, TypeError, sqlite3.Error):
+                    update_delivery_status(conn, item["delivery_id"], item["lease_token"],
+                        DeliveryResult(status="permanent_failure", safe_error="invalid_frozen_snapshot"),
+                        int(item["attempt_count"]) + 1, started)
+                    continue
             # Parse payload
             try:
-                frozen = None
-                payload = json.loads(item["payload_json"])
-                frozen = payload.get("_web_frozen_email")
-                if frozen:
+                if web_frozen:
                     subject, text_body, html_body = (frozen[key] for key in ("subject", "text_body", "html_body"))
                 else:
+                    payload = json.loads(item["payload_json"])
                     subject = f"【重試通知】{item['event_type']}"
                     text_body = json.dumps(payload, ensure_ascii=False, indent=2)
                     html_body = None
@@ -658,7 +713,17 @@ def run_notification_retry(root: Path, provider: BaseProvider | None = None) -> 
                 text_body = "無法解碼 payload"
                 html_body = None
 
-            active_provider = provider or (get_configured_provider(item["provider"]) if frozen else get_configured_provider())
+            active_provider = provider or (get_configured_provider(item["provider"]) if web_frozen else get_configured_provider())
+            if web_frozen:
+                task = conn.execute("SELECT status FROM operation_tasks WHERE task_id=?", (task_id,)).fetchone()
+                status = task["status"] if task else "unknown"
+                if status != "failed":
+                    status = "cancelled" if status in {"cancel_requested", "cancelled"} else "retry_wait" if status == "running" else "unknown"
+                    with conn:
+                        conn.execute("UPDATE notification_deliveries SET status=?,lease_owner=NULL,lease_token=NULL,lease_expires_at=NULL WHERE delivery_id=? AND lease_token=?",
+                                     (status, item["delivery_id"], item["lease_token"]))
+                    continue
+            retried_count += 1
             result = active_provider.send(
                 recipient=item["recipient_id"],
                 subject=subject,
@@ -674,6 +739,7 @@ def run_notification_retry(root: Path, provider: BaseProvider | None = None) -> 
                 result=result,
                 attempt_no=int(item["attempt_count"]) + 1,
                 started_at=started,
+                task_id=task_id,
             )
             if result.status == "accepted":
                 accepted_count += 1
@@ -722,7 +788,7 @@ def record_pipeline_completed_event(root: Path, job_dir: Path, manifest: dict[st
                     payload_hash=hashlib.sha256(dedup_key.encode()).hexdigest(),
                 )
                 # Dispatch immediately
-                claimed = claim_pending_deliveries(conn, worker_id=f"pipeline_{os.getpid()}", limit=1)
+                claimed = claim_pending_deliveries(conn, worker_id=f"pipeline_{os.getpid()}", limit=1, delivery_id=delivery_id)
                 if claimed:
                     target = claimed[0]
                     text, html_msg = render_event_email("video.completed", event_payload)

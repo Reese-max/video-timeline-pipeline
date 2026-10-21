@@ -24,6 +24,8 @@ Dashboard 是既有 pipeline／RSS／評分／成本／Digest service 的選用�
 
 `POST /api/search`、`/api/ask`、`/api/jobs/{job}/retry`、`/api/digest/send` 都需 Bearer 及 `Idempotency-Key`，先回 202／task ID。`GET /api/tasks/{id}` 只讀進度。`POST /api/tasks/{id}/cancel` 可重複呼叫；queued 轉 cancelled，running 轉 cancel_requested，禁止後續傳輸，不宣稱遠端已取消或退款。
 
+摘要取消也會在同一交易停止 outbox 中尚未傳輸的 pending／retry_wait；已知寄送失敗的摘要 task 也可取消其後續重試。其他寄送者不能搶領仍由 Dashboard task 控制的 pending 郵件，重試必須等原 task 結束並重新核對取消狀態。
+
 `python pipeline.py --root <資料目錄> --web-worker` 每次只處理一筆，沒有隱藏常駐排程。`operation_tasks` 保存 library／job／revision、safe_payload、去重鍵、狀態、lease、heartbeat、checkpoint、遠端 ID 與結果；`operation_requests` 保留每個請求鍵的原始收據。同一資料目錄僅領取一筆工作，網路在短交易外執行。
 
 lease 60 秒、每 10 秒 heartbeat。領取時用 `BEGIN IMMEDIATE`，結果寫回核對 token 與期限。重啟後只重排尚未提交的本機步驟；已 checkpoint=submitted 且失聯者轉 unknown，不自動重播。每個付費 POST 前重新核對取消與 lease，逾時／408／5xx／無法解碼回應保守保留 unknown；只有明確未接受且可重試的回應才沿用原 provider retry 規則。
@@ -37,6 +39,8 @@ unknown 必須先由操作人員核對供應商紀錄與費用；本版沒有自
 `POST /api/digest/preview` 只讀既有摘要並組裝本機 draft，零遠端呼叫；唯讀模式不落盤，寫入模式保存 immutable draft。預覽顯示設定的 `EMAIL_TO`、provider、日／週確切窗口與候選／選入／待補數；既有即時通知覆蓋無法可靠判定時標 unknown。Web 只允許設定的單一 email；不接收字幕／LLM 提供的收件者或任意 webhook URL。
 
 送出必須引用 `digest_id + revision + payload_hash`；內容、來源摘要、設定的 provider／收件者或儲存 payload 改變會拒絕舊確認。worker 透過既有 outbox 送出凍結的 subject／text／HTML，重試沿用相同內容與 idempotency key。只有 `retryable_not_accepted` 可由既有明確 `--notification-retry` 重試；unknown 不排自動重送。accepted 顯示「供應商已接受」，不宣稱送達；通知頁保留實際狀態。沒有可靠 bounce／delivery callback 時不自行猜測。
+
+每次摘要重試都核對原確認雜湊、收件者、provider、凍結的 subject／text／HTML 與原 task。損壞、缺欄位、型別錯誤或被改寫的 snapshot 會記為 dead，零傳輸；不寄出解碼失敗的替代文字。模板版本改變也須重新預覽確認。Resend 的 408／5xx 保存為 unknown，成本預留維持未結清，不因錯誤回應推定尚未接受而重送。
 
 需補寄／重寄時勾選「明確建立新版」，重新預覽並確認新版；一般重新整理與重複確認只取得原有收據。這仍是使用者明確送出，不能用作 unknown 的自動恢復。
 
