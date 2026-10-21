@@ -765,6 +765,14 @@ SPLIT_DEFAULT_MAX_LONG_SIDE = 1280
 SPLIT_MIN_LONG_SIDE = 240
 
 
+class SplitFfmpegError(RuntimeError):
+    """ffmpeg 執行分段失敗；copy 模式可以退回重新編碼。"""
+
+
+class SplitValidationError(RuntimeError):
+    """分段驗證失敗（列數、檔名、時間連續、長度不符）；copy 模式可以退回重新編碼。"""
+
+
 def split_mode() -> str:
     """MCP_SEGMENT_MODE：copy=直接剪開（不重編碼），transcode=重新編碼。"""
     value = (os.getenv("MCP_SEGMENT_MODE") or "copy").strip().lower()
@@ -804,9 +812,13 @@ def split_scale_filter(long_side: int) -> str:
 
     以 iw/ih 判斷長邊，不依賴 probe 寬高：ffmpeg 預設會先自動套用旋轉 metadata，
     濾鏡看到的 iw/ih 已是顯示方向（直式手機影片因此不會被橫著縮）。
+
+    兩個維度都要偶數：長邊用 trunc(min(L,iw)/2)*2 強制偶數化，另一邊維持 -2
+    （ffmpeg 依長寬比換算後取偶數倍數）。libx264 的 yuv420p 不接受奇數尺寸，
+    不能依賴 ffmpeg 自動修正。
     """
-    return (f"scale='if(gt(iw,ih),min({long_side},iw),-2)'"
-            f":'if(gt(iw,ih),-2,min({long_side},ih))'")
+    return (f"scale='if(gt(iw,ih),trunc(min({long_side},iw)/2)*2,-2)'"
+            f":'if(gt(iw,ih),-2,trunc(min({long_side},ih)/2)*2)'")
 
 
 def _copy_encoder_args() -> list[str]:
@@ -853,7 +865,8 @@ def _split_params(video_path: Path, segment_seconds: int, mode: str,
 def _clear_split_artifacts(segment_dir: Path) -> None:
     """清掉既有分段與清單；重切或退回重新編碼前一律呼叫。"""
     for stale in segment_dir.glob("segment_*.mp4"):
-        stale.unlink()
+        # 檔案可能已經被清掉或是別的程序刪除，不得因此蓋掉原本的失敗原因。
+        stale.unlink(missing_ok=True)
     (segment_dir / "segments.csv").unlink(missing_ok=True)
     (segment_dir / "segments.resume.csv").unlink(missing_ok=True)
 
@@ -996,8 +1009,9 @@ def split_video(video_path: Path, segment_dir: Path, segment_seconds: int,
     except (DeadlineExceeded, ExecutionCancelled):
         # 取消與逾時是硬性中止，不能默默改用重新編碼。
         raise
-    except (RuntimeError, OSError) as error:
-        # 直接剪開失敗（ffmpeg 失敗或分段沒通過驗證）：清掉半成品，改用重新編碼。
+    except (SplitFfmpegError, SplitValidationError) as error:
+        # 只有 copy 的 ffmpeg 執行失敗與分段驗證失敗才退回；
+        # 來源指紋、寫標記等前置／收尾錯誤直接往上拋，不該白跑一次重新編碼。
         print(f"! 直接剪開失敗，改用重新編碼切分段：{error}")
         _clear_split_artifacts(segment_dir)
         return _split_with_encoder(video_path, segment_dir, segment_seconds, duration,
@@ -1087,7 +1101,9 @@ def _split_with_encoder(video_path: Path, segment_dir: Path, segment_seconds: in
             "-segment_start_number",
             str(index),
             "-avoid_negative_ts",
-            "disabled",
+            # transcode 續切用 -ss 定位，需要保留原本的時間軸（disabled）；
+            # copy 不定位，改用 make_zero 讓分段時間戳不會是負數。
+            "make_zero" if mode == "copy" else "disabled",
             "-reset_timestamps",
             "1",
             str(segment_dir / "segment_%03d.mp4"),
@@ -1103,6 +1119,11 @@ def _split_with_encoder(video_path: Path, segment_dir: Path, segment_seconds: in
         progress.start()
         try:
             pipeline.run_external(command, stream=True)
+        except (DeadlineExceeded, ExecutionCancelled):
+            # 取消與逾時要原樣往上拋，不能包成可退回的錯誤。
+            raise
+        except (RuntimeError, OSError) as error:
+            raise SplitFfmpegError(f"ffmpeg 切分段失敗：{error}") from error
         finally:
             stop.set()
             progress.join()
@@ -1116,7 +1137,11 @@ def _split_with_encoder(video_path: Path, segment_dir: Path, segment_seconds: in
             )
             _write_segment_csv(list_path, completed)
             resume_path.unlink(missing_ok=True)
-    result = _validated_segments(segment_dir, duration)
+    try:
+        result = _validated_segments(segment_dir, duration)
+    except (RuntimeError, ValueError, OSError) as error:
+        # 驗證階段的失敗（含 csv 時間不是數字造成的 ValueError）統一視為可退回的錯誤。
+        raise SplitValidationError(f"分段驗證失敗：{error}") from error
     total = len(result) if mode == "copy" else (expected or len(result))
     current, message = _split_progress_value(len(result), total, len(result), 0.0, label)
     report_progress("split", current, message)
