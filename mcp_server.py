@@ -759,10 +759,15 @@ def restore_before_download(job_dir: Path) -> Path | None:
 
 SPLIT_PROGRESS_BASE = 45
 SPLIT_PROGRESS_LIMIT = 64  # 下一階段 previews 從 65 開始
+SPLIT_PROGRESS_POLL_SECONDS = 5.0
 SPLIT_MODES = ("copy", "transcode")
 SPLIT_X264_PRESETS = ("superfast", "veryfast", "faster", "fast", "medium")
 SPLIT_DEFAULT_MAX_LONG_SIDE = 1280
 SPLIT_MIN_LONG_SIDE = 240
+# transcode 強制關鍵畫面、邊界精準：最後一段與影片長度差超過 0.25 秒就視為缺尾段，
+# 必須續切；copy 切點只能落在來源既有關鍵畫面，最終驗證容差維持 1 秒。
+SPLIT_TAIL_TOLERANCE_TRANSCODE = 0.25
+SPLIT_TAIL_TOLERANCE_COPY = 1.0
 
 
 class SplitFfmpegError(RuntimeError):
@@ -830,6 +835,10 @@ def _transcode_encoder_args(long_side: int, preset: str) -> list[str]:
     args = ["-map", "0:v:0", "-map", "0:a:0?"]
     if long_side:
         args += ["-vf", split_scale_filter(long_side)]
+    else:
+        # 不縮放也要把奇數寬高偶數化：libx264 的 yuv420p 不接受奇數尺寸，
+        # trunc(iw/2)*2 對偶數來源不改變尺寸。
+        args += ["-vf", "scale=trunc(iw/2)*2:trunc(ih/2)*2"]
     args += [
         "-c:v", "libx264",
         "-preset", preset,
@@ -958,11 +967,13 @@ def _report_split_progress(
             report_progress("split", current, message)
         except Exception:
             pass
-        if stop.wait(5.0):
+        if stop.wait(SPLIT_PROGRESS_POLL_SECONDS):
             return
 
 
-def _validated_segments(segment_dir: Path, duration: float | None) -> list[tuple[Path, float, float]]:
+def _validated_segments(segment_dir: Path, duration: float | None,
+                        tail_tolerance: float = SPLIT_TAIL_TOLERANCE_COPY
+                        ) -> list[tuple[Path, float, float]]:
     segments = sorted(segment_dir.glob("segment_*.mp4"), key=lambda p: int(p.stem.split("_")[-1]))
     if not segments:
         raise RuntimeError("FFmpeg 沒有產生影片片段。")
@@ -981,7 +992,7 @@ def _validated_segments(segment_dir: Path, duration: float | None) -> list[tuple
         result.append((path, start, end))
         previous_end = end
     if duration is not None and math.isfinite(duration) and duration > 0 \
-            and abs(result[-1][2] - duration) > 1.0:
+            and abs(result[-1][2] - duration) > tail_tolerance:
         raise RuntimeError("FFmpeg 影片分段結束時間與影片長度不符。")
     return result
 
@@ -998,6 +1009,14 @@ def split_video(video_path: Path, segment_dir: Path, segment_seconds: int,
     preset = split_x264_preset()
     settings = {"max_long_side": long_side, "x264_preset": preset}
     segment_dir.mkdir(parents=True, exist_ok=True)
+    if duration is None:
+        # 呼叫端沒給長度時自行 probe；probe 失敗退回「無法判斷是否全部完成」的原行為。
+        try:
+            duration = pipeline.video_duration(pipeline.probe_video(video_path))
+        except (DeadlineExceeded, ExecutionCancelled):
+            raise
+        except Exception:
+            duration = None
     if mode == "transcode":
         return _split_with_encoder(video_path, segment_dir, segment_seconds, duration,
                                    split_encoder_args(), "transcode",
@@ -1063,8 +1082,10 @@ def _split_with_encoder(video_path: Path, segment_dir: Path, segment_seconds: in
     if mode == "copy":
         # 直接剪開的切點落在下一個關鍵畫面，段數事先推不準，不顯示預估值。
         expected = None
+    tail_tolerance = (SPLIT_TAIL_TOLERANCE_TRANSCODE if mode == "transcode"
+                      else SPLIT_TAIL_TOLERANCE_COPY)
     finished = (bool(completed) and duration is not None and math.isfinite(duration)
-                and duration > 0 and completed[-1][2] >= duration - 1.0)
+                and duration > 0 and completed[-1][2] >= duration - tail_tolerance)
     if not finished:
         offset = completed[-1][2] if completed else 0.0
         # 定位點往前 1ms：csv 記錄的邊界經過 %.6f 捨入，直接以記錄值 seek 可能
@@ -1101,9 +1122,10 @@ def _split_with_encoder(video_path: Path, segment_dir: Path, segment_seconds: in
             "-segment_start_number",
             str(index),
             "-avoid_negative_ts",
-            # transcode 續切用 -ss 定位，需要保留原本的時間軸（disabled）；
-            # copy 不定位，改用 make_zero 讓分段時間戳不會是負數。
-            "make_zero" if mode == "copy" else "disabled",
+            # copy 與 transcode 一律 disabled：make_zero 會依來源首個時間戳把
+            # 分段時間整體平移，切點與播放時間軸對不上；transcode 續切用 -ss
+            # 定位，本來就需要保留原本的時間軸。
+            "disabled",
             "-reset_timestamps",
             "1",
             str(segment_dir / "segment_%03d.mp4"),
@@ -1114,6 +1136,7 @@ def _split_with_encoder(video_path: Path, segment_dir: Path, segment_seconds: in
             target=_report_split_progress,
             args=(stop, lambda: index + _count_segment_list_rows(active_list),
                   expected, index, started, label),
+            name="split-progress",
             daemon=True,
         )
         progress.start()
@@ -1138,7 +1161,7 @@ def _split_with_encoder(video_path: Path, segment_dir: Path, segment_seconds: in
             _write_segment_csv(list_path, completed)
             resume_path.unlink(missing_ok=True)
     try:
-        result = _validated_segments(segment_dir, duration)
+        result = _validated_segments(segment_dir, duration, tail_tolerance)
     except (RuntimeError, ValueError, OSError) as error:
         # 驗證階段的失敗（含 csv 時間不是數字造成的 ValueError）統一視為可退回的錯誤。
         raise SplitValidationError(f"分段驗證失敗：{error}") from error

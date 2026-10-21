@@ -193,16 +193,16 @@ class SplitModeTests(unittest.TestCase):
             self.assertGreaterEqual(start, previous_end - 0.001, "分段時間必須連續")
             self.assertGreater(end, start)
             previous_end = end
-        self.assertAlmostEqual(parts[-1][2], self.split_duration(source), delta=0.5,
+        self.assertAlmostEqual(parts[-1][2], self.split_duration(source), delta=0.15,
                                msg="最後一段必須接近影片長度")
         # copy 不能強制關鍵畫面：切點落在來源既有的關鍵畫面（3 秒），不是 2 秒。
-        # copy 模式用 -avoid_negative_ts make_zero，時間戳會依來源的首個時間戳
-        # 正規化（偏移 = 來源 edit list 的起始偏移），因此切點整體平移同一個量。
+        # copy 與 transcode 都用 -avoid_negative_ts disabled，分段沿用來源時間軸，
+        # 切點與播放時間軸一致，不會整體平移。
         shift = parts[1][1] - 3.0
-        self.assertAlmostEqual(parts[1][1], 3.0, delta=0.5)
+        self.assertAlmostEqual(parts[1][1], 3.0, delta=0.15)
         if len(parts) > 2:
             self.assertAlmostEqual(parts[2][1] - 6.0, shift, delta=0.01,
-                                   msg="所有切點的正規化偏移必須一致")
+                                   msg="所有切點的偏移必須一致")
 
     def split_duration(self, source: Path) -> float:
         return server.pipeline.video_duration(server.pipeline.probe_video(source))
@@ -260,12 +260,12 @@ class SplitModeTests(unittest.TestCase):
             calls.append(command)
             return original(command, **kwargs)
 
-        def validate(segment_dir, duration):
+        def validate(segment_dir, duration, *args, **kwargs):
             state["validated"] += 1
             if state["validated"] == 1:
                 # 第一次是 copy 分段的驗證：模擬沒通過（列數／檔名／時間對不上）。
                 raise RuntimeError("FFmpeg 影片分段與實際時間清單數量不一致。")
-            return original_validate(segment_dir, duration)
+            return original_validate(segment_dir, duration, *args, **kwargs)
 
         with self.env(MCP_SEGMENT_MODE="copy", MCP_SEGMENT_MAX_LONG_SIDE="320"), \
                 patch.object(server.pipeline, "run_external", side_effect=spy), \
@@ -463,6 +463,25 @@ class SplitModeTests(unittest.TestCase):
                 self.assertEqual(width % 2, 0)
                 self.assertEqual(height % 2, 0)
 
+    # X2：MCP_SEGMENT_MAX_LONG_SIDE=0 不縮放，仍要把奇數寬高偶數化（libx264 yuv420p）；
+    # 偶數來源尺寸不變。
+    def test_no_scaling_still_evenizes_odd_dimensions(self):
+        source = self.make_odd_source(size="171x95", duration=2)
+        source_width, source_height = probe_size(source)
+        self.assertTrue(source_width % 2 or source_height % 2,
+                        "測試來源必須是奇數尺寸")
+        with self.env(MCP_SEGMENT_MODE="transcode", MCP_SEGMENT_MAX_LONG_SIDE="0"):
+            parts = self.split(source)
+        width, height = probe_size(parts[0][0])
+        self.assertEqual(width % 2, 0, "不縮放模式輸出寬度仍必須是偶數")
+        self.assertEqual(height % 2, 0, "不縮放模式輸出高度仍必須是偶數")
+        self.assertEqual((width, height), (170, 94))
+        even_source = self.make_source(name="even_640x360.mp4", size="640x360", duration=2)
+        with self.env(MCP_SEGMENT_MODE="transcode", MCP_SEGMENT_MAX_LONG_SIDE="0"):
+            parts = self.split(even_source)
+        self.assertEqual(probe_size(parts[0][0]), (640, 360),
+                         "偶數來源在不縮放模式尺寸不得改變")
+
     # M2：copy 的分段驗證階段拋 ValueError 時也必須退回重新編碼。
     def test_copy_validation_value_error_falls_back_to_transcode(self):
         source = self.make_source(size="640x360", duration=7, gop=21)
@@ -542,8 +561,8 @@ class SplitModeTests(unittest.TestCase):
             server._clear_split_artifacts(self.segments_dir)
         self.assertFalse((self.segments_dir / "segments.csv").exists())
 
-    # L3：copy 用 make_zero，transcode 續切維持 disabled。
-    def test_avoid_negative_ts_differs_between_copy_and_transcode(self):
+    # L3：copy 與 transcode 都用 disabled；make_zero 會把切點時間整體平移。
+    def test_avoid_negative_ts_disabled_in_both_modes(self):
         source = self.make_source(size="64x64", duration=5, gop=7)
         calls = []
         original = server.pipeline.run_external
@@ -552,8 +571,7 @@ class SplitModeTests(unittest.TestCase):
             calls.append(command)
             return original(command, **kwargs)
 
-        expectations = {"copy": "make_zero", "transcode": "disabled"}
-        for mode, expected in expectations.items():
+        for mode in ("copy", "transcode"):
             with self.subTest(mode=mode):
                 calls.clear()
                 with self.env(MCP_SEGMENT_MODE=mode), \
@@ -561,7 +579,7 @@ class SplitModeTests(unittest.TestCase):
                     self.split(source)
                 command = self.segment_commands(calls)[0]
                 self.assertIn("-avoid_negative_ts", command)
-                self.assertEqual(command[command.index("-avoid_negative_ts") + 1], expected)
+                self.assertEqual(command[command.index("-avoid_negative_ts") + 1], "disabled")
 
     # L5：copy 與 transcode 的指令都要明確指定影像與音軌。
     def test_both_modes_map_video_and_optional_audio(self):
