@@ -34,7 +34,8 @@ DERIVED = re.compile(
     r"(?:previews/preview_\d+\.jpg|"
     r"analysis/(?:runs/[a-f0-9]{64}/)?(?:frames|budgeted-frames)/frame_\d+\.jpg|"
     r"analysis/(?:runs/[a-f0-9]{64}/)?audio/audio_\d+\.mp3|"
-    r"analysis/runs/[a-f0-9]{64}/vision-video-work/minimax-compressed\.mp4)", re.I)
+    r"analysis/runs/[a-f0-9]{64}/vision-video-work/minimax-compressed\.mp4|"
+    r"threads_media_\d+\.mp4)", re.I)
 
 
 def drive_backup_still_verified(job: Path) -> bool:
