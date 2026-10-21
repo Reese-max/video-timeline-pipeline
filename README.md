@@ -256,6 +256,8 @@ python pipeline.py --rss-update '<SUBSCRIPTION_ID>' --facebook-max-items 10
 
 `RSS_FACEBOOK_FALLBACK_PROVIDER` 預設空值；可設 `apify`（其他值會拒絕）。只有 Bright Data 帳本在送出前拒絕額度，且 Apify 另經 `RSS_PAID_DISCOVERY=apify,brightdata` 或明確 `--allow-batch-cloud` 放行時，才使用 Apify 備援。結果會記錄 `provider=apify`、`fallback_from=brightdata`；Bright Data 送出後的失敗、逾時或回應不明不啟動備援，避免雙重計費。
 
+Facebook／Instagram 的 Bright Data 作者盤點會照實結算所有 record（含錯誤），以 `error_count`／`errors` 回報錯誤（最多 3 筆、訊息各前 200 字），CLI 顯示原始／有效／錯誤筆數；全部為錯誤時盤點與刷新失敗並保留原因及原回執，重試沿用 snapshot、不新增計費 trigger，部分錯誤則保留正常項目。
+
 ### Bright Data 共用免費月額度
 
 依 2026-10-21 已查證的方案，免費層每月 5,000 credits，由 Web Scraper API、SERP、Unlocker 與 Browser API 共用，**每月 1 日 UTC 重置**且不累積。Scraper API 每交付一筆 record 扣 1 credit，輸入錯誤造成的 error record 也計費；帳戶沒有儲值時用完即 hard stop。

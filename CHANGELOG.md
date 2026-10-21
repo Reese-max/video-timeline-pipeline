@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- 修正：Facebook／Instagram Bright Data 作者盤點先結算含錯誤的全部 record，再以 `error_count`／`errors` 回報；全部錯誤時 CLI 非零結束、RSS 記錄失敗且不推進 snapshot，部分錯誤保留正常項目，重試沿用回執不重送計費 trigger。
+
 - 新增：Facebook 粉專 Reels 可用 `--facebook-provider brightdata --facebook-max-items N`，結果預算支援訂閱更新與 OPML；與 IG 共用單次提交／snapshot 續查、本機日期篩選及 RSS 付費盤點間隔。`RSS_FACEBOOK_FALLBACK_PROVIDER=apify` 僅在帳本送出前拒絕且 Apify 另獲放行時備援，送出後失敗不另開計費工作。
 - 新增：`BRIGHTDATA_MONTHLY_CREDIT_LIMIT`（4500）、`BRIGHTDATA_CREDIT_LEDGER`（預設使用者共用 SQLite）、`BRIGHTDATA_POST_DAILY_LIMIT`（20），原子預留最壞結果筆數、依實際交付含 error records 結算，未知結果保留預留；`--brightdata-usage` 輸出月／日用量 JSON。免費層每月 5,000 credits，由 Scraper／SERP／Unlocker／Browser 共用，每月 1 日 UTC 重置且不累積，無儲值用完即停止。
 - 新增：`BRIGHTDATA_ALLOWED_POST_URLS=*` 允許既有驗證範圍內任何公開單篇貼文，仍需 `allow_paid=true`；共用月額度或每日上限擋下時回 `quota_exhausted`／`BRIGHTDATA_QUOTA` 與 `resets_at`，到期前禁止重試或換網址繞過。`RSS_PAID_DISCOVERY=brightdata` 可放行 FB／IG 排程刷新。

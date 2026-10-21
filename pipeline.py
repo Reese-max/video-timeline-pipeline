@@ -5803,7 +5803,7 @@ def fetch_social_post(url: str, cache_root: Path, *, allow_paid: bool = False) -
 
 
 def brightdata_author_snapshot(folder: Path, trigger_url: str, headers: dict[str, str],
-                              body: bytes, timeout_seconds: int) -> tuple[str, list]:
+                              body: bytes, timeout_seconds: int) -> tuple[str, list, dict[str, Any]]:
     brightdata_credits.limits()
     token = headers["Authorization"].removeprefix("Bearer ")
     try:
@@ -5824,7 +5824,15 @@ def brightdata_author_snapshot(folder: Path, trigger_url: str, headers: dict[str
         if not isinstance(rows, list):
             raise RuntimeError("Bright Data snapshot 回應不是 JSON 陣列。")
         settle_brightdata_receipt(folder, len(rows))
-        return snapshot_id, rows
+        error_records = [row for row in rows if isinstance(row, dict)
+                         and ("error" in row or "error_code" in row)]
+        errors = [{"error_code": str(row.get("error_code") or "").replace(token, "<redacted>"),
+                   "error": str(row.get("error") or "").replace(token, "<redacted>")[:200]}
+                  for row in error_records[:3]]
+        if rows and len(error_records) == len(rows):
+            detail = "；".join(f"{error['error_code']}（{error['error']}）" for error in errors)
+            raise RuntimeError(f"Bright Data 回報錯誤：{detail}；已計費 {len(rows)} 筆，未取得任何結果。")
+        return snapshot_id, rows, {"raw_count": len(rows), "error_count": len(error_records), "errors": errors}
     except budget_blocked_error():
         raise
     except Exception as exc:
@@ -5883,12 +5891,14 @@ def fetch_facebook_author_brightdata(
     body = json.dumps([discovery_input], sort_keys=True).encode("utf-8")
     folder = secure_rss_directory(root or Path(__file__).resolve().parent) / "brightdata" / job_key(
         f"facebook:{page_id}:{since}:{previous_snapshot_id}", body.decode("utf-8"))
-    snapshot_id, rows = brightdata_author_snapshot(
+    snapshot_id, rows, record_meta = brightdata_author_snapshot(
         folder, f"{BRIGHTDATA_API_ROOT}/trigger?{query}", headers, body, timeout_seconds)
     raw_items = [item for item in rows if isinstance(item, dict)]
     by_id = {}
     missing_dates = 0
     for record in raw_items:
+        if "error" in record or "error_code" in record:
+            continue
         item = brightdata_facebook_item(record)
         if item is None:
             continue
@@ -5903,7 +5913,7 @@ def fetch_facebook_author_brightdata(
             "raw_items": raw_items, "not_modified": False,
             "facebook": {"provider": "brightdata", "page_id": page_id, "author_url": author_url,
                          "since": since, "max_items": max_items, "snapshot_id": snapshot_id,
-                         "dataset_id": dataset_id, "raw_count": len(raw_items),
+                         "dataset_id": dataset_id, **record_meta,
                          "missing_date_count": missing_dates, "date_filter_complete": missing_dates == 0,
                          "fetched_at": rss_now()}}
 
@@ -5963,12 +5973,14 @@ def fetch_instagram_author(
     # Only the caller's persisted success advances the cycle, including empty discoveries.
     folder = secure_rss_directory(root or Path(__file__).resolve().parent) / "brightdata" / job_key(
         f"instagram:{username}:{since}:{previous_snapshot_id}", body.decode("utf-8"))
-    snapshot_id, rows = brightdata_author_snapshot(folder, trigger_url, headers, body, timeout_seconds)
+    snapshot_id, rows, record_meta = brightdata_author_snapshot(folder, trigger_url, headers, body, timeout_seconds)
     raw_items = [item for item in rows if isinstance(item, dict)]
 
     by_id: dict[str, dict[str, str]] = {}
     missing_dates = 0
     for record in raw_items:
+        if "error" in record or "error_code" in record:
+            continue
         item = instagram_feed_item(record)
         if item is None:
             continue
@@ -5991,7 +6003,7 @@ def fetch_instagram_author(
             "max_items": max_items,
             "snapshot_id": snapshot_id,
             "dataset_id": BRIGHTDATA_INSTAGRAM_REELS_DATASET_ID,
-            "raw_count": len(raw_items),
+            **record_meta,
             "missing_date_count": missing_dates,
             "date_filter_complete": missing_dates == 0,
             "fetched_at": rss_now(),
@@ -7020,6 +7032,10 @@ def run_rss_command(args: argparse.Namespace) -> int:
             detail = (
                 f"{feed['facebook']['pages']} 個 API 分頁"
                 if provider == "meta"
+                else (f"原始 {feed['facebook']['raw_count']} 筆、"
+                      f"有效 {feed['facebook']['raw_count'] - feed['facebook']['error_count']} 筆、"
+                      f"錯誤 {feed['facebook']['error_count']} 筆")
+                if feed["facebook"]["provider"] == "brightdata"
                 else f"{feed['facebook']['raw_count']} 筆公開貼文"
             )
             print(
@@ -7072,7 +7088,9 @@ def run_rss_command(args: argparse.Namespace) -> int:
             )
             print(
                 f"Instagram/Bright Data 盤點：@{feed['instagram']['username']}，"
-                f"找到 {len(feed['items'])} 支 Reel；{feed['instagram']['raw_count']} 筆原始結果"
+                f"找到 {len(feed['items'])} 支 Reel；原始 {feed['instagram']['raw_count']} 筆、"
+                f"有效 {feed['instagram']['raw_count'] - feed['instagram']['error_count']} 筆、"
+                f"錯誤 {feed['instagram']['error_count']} 筆"
                 f"{incomplete} → {snapshot}"
             )
         else:

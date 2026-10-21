@@ -32,6 +32,7 @@ class BrightDataDiscoveryTests(unittest.TestCase):
             "BRIGHTDATA_ALLOWED_POST_URLS": "*", "HOME": str(self.root), "USERPROFILE": str(self.root),
         }, clear=True))
         self.enter(patch.object(pipeline, "load_dotenv"))
+        self.enter(cost_tracker.cost_root_scope(self.root))
         self.enter(patch.object(server, "MCP_JOBS_ROOT", self.root / "mcp"))
         self.submit = self.enter(patch.object(pipeline, "request_json", return_value={"snapshot_id": "sd_test"}))
         self.read = self.enter(patch.object(pipeline, "get_json", side_effect=lambda url, headers:
@@ -47,6 +48,139 @@ class BrightDataDiscoveryTests(unittest.TestCase):
     def facebook(self, **kwargs):
         return pipeline.fetch_facebook_author("example", "2026-01-01", "brightdata",
             max_items=5, allow_paid=True, root=self.root, **kwargs)
+
+    def author(self, platform):
+        if platform == "facebook":
+            return self.facebook()
+        return pipeline.fetch_instagram_author("example", "2026-01-01", max_items=5,
+                                              allow_paid=True, root=self.root)
+
+    def author_records(self, records):
+        self.read.side_effect = lambda url, headers: (
+            {"status": "ready"} if "/progress/" in url else records)
+
+    def rss_directory(self, root):
+        directory = root / "rss"
+        directory.mkdir(parents=True, exist_ok=True)
+        return directory
+
+    def test_author_all_errors_settle_and_retry_reuses_receipt(self):
+        records = [{"error_code": "dead_page", "error": "Seems page have not reels"},
+                   {"error_code": "bad_input", "error": "offline-token " + "錯" * 250}]
+        self.author_records(records)
+        for platform in ("facebook", "instagram"):
+            with self.subTest(platform=platform), patch.object(
+                pipeline, "secure_rss_directory", side_effect=self.rss_directory
+            ):
+                used = self.usage()["used"]
+                triggers = self.submit.call_count
+                for _ in range(2):
+                    with self.assertRaises(RuntimeError) as raised:
+                        self.author(platform)
+                    message = str(raised.exception)
+                    self.assertIn("dead_page（Seems page have not reels）", message)
+                    self.assertIn("已計費 2 筆，未取得任何結果", message)
+                    self.assertNotIn("offline-token", message)
+                    self.assertNotIn("錯" * 201, message)
+                    self.assertEqual(self.usage()["used"], used + 2)
+                    self.assertEqual(self.usage()["reserved"], 0)
+                self.assertEqual(self.submit.call_count, triggers + 1)
+
+    def test_author_partial_errors_keep_only_normal_items_and_bounded_safe_meta(self):
+        for platform in ("facebook", "instagram"):
+            valid = {"url": f"https://{platform}.com/reel/123", "post_id": "123",
+                     "date_posted": "2026-02-01", "content": "valid"}
+            records = [valid, {**valid, "error": "offline-token " + "錯" * 250,
+                                "error_code": "bad_input"},
+                       {**valid, "error_code": "offline-token"},
+                       {"error": ""}, {"error_code": ""}, None]
+            self.author_records(records)
+            with self.subTest(platform=platform), patch.object(
+                pipeline, "secure_rss_directory", side_effect=self.rss_directory
+            ):
+                used = self.usage()["used"]
+                parser = "brightdata_facebook_item" if platform == "facebook" else "instagram_feed_item"
+                with patch.object(pipeline, parser, wraps=getattr(pipeline, parser)) as parse:
+                    feed = self.author(platform)
+                self.assertEqual(parse.call_count, 1)
+                self.assertEqual(len(feed["items"]), 1)
+                self.assertEqual(feed["items"][0]["url"], valid["url"])
+                meta = feed[platform]
+                self.assertEqual(meta["raw_count"], 6)
+                self.assertEqual(meta["error_count"], 4)
+                self.assertEqual(len(meta["errors"]), 3)
+                self.assertEqual(set(meta["errors"][0]), {"error_code", "error"})
+                self.assertEqual(len(meta["errors"][0]["error"]), 200)
+                self.assertNotIn("offline-token", json.dumps(meta))
+                self.assertEqual(self.usage()["used"], used + 6)
+                self.assertEqual(self.usage()["reserved"], 0)
+
+    def test_author_empty_snapshots_have_zero_errors(self):
+        for platform in ("facebook", "instagram"):
+            with self.subTest(platform=platform), patch.object(
+                pipeline, "secure_rss_directory", side_effect=self.rss_directory
+            ):
+                meta = self.author(platform)[platform]
+                self.assertEqual(meta["raw_count"], 0)
+                self.assertEqual(meta["error_count"], 0)
+                self.assertEqual(meta["errors"], [])
+
+    def test_author_refresh_all_errors_persists_failure_without_advancing_snapshot(self):
+        self.author_records([{"error_code": "dead_page", "error": "Seems page have not reels"}])
+        for platform in ("facebook", "instagram"):
+            root = self.root / platform
+            with self.subTest(platform=platform), patch.object(
+                pipeline, "secure_rss_directory", side_effect=self.rss_directory
+            ):
+                state = pipeline.load_rss_state(root)
+                state["subscriptions"] = [{"id": platform, "kind": f"{platform}-author",
+                    "url": f"https://{platform}.com/example", f"{platform}_max_items": 5,
+                    f"{platform}_provider": "brightdata", f"{platform}_last_snapshot_id": "sd_old"}]
+                pipeline.save_rss_state(root, state)
+                triggers = self.submit.call_count
+                for _ in range(2):
+                    totals = pipeline.refresh_rss(root, allow_paid=True)
+                    saved = pipeline.load_rss_state(root)["subscriptions"][0]
+                    self.assertEqual(totals["failed"], 1)
+                    self.assertIn("dead_page", saved["last_error"])
+                    self.assertEqual(saved[f"{platform}_last_snapshot_id"], "sd_old")
+                    self.assertNotIn(f"{platform}_last_discovery", saved)
+                self.assertEqual(self.submit.call_count, triggers + 1)
+
+    def test_author_cli_all_errors_exits_nonzero_without_a_second_trigger(self):
+        self.author_records([{"error_code": "dead_page", "error": "offline-token unavailable"}])
+        for platform in ("facebook", "instagram"):
+            argv = ["pipeline.py", f"--{platform}-author", "example", f"--{platform}-max-items", "5",
+                    f"--{platform}-discover-only", "--allow-batch-cloud", "--root", str(self.root)]
+            if platform == "facebook":
+                argv += ["--facebook-provider", "brightdata"]
+            with self.subTest(platform=platform), patch.object(pipeline.sys, "argv", argv), \
+                    patch.object(pipeline, "secure_rss_directory", side_effect=self.rss_directory), \
+                    patch.object(pipeline, "rss_writer_lock", side_effect=lambda root: nullcontext()), \
+                    patch("sys.stdout", new_callable=io.StringIO), \
+                    patch("sys.stderr", new_callable=io.StringIO) as stderr:
+                triggers = self.submit.call_count
+                for _ in range(2):
+                    self.assertEqual(pipeline.main(), 1)
+                self.assertIn("dead_page", stderr.getvalue())
+                self.assertNotIn("offline-token", stderr.getvalue())
+                self.assertEqual(self.submit.call_count, triggers + 1)
+
+    def test_author_cli_partial_errors_prints_raw_valid_and_error_counts(self):
+        for platform in ("facebook", "instagram"):
+            self.author_records([{"error_code": "dead_page"},
+                {"url": f"https://{platform}.com/reel/123", "date_posted": "2026-02-01"}])
+            argv = ["pipeline.py", f"--{platform}-author", "example", f"--{platform}-max-items", "5",
+                    f"--{platform}-discover-only", "--allow-batch-cloud", "--root", str(self.root)]
+            if platform == "facebook":
+                argv += ["--facebook-provider", "brightdata"]
+            with self.subTest(platform=platform), patch.object(pipeline.sys, "argv", argv), \
+                    patch.object(pipeline, "secure_rss_directory", side_effect=self.rss_directory), \
+                    patch.object(pipeline, "rss_writer_lock", side_effect=lambda root: nullcontext()), \
+                    patch("sys.stdout", new_callable=io.StringIO) as stdout:
+                self.assertEqual(pipeline.run_rss_command(pipeline.parse_args()), 0)
+                self.assertIn("原始 2 筆、有效 1 筆、錯誤 1 筆", stdout.getvalue())
+                self.assertNotIn("公開貼文", stdout.getvalue())
 
     def test_facebook_manual_paths_require_explicit_permission_despite_env(self):
         opml = self.root / "subscriptions.opml"
