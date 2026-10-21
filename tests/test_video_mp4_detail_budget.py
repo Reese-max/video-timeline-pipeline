@@ -4,7 +4,8 @@ Measured 2026-10-22 on A1 with one 59.2s video (fps=1, MiniMax-M3):
 detail=default spent 10,567 prompt tokens (~179/frame) and detail=high spent
 36,367 (~616/frame, 3.44x). The fps ceiling therefore has to follow the
 requested detail, and a video that is too long even for the 0.2 fps floor has
-to fall back to detail=default instead of overflowing the context window.
+to fall back to detail=default instead of overflowing MiniMax's per-request
+video input limit (~390k prompt tokens, measured on the same day).
 
 Long videos are no longer downsampled at all: with MINIMAX_VIDEO_CHUNKING=on
 (the default) they are analysed in segments that keep the requested fps and
@@ -15,6 +16,7 @@ from __future__ import annotations
 import contextlib
 import io
 import json
+import math
 import os
 import tempfile
 import unittest
@@ -66,7 +68,11 @@ class VideoDetailTokenCostTests(unittest.TestCase):
 
     def test_high_thirty_minutes_drops_fps_but_stays_inside_the_budget(self) -> None:
         fps = pipeline.video_mp4_fps_for_duration(1.0, 1800.0, "high")
-        self.assertEqual(fps, 0.721)
+        expected = math.floor(
+            pipeline.MINIMAX_VIDEO_CONTEXT_TOKEN_BUDGET / (616 * 1800.0) * 1000
+        ) / 1000
+        self.assertEqual(fps, expected)
+        self.assertLess(fps, 1.0)
         self.assertLessEqual(1800.0 * fps * 616, pipeline.MINIMAX_VIDEO_CONTEXT_TOKEN_BUDGET)
 
     def test_high_video_too_long_for_the_floor_falls_back_to_default(self) -> None:
@@ -133,13 +139,18 @@ class VideoDetailCallSiteTests(unittest.TestCase):
         chat, _, _ = self._run(1800.0, "high", env={"MINIMAX_VIDEO_CHUNKING": "off"})
         video = self._video_part(chat.call_args_list[0])
         self.assertEqual(video["detail"], "high")
-        self.assertEqual(video["fps"], 0.721)
+        self.assertEqual(
+            video["fps"],
+            math.floor(
+                pipeline.MINIMAX_VIDEO_CONTEXT_TOKEN_BUDGET / (616 * 1800.0) * 1000
+            ) / 1000,
+        )
 
     def test_chunked_payload_keeps_the_requested_detail_and_fps(self) -> None:
         # Chunking on (the default): the video is split and every segment keeps
         # the requested fps and detail.
-        chunk = pipeline.VideoMp4Chunk(self.video, 0.0, 1140.0)
-        chat = mock.MagicMock(side_effect=[_answer(*range(0, 1140, 30))])
+        chunk = pipeline.VideoMp4Chunk(self.video, 0.0, 480.0)
+        chat = mock.MagicMock(side_effect=[_answer(*range(0, 480, 30))])
         printed = io.StringIO()
         with mock.patch.dict(os.environ, {"ANALYZE_VIDEO_DETAIL": "high"}, clear=False), \
              mock.patch.object(pipeline, "split_video_mp4_into_chunks", return_value=[chunk]), \
@@ -192,6 +203,8 @@ class VideoDetailCallSiteTests(unittest.TestCase):
 
 class McpSamplingStatsTests(unittest.TestCase):
     JOB_ID = "0123456789ab"
+    # The planned segment length for high/1 fps with the current budget.
+    CHUNK_SECONDS = 480
 
     def setUp(self) -> None:
         temporary = tempfile.TemporaryDirectory()
@@ -211,7 +224,10 @@ class McpSamplingStatsTests(unittest.TestCase):
 
     def _run(self, duration: float, detail: str, env: dict[str, str] | None = None,
              chunked: bool = False):
-        chat = mock.MagicMock(return_value=_answer(0.0, duration / 2))
+        # A chunked run analyses one segment, so the answer has to stay inside
+        # that segment's own length.
+        span = self.CHUNK_SECONDS if chunked else duration
+        chat = mock.MagicMock(return_value=_answer(0.0, span / 2))
         settings = {"ANALYZE_VIDEO_DETAIL": detail}
         settings.update(env or {})
         patches = [
@@ -235,7 +251,7 @@ class McpSamplingStatsTests(unittest.TestCase):
         if chunked:
             patches.append(mock.patch.object(
                 mcp_server.pipeline, "split_video_mp4_into_chunks",
-                return_value=[pipeline.VideoMp4Chunk(self.source, 0.0, 1140.0)]))
+                return_value=[pipeline.VideoMp4Chunk(self.source, 0.0, self.CHUNK_SECONDS)]))
         for patcher in patches:
             patcher.start()
             self.addCleanup(patcher.stop)
@@ -260,8 +276,8 @@ class McpSamplingStatsTests(unittest.TestCase):
         self.assertEqual(sampling["fps"], 1.0)
         self.assertEqual(sampling["detail"], "high")
         self.assertEqual(sampling["detail_requested"], "high")
-        self.assertEqual(sampling["chunk_seconds"], 1140)
-        self.assertEqual(sampling["chunk_count"], 2)
+        self.assertEqual(sampling["chunk_seconds"], 480)
+        self.assertEqual(sampling["chunk_count"], 4)
         self.assertEqual(sampling["fps"], video["fps"])
         self.assertEqual(sampling["detail"], video["detail"])
 

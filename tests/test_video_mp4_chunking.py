@@ -13,6 +13,7 @@ from __future__ import annotations
 import contextlib
 import io
 import json
+import math
 import os
 import shutil
 import subprocess
@@ -57,18 +58,27 @@ class VideoChunkLengthTests(unittest.TestCase):
 
     def test_chunk_length_formula(self) -> None:
         # floor(budget * 0.9 / (tokens per frame * fps) / 60) * 60
-        self.assertEqual(pipeline.video_mp4_chunk_seconds_limit(1.0, "high"), 1140)
-        self.assertEqual(pipeline.video_mp4_chunk_seconds_limit(1.0, "default"), 4020)
-        self.assertEqual(pipeline.video_mp4_chunk_seconds_limit(0.2, "high"), 5820)
+        # 360,000 * 0.9 / (616 * 1) / 60 -> 8 whole minutes
+        self.assertEqual(pipeline.video_mp4_chunk_seconds_limit(1.0, "high"), 480)
+        self.assertEqual(
+            pipeline.video_mp4_chunk_seconds_limit(1.0, "default"),
+            math.floor(
+                pipeline.MINIMAX_VIDEO_CONTEXT_TOKEN_BUDGET
+                * pipeline.MINIMAX_VIDEO_CHUNK_BUDGET_RATIO
+                / (pipeline.minimax_video_tokens_per_frame("default") * 1.0)
+                / 60
+            ) * 60,
+        )
+        self.assertEqual(pipeline.video_mp4_chunk_seconds_limit(0.2, "high"), 2580)
         # Every chunk keeps 90% of the budget at the requested fps and detail.
         self.assertLessEqual(
-            1140 * 1.0 * pipeline.minimax_video_tokens_per_frame("high"),
+            480 * 1.0 * pipeline.minimax_video_tokens_per_frame("high"),
             pipeline.MINIMAX_VIDEO_CONTEXT_TOKEN_BUDGET,
         )
 
     def test_chunk_seconds_override_may_only_shorten(self) -> None:
-        with mock.patch.dict(os.environ, {"MINIMAX_VIDEO_CHUNK_SECONDS": "600"}):
-            self.assertEqual(pipeline.video_mp4_chunk_seconds(1.0, "high"), 600)
+        with mock.patch.dict(os.environ, {"MINIMAX_VIDEO_CHUNK_SECONDS": "300"}):
+            self.assertEqual(pipeline.video_mp4_chunk_seconds(1.0, "high"), 300)
         with mock.patch.dict(os.environ, {"MINIMAX_VIDEO_CHUNK_SECONDS": "1200"}):
             with self.assertRaises(RuntimeError) as caught:
                 pipeline.video_mp4_chunk_seconds(1.0, "high")
@@ -91,11 +101,12 @@ class VideoChunkLengthTests(unittest.TestCase):
         self.assertEqual(plan.detail, "high")
         self.assertEqual(plan.detail_requested, "high")
         self.assertFalse(plan.downgraded)
-        self.assertEqual(plan.chunk_seconds, 1140)
-        self.assertEqual(plan.chunk_count, 2)
+        self.assertEqual(plan.chunk_seconds, 480)
+        self.assertEqual(plan.chunk_count, 4)
 
     def test_plan_of_a_short_video_is_a_single_call(self) -> None:
-        plan = pipeline.plan_video_mp4_analysis(1.0, 600.0, "high")
+        # 500 s at high/1 fps still fits the whole budget in one call.
+        plan = pipeline.plan_video_mp4_analysis(1.0, 500.0, "high")
         self.assertFalse(plan.chunked)
         self.assertEqual(plan.fps, 1.0)
         self.assertEqual(plan.detail, "high")

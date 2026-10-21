@@ -107,11 +107,11 @@ class VideoMp4OutputCeilingTests(unittest.TestCase):
         root = Path(tempfile.mkdtemp(prefix="video-ceiling-"))
         video = root / "clip.mp4"
         video.write_bytes(b"fake-mp4-bytes")
-        chunk = pipeline.VideoMp4Chunk(video, 0.0, 1140.0)
+        chunk = pipeline.VideoMp4Chunk(video, 0.0, 480.0)
         with mock.patch.dict(os.environ, {"MINIMAX_VIDEO_CHUNKING": "on"}, clear=False), \
              mock.patch.object(pipeline, "split_video_mp4_into_chunks", return_value=[chunk]), \
              mock.patch.object(pipeline, "minimax_upload_video_understanding", return_value="fid"), \
-             mock.patch.object(pipeline, "minimax_chat", return_value=_spread_response(1140.0)) as chat:
+             mock.patch.object(pipeline, "minimax_chat", return_value=_spread_response(480.0)) as chat:
             pipeline.analyze_video_mp4(
                 video, "key", "MiniMax-M3", duration=7200.0, work_dir=root / "work"
             )
