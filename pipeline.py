@@ -2551,11 +2551,142 @@ def resolve_video_mp4_sampling(
         # default costs the same per frame, so falling back frees nothing.
         return VideoMp4Sampling(requested, requested, value, False, None)
     fallback_fps = video_mp4_fps_for_duration(fps, duration, "default")
+    fallback_tokens = fallback_fps * duration * minimax_video_tokens_per_frame("default")
     note = (
         f"影片過長（{duration:.0f} 秒），畫面分析由 {requested} 降為 default "
         "以免超過 MiniMax 上限"
     )
+    if fallback_tokens > MINIMAX_VIDEO_CONTEXT_TOKEN_BUDGET:
+        # The fallback does not actually fit; say so instead of pretending it does.
+        note += (
+            f"；但 default 在 {fallback_fps:g} fps 下仍需約 {fallback_tokens:.0f} token，"
+            "仍會超過預算，請改用分段分析（MINIMAX_VIDEO_CHUNKING=on）"
+        )
     return VideoMp4Sampling("default", requested, fallback_fps, True, note)
+
+
+# Long videos are analysed segment by segment instead of being downsampled: the
+# caller asked to keep the requested fps and detail and only to stop the context
+# window from overflowing.
+MINIMAX_VIDEO_CHUNKING_ON = "on"
+MINIMAX_VIDEO_CHUNKING_OFF = "off"
+MINIMAX_VIDEO_CHUNK_SECONDS_ENV = "MINIMAX_VIDEO_CHUNK_SECONDS"
+# One chunk may use this share of the token budget; the rest absorbs keyframe drift.
+MINIMAX_VIDEO_CHUNK_BUDGET_RATIO = 0.9
+# A chunk shorter than a minute only buys extra uploads.
+VIDEO_MP4_MIN_CHUNK_SECONDS = 60
+VIDEO_MP4_CHUNK_DIRNAME = "minimax-chunks"
+
+
+def video_mp4_chunking_mode() -> str:
+    """MINIMAX_VIDEO_CHUNKING: 'on' (default) splits long videos, 'off' downgrades them."""
+    raw = os.getenv("MINIMAX_VIDEO_CHUNKING", MINIMAX_VIDEO_CHUNKING_ON).strip().lower()
+    raw = raw or MINIMAX_VIDEO_CHUNKING_ON
+    if raw not in {MINIMAX_VIDEO_CHUNKING_ON, MINIMAX_VIDEO_CHUNKING_OFF}:
+        raise RuntimeError(
+            "MINIMAX_VIDEO_CHUNKING 只能是 on（預設，長片改用分段分析）或 "
+            "off（長片降 fps／detail）。"
+        )
+    return raw
+
+
+def video_mp4_chunk_seconds_limit(fps: float, detail: str) -> int:
+    """Longest chunk (whole minutes) whose frames still fit the token budget."""
+    per_frame = minimax_video_tokens_per_frame(detail)
+    seconds = math.floor(
+        MINIMAX_VIDEO_CONTEXT_TOKEN_BUDGET * MINIMAX_VIDEO_CHUNK_BUDGET_RATIO
+        / (per_frame * max(fps, VIDEO_MP4_MIN_FPS)) / 60
+    ) * 60
+    return max(VIDEO_MP4_MIN_CHUNK_SECONDS, int(seconds))
+
+
+def video_mp4_chunk_seconds(fps: float, detail: str) -> int:
+    """Chunk length in seconds; MINIMAX_VIDEO_CHUNK_SECONDS may only shorten it."""
+    limit = video_mp4_chunk_seconds_limit(fps, detail)
+    raw = os.getenv(MINIMAX_VIDEO_CHUNK_SECONDS_ENV, "").strip()
+    if not raw:
+        return limit
+    try:
+        value = int(raw)
+    except ValueError:
+        raise RuntimeError(f"{MINIMAX_VIDEO_CHUNK_SECONDS_ENV} 必須是正整數秒。") from None
+    if value <= 0:
+        raise RuntimeError(f"{MINIMAX_VIDEO_CHUNK_SECONDS_ENV} 必須是正整數秒。")
+    if value > limit:
+        raise RuntimeError(
+            f"{MINIMAX_VIDEO_CHUNK_SECONDS_ENV}={value} 超過依預算算出的上限 {limit} 秒："
+            "每段的畫面 token 必須留在 MiniMax 的 context 預算內。"
+        )
+    return value
+
+
+def video_mp4_total_tokens(fps: float, duration: float, detail: str) -> float:
+    """Prompt tokens the whole video would cost at the requested fps and detail."""
+    return fps * duration * minimax_video_tokens_per_frame(detail)
+
+
+class VideoMp4ChunkPlan(NamedTuple):
+    """How one video will be analysed: a single call, or a sequence of chunks."""
+
+    chunked: bool
+    chunk_seconds: int
+    chunk_count: int
+    fps: float
+    detail: str
+    detail_requested: str
+    downgraded: bool
+    note: str | None
+
+
+def plan_video_mp4_analysis(
+    fps: float,
+    duration: float | None,
+    detail: str,
+) -> VideoMp4ChunkPlan:
+    """Decide between one whole-video call and chunked analysis.
+
+    Chunking is on by default: a video whose frames would overflow the context
+    window keeps the requested fps and detail and is analysed segment by
+    segment instead of being downsampled. With MINIMAX_VIDEO_CHUNKING=off the
+    old downgrade (lower fps, then lower detail) applies again.
+    """
+    requested = (detail or "default").strip().lower()
+    if requested not in MINIMAX_VIDEO_TOKENS_PER_FRAME_BY_DETAIL:
+        raise RuntimeError(VIDEO_DETAIL_ERROR)
+    if video_mp4_chunking_mode() == MINIMAX_VIDEO_CHUNKING_ON:
+        # Reading the override here also rejects an illegal value before any call.
+        chunk_seconds = video_mp4_chunk_seconds(fps, requested)
+        if (
+            duration is not None
+            and duration > 0
+            and video_mp4_total_tokens(fps, duration, requested)
+            > MINIMAX_VIDEO_CONTEXT_TOKEN_BUDGET
+        ):
+            note = (
+                f"影片過長（{duration:.0f} 秒），改用分段分析：每段 {chunk_seconds} 秒、"
+                f"維持 fps={fps:g} 與 detail={requested}（不降取樣率、不降畫質）"
+            )
+            return VideoMp4ChunkPlan(
+                True,
+                chunk_seconds,
+                max(1, math.ceil(duration / chunk_seconds)),
+                fps,
+                requested,
+                requested,
+                False,
+                note,
+            )
+    sampling = resolve_video_mp4_sampling(fps, duration, requested)
+    return VideoMp4ChunkPlan(
+        False,
+        0,
+        1,
+        sampling.fps,
+        sampling.detail,
+        sampling.detail_requested,
+        sampling.downgraded,
+        sampling.note,
+    )
 
 
 def choose_video_mp4_upload_strategy(
@@ -3271,27 +3402,59 @@ def analyze_video_mp4(
     timeout: int | None = None,
     work_dir: Path | None = None,
 ) -> list[dict[str, Any]]:
-    """Send the whole MP4 to MiniMax-M3 via Files API + video_url (not per-frame images).
+    """Send the MP4 to MiniMax-M3 via Files API + video_url (not per-frame images).
+
+    A video whose frames would overflow the context window at the requested
+    fps/detail is analysed in segments instead of being downsampled: every
+    segment keeps the requested fps and detail, and the segment answers are
+    merged back onto the original timeline (MINIMAX_VIDEO_CHUNKING=off keeps
+    the old lower-fps/lower-detail behaviour).
 
     When the source exceeds the Files API ~512MB limit or upload rejects for size,
     prefer ffmpeg compress/transcode under ~450MB and retry. If compress is
     unavailable, fails, or still too large, raise: frame sampling was removed and
     the video is never analysed as individual images.
     """
-    if cache_dir is not None:
-        cache_dir.mkdir(parents=True, exist_ok=True)
     fps_value = float(os.getenv("ANALYZE_VIDEO_FPS", "1") if fps is None else fps)
     detail_value = (detail or os.getenv("ANALYZE_VIDEO_DETAIL", "default")).strip().lower()
-    if detail_value not in MINIMAX_VIDEO_TOKENS_PER_FRAME_BY_DETAIL:
-        raise RuntimeError(VIDEO_DETAIL_ERROR)
     # The detail decides how many tokens a frame costs, so it has to be known
     # before the fps ceiling is computed (detail=high is ~3.4x the default).
-    sampling = resolve_video_mp4_sampling(
-        max(VIDEO_MP4_MIN_FPS, min(5.0, fps_value)), duration, detail_value)
-    detail_value = sampling.detail
-    fps_value = sampling.fps
+    requested_fps = max(VIDEO_MP4_MIN_FPS, min(5.0, fps_value))
+    plan = plan_video_mp4_analysis(requested_fps, duration, detail_value)
     timeout = video_mp4_timeout_seconds() if timeout is None else timeout
     max_completion_tokens = video_mp4_max_completion_tokens()
+    if plan.chunked:
+        return _analyze_video_mp4_chunked(
+            video_path,
+            api_key,
+            model,
+            duration=duration,
+            cache_dir=cache_dir,
+            fps_value=plan.fps,
+            detail_value=plan.detail,
+            timeout=timeout,
+            work_dir=work_dir,
+            plan=plan,
+            max_completion_tokens=max_completion_tokens,
+        )
+    observations, _parsed, _file_id = _analyze_video_mp4_single(
+        video_path,
+        api_key,
+        model,
+        duration=duration,
+        cache_dir=cache_dir,
+        fps_value=plan.fps,
+        detail_value=plan.detail,
+        timeout=timeout,
+        work_dir=work_dir,
+        max_completion_tokens=max_completion_tokens,
+        note=plan.note,
+    )
+    return observations
+
+
+def _video_mp4_prompt(duration: float | None) -> str:
+    """The prompt every whole-video (or per-chunk) request starts from."""
     prompt = (
         "請完整觀看這支影片，只輸出 JSON object，不要 Markdown。"
         "欄位必須包含 events（陣列）與 overall_summary（字串）。"
@@ -3306,9 +3469,40 @@ def analyze_video_mp4(
         )
     else:
         prompt += "\nevents 須依 timestamp 遞增覆蓋全片直到片尾。"
+    return prompt
+
+
+def _video_mp4_cache_path(cache_dir: Path, material: dict[str, Any]) -> Path:
+    encoded = json.dumps(material, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return cache_dir / (hashlib.sha256(encoded.encode("utf-8")).hexdigest() + ".json")
+
+
+def _analyze_video_mp4_single(
+    video_path: Path,
+    api_key: str,
+    model: str,
+    *,
+    duration: float | None,
+    cache_dir: Path | None,
+    fps_value: float,
+    detail_value: str,
+    timeout: int,
+    work_dir: Path | None,
+    max_completion_tokens: int,
+    note: str | None = None,
+) -> tuple[list[dict[str, Any]], dict[str, Any] | None, str | None]:
+    """Analyse one video file: cache lookup, upload, chat, gap fill.
+
+    Returns (observations, parsed answer, file id) so a chunked run can keep
+    every segment's own summary.
+    """
+    if cache_dir is not None:
+        cache_dir.mkdir(parents=True, exist_ok=True)
+    prompt = _video_mp4_prompt(duration)
     cache_path: Path | None = None
     if cache_dir is not None:
-        material = json.dumps(
+        cache_path = _video_mp4_cache_path(
+            cache_dir,
             {
                 "version": 2,
                 "mode": "video_mp4",
@@ -3320,18 +3514,18 @@ def analyze_video_mp4(
                 "max_completion_tokens": max_completion_tokens,
                 "video_sha256": file_sha256(video_path),
             },
-            ensure_ascii=False,
-            sort_keys=True,
-            separators=(",", ":"),
         )
-        cache_path = cache_dir / (hashlib.sha256(material.encode("utf-8")).hexdigest() + ".json")
         cached = reuse_artifact(cache_path)
         if isinstance(cached, dict) and isinstance(cached.get("observations"), list):
             if reusable_video_artifact(cached["observations"]):
-                return cached["observations"]
-    if sampling.note:
+                return (
+                    cached["observations"],
+                    {"overall_summary": cached.get("overall_summary")},
+                    cached.get("minimax_file_id"),
+                )
+    if note:
         # Printed only when a request is really sent (a cache hit sends none).
-        print(f"! {sampling.note}")
+        print(f"! {note}")
 
     source_size = video_path.stat().st_size
     strategy = choose_video_mp4_upload_strategy(source_size)
@@ -3367,7 +3561,11 @@ def analyze_video_mp4(
             upload_record_dir=work_dir,
         )
 
-    def persist(observations: list[dict[str, Any]], parsed: dict[str, Any] | None, file_id: str | None) -> list[dict[str, Any]]:
+    def persist(
+        observations: list[dict[str, Any]],
+        parsed: dict[str, Any] | None,
+        file_id: str | None,
+    ) -> tuple[list[dict[str, Any]], dict[str, Any] | None, str | None]:
         if cache_path is not None and parsed is not None and all(
             usable_visual_observation(item) for item in observations
         ):
@@ -3379,7 +3577,7 @@ def analyze_video_mp4(
                     "minimax_file_id": file_id,
                 },
             )
-        return observations
+        return observations, parsed, file_id
 
     try:
         if strategy == "direct":
@@ -3471,6 +3669,267 @@ def analyze_video_mp4(
         if failure_reasons:
             reason += " | prior: " + " ; ".join(failure_reasons)
         raise VideoMp4UnavailableError(f"video_mp4 無法交給 MiniMax 直接讀取（抽幀備援已移除）：{reason}")
+    finally:
+        if owned_temp is not None:
+            owned_temp.cleanup()
+
+
+class VideoMp4Chunk(NamedTuple):
+    """One segment of a chunked analysis; start/end come from ffmpeg's segment list."""
+
+    path: Path
+    start: float
+    end: float
+
+    @property
+    def duration(self) -> float:
+        return max(0.0, self.end - self.start)
+
+
+def format_media_clock(seconds: float) -> str:
+    """Seconds as mm:ss; minutes keep counting past an hour."""
+    total = max(0, int(round(float(seconds))))
+    return f"{total // 60:02d}:{total % 60:02d}"
+
+
+def read_video_mp4_chunks(list_path: Path, output_dir: Path) -> list[VideoMp4Chunk]:
+    """Parse ffmpeg's csv segment list into chunks with their real start times.
+
+    A stream copy cuts on keyframes, so the recorded start is the only truth
+    about where a segment really begins.
+    """
+    if not list_path.is_file():
+        raise RuntimeError(f"分段清單不存在：{list_path}")
+    try:
+        text = list_path.read_text(encoding="utf-8", errors="replace")
+    except OSError as error:
+        raise RuntimeError(f"分段清單讀取失敗：{error}") from error
+    chunks: list[VideoMp4Chunk] = []
+    for row in csv.reader(text.splitlines()):
+        if len(row) < 2:
+            continue
+        name = (row[0] or "").strip()
+        if not name or name.lower() == "filename":
+            continue  # some ffmpeg builds write a csv header line
+        try:
+            start = float(row[1])
+            end = float(row[2]) if len(row) > 2 else start
+        except (TypeError, ValueError):
+            raise RuntimeError(f"分段清單格式錯誤（{row}）：無法解析起訖秒數。") from None
+        path = output_dir / name
+        if not path.is_file():
+            raise RuntimeError(f"分段清單指向的檔案不存在：{path}")
+        chunks.append(VideoMp4Chunk(path, start, end))
+    if not chunks:
+        raise RuntimeError("分段清單沒有任何分段，無法分段分析。")
+    chunks.sort(key=lambda chunk: chunk.start)
+    return chunks
+
+
+def split_video_mp4_into_chunks(
+    video_path: Path,
+    output_dir: Path,
+    chunk_seconds: int,
+    duration: float | None = None,
+) -> list[VideoMp4Chunk]:
+    """Cut the video into segments with an ffmpeg stream copy.
+
+    Nothing is re-encoded: a failed cut or an unreadable segment list is an
+    error, never a silent fallback to another encoding.
+    """
+    output_dir.mkdir(parents=True, exist_ok=True)
+    ffmpeg = require_tool("ffmpeg")
+    list_path = output_dir / "chunks.csv"
+    list_path.unlink(missing_ok=True)
+    for stale in output_dir.glob("chunk-*.mp4"):
+        stale.unlink(missing_ok=True)
+    run_external(
+        [
+            ffmpeg,
+            "-y",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-i",
+            str(video_path),
+            "-map",
+            "0:v:0",
+            "-map",
+            "0:a:0?",
+            "-c",
+            "copy",
+            "-f",
+            "segment",
+            "-segment_time",
+            str(int(chunk_seconds)),
+            "-segment_list",
+            str(list_path),
+            "-segment_list_type",
+            "csv",
+            "-reset_timestamps",
+            "1",
+            str(output_dir / "chunk-%04d.mp4"),
+        ]
+    )
+    chunks = read_video_mp4_chunks(list_path, output_dir)
+    # The csv end time is the next segment's start; keep the last segment open
+    # when the muxer did not report a usable end.
+    fixed: list[VideoMp4Chunk] = []
+    for index, chunk in enumerate(chunks):
+        end = chunk.end
+        if index + 1 < len(chunks):
+            end = max(end, chunks[index + 1].start)
+        elif duration is not None and duration > chunk.start:
+            end = max(end, float(duration))
+        fixed.append(chunk._replace(end=max(end, chunk.start)))
+    return fixed
+
+
+def offset_chunk_timestamps(observations: list[dict[str, Any]], offset: float) -> None:
+    """Move a chunk's timestamps onto the original video timeline."""
+    if not offset:
+        return
+    for observation in observations:
+        _offset_timestamp_field(observation, "timestamp", offset)
+        _offset_timestamp_field(observation, "timestamp_original", offset)
+        data = observation.get("data")
+        if isinstance(data, dict):
+            _offset_timestamp_field(data, "timestamp", offset)
+            _offset_timestamp_field(data, "timestamp_original", offset)
+
+
+def _offset_timestamp_field(container: dict[str, Any], key: str, offset: float) -> None:
+    value = container.get(key)
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return
+    container[key] = float(value) + offset
+
+
+def _observation_sort_key(observation: dict[str, Any]) -> float:
+    value = observation.get("timestamp")
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return 0.0
+    return float(value)
+
+
+def _analyze_video_mp4_chunked(
+    video_path: Path,
+    api_key: str,
+    model: str,
+    *,
+    duration: float | None,
+    cache_dir: Path | None,
+    fps_value: float,
+    detail_value: str,
+    timeout: int,
+    work_dir: Path | None,
+    plan: VideoMp4ChunkPlan,
+    max_completion_tokens: int,
+) -> list[dict[str, Any]]:
+    """Analyse a long video segment by segment and merge the answers.
+
+    Each segment is sent with the requested fps and detail (never lowered) and
+    analysed on its own, so one segment stays inside the token budget. The
+    segments run in order; cancellation, deadlines and budget blocks keep
+    travelling upwards.
+    """
+    prompt = _video_mp4_prompt(duration)
+    cache_path: Path | None = None
+    if cache_dir is not None:
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        cache_path = _video_mp4_cache_path(
+            cache_dir,
+            {
+                "version": 2,
+                "mode": "video_mp4_chunked",
+                "max_event_gap_seconds": VIDEO_EVENT_MAX_GAP_SECONDS,
+                "model": model,
+                "prompt": prompt,
+                "fps": fps_value,
+                "detail": detail_value,
+                "max_completion_tokens": max_completion_tokens,
+                "video_sha256": file_sha256(video_path),
+                "chunked": True,
+                "chunk_seconds": plan.chunk_seconds,
+            },
+        )
+        cached = reuse_artifact(cache_path)
+        if (
+            isinstance(cached, dict)
+            and isinstance(cached.get("observations"), list)
+            and reusable_video_artifact(cached["observations"])
+        ):
+            return cached["observations"]
+    if plan.note:
+        print(f"! {plan.note}")
+
+    scratch = work_dir
+    owned_temp: tempfile.TemporaryDirectory[str] | None = None
+    if scratch is None:
+        owned_temp = tempfile.TemporaryDirectory(prefix="minimax-video-chunks-")
+        scratch = Path(owned_temp.name)
+    else:
+        scratch.mkdir(parents=True, exist_ok=True)
+    try:
+        chunk_dir = scratch / VIDEO_MP4_CHUNK_DIRNAME
+        chunks = split_video_mp4_into_chunks(
+            video_path, chunk_dir, plan.chunk_seconds, duration=duration
+        )
+        per_frame = minimax_video_tokens_per_frame(detail_value)
+        merged: list[dict[str, Any]] = []
+        summaries: list[str] = []
+        for index, chunk in enumerate(chunks, start=1):
+            tokens = fps_value * chunk.duration * per_frame
+            if tokens > MINIMAX_VIDEO_CONTEXT_TOKEN_BUDGET:
+                raise RuntimeError(
+                    f"第 {index} 段長 {chunk.duration:.1f} 秒（約 {tokens:.0f} token）仍超出 "
+                    f"MiniMax 預算 {MINIMAX_VIDEO_CONTEXT_TOKEN_BUDGET}：關鍵畫面間隔太久，"
+                    f"請把 {MINIMAX_VIDEO_CHUNK_SECONDS_ENV} 設得更小。"
+                )
+            print(
+                f"· MiniMax 分段分析 {index}/{len(chunks)}"
+                f"（{format_media_clock(chunk.start)}–{format_media_clock(chunk.end)}）"
+            )
+            chunk_work = chunk_dir / f"chunk-{index:04d}-work"
+            chunk_work.mkdir(parents=True, exist_ok=True)
+            observations, parsed, _file_id = _analyze_video_mp4_single(
+                chunk.path,
+                api_key,
+                model,
+                duration=chunk.duration,
+                cache_dir=cache_dir,
+                fps_value=fps_value,
+                detail_value=detail_value,
+                timeout=timeout,
+                work_dir=chunk_work,
+                max_completion_tokens=max_completion_tokens,
+            )
+            offset_chunk_timestamps(observations, chunk.start)
+            for observation in observations:
+                observation["chunk_index"] = index
+                observation["chunk_start"] = chunk.start
+            merged.extend(observations)
+            summary = (parsed or {}).get("overall_summary")
+            if isinstance(summary, str) and summary.strip():
+                summaries.append(
+                    f"第 {index} 段（{format_media_clock(chunk.start)}–"
+                    f"{format_media_clock(chunk.end)}）：{summary.strip()}"
+                )
+        merged.sort(key=_observation_sort_key)
+        if cache_path is not None and merged and all(
+            usable_visual_observation(item) for item in merged
+        ):
+            write_json(
+                cache_path,
+                {
+                    "observations": merged,
+                    "overall_summary": "\n".join(summaries),
+                    "chunked": True,
+                    "chunk_count": len(chunks),
+                    "chunk_seconds": plan.chunk_seconds,
+                },
+            )
+        return merged
     finally:
         if owned_temp is not None:
             owned_temp.cleanup()

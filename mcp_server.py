@@ -1636,6 +1636,10 @@ def analysis_cache_signature(video_path: Path, manifest: dict) -> str:
         "video_fps": float(os.getenv("ANALYZE_VIDEO_FPS", "1") or 1),
         "video_detail": os.getenv("ANALYZE_VIDEO_DETAIL", "default").strip().lower() or "default",
         "video_max_tokens": pipeline.video_mp4_max_completion_tokens(),
+        # Chunking changes how the same video is analysed, so it belongs in the
+        # signature: switching it on/off must not reuse the other mode's result.
+        "video_chunking": os.getenv("MINIMAX_VIDEO_CHUNKING", "on").strip().lower() or "on",
+        "video_chunk_seconds": os.getenv("MINIMAX_VIDEO_CHUNK_SECONDS", "").strip(),
     }
     return hashlib.sha256(json.dumps(configuration, sort_keys=True).encode()).hexdigest()
 
@@ -1739,8 +1743,9 @@ def analyze_prepared_sync(job_id: str) -> dict[str, Any]:
         report_progress("upload", 20, "上傳整支影片給 MiniMax 直接理解")
         # The same resolution the pipeline applies, so the recorded fps/detail
         # match the request that is really sent (detail=high is ~3.4x the cost
-        # of default and a too-long video falls back to default).
-        sampling = pipeline.resolve_video_mp4_sampling(
+        # of default; a too-long video is analysed in segments instead of
+        # being downsampled, and only falls back to default when chunking is off).
+        plan = pipeline.plan_video_mp4_analysis(
             max(pipeline.VIDEO_MP4_MIN_FPS,
                 min(5.0, float(os.getenv("ANALYZE_VIDEO_FPS", "1") or 1))),
             duration,
@@ -1748,11 +1753,14 @@ def analyze_prepared_sync(job_id: str) -> dict[str, Any]:
         )
         sampling_stats.update({
             "mode": "video_mp4",
-            "fps": sampling.fps,
+            "fps": plan.fps,
             "max_completion_tokens": pipeline.video_mp4_max_completion_tokens(),
-            "detail": sampling.detail,
-            "detail_requested": sampling.detail_requested,
+            "detail": plan.detail,
+            "detail_requested": plan.detail_requested,
             "source_bytes": video_path.stat().st_size,
+            "chunked": plan.chunked,
+            "chunk_seconds": plan.chunk_seconds,
+            "chunk_count": plan.chunk_count,
         })
         check_job_capacity(job_id)
         report_progress("evidence", 40, "MiniMax 直接讀取 mp4")
