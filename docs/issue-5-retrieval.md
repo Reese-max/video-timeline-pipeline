@@ -84,3 +84,10 @@ pwsh -NoProfile -NonInteractive -File tests/test_windows_sync.ps1
 - 未執行 push、PR、merge、部署或 issue 關閉；外部動作由 driver 處理。
 
 官方契約：[OpenRouter embeddings](https://openrouter.ai/docs/api_reference/embeddings)、[OpenRouter rerank](https://openrouter.ai/docs/api/api-reference/rerank/submit-a-rerank-request)。模型／帳戶可用性不由文件存在推定。
+
+## 自我審查修補（2026-10-21）
+
+- Ask 在模型回傳後重新讀取來源並核對 revision；等待期間變更的片段不會成為已核對引用，會列入 `context.omitted`。
+- 未快取的本機模型載入失敗時，semantic／hybrid 依既有策略降級為 FTS；strict 仍明確失敗，不下載模型，並保留原本可用的常駐模型。
+- 兩項回歸修補前為 `grounded != insufficient_evidence` 與未攔截的 `OSError`（exit 1），修補後通過（exit 0）；檢索套件從 33 增為 35 項，全部通過。A9 人工標註與語意支持率仍為 `needs-human`。
+- 本次完整離線檢查**尚未全綠**：656 項中 630 通過、2 errors、24 skipped，exit 1；本機 venv 也重現相同結果。錯誤為 `test_cooperative_cancellation_stops_child` 與 `test_normal_command_output_and_failed_exit_mapping_are_preserved` 的 `subprocess.Popen`／`WinError 87`；該檔案單獨重跑為 11 通過、2 skipped、exit 0，未更動其斷言。四個 Node widget suites（44／2／16／32 項）、Windows 同步 fixture（30 checks）、self-test 與三個 shell 語法檢查另行通過，exit 0。

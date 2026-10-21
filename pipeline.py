@@ -4535,8 +4535,12 @@ def embed_texts_local(texts: list[str], model: str) -> list[list[float]]:
             ) from exc
         device = "cuda" if torch.cuda.is_available() else "cpu"
         # Ordinary searches never download a model; installation is an explicit operator step.
+        try:
+            embedder = SentenceTransformer(model, device=device, local_files_only=True)
+        except OSError as exc:
+            raise RuntimeError("本機嵌入模型無法讀取；請先安裝及快取模型。") from exc
         _LOCAL_EMBEDDERS.clear()  # ponytail: one resident model; use an LRU if measured switching needs it.
-        _LOCAL_EMBEDDERS[model] = SentenceTransformer(model, device=device, local_files_only=True)
+        _LOCAL_EMBEDDERS[model] = embedder
     encoded = _LOCAL_EMBEDDERS[model].encode(texts, normalize_embeddings=False)
     return [vector.tolist() for vector in encoded]
 
@@ -5181,6 +5185,16 @@ def answer_question(
             raw = parse_json_object(answer)
         except (RuntimeError, ValueError):
             raw = {}  # Unstructured legacy answers are not silently labelled as supported.
+        # A provider request can outlive a source rewrite; do not reuse the pre-request snapshot.
+        artifacts.clear()
+        current_hits = []
+        for hit in hits:
+            if _evidence_current(root, hit, artifacts):
+                current_hits.append(hit)
+            else:
+                packed["omitted"].append({"occurrence_id": hit["occurrence_id"], "reason": "stale_or_unresolved"})
+        hits = current_hits
+        packed["selected_count"] = len(hits)
     result = validate_grounded_answer(raw, hits)
     result.update(question=question, keywords=keywords, citations=hits, evidence=hits,
                   retrieval=retrieved["retrieval"], context=packed)

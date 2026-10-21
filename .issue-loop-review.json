@@ -1,0 +1,26 @@
+{
+  "pr": 6,
+  "head": "2c4dc18c5d3fd88c283d7ed0e925352609e41141",
+  "findings": [
+    {
+      "severity": "high",
+      "file": "pipeline.py",
+      "line": 5184,
+      "issue": "Ask checks source revisions only before the completion request. Replacing a timeline while the provider answers still returns grounded claims and citations to the removed revision. Recheck packed evidence against fresh source artifacts before validating and returning the answer."
+    },
+    {
+      "severity": "med",
+      "file": "pipeline.py",
+      "line": 4539,
+      "issue": "An uncached local SentenceTransformer raises OSError with local_files_only=True. This escapes the shared retrieval fallback, so non-strict semantic/hybrid searches fail instead of returning FTS with semantic_unavailable. Normalize model-load availability errors at the embedding boundary."
+    },
+    {
+      "severity": "med",
+      "file": "tests/fixtures/retrieval.json",
+      "line": 3,
+      "issue": "needs-human: A9 requires human-reviewed golden evidence/time ranges and semantic support evaluation, but the only replay labels are agent-authored synthetic spans and the human support rate is null. Human validation remains necessary before claiming complete issue acceptance."
+    }
+  ],
+  "fixed": true,
+  "summary": "Fixed Ask's stale-source race and uncached local-model fallback; both regressions were red before repair and all 35 retrieval tests are green. Full offline Python validation remains non-green (630 passed, 2 WinError 87 subprocess errors, 24 skipped); the affected file passes alone, and A9 human evaluation remains needs-human. The supplied patch is empty and PR #6 returned 404, so review used the specified HEAD, its parent, and linked issue #5."
+}

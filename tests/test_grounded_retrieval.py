@@ -133,6 +133,27 @@ class RetrievalTests(unittest.TestCase):
             with self.assertRaises(cost_tracker.BudgetBlockedError):
                 pipeline.retrieve_evidence(self.root, "AI", 4, mode="hybrid")
 
+    def test_uncached_local_model_degrades_to_fts(self):
+        self.embed()
+        loader = mock.Mock(side_effect=OSError)
+        previous_model = object()
+        with mock.patch.dict("sys.modules", {
+            "torch": mock.Mock(cuda=mock.Mock(is_available=lambda: False)),
+            "sentence_transformers": mock.Mock(SentenceTransformer=loader),
+        }), mock.patch.object(pipeline, "_LOCAL_EMBEDDERS", {"cached": previous_model}):
+            for mode in ("semantic", "hybrid"):
+                with self.subTest(mode=mode):
+                    result = pipeline.retrieve_evidence(self.root, "AI", 4, mode=mode,
+                                                        embed_backend="local", embed_model="fixture")
+                    self.assertTrue(result["evidence"])
+                    self.assertEqual(result["retrieval"]["retrieval_mode"], "fts")
+                    self.assertEqual(result["retrieval"]["degraded_reason"], "semantic_unavailable")
+                    with self.assertRaisesRegex(RuntimeError, "semantic_unavailable"):
+                        pipeline.retrieve_evidence(self.root, "AI", 4, mode=mode, strict=True,
+                                                   embed_backend="local", embed_model="fixture")
+            self.assertIs(pipeline._LOCAL_EMBEDDERS.get("cached"), previous_model)
+        self.assertTrue(all(call.kwargs["local_files_only"] for call in loader.call_args_list))
+
     def test_embedding_contract_cache_rebuild_and_shadow_failure(self):
         (added, _), first = self.embed()
         self.assertGreater(added, 0)
@@ -426,6 +447,24 @@ class RetrievalTests(unittest.TestCase):
         chat.assert_not_called()
         self.assertEqual(result["status"], "insufficient_evidence")
         self.assertTrue(result["context"]["omitted"])
+
+    def test_ask_rejects_sources_changed_while_provider_answers(self):
+        def answer(messages, *_args, **_kwargs):
+            doc = json.loads(messages[1]["content"].splitlines()[1])
+            pipeline.write_json(self.root / "jobs" / "a" / "timeline.json", [
+                {"type": "speech", "timestamp": 10, "text": "修訂後原文"}])
+            return json.dumps({"claims": [{"text": doc["text"], "quotes": [doc["text"]],
+                                            "evidence_ids": [doc["id"]], "support_kind": "speaker_statement"}]})
+
+        with mock.patch.object(pipeline, "question_keywords", return_value=["AI"]), \
+             mock.patch.object(pipeline, "minimax_chat", side_effect=answer) as chat:
+            result = pipeline.answer_question(self.root, "AI", "", "fixture", 1,
+                                              filters=pipeline.SearchFilter(job="a", kind="speech"))
+        chat.assert_called_once()
+        self.assertEqual(result["status"], "insufficient_evidence")
+        self.assertEqual(result["citations"], [])
+        self.assertEqual(result["context"]["selected_count"], 0)
+        self.assertEqual(result["context"]["omitted"][0]["reason"], "stale_or_unresolved")
 
     def test_malformed_provider_claims_fail_closed(self):
         hit = pipeline.search_index(self.root, "AI", 1, filters=pipeline.SearchFilter(kind="speech"))[0]
