@@ -51,15 +51,24 @@ videos need those raised too.
 Long videos are analysed in segments instead of being downsampled. The trigger is
 the requested frame rate (the `ANALYZE_VIDEO_FPS` value, clamped to 0.2-5) times the
 video duration times the measured cost of one frame at the requested detail
-(`detail=high` ~616 tokens, `default`/`low` ~179) exceeding the ~800k token budget.
+(`detail=high` ~616 tokens, `default`/`low` ~179) exceeding the ~360k token budget.
+That budget is MiniMax's measured limit for the video input of a *single*
+request (~390k prompt tokens, measured 2026-10-22 on A1: `detail=high` passed up
+to 387,558 tokens and `detail=default` up to 394,629; more is refused with
+HTTP 400 `invalid params, 410 (2013)`), not the 1M context window -
+`max_completion_tokens` does not count against it. 360k keeps about 7% headroom
+below the lowest measured pass value.
 When it triggers, the video is cut with an ffmpeg stream copy (no re-encode) and
 each segment is uploaded and analysed on its own with the requested fps and detail,
 which is never lowered for a segment. Segment length is
 `floor(budget * 0.9 / (tokens per frame * fps) / 60) * 60` seconds (at least 60;
-about 1140 s for `high` at 1 fps) and can be shortened with
+480 s for `high` at 1 fps, 1800 s for `default` at 1 fps) and can be shortened with
 `MINIMAX_VIDEO_CHUNK_SECONDS` (positive seconds, at least 60 and at most the
 budget-derived limit). An illegal `MINIMAX_VIDEO_CHUNK_SECONDS` is rejected before any
 call, even for a video short enough to be analysed in one piece.
+A single un-chunked call is bounded by the same budget: at 1 fps `high` covers
+about 584 s (9.7 min) and `default` about 2011 s (33 min); anything longer is
+split into segments of the length above.
 `MINIMAX_VIDEO_CHUNKING=off` restores the old behaviour: lower the fps first, and
 fall back to `detail=default` when even 0.2 fps does not fit (the note then says
 plainly that the budget is still exceeded).

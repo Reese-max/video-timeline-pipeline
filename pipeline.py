@@ -2464,8 +2464,23 @@ MINIMAX_VIDEO_COMPRESS_RETRY_BYTES = 350 * 1024 * 1024
 # MiniMax-M3 output ceiling; omitting the field falls back to a small server default
 # that truncated a 9-minute video (finish_reason=length).
 MINIMAX_VIDEO_MAX_COMPLETION_TOKENS = 524288
-# 1M context minus headroom for the prompt and reasoning.
-MINIMAX_VIDEO_CONTEXT_TOKEN_BUDGET = 800_000
+# MiniMax caps the video input of a SINGLE request at roughly 390k prompt
+# tokens. Measured 2026-10-22 on A1 with one 25.5-minute clip (MiniMax-M3):
+# the /v1/responses/input_tokens estimate endpoint plus real chat calls.
+# detail=high: 345,343 tokens (0.5 fps) was accepted, 387,558 tokens (0.56 fps)
+# was the last estimate that passed and 0.565 fps on returned 0 (rejected).
+# detail=default: 394,629 tokens (1.99 fps) was the last estimate that passed
+# and 2.0 fps (2290 frames) on returned 0 (rejected).
+# A real chat call at ~400k tokens of high detail (0.58 fps) is refused
+# immediately (0.3 s) with HTTP 400 "invalid params, 410 (2013)", while the
+# 0.5 fps call with the same max_completion_tokens=524288 succeeded and
+# reported prompt_tokens=345,356. The output allowance does not count against
+# this limit: 400k input plus 524,288 output is still below the 1M context and
+# was still refused.
+# This is therefore a separate per-request video-input ceiling, NOT the 1M
+# context window. 360,000 keeps about 7% headroom below the lowest measured
+# pass value (387,558 at detail=high).
+MINIMAX_VIDEO_CONTEXT_TOKEN_BUDGET = 360_000
 # Lowest frame rate the whole-video sampler may fall back to.
 VIDEO_MP4_MIN_FPS = 0.2
 # Prompt tokens one frame costs, measured 2026-10-22 on A1 with one 59.2s
@@ -2473,6 +2488,8 @@ VIDEO_MP4_MIN_FPS = 0.2
 # and detail=high -> 36,367 prompt tokens (~616/frame, 3.44x).
 # An earlier 552s run with detail=default measured 95,839 tokens (~174/frame).
 # detail=low was never measured, so it conservatively reuses the default cost.
+# The 2026-10-22 input-limit sweep put detail=low at ~104 tokens/frame, but the
+# estimate stays at 179 so a low-detail request is never under-budgeted.
 MINIMAX_VIDEO_TOKENS_PER_FRAME = 179
 MINIMAX_VIDEO_TOKENS_PER_FRAME_BY_DETAIL = {
     "low": 179,
@@ -2504,7 +2521,8 @@ def video_mp4_fps_for_duration(
     duration: float | None,
     detail: str = "default",
 ) -> float:
-    """Lower fps for long videos so the frame tokens stay inside the context window.
+    """Lower fps for long videos so the frame tokens stay inside MiniMax's
+    per-request video input limit.
 
     detail=high costs ~616 tokens per frame (measured 2026-10-22) against ~179
     for default, so the ceiling has to follow the detail actually requested.
@@ -2531,10 +2549,10 @@ def resolve_video_mp4_sampling(
     duration: float | None,
     detail: str,
 ) -> VideoMp4Sampling:
-    """Pick the detail level and fps that fit MiniMax's context window.
+    """Pick the detail level and fps that fit MiniMax's video input limit.
 
     A video that still exceeds the budget at the 0.2 fps floor (detail=high
-    needs about 108 minutes) falls back to detail=default; the note explains
+    needs about 49 minutes) falls back to detail=default; the note explains
     the change. detail=low is only a conservative estimate of the default
     cost, so a downgrade there would free no budget and is not applied.
     """
@@ -2566,8 +2584,8 @@ def resolve_video_mp4_sampling(
 
 
 # Long videos are analysed segment by segment instead of being downsampled: the
-# caller asked to keep the requested fps and detail and only to stop the context
-# window from overflowing.
+# caller asked to keep the requested fps and detail and only to stop the
+# per-request video input limit from overflowing.
 MINIMAX_VIDEO_CHUNKING_ON = "on"
 MINIMAX_VIDEO_CHUNKING_OFF = "off"
 MINIMAX_VIDEO_CHUNK_SECONDS_ENV = "MINIMAX_VIDEO_CHUNK_SECONDS"
@@ -2621,7 +2639,7 @@ def video_mp4_chunk_seconds(fps: float, detail: str) -> int:
     if value > limit:
         raise RuntimeError(
             f"{MINIMAX_VIDEO_CHUNK_SECONDS_ENV}={value} 超過依預算算出的上限 {limit} 秒："
-            "每段的畫面 token 必須留在 MiniMax 的 context 預算內。"
+            "每段的畫面 token 必須留在 MiniMax 單次請求的影片輸入上限內。"
         )
     return value
 
@@ -2651,10 +2669,11 @@ def plan_video_mp4_analysis(
 ) -> VideoMp4ChunkPlan:
     """Decide between one whole-video call and chunked analysis.
 
-    Chunking is on by default: a video whose frames would overflow the context
-    window keeps the requested fps and detail and is analysed segment by
-    segment instead of being downsampled. With MINIMAX_VIDEO_CHUNKING=off the
-    old downgrade (lower fps, then lower detail) applies again.
+    Chunking is on by default: a video whose frames would overflow MiniMax's
+    per-request video input limit keeps the requested fps and detail and is
+    analysed segment by segment instead of being downsampled. With
+    MINIMAX_VIDEO_CHUNKING=off the old downgrade (lower fps, then lower detail)
+    applies again.
     """
     requested = (detail or "default").strip().lower()
     if requested not in MINIMAX_VIDEO_TOKENS_PER_FRAME_BY_DETAIL:
@@ -3410,11 +3429,11 @@ def analyze_video_mp4(
 ) -> list[dict[str, Any]]:
     """Send the MP4 to MiniMax-M3 via Files API + video_url (not per-frame images).
 
-    A video whose frames would overflow the context window at the requested
-    fps/detail is analysed in segments instead of being downsampled: every
-    segment keeps the requested fps and detail, and the segment answers are
-    merged back onto the original timeline (MINIMAX_VIDEO_CHUNKING=off keeps
-    the old lower-fps/lower-detail behaviour).
+    A video whose frames would overflow MiniMax's per-request video input limit
+    at the requested fps/detail is analysed in segments instead of being
+    downsampled: every segment keeps the requested fps and detail, and the
+    segment answers are merged back onto the original timeline
+    (MINIMAX_VIDEO_CHUNKING=off keeps the old lower-fps/lower-detail behaviour).
 
     When the source exceeds the Files API ~512MB limit or upload rejects for size,
     prefer ffmpeg compress/transcode under ~450MB and retry. If compress is
@@ -3907,7 +3926,7 @@ def _analyze_video_mp4_chunked(
             if tokens > MINIMAX_VIDEO_CONTEXT_TOKEN_BUDGET:
                 raise RuntimeError(
                     f"第 {index} 段長 {chunk.duration:.1f} 秒（約 {tokens:.0f} token）仍超出 "
-                    f"MiniMax 預算 {MINIMAX_VIDEO_CONTEXT_TOKEN_BUDGET}：關鍵畫面間隔太久，"
+                    f"MiniMax 單次請求預算 {MINIMAX_VIDEO_CONTEXT_TOKEN_BUDGET}：關鍵畫面間隔太久，"
                     f"請把 {MINIMAX_VIDEO_CHUNK_SECONDS_ENV} 設得更小。"
                 )
             # A cancelled or expired job must not pay for another segment.
