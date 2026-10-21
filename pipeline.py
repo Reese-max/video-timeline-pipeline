@@ -6099,18 +6099,72 @@ def paid_discovery_allowed(provider: str, allow_paid: bool) -> bool:
     return provider.lower() in allowed
 
 
+def paid_discovery_provider(subscription: dict[str, Any]) -> str:
+    kind = str(subscription.get("kind") or "rss")
+    if kind == "facebook-author" and str(subscription.get("facebook_provider") or "meta") == "apify":
+        return "apify"
+    return "brightdata" if kind == "instagram-author" else ""
+
+
+def paid_discovery_min_hours() -> float:
+    raw = os.getenv("RSS_PAID_DISCOVERY_MIN_HOURS", "").strip()
+    try:
+        hours = float(raw) if raw else 0.0
+    except ValueError:
+        hours = -1.0
+    if not math.isfinite(hours) or hours < 0:
+        raise ValueError("RSS_PAID_DISCOVERY_MIN_HOURS 必須是非負的小時數。")
+    return hours
+
+
 def refresh_rss(root: Path, workers: int = 4, allow_paid: bool = False) -> dict[str, int]:
     state = load_rss_state(root)
     if not state["subscriptions"]:
         raise RuntimeError("尚未加入 RSS 訂閱；先使用 --rss-add。")
     enabled = [item for item in state["subscriptions"] if item.get("enabled", True)]
+    # 排程自行放行的付費盤點，每個訂閱至少間隔 RSS_PAID_DISCOVERY_MIN_HOURS；明確 --allow-batch-cloud 不受限。
+    interval_hours = paid_discovery_min_hours()
+    min_hours = 0.0 if allow_paid else interval_hours
+    now = time.time()
+
+    def waiting(item: dict[str, Any]) -> bool:
+        last = feed_timestamp(str(item.get("paid_discovery_at") or ""))
+        # A timestamp from the future (clock jump, hand edit) must not block discovery forever.
+        return bool(min_hours and paid_discovery_provider(item) and last <= now + 60
+                    and now - last < min_hours * 3600)
+
+    due = [item for item in enabled if not waiting(item)]
     totals = {
         "feeds": len(enabled), "unchanged": 0, "failed": 0,
-        "queued": 0, "filtered": 0, "skipped": 0, "updated": 0,
+        "queued": 0, "filtered": 0, "skipped": 0, "updated": 0, "deferred": len(enabled) - len(due),
     }
+    stamp_lock = threading.Lock()
+    dispatched: set[int] = set()
+
+    def stamp_paid_attempt(subscription: dict[str, Any]) -> None:
+        """Save the attempt time right before each billable call, so a run billed and then killed (or
+        queued behind slower fetches) still starts the clock at its real send time. Only when an interval is
+        configured; if the stamp cannot be saved the paid call is not made. Conservative: a call that a later
+        local check refuses still uses up the interval. Residual window: a kill right after a save that
+        itself stalled leaves the stamp that much early (a local JSON write; bounded by the provider cap)."""
+        provider = paid_discovery_provider(subscription)
+        if interval_hours and provider and paid_discovery_allowed(provider, allow_paid):
+            with stamp_lock:
+                previous = subscription.get("paid_discovery_at")
+                subscription["paid_discovery_at"] = rss_now()
+                try:
+                    save_rss_state(root, state)
+                except Exception:
+                    if previous is None:
+                        subscription.pop("paid_discovery_at", None)
+                    else:
+                        subscription["paid_discovery_at"] = previous
+                    raise
+                dispatched.add(id(subscription))
 
     def fetch_one(subscription: dict[str, Any]) -> tuple[dict[str, Any] | None, Exception | None]:
         try:
+            stamp_paid_attempt(subscription)
             kind = str(subscription.get("kind") or "rss")
             if kind == "facebook-author":
                 since = str(
@@ -6154,10 +6208,12 @@ def refresh_rss(root: Path, workers: int = 4, allow_paid: bool = False) -> dict[
             return None, exc
 
     results: list[tuple[dict[str, Any] | None, Exception | None]] = []
-    with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, min(workers, 4, len(enabled) or 1))) as pool:
-        results = list(pool.map(fetch_one, enabled))
-    for subscription, (feed, error) in zip(enabled, results):
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, min(workers, 4, len(due) or 1))) as pool:
+        results = list(pool.map(fetch_one, due))
+    for subscription, (feed, error) in zip(due, results):
         subscription["last_checked"] = rss_now()
+        if id(subscription) in dispatched:
+            subscription["paid_discovery_at"] = subscription["last_checked"]  # after the call returned
         if error is None and feed is not None:
             subscription["last_error"] = ""
             if feed.get("not_modified"):
@@ -6907,7 +6963,7 @@ def run_rss_command(args: argparse.Namespace) -> int:
         with rss_writer_lock(root):
             totals = refresh_rss(root, args.rss_refresh_workers, bool(args.allow_batch_cloud))
         print(
-            f"RSS 刷新：{totals['feeds']} feeds、queued {totals['queued']}、"
+            f"RSS 刷新：{totals['feeds']} feeds（付費盤點未到間隔 {totals['deferred']}）、queued {totals['queued']}、"
             f"filtered {totals['filtered']}、skipped {totals['skipped']}、failed {totals['failed']}"
         )
         if totals["failed"]:
