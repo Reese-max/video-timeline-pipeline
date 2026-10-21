@@ -136,6 +136,7 @@ class BrightDataDiscoveryTests(unittest.TestCase):
                 state = pipeline.load_rss_state(root)
                 state["subscriptions"] = [{"id": platform, "kind": f"{platform}-author",
                     "url": f"https://{platform}.com/example", f"{platform}_max_items": 5,
+                    **({"facebook_brightdata_mode": "reels"} if platform == "facebook" else {}),
                     f"{platform}_provider": "brightdata", f"{platform}_last_snapshot_id": "sd_old"}]
                 pipeline.save_rss_state(root, state)
                 triggers = self.submit.call_count
@@ -154,7 +155,7 @@ class BrightDataDiscoveryTests(unittest.TestCase):
             argv = ["pipeline.py", f"--{platform}-author", "example", f"--{platform}-max-items", "5",
                     f"--{platform}-discover-only", "--allow-batch-cloud", "--root", str(self.root)]
             if platform == "facebook":
-                argv += ["--facebook-provider", "brightdata"]
+                argv += ["--facebook-provider", "brightdata", "--facebook-brightdata-mode", "reels"]
             with self.subTest(platform=platform), patch.object(pipeline.sys, "argv", argv), \
                     patch.object(pipeline, "secure_rss_directory", side_effect=self.rss_directory), \
                     patch.object(pipeline, "rss_writer_lock", side_effect=lambda root: nullcontext()), \
