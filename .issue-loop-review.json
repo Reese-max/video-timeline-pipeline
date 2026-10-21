@@ -1,0 +1,14 @@
+{
+  "pr": 89,
+  "head": "0dea1c66de366191b74bd229924e666003f95146",
+  "findings": [
+    {
+      "severity": "med",
+      "file": "web/widget.html",
+      "line": 347,
+      "issue": "The new #59 checkpoint prompts reuse the released v16 UI resource URI: mcp_server.py still sets WIDGET_VERSION=16 and ui_uri hashes only the media base URL. A host caching that URI can keep the old fixed-10-second prompt after deployment, so the advertised timestamp fix is not delivered. Publish a fresh widget URI, retain the previous URI aliases, and keep bridge/version assertions and docs aligned."
+    }
+  ],
+  "fixed": true,
+  "summary": "Fixed the medium-severity widget cache identity defect by publishing v17, preserving v15/v16 aliases, and aligning bridge assertions and docs. The regression failed before the fix; the Git Bash offline gate passed 744 tests with 24 platform skips. needs-human: #59 still requires actual ChatGPT library appearance, post-upload SHA-256 equality, and model decoding at the requested checkpoints."
+}

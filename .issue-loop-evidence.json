@@ -1,24 +1,12 @@
 {
   "repo": "Reese-max/video-timeline-pipeline",
-  "issue": 59,
-  "base_sha": "42d225936ba704cf70b93cac7bdf84da85ac86b8",
-  "red_proof": "FAIL - model read checks use uploaded clip times: first clip AssertionError [ERR_ASSERTION]: Missing checkpoint: 片段第 30 秒（原片 0:30）\nFAIL - model read checks use uploaded clip times: second clip AssertionError [ERR_ASSERTION]: Missing checkpoint: 片段第 10 秒（原片 2:10）\n7 FAIL; 32 PASS",
-  "test_command": "node tests/test_widget_library_experiment.cjs && node tests/test_widget_handoff.cjs && node tests/test_parallel_submission.cjs && node tests/test_widget_analysis_report.cjs",
+  "issue": 89,
+  "base_sha": "0dea1c66de366191b74bd229924e666003f95146",
+  "red_proof": "Before fix: env -u _ /c/Users/Administrator/.venvs/vtp-test/Scripts/python.exe -X utf8 -B -m unittest discover -s tests -p test_mcp_protocol.py -k test_library_checkpoint_widget_uses_fresh_cache_key -v (exit 1).\nFAIL: test_library_checkpoint_widget_uses_fresh_cache_key (test_mcp_protocol.ProtocolSmokeTests.test_library_checkpoint_widget_uses_fresh_cache_key)\nAssertionError: 'ui://video-timeline-pipeline/v16-b1a61bf29a38.html' == 'ui://video-timeline-pipeline/v16-b1a61bf29a38.html' : The #59 checkpoint fix must not reuse the released v16 widget cache key\nRan 1 test; FAILED (failures=1). After the fix, the protocol suite passed 2/2 (exit 0), including actual MCP resource/alias reads and health/version checks.",
+  "test_command": "env -u _ /c/Users/Administrator/.venvs/vtp-test/Scripts/python.exe -X utf8 -B scripts/check_offline.py",
   "test_exit": 0,
-  "tests_passed": 104,
+  "tests_passed": 744,
   "tests_failed": 0,
-  "summary": "Reused the existing per-segment library upload, SHA-256, diagnostics, explicit fallback and model-visible file-ID flow. Fixed verification prompts to map original timestamps 0:30, 1:05 and 2:10 against the uploaded segment snapshot, preserve millisecond precision and version the changed widget resource as v15. Added ten regression cases and updated acceptance and manual-check documentation. The full offline gate completed 621 Python cases (597 passed, 24 skipped) plus 104 passing widget checks, and independent review found no remaining defects.",
-  "not_done": "Real ChatGPT library appearance, post-upload byte/hash equality, same/new-conversation model decoding and 4.4/13.2 MB acceptance remain unverified. No push, PR, deployment or CI run. The existing offline runner has no separate lint, coverage-ratchet, CRAP or mutation gate.",
-  "merged_base_evidence": {
-    "repo": "Reese-max/video-timeline-pipeline",
-    "issue": 58,
-    "base_sha": "42d225936ba704cf70b93cac7bdf84da85ac86b8",
-    "red_proof": "Before implementation: node tests/test_widget_analysis_report.cjs (exit 1)\nFAIL - submission follows a submitted report while its Drive prerequisites finish AssertionError [ERR_ASSERTION]: No poll timer\nFAIL - notification follows a submitted report while its Drive prerequisites finish AssertionError [ERR_ASSERTION]: No poll timer\nFAIL - restore follows a submitted report while its Drive prerequisites finish AssertionError [ERR_ASSERTION]: No poll timer\nFAIL - waiting report snapshot errors and mismatched bindings stop without resubmission AssertionError [ERR_ASSERTION]: No poll timer\nFAIL - waiting snapshot polling is bounded and explicit refresh can start a new read-only wait AssertionError [ERR_ASSERTION]: The input did not match the regular expression /重新取得狀態/. Input:\nError: 5 widget report scenarios failed",
-    "test_command": "env -u _ /c/Users/Administrator/.venvs/vtp-test/Scripts/python.exe -X utf8 -B scripts/check_offline.py",
-    "test_exit": 0,
-    "tests_passed": 698,
-    "tests_failed": 0,
-    "summary": "修正 #58 在摘要早於 Drive 片段上傳／兩路 worker 結束前提交時，widget 停在 awaiting_segments 的缺口，改以唯讀快照接續既有報告工作輪詢。查詢核對 job、cache signature、分析與報告雜湊，最多等待 60 次，錯誤、換影片及關閉均停止，僅既有 verified 報告可顯示「A 已完成」並複製合併指令。沿用既有含摘要／逐字稿／畫面時間軸的同資料夾上傳與 caller_submitted 來源聲明，UI URI／bridge／health 同步升為 v15；報告情境由 16 增至 23。完整離線檢查共 597 個 Python 與 101 個 Node 測試通過，另有 24 個 Windows 平台略過。",
-    "not_done": "未執行 §4.5 指定 Facebook 真實媒體、真實 Drive 同資料夾上傳與 ChatGPT 小工具／B 對話的合併品質驗收，故不能據本機測試關閉 #58；未部署、未 push、未建立 PR，未變更其他分支。未重跑遠端 CI／Linux；專案沒有 lint、coverage ratchet、CRAP 或 mutation gates，本次未新增。"
-  }
+  "summary": "Fixed the medium-severity widget cache identity defect by publishing v17, preserving v15/v16 aliases, and aligning bridge assertions and docs. The regression failed before the fix; the Git Bash offline gate passed 744 tests with 24 platform skips. needs-human: #59 still requires actual ChatGPT library appearance, post-upload SHA-256 equality, and model decoding at the requested checkpoints.",
+  "not_done": "Real ChatGPT library appearance, post-upload byte/hash equality, same/new-conversation MP4 decoding and the 4.4/13.2 MB host acceptance remain unverified (needs-human); offline mocks cannot close #59. No push, PR comment, deployment, CI run, external upload, or branch change. No new lint, coverage-ratchet, CRAP, or mutation gate was installed."
 }
