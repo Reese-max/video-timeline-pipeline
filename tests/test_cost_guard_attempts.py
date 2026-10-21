@@ -49,6 +49,7 @@ class CostAttemptTests(unittest.TestCase):
             "BUDGET_HARD_STOP": "false", "DAILY_BUDGET_USD": "100",
             "MINIMAX_BASE_URL": "https://api.minimax.io/v1",
             "APIFY_API_TOKEN": "offline-placeholder", "APIFY_MAX_TOTAL_CHARGE_USD": "0.75",
+            "BRIGHTDATA_CREDIT_LEDGER": str(self.root / "brightdata-credits.sqlite3"),
         }, clear=True)
         self.environment.start()
         self.scope = cost_tracker.cost_root_scope(self.root)

@@ -195,7 +195,7 @@ class GuardAccountingTests(unittest.TestCase):
     def setUp(self) -> None:
         self.tmp_dir = tempfile.TemporaryDirectory()
         self.root = Path(self.tmp_dir.name)
-        self.env = patch.dict(os.environ, OPEN_ENV)
+        self.env = patch.dict(os.environ, {**OPEN_ENV, "BRIGHTDATA_CREDIT_LEDGER": str(self.root / "brightdata-credits.sqlite3")})
         self.env.start()
         self.scope = cost_tracker.cost_root_scope(self.root)
         self.scope.__enter__()
@@ -288,7 +288,7 @@ class UncertainSubmissionTests(unittest.TestCase):
     def setUp(self) -> None:
         self.tmp_dir = tempfile.TemporaryDirectory()
         self.root = Path(self.tmp_dir.name)
-        self.env = patch.dict(os.environ, OPEN_ENV)
+        self.env = patch.dict(os.environ, {**OPEN_ENV, "BRIGHTDATA_CREDIT_LEDGER": str(self.root / "brightdata-credits.sqlite3")})
         self.env.start()
         self.scope = cost_tracker.cost_root_scope(self.root)
         self.scope.__enter__()
@@ -325,7 +325,7 @@ class UnidentifiedSubmissionTests(unittest.TestCase):
     def setUp(self) -> None:
         self.tmp_dir = tempfile.TemporaryDirectory()
         self.root = Path(self.tmp_dir.name)
-        self.env = patch.dict(os.environ, OPEN_ENV)
+        self.env = patch.dict(os.environ, {**OPEN_ENV, "BRIGHTDATA_CREDIT_LEDGER": str(self.root / "brightdata-credits.sqlite3")})
         self.env.start()
         self.scope = cost_tracker.cost_root_scope(self.root)
         self.scope.__enter__()
@@ -385,7 +385,7 @@ class NotificationEntryPointTests(unittest.TestCase):
         import notifications
 
         payload = FakeResponse({"id": "msg-1"})
-        with patch.dict(os.environ, OPEN_ENV), patch.object(
+        with patch.dict(os.environ, {**OPEN_ENV, "BRIGHTDATA_CREDIT_LEDGER": str(self.root / "brightdata-credits.sqlite3")}), patch.object(
             urllib.request, "urlopen", return_value=payload
         ), cost_tracker.cost_root_scope(self.root), patch.object(
             notifications, "get_configured_provider", return_value=email_providers.ResendProvider(api_key="resend-key")
