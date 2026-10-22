@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- 變更：A1 的自動部署程式與 systemd unit 納入版控（`scripts/a1-autodeploy/`，先原樣匯入 A1 目前安裝的版本），安裝與流程說明寫進 `docs/gitops.md`，並新增 `tests/test_a1_autodeploy.py`（只在 Linux 執行）。同時把 `http.client.HTTPException`（例如回應被截斷的 `IncompleteRead`）納入網路暫時錯誤的重試。測試涵蓋：重試間隔與次數、非網路錯誤不重試、`ls-remote` 短暫失敗後仍判定最新、CI 未完成直接延後不重試、candidate 與正式 checkout 的 `git fetch` 重試、`git fetch` 在 drain 之前且持續失敗時不 drain、切換與回滾都不再 `git fetch`、CI 查詢收到截斷回應時會重試。部署程式不會被自動部署更新，改動須依 `docs/gitops.md` 在 A1 手動安裝後才生效。
+
 - 修正：Facebook 影片的標題不再帶互動數與作者。yt-dlp 給的 Facebook 標題是「`2K views · 22 reactions | 貼文內文 | 作者`」，原本整串原樣寫進 `manifest.json` 的 `source.title`，連帶出現在報告、影片庫與 Drive 檔名（例如「2K views _ 22 reactions _ …」）。`pipeline.source_title()` 現在只在 `extractor` 為 `facebook*` 時，去掉開頭的互動數（views／plays／reactions／likes／comments／shares 與「次觀看／次播放／個心情／則留言／次分享」，以 `·` 串接、`|` 結尾）與結尾的「` | {uploader}`」，貼文內文完整保留（全文索引仍可搜尋）；去掉後是空字串就沿用原標題。其他平台不受影響。已準備好的工作不會自動改名，重新準備（或 CLI 重跑）時才會套用新標題；已上傳 Drive 的工作仍沿用原本的 Drive 檔名前綴，不會重傳。
 
 - 修正：`media_retention.py` 不再因為「早已被重跑取代」的失敗紀錄永久保留媒體。舊規則只要佇列裡同一個 job 有任何一筆非 `completed` 的紀錄就永遠跳過（`queue_failure_or_review`），例如先被使用者取消、之後同一個 prepare 重跑完成的 job，本機媒體永遠不會清。現在 failed／cancelled／expired／interrupted 的紀錄，只有在之後出現**同一 job、同一請求（`input_hash` 相同，因此也是同一種 operation）、建立時間更晚且已 `completed`** 的紀錄時才不再保護；別種 operation 成功、不同參數的重跑成功、或「先成功後失敗」都仍保護。`queued`／`running` 與沒有 `job_id` 的紀錄維持原本「整次清理中止」的行為。其餘條件（分析完成、品質、Drive 備份重新核對等）不變。

@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import fcntl
 import hashlib
+import http.client
 import ipaddress
 import json
 import os
@@ -73,7 +74,8 @@ def retry_network(action, what: str, attempts: int = 4, delay: int = 30):
     for attempt in range(1, attempts + 1):
         try:
             return action()
-        except (RuntimeError, OSError, subprocess.TimeoutExpired) as error:  # git exit != 0, urllib/socket
+        # git exit != 0, urllib/socket errors, truncated or malformed HTTP responses
+        except (RuntimeError, OSError, http.client.HTTPException, subprocess.TimeoutExpired) as error:
             if attempt == attempts:
                 raise
             wait = delay * attempt
