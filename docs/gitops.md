@@ -44,6 +44,32 @@ bash /home/box/video-timeline-deploy/sync-linux.sh --once
 
 部署紀錄是 deploy home 的 `last-result.json`、`events.jsonl`、`last-health.json`、`last-rollback.json` 與 release 的 private test log、`prepared.json`。已失敗的完整準備目錄會保留，不自動刪除；須先調查該目錄再安排重試。URL 改變時部署延後並記原因，要求核對 ChatGPT 連線設定，舊 heal 不得直接 kill 或 fuser。
 
+## A1（正式環境）
+
+正式服務在 A1 的 `/home/ubuntu/video-timeline-pipeline`（systemd `video-mcp`）。自動部署程式與 unit 放在 `scripts/a1-autodeploy/`，安裝於 `/usr/local/lib/video-mcp-autodeploy/autodeploy.py` 與 `/etc/systemd/system/video-mcp-autodeploy.{service,timer}`，以 root 每 6 小時（主機時區 00／06／12／18 點，A1 為 UTC；隨機延遲 15 分鐘）執行。
+
+流程：`git ls-remote` 取 main SHA → 該 SHA 的 `Video Timeline CI` push run 成功 → 在獨立 candidate checkout 跑完整離線 unittest → 正式 checkout 先 `git fetch` → drain（拒絕新工作，等 queued／running 與執行中的 `video-rss` 歸零）→ checkout 並重啟 → 驗本機 `/health` 與工具清單（不得少工具）、公開 `/health` 的 SHA → 解除 drain。切換後任何失敗都回滾到原 SHA。回滾的 git 部分只做本機 checkout、不再 `git fetch`；但若這次部署改過 requirements，回滾會用 pip 把套件裝回部署前的版本，最後也會驗公開 `/health`，這兩步仍需要網路。
+
+`ls-remote`、CI 查詢與兩處 `git fetch` 遇到暫時錯誤（git 失敗、DNS／socket 錯誤、HTTP 回應不完整、逾時）會間隔 30、60、90 秒重試，共 4 次。結果狀態：
+- `UP_TO_DATE`／`DEPLOYED`：已是最新或已部署。
+- `DEFERRED`（exit 0，下一輪再試）：該 SHA 的 CI 不是成功（尚未完成、失敗或找不到 run；**CI 失敗也只會每輪安靜地延後**）、drain 等超過 `AUTODEPLOY_DRAIN_SECONDS`（預設 3 小時），或讀不到 `video-rss` 狀態。
+- `FAILED`（exit 1）：切換前的錯誤，例如網路重試用完、candidate 測試失敗、正式 checkout 有本機修改，或開始前就有殘留的 drain 旗標；這些情況都不會 drain 或切換。回滾本身失敗時 drain 旗標會留著，之後每輪都會因旗標存在而 `FAILED`，須人工處理。
+- `ROLLED_BACK`（exit 1）：切換後檢查失敗，已回滾到原 SHA。
+
+結果在 `/var/lib/video-mcp-autodeploy/last.json`，紀錄用 `journalctl -u video-mcp-autodeploy`；要立即部署可執行 `sudo systemctl start video-mcp-autodeploy.service`。
+
+自動部署不會更新部署程式本身；部署前跑的測試用的是 repo 裡的副本，不代表 A1 已安裝的版本有同樣行為。修改 `scripts/a1-autodeploy/` 並合併、部署後，在 A1 從已部署的 checkout 先檢查語法再安裝：
+
+```bash
+cd /home/ubuntu/video-timeline-pipeline
+python3 -c 'import ast, sys; ast.parse(open(sys.argv[1], encoding="utf-8").read(), sys.argv[1])' scripts/a1-autodeploy/autodeploy.py \
+  && sudo install -m 755 scripts/a1-autodeploy/autodeploy.py /usr/local/lib/video-mcp-autodeploy/autodeploy.py \
+  && sudo install -m 644 scripts/a1-autodeploy/video-mcp-autodeploy.service scripts/a1-autodeploy/video-mcp-autodeploy.timer /etc/systemd/system/ \
+  && sudo systemctl daemon-reload
+```
+
+回歸測試：`python3 -m unittest discover -s tests -p test_a1_autodeploy.py -v`（只在 Linux 執行，Windows 會跳過）。
+
 ## 驗收界線
 
 離線 Python／Widget、實際 MCP HTTP 與工具 schema、正式部署與回滾、ChatGPT UI 是不同證據。`/health` 不代表付費影片分析端到端成功。伺服器 SHA／Widget resource URI 也不是 ChatGPT 外掛封裝版本。外部來源的 yt-dlp 下載與所有 redirect 並非本次已完成的完整 SSRF 驗證。

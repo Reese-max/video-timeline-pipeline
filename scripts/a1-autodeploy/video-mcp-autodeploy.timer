@@ -1,0 +1,10 @@
+[Unit]
+Description=Run video-mcp auto-deploy every 6 hours
+
+[Timer]
+OnCalendar=*-*-* 00/6:00:00
+RandomizedDelaySec=15min
+Persistent=true
+
+[Install]
+WantedBy=timers.target
