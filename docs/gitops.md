@@ -72,6 +72,18 @@ python3 -c 'import ast, sys; ast.parse(open(sys.argv[1], encoding="utf-8").read(
 
 回歸測試：`python3 -m unittest discover -s tests -p test_a1_autodeploy.py -v`（只在 Linux 執行，Windows 會跳過）。
 
+### YouTube 出口
+
+YouTube 對雲端 IP（含 A1）一律回「Sign in to confirm you're not a bot」，換 yt-dlp 版本或 player client 都沒用；同一支影片從家用網路不帶 cookie 就抓得到。所以 A1 的 `.env` 設 `YTDLP_YOUTUBE_PROXY`，只有 YouTube 網址（`youtube.com`、`youtu.be` 等，含字幕抓取）會加 `--proxy`，其他網站照舊直連。
+
+出口是家中常開電腦上的 `scripts/youtube-egress/egress_proxy.py`（只用標準庫的 HTTP CONNECT proxy，經 Tailscale 連線）。A1 的 MCP 是公開的，所以它只回應允許的來源 IP（A1 的 Tailscale 位址），只接受 `CONNECT` 到 YouTube／Google 網域的 443 埠，不接受 IP 位址，網域解析到內網、Tailscale 或其他非公開位址也拒絕；不會成為進入家中網路的跳板。在那台電腦以系統管理員身分執行：
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\youtube-egress\install-windows.ps1 -ListenAddress <該機 Tailscale IP> -AllowClient 100.82.40.33
+```
+
+它會建立開機自動執行的排程工作（S4U，不需登入、不存密碼，結束時每分鐘重啟）與只允許 A1 的防火牆規則，紀錄在 `%LOCALAPPDATA%\youtube-egress\egress.log`；`-Uninstall` 移除工作與規則。那台電腦關機或 Tailscale 不通時，YouTube 下載會失敗，其他網站不受影響。
+
 ### 監控與告警
 
 `scripts/a1-health/probe.py` 安裝於 `/usr/local/lib/video-mcp-health/probe.py`，由 `video-mcp-health.timer` 每 5 分鐘以 DynamicUser 執行（OCI SDK 在 A1 的 `/opt/video-mcp-health/venv`，不在 `requirements.txt`），用 instance principal 寫 OCI Monitoring 命名空間 `video_mcp_health`：
