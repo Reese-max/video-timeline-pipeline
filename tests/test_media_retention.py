@@ -209,8 +209,8 @@ class RetentionTests(unittest.TestCase):
                 state_dir.mkdir()
                 db_path = state_dir / "jobs.sqlite3"
                 with closing(sqlite3.connect(db_path)) as db, db:
-                    db.execute("CREATE TABLE jobs (job_id TEXT,status TEXT)")
-                    db.execute("INSERT INTO jobs VALUES (?,?)", (job.name, state if state not in {"live_share", "changed_bytes"} else "completed"))
+                    db.execute("CREATE TABLE jobs (job_id TEXT,status TEXT,input_hash TEXT,created REAL)")
+                    db.execute("INSERT INTO jobs VALUES (?,?,'h',1)", (job.name, state if state not in {"live_share", "changed_bytes"} else "completed"))
                 if state == "live_share":
                     marker = job / ".media-lifecycle.json"
                     pipeline.write_json(marker, {"version": 1, "job_id": job.name,
@@ -227,6 +227,28 @@ class RetentionTests(unittest.TestCase):
                 self.assertTrue((job / "analysis/result.json").exists())
                 with closing(sqlite3.connect(db_path)) as db:
                     self.assertEqual(db.execute("SELECT count(*) FROM jobs").fetchone()[0], 1)
+
+    def test_failure_is_released_only_by_a_later_completed_run_of_the_same_request(self):
+        cases = {"superseded": ([("cancelled", "h", 1), ("completed", "h", 2)], 6),
+                 "failed_then_two_retries": ([("failed", "h", 1), ("interrupted", "h", 2), ("completed", "h", 3)], 6),
+                 "other_request": ([("cancelled", "h", 1), ("completed", "x", 2)], 0),
+                 "earlier_success": ([("completed", "h", 1), ("failed", "h", 2)], 0),
+                 "other_job": ([("cancelled", "h", 1), ("completed", "h", 2, "ba9876543210")], 0),
+                 "active_never_superseded": ([("queued", "h", 1), ("completed", "h", 2)], 0)}
+        for name, (rows, deleted) in cases.items():
+            with self.subTest(case=name), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory).resolve() / "mcp_jobs"
+                job = self.make_job(root)
+                state_dir = root.parent / ".video-state"
+                state_dir.mkdir()
+                with closing(sqlite3.connect(state_dir / "jobs.sqlite3")) as db, db:
+                    db.execute("CREATE TABLE jobs (job_id TEXT,status TEXT,input_hash TEXT,created REAL)")
+                    for status, key, created, *other in rows:
+                        db.execute("INSERT INTO jobs VALUES (?,?,?,?)", (other[0] if other else job.name, status, key, created))
+                report = retention.cleanup(root, apply=True, now=self.now)
+                self.assertEqual(report["deleted_files"], deleted)
+                self.assertEqual(report["skipped"]["queue_failure_or_review"], int(deleted == 0 and name != "active_never_superseded"))
+                self.assertEqual(report["skipped"]["queue_active_or_unresolved"], int(name == "active_never_superseded"))
 
     def test_real_worker_dispatch_respects_cleanup_lock_for_every_operation(self):
         import job_worker

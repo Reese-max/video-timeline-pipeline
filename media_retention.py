@@ -178,7 +178,11 @@ def cleanup(jobs_root: Path, *, apply: bool = False, now: float | None = None) -
             try:
                 # Serialize enqueue/status changes with the complete cleanup, without changing rows.
                 db.execute("BEGIN IMMEDIATE")
-                for job_id, status in db.execute("SELECT job_id,status FROM jobs WHERE status!='completed'"):
+                # A failed or cancelled row stops protecting media once a later run of the same request completes.
+                for job_id, status in db.execute(
+                        "SELECT job_id,status FROM jobs AS old WHERE status!='completed' AND (status IN ('queued','running') "
+                        "OR job_id IS NULL OR NOT EXISTS (SELECT 1 FROM jobs AS new WHERE new.status='completed' "
+                        "AND new.job_id=old.job_id AND new.input_hash=old.input_hash AND new.created>old.created))"):
                     if status in {"queued", "running"} or job_id is None:
                         report["skipped"]["queue_active_or_unresolved"] += 1
                         return report
