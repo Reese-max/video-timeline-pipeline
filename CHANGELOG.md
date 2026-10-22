@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- 新增：YouTube 改走家用網路出口。A1 實測所有 YouTube 影片（連 `jNQXAC9IVRw`）都回「Sign in to confirm you're not a bot」，yt-dlp 2026.8.19 與 2026.10.21 相同，同一支影片從家用 IP 不帶 cookie 可抓。新增環境變數 `YTDLP_YOUTUBE_PROXY`：有設定時只有 YouTube 網址（`pipeline.is_youtube_url`：`youtube.com`、`www.`／`m.`／`music.`、`youtu.be`、`youtube-nocookie.com`）的下載與字幕抓取加上 `--proxy`，其他網站不變。新增 `scripts/youtube-egress/egress_proxy.py`（標準庫 HTTP CONNECT proxy：只回應允許的來源 IP、只接受 CONNECT 到 YouTube／Google 網域的 443 埠、拒絕 IP 字面值與解析到非公開位址的網域）與 Windows 安裝腳本 `install-windows.ps1`（開機排程工作＋只允許 A1 的防火牆規則，`-Uninstall` 移除）。新增 `tests/test_youtube_egress.py`；說明見 `docs/gitops.md`。
+
 - 變更：yt-dlp 下限從 `2026.8.19` 提高到 `2026.10.21`，並新增 `.github/dependabot.yml`（每週檢查，只管 yt-dlp，有新版就開 PR 提高下限）。原因：A1 自動部署只在 `requirements.txt` 改變時才更新套件，CI 卻每次全新安裝，結果 CI 測的是 2026.10.21、A1 正式環境與 candidate 測試環境都還停在 2026.8.19。
 
 - 新增：A1 健康探針（`scripts/a1-health/`，先原樣匯入 A1 目前安裝的版本）另外回報 `video_mcp_health/deploy_health`，自動部署需要人處理時為 0，搭配 OCI 告警 `a1-deploy-stuck`（WARNING）。判定條件：最近一次自動部署 `FAILED`／`ROLLED_BACK`；服務在 drain 但 `/proc/locks` 顯示沒有部署執行持有部署鎖（涵蓋手動執行）；正在執行的版本從探針第一次發現落後 GitHub main 起超過 18 小時（起算時間存在 unit 新增的 `StateDirectory`，新的 merge 不會重新起算，涵蓋 CI 失敗時自動部署只記 `DEFERRED` 而沒人發現的情況）。`mcp_health` 先送出，部署檢查之後另外送，所以檢查變慢或出錯都不影響原本的告警；讀不到狀態檔或 GitHub 時該項本輪略過。新增 `tests/test_a1_health_probe.py`，`docs/gitops.md` 補監控說明與安裝步驟。

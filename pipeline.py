@@ -52,6 +52,10 @@ FACEBOOK_HOSTS = {
     "facebook.com", "www.facebook.com", "web.facebook.com", "m.facebook.com",
     "fb.watch", "www.fb.watch",
 }
+YOUTUBE_HOSTS = {
+    "youtube.com", "www.youtube.com", "m.youtube.com", "music.youtube.com",
+    "youtu.be", "youtube-nocookie.com", "www.youtube-nocookie.com",
+}
 THREADS_POST_RE = re.compile(r"/(?:@[^/]+/)?(?:post|t)/(?P<id>[^/?#&]+)", re.IGNORECASE)
 THREADS_CRAWLER_USER_AGENT = "facebookexternalhit/1.1"
 THREADS_PAGE_MAX_BYTES = 16 * 1024 * 1024
@@ -342,6 +346,21 @@ def is_facebook_url(url: str) -> bool:
     except ValueError:
         return False
     return hostname in FACEBOOK_HOSTS
+
+
+def is_youtube_url(url: str) -> bool:
+    try:
+        hostname = (urllib.parse.urlsplit(url).hostname or "").lower()
+    except ValueError:
+        return False
+    return hostname in YOUTUBE_HOSTS
+
+
+def youtube_proxy_options(url: str) -> list[str]:
+    """YouTube refuses cloud IPs ("Sign in to confirm you're not a bot"), so YouTube alone goes through
+    YTDLP_YOUTUBE_PROXY (A1: a home connection over Tailscale, scripts/youtube-egress/)."""
+    proxy = os.getenv("YTDLP_YOUTUBE_PROXY", "").strip()
+    return ["--proxy", proxy] if proxy and is_youtube_url(url) else []
 
 
 def threads_post_id(url: str) -> str:
@@ -872,6 +891,7 @@ def download_video(
     if max_duration is not None:
         # "<=?" lets direct-file URLs without duration metadata through; prepare re-checks the probed duration.
         command += ["--match-filter", f"duration <=? {max_duration}"]
+    command += youtube_proxy_options(url)
     command.append(url)
     hostname = (urllib.parse.urlsplit(url).hostname or "").lower()
     if hostname in {"instagram.com", "www.instagram.com", "m.instagram.com"}:
@@ -2226,6 +2246,7 @@ def fetch_youtube_transcript(url: str, job_dir: Path, language: str) -> dict[str
             "json3",
             "--output",
             str(job_dir / "source.%(ext)s"),
+            *youtube_proxy_options(url),
             url,
         ],
         stream=True,
