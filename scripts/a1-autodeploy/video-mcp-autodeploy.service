@@ -1,0 +1,10 @@
+[Unit]
+Description=Auto-deploy video-timeline-pipeline main (CI gated, drained, rollback on failure)
+After=network-online.target video-mcp.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 -X utf8 -B /usr/local/lib/video-mcp-autodeploy/autodeploy.py
+TimeoutStartSec=5h
+Nice=10
