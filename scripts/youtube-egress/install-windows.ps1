@@ -61,7 +61,8 @@ $arguments = "`"$Script`" --listen ${ListenAddress}:$Port $clientArgs --log `"$l
 # Starts at boot without a logon session and without a stored password (S4U); restarts if it dies.
 $action = New-ScheduledTaskAction -Execute $pythonw -Argument $arguments -WorkingDirectory $InstallDir
 $trigger = New-ScheduledTaskTrigger -AtStartup
-$principal = New-ScheduledTaskPrincipal -UserId "$env:USERDOMAIN\$env:USERNAME" -LogonType S4U -RunLevel Limited
+# Not $env:USERDOMAIN: over SSH it can read WORKGROUP instead of the machine name of a local account.
+$principal = New-ScheduledTaskPrincipal -UserId ([Security.Principal.WindowsIdentity]::GetCurrent().Name) -LogonType S4U -RunLevel Limited
 $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable `
     -RestartCount 999 -RestartInterval (New-TimeSpan -Minutes 1) -ExecutionTimeLimit (New-TimeSpan -Seconds 0) `
     -MultipleInstances IgnoreNew
