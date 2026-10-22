@@ -1,0 +1,10 @@
+[Unit]
+Description=Post video MCP health to OCI Monitoring (video_mcp_health)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+DynamicUser=yes
+ExecStart=/opt/video-mcp-health/venv/bin/python /usr/local/lib/video-mcp-health/probe.py
+TimeoutStartSec=120
