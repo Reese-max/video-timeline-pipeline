@@ -283,12 +283,24 @@ def reuse_artifact(path: Path, required_key: str = "") -> Any | None:
     return value
 
 
+# Facebook 的標題是「2K views · 22 reactions | 貼文內文 | 作者」：互動數會變動，不算標題。
+_FACEBOOK_COUNT = r"[\d.,]+\s*[KMB萬億]?\s*(?:views?|plays?|reactions?|likes?|comments?|shares?|次觀看|次播放|個心情|則留言|次分享)"
+FACEBOOK_ENGAGEMENT = re.compile(rf"^{_FACEBOOK_COUNT}(?:\s*·\s*{_FACEBOOK_COUNT})*\s*\|\s*", re.IGNORECASE)
+
+
 def source_title(job_dir: Path, video_path: Path) -> str:
     """yt-dlp 的 info.json 有真實標題；本機檔案就退回檔名。"""
     info_path = job_dir / "source.info.json"
     if info_path.is_file():
         try:
-            title = str(json.loads(info_path.read_text(encoding="utf-8")).get("title", "")).strip()
+            info = json.loads(info_path.read_text(encoding="utf-8"))
+            title = str(info.get("title", "")).strip()
+            if title and str(info.get("extractor") or "").lower().startswith("facebook"):
+                uploader = str(info.get("uploader") or "").strip()
+                cleaned = FACEBOOK_ENGAGEMENT.sub("", title, count=1)
+                if uploader and cleaned.endswith(f" | {uploader}"):
+                    cleaned = cleaned[:-len(f" | {uploader}")]
+                title = cleaned.strip() or title
             if title:
                 return title
         except (json.JSONDecodeError, OSError):
