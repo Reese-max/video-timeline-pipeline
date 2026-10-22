@@ -120,6 +120,23 @@ class FacebookDownloadTests(unittest.TestCase):
         self.assertTrue(pipeline.is_facebook_url("https://fb.watch/abc"))
         self.assertFalse(pipeline.is_facebook_url("https://www.instagram.com/reel/1"))
 
+    def test_source_title_drops_facebook_engagement_counts_and_author(self):
+        post = "什麼，你連它都不放過？弄彎 Claude Code 自動路由到破解模型 其實最近決策模型很紅"
+        cases = [
+            ({"extractor": "facebook", "uploader": "胡嘉璽", "title": f"2K views · 22 reactions | {post} | 胡嘉璽"}, post),
+            ({"extractor": "facebook", "uploader": "Page", "title": "1.2M views · 3.4K reactions · 120 comments | Title | Page"}, "Title"),
+            ({"extractor": "facebook:reel", "title": "2.1萬次觀看 · 22 個心情 | 標題"}, "標題"),
+            ({"extractor": "facebook", "uploader": "Page", "title": "10 tips | Page"}, "10 tips"),
+            ({"extractor": "facebook", "title": "2K views · 22 reactions | "}, "2K views · 22 reactions |"),
+            ({"extractor": "youtube", "uploader": "Page", "title": "2K views · 22 reactions | Title | Page"},
+             "2K views · 22 reactions | Title | Page"),
+        ]
+        for info, expected in cases:
+            with self.subTest(title=info["title"]), tempfile.TemporaryDirectory() as folder:
+                root = Path(folder)
+                (root / "source.info.json").write_text(json.dumps(info, ensure_ascii=False), encoding="utf-8")
+                self.assertEqual(pipeline.source_title(root, root / "source.mp4"), expected)
+
 
 if __name__ == "__main__":
     unittest.main()
