@@ -166,6 +166,26 @@ Drive 上傳以 1 MiB 分塊；遇到斷線、HTTP 429／5xx，最多退避重�
 
 可用環境變數：`MCP_MAX_SOURCE_MB`（預設 512）、`MCP_MAX_SEGMENT_SECONDS`（預設 600）、`MCP_MAX_SEGMENTS`（預設 0，不限段數；設為正整數後，省略 `max_segments` 也不會繞過伺服器上限）、`MCP_MIN_FREE_MB`（預設保留 1024 MiB）、`MCP_ROOT`（預設 repo 根目錄）、`MCP_SEGMENT_MODE`（預設 `copy`，見下）、`MCP_SEGMENT_MAX_LONG_SIDE`（預設 1280）、`MCP_SEGMENT_X264_PRESET`（預設 `veryfast`）、`TRANSCRIBE_BACKEND`（`groq` 或 `local`）、`GROQ_ASR_MODEL`、`MINIMAX_MODEL`。工具的 `max_segments` 預設仍不設上限。
 
+### Drive 檔案排版：只有一個「Video Timeline」資料夾
+
+`GOOGLE_DRIVE_FOLDER_ID`（留白＝我的雲端硬碟根目錄）底下**只會有一個**「Video Timeline」資料夾。所有影片的分段、原片與 A 報告都在這個資料夾裡的**同一層**，檔名是「標題 - job_id - 原檔名」：
+
+- `第一支影片 - 0123456789ab - segment_000.mp4`
+- `第一支影片 - 0123456789ab - source.mp4`
+- `第一支影片 - 0123456789ab - A_server_analysis.md`
+
+共用資料夾的檔案 ID 記在 `mcp_jobs/drive-video-folder.json`，先預留 ID 再建立資料夾，當機後沿用同一個 ID。資料夾不見、已在垃圾桶、不是資料夾，或 `GOOGLE_DRIVE_FOLDER_ID` 換了，都不會把影片寫進舊資料夾：狀態檔遺失或損壞、預留的 ID 在 Drive 上已不存在時，會先在 Drive 上找既有的同名「Video Timeline」資料夾沿用（多個時，優先沿用狀態檔或本機 manifest 已指向的那個，否則取建立時間最早的那個；多個同名資料夾會回報問題），真的沒有才另配新 ID 重建，所以共用資料夾永遠只有一個。舊版每支影片一個「Video Timeline - 標題 - job_id」資料夾的排版，用一次性遷移腳本搬進共用資料夾（只搬移、不刪檔；舊資料夾清空後移入垃圾桶）：
+
+```bash
+python scripts/migrate_drive_single_folder.py --jobs-root mcp_jobs              # dry-run：只印計畫
+python scripts/migrate_drive_single_folder.py --jobs-root mcp_jobs --apply      # 真的搬移
+python scripts/migrate_drive_single_folder.py --jobs-root mcp_jobs --apply --trash-job <job_id>
+```
+
+預設是 dry-run，**不寫入任何東西**（不呼叫 Drive 寫入、不改本機檔案），但仍需要 Drive 憑證，也會讀取 Drive 的資料夾清單來印出計畫；`--apply` 才執行。執行前先確認 MCP 服務沒有進行中的 Drive 上傳。腳本可重跑：每個舊資料夾的順序都是「先搬檔並逐檔核對 → 再改寫 manifest 與報告狀態檔 → 最後才把清空的舊資料夾丟垃圾桶」，中途失敗或當機後再跑一次，會以本機 manifest 為準補上沒做完的那一步，收斂後第二次 `--apply` 不會再寫入 Drive。
+
+腳本一律「寧可保留舊資料夾並回報問題（結束碼非 0）」：改寫 manifest 前會逐一驗證 manifest 記錄的每個 file_id（未在垃圾桶、在共用資料夾、SHA-256 相符、檔名是「{前綴} - {file_name}」），任何一個不符就不改寫、不丟資料夾；修復階段擋下的 job 在資料夾階段整個資料夾都不動；還被本機 manifest 或報告狀態檔引用的檔案不會被當成重複檔丟進垃圾桶；本機 manifest 讀不到（壞掉的 JSON）算問題、該 job 的資料夾原封不動；本機寫入失敗只擋下那個 job，其他 job 照常完成。步驟與回報見 [docs/video-mcp-operations.md](docs/video-mcp-operations.md)。「RSS 自動摘要」資料夾不受影響。
+
 ### 分段模式：預設直接剪開（stream copy）
 
 切割預設改成**直接剪開**：ffmpeg 用 `-c copy` 直接把原影片剪成分段，不重新編碼。分段只用於 Drive 分段備份、ChatGPT 面板播放與偶爾的一般對話讀取；MiniMax 畫面分析與 Groq 語音轉文字都直接讀原片（`video_path`），不讀分段，所以分段不需要為了 AI 分析而重編碼。

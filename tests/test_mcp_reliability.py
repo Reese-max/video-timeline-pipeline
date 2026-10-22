@@ -369,7 +369,7 @@ class ReliabilityTests(unittest.TestCase):
                 def upload(_token, path, name, parent, *, file_id):
                     nonlocal fail
                     uploaded.append(file_id)
-                    should_fail = name == "segment_001.mp4" and fail
+                    should_fail = name.endswith("segment_001.mp4") and fail
                     if not should_fail or committed:
                         remote[file_id] = {"id": file_id, "mimeType": "video/mp4", "parents": [parent],
                             "size": str(path.stat().st_size), "sha256Checksum": drive._sha256(path),
@@ -384,6 +384,7 @@ class ReliabilityTests(unittest.TestCase):
                       patch.object(drive, "_env", return_value=""),
                       patch.object(drive, "_new_id", side_effect=reserve),
                       patch.object(drive, "_create_folder", side_effect=folder),
+                      patch.object(drive, "_list_children", return_value=[]),
                       patch.object(drive, "_upload_file", side_effect=upload),
                       patch.object(drive, "_get_file", side_effect=lambda _, fid: remote.get(fid))):
                     args = (root, "0123456789ab", "demo", "source", rows)
