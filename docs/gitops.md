@@ -70,6 +70,30 @@ python3 -c 'import ast, sys; ast.parse(open(sys.argv[1], encoding="utf-8").read(
 
 回歸測試：`python3 -m unittest discover -s tests -p test_a1_autodeploy.py -v`（只在 Linux 執行，Windows 會跳過）。
 
+### 監控與告警
+
+`scripts/a1-health/probe.py` 安裝於 `/usr/local/lib/video-mcp-health/probe.py`，由 `video-mcp-health.timer` 每 5 分鐘以 DynamicUser 執行（OCI SDK 在 A1 的 `/opt/video-mcp-health/venv`，不在 `requirements.txt`），用 instance principal 寫 OCI Monitoring 命名空間 `video_mcp_health`：
+
+- `mcp_health`（`check=local` 本機 `/health`、`check=public` 經公開 DNS 打公開網址）：告警 `a1-mcp-unhealthy`（任一 check 為 0 持續 10 分鐘）與 `a1-health-missing`（指標中斷），CRITICAL。
+- `deploy_health`：自動部署需要人處理時為 0，告警 `a1-deploy-stuck`（`deploy_health[5m].min() < 1` 持續 15 分鐘，WARNING，每 24 小時重送）。三種情況：
+  - 最近一次自動部署是 `FAILED` 或 `ROLLED_BACK`。這個結果會維持到下一次自動部署（最多約 6 小時 15 分），期間持續告警；手動 `--check` 或之後的 `DEFERRED` 會覆寫它。
+  - 服務在 drain，但沒有任何部署執行持有 `/run/video-mcp-autodeploy.lock`（從 `/proc/locks` 判斷，涵蓋手動執行，探針本身不拿鎖），例如回滾失敗留下旗標。
+  - 正在執行的版本落後 GitHub main 超過 18 小時。起算點是探針**第一次發現落後**的時間，記在 `StateDirectory` 的 `/var/lib/video-mcp-health/behind.json`；之後 main 再有新的 merge 也不會重新起算，部署或追上 main 才重置。涵蓋 main 的 CI 一直失敗、自動部署只記 `DEFERRED` 的情況。18 小時容許正常的最壞情形：剛錯過一輪、下一輪 drain 等滿 3 小時而延後、再下一輪才部署。
+
+  `mcp_health` 先送出後才做部署檢查並另外送 `deploy_health`，所以部署檢查變慢或出錯都不會影響 `mcp_health`。讀不到 `last.json` 或 GitHub（`commits/main`，只取 SHA，每 5 分鐘一次）時該項本輪略過；整個部署檢查出錯時本輪不送 `deploy_health`。
+
+修改後同樣從已部署的 checkout 安裝：
+
+```bash
+cd /home/ubuntu/video-timeline-pipeline
+python3 -c 'import ast, sys; ast.parse(open(sys.argv[1], encoding="utf-8").read(), sys.argv[1])' scripts/a1-health/probe.py \
+  && sudo install -m 644 scripts/a1-health/probe.py /usr/local/lib/video-mcp-health/probe.py \
+  && sudo install -m 644 scripts/a1-health/video-mcp-health.service scripts/a1-health/video-mcp-health.timer /etc/systemd/system/ \
+  && sudo systemctl daemon-reload
+```
+
+回歸測試：`python -m unittest discover -s tests -p test_a1_health_probe.py -v`（以假的 `oci` 模組執行，不連 OCI）。
+
 ## 驗收界線
 
 離線 Python／Widget、實際 MCP HTTP 與工具 schema、正式部署與回滾、ChatGPT UI 是不同證據。`/health` 不代表付費影片分析端到端成功。伺服器 SHA／Widget resource URI 也不是 ChatGPT 外掛封裝版本。外部來源的 yt-dlp 下載與所有 redirect 並非本次已完成的完整 SSRF 驗證。
