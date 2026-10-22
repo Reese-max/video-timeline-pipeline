@@ -1,0 +1,15 @@
+# yt-dlp fixes site extractors (YouTube, Facebook, Instagram) in nearly every release, but A1's
+# auto-deploy only reinstalls packages when requirements.txt changes. Raise the floor each release
+# so the new version goes through CI and the candidate tests before it reaches production.
+version: 2
+updates:
+  - package-ecosystem: "pip"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    allow:
+      - dependency-name: "yt-dlp"
+    versioning-strategy: "increase"
+    open-pull-requests-limit: 1
+    commit-message:
+      prefix: "chore(deps)"

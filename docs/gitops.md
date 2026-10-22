@@ -58,6 +58,8 @@ bash /home/box/video-timeline-deploy/sync-linux.sh --once
 
 結果在 `/var/lib/video-mcp-autodeploy/last.json`，紀錄用 `journalctl -u video-mcp-autodeploy`；要立即部署可執行 `sudo systemctl start video-mcp-autodeploy.service`。
 
+套件只在 `requirements.txt` 內容改變時才會更新（先存 `pip freeze` 供回滾，再 `pip install -r`）；CI 每次都全新安裝，所以 `>=` 下限沒跟上時，CI 測的是新版、A1 跑的仍是舊版。yt-dlp 幾乎每版都在修網站抓取，因此 `.github/dependabot.yml` 每週檢查一次，有新版就開 PR 調高下限，合併後照一般流程經 CI 與 candidate 測試再上 A1。
+
 自動部署不會更新部署程式本身；部署前跑的測試用的是 repo 裡的副本，不代表 A1 已安裝的版本有同樣行為。修改 `scripts/a1-autodeploy/` 並合併、部署後，在 A1 從已部署的 checkout 先檢查語法再安裝：
 
 ```bash
