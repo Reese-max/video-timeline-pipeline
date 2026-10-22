@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- 新增：A1 健康探針（`scripts/a1-health/`，先原樣匯入 A1 目前安裝的版本）另外回報 `video_mcp_health/deploy_health`，自動部署需要人處理時為 0，搭配 OCI 告警 `a1-deploy-stuck`（WARNING）。判定條件：最近一次自動部署 `FAILED`／`ROLLED_BACK`；服務在 drain 但 `/proc/locks` 顯示沒有部署執行持有部署鎖（涵蓋手動執行）；正在執行的版本從探針第一次發現落後 GitHub main 起超過 18 小時（起算時間存在 unit 新增的 `StateDirectory`，新的 merge 不會重新起算，涵蓋 CI 失敗時自動部署只記 `DEFERRED` 而沒人發現的情況）。`mcp_health` 先送出，部署檢查之後另外送，所以檢查變慢或出錯都不影響原本的告警；讀不到狀態檔或 GitHub 時該項本輪略過。新增 `tests/test_a1_health_probe.py`，`docs/gitops.md` 補監控說明與安裝步驟。
+
 - 變更：A1 的自動部署程式與 systemd unit 納入版控（`scripts/a1-autodeploy/`，先原樣匯入 A1 目前安裝的版本），安裝與流程說明寫進 `docs/gitops.md`，並新增 `tests/test_a1_autodeploy.py`（只在 Linux 執行）。同時把 `http.client.HTTPException`（例如回應被截斷的 `IncompleteRead`）納入網路暫時錯誤的重試。測試涵蓋：重試間隔與次數、非網路錯誤不重試、`ls-remote` 短暫失敗後仍判定最新、CI 未完成直接延後不重試、candidate 與正式 checkout 的 `git fetch` 重試、`git fetch` 在 drain 之前且持續失敗時不 drain、切換與回滾都不再 `git fetch`、CI 查詢收到截斷回應時會重試。部署程式不會被自動部署更新，改動須依 `docs/gitops.md` 在 A1 手動安裝後才生效。
 
 - 修正：Facebook 影片的標題不再帶互動數與作者。yt-dlp 給的 Facebook 標題是「`2K views · 22 reactions | 貼文內文 | 作者`」，原本整串原樣寫進 `manifest.json` 的 `source.title`，連帶出現在報告、影片庫與 Drive 檔名（例如「2K views _ 22 reactions _ …」）。`pipeline.source_title()` 現在只在 `extractor` 為 `facebook*` 時，去掉開頭的互動數（views／plays／reactions／likes／comments／shares 與「次觀看／次播放／個心情／則留言／次分享」，以 `·` 串接、`|` 結尾）與結尾的「` | {uploader}`」，貼文內文完整保留（全文索引仍可搜尋）；去掉後是空字串就沿用原標題。其他平台不受影響。已準備好的工作不會自動改名，重新準備（或 CLI 重跑）時才會套用新標題；已上傳 Drive 的工作仍沿用原本的 Drive 檔名前綴，不會重傳。
