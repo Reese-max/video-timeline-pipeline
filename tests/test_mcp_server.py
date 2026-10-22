@@ -466,6 +466,17 @@ class MCPValidationTests(unittest.TestCase):
                 "parents": ["folder_1"],
                 "webViewLink": "https://drive.google.com/file/d/file_1/view",
             }
+            created = {"folder": False}
+
+            def get_file(token, fid):
+                if fid == "folder_1":
+                    return folder if created["folder"] else None
+                return uploaded
+
+            def create_folder(token, name, parent_id, file_id=None):
+                created["folder"] = True
+                return folder
+
             with (
                 patch.dict(
                     drive_storage.os.environ,
@@ -474,8 +485,9 @@ class MCPValidationTests(unittest.TestCase):
                 ),
                 patch.object(drive_storage, "_access_token", return_value="token"),
                 patch.object(drive_storage, "_new_id", side_effect=["folder_1", "file_1"]),
-                patch.object(drive_storage, "_get_file", side_effect=lambda token, fid: folder if fid == "folder_1" else uploaded),
-                patch.object(drive_storage, "_create_folder", return_value=folder) as create_folder,
+                patch.object(drive_storage, "_get_file", side_effect=get_file),
+                patch.object(drive_storage, "_create_folder", side_effect=create_folder) as create_folder,
+                patch.object(drive_storage, "_list_children", return_value=[]),
                 patch.object(drive_storage, "_upload_file", return_value=uploaded) as upload_file,
             ):
                 first = drive_storage.upload_prepared_segments(

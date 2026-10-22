@@ -14,13 +14,15 @@ import json
 import mimetypes
 import os
 import re
+import sys
 import threading
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable
 
 import analysis_report
 from pipeline import write_json
@@ -37,6 +39,8 @@ _DRIVE_ID = re.compile(r"[A-Za-z0-9_-]+")
 _SHA256 = re.compile(r"[0-9a-f]{64}")
 _SEGMENT_NAME = re.compile(r"segment_\d{3,}\.mp4")
 _SOURCE_NAME = re.compile(r"source\.[A-Za-z0-9]{1,8}")
+# One shared folder holds every video: segments, source and the A report sit side by side.
+VIDEO_FOLDER_NAME = "Video Timeline"
 
 
 class DriveNotConfigured(RuntimeError):
@@ -176,6 +180,44 @@ def _create_folder(token: str, name: str, parent_id: str, file_id: str | None = 
     if not result.get("id"):
         raise RuntimeError("Google Drive 建立工作資料夾時沒有回傳 file id。")
     return result
+
+
+def _list_children(token: str, parent_id: str) -> list[dict[str, Any]]:
+    """Every non-trashed child of a folder (My Drive when parent_id is empty)."""
+    parent = parent_id or "root"
+    children: list[dict[str, Any]] = []
+    page_token = ""
+    while True:
+        query = {"q": f"'{parent}' in parents and trashed = false",
+                 "fields": ("nextPageToken,files(id,name,mimeType,size,sha256Checksum,webViewLink,"
+                            "trashed,parents,createdTime)"),
+                 "supportsAllDrives": "true", "pageSize": "1000"}
+        if page_token:
+            query["pageToken"] = page_token
+        result = _api_json("GET", f"{DRIVE_FILES_URL}?{urllib.parse.urlencode(query)}", token)
+        for item in result.get("files") or []:
+            if isinstance(item, dict):
+                children.append(item)
+        page_token = str(result.get("nextPageToken") or "").strip()
+        if not page_token:
+            return children
+
+
+def _move_file(token: str, file_id: str, name: str, add_parent: str, remove_parent: str) -> dict[str, Any]:
+    """Move one file into another folder and rename it in a single update."""
+    query = urllib.parse.urlencode({"addParents": add_parent, "removeParents": remove_parent,
+                                    "supportsAllDrives": "true",
+                                    "fields": "id,name,mimeType,parents,webViewLink,sha256Checksum,size"})
+    return _api_json("PATCH", f"{DRIVE_FILES_URL}/{urllib.parse.quote(file_id, safe='')}?{query}",
+                     token, {"name": name})
+
+
+def _trash_file(token: str, file_id: str) -> dict[str, Any]:
+    """Move one file to the trash; the bytes stay in Drive until the trash is emptied."""
+    query = urllib.parse.urlencode({"supportsAllDrives": "true",
+                                    "fields": "id,name,trashed,parents"})
+    return _api_json("PATCH", f"{DRIVE_FILES_URL}/{urllib.parse.quote(file_id, safe='')}?{query}",
+                     token, {"trashed": True})
 
 
 def _upload_file(
@@ -318,6 +360,123 @@ def _matches_file(remote: dict | None, file_id: str, local: dict, folder_id: str
                 and folder_id in remote.get("parents", []) and remote.get("webViewLink"))
 
 
+def _shared_video_folder_candidates(token: str, parent_id: str) -> list[dict[str, Any]]:
+    """Every non-trashed folder under the parent that carries the shared name."""
+    return [item for item in _list_children(token, parent_id)
+            if item.get("mimeType") == FOLDER_MIME
+            and str(item.get("name") or "") == VIDEO_FOLDER_NAME
+            and not item.get("trashed")]
+
+
+def _choose_shared_video_folder(candidates: list[dict[str, Any]],
+                                preferred_ids: Iterable[str] = ()) -> dict[str, Any] | None:
+    """Pick the shared folder: a pinned ID first, otherwise the oldest one.
+
+    Several folders may carry the shared name (a duplicated folder, or a state file
+    that was lost). The pinned ID is the one the state file or a local manifest
+    already points at; without one the oldest folder wins (created time, then ID).
+    Several candidates are a real ambiguity, so it is warned about on stderr.
+    """
+    if not candidates:
+        return None
+    chosen = None
+    for preferred in preferred_ids:
+        preferred = str(preferred or "")
+        if not preferred:
+            continue
+        for item in candidates:
+            if str(item.get("id") or "") == preferred:
+                chosen = item
+                break
+        if chosen is not None:
+            break
+    if chosen is None:
+        chosen = sorted(candidates, key=lambda item: (str(item.get("createdTime") or ""),
+                                                     str(item.get("id") or "")))[0]
+    if len(candidates) > 1:
+        print(f"警告：Drive 上有多個「{VIDEO_FOLDER_NAME}」同名資料夾（{len(candidates)} 個），"
+              f"共用資料夾沿用 {chosen.get('id')}", file=sys.stderr)
+    return chosen
+
+
+def _find_shared_video_folder(token: str, parent_id: str,
+                              preferred_ids: Iterable[str] = ()) -> dict[str, Any] | None:
+    """The shared folder that already exists under the parent, if there is one.
+
+    Drive never lists trashed folders, so a trashed shared folder does not come back
+    here: the caller reserves a fresh ID and creates the folder again. When several
+    folders carry the shared name the pinned one wins (state file or local manifest),
+    otherwise the oldest one wins (created time, then lowest ID).
+    """
+    return _choose_shared_video_folder(_shared_video_folder_candidates(token, parent_id),
+                                       preferred_ids)
+
+
+def _video_folder(token: str, state_path: Path,
+                  preferred_ids: Iterable[str] = ()) -> dict[str, Any]:
+    """One shared folder holds every video; its ID is durable before the folder is created.
+
+    A folder that is gone, trashed, no longer a folder, or no longer under the configured
+    parent is never written into again. A lost state file or a reserved ID that is gone
+    reuses the shared folder that is still on Drive; only when there is none a fresh ID
+    is reserved and a new folder is created. A reserved ID that was never created
+    survives a crash and is reused as-is.
+    """
+    parent_id = _env("GOOGLE_DRIVE_FOLDER_ID")
+    if state_path.is_symlink():
+        raise ValueError("Drive video folder state is not owned")
+    state = None
+    if state_path.exists():
+        try:
+            candidate = _load_owned_state(state_path)
+        except (OSError, json.JSONDecodeError, ValueError):
+            candidate = None  # A broken state file never blocks a new folder.
+        if (candidate and candidate.get("parent_id") == parent_id
+                and _DRIVE_ID.fullmatch(str(candidate.get("folder_id") or ""))):
+            state = candidate
+    if state is None:
+        # A lost state file must not create a second shared folder.
+        existing = _find_shared_video_folder(token, parent_id, preferred_ids)
+        if existing:
+            state = {"folder_id": str(existing.get("id") or ""), "parent_id": parent_id,
+                     "name": VIDEO_FOLDER_NAME,
+                     "created": str(existing.get("createdTime") or ""),
+                     "folder_url": str(existing.get("webViewLink") or "")}
+        else:
+            # Another parent needs its own folder; the ID is durable BEFORE any POST.
+            state = {"folder_id": _new_id(token), "parent_id": parent_id, "name": VIDEO_FOLDER_NAME,
+                     "created": "", "folder_url": ""}
+        write_json(state_path, state)
+    folder_id = str(state["folder_id"])
+    folder = _get_file(token, folder_id)
+    if folder and (folder.get("trashed") or folder.get("mimeType") != FOLDER_MIME
+                   or (parent_id and parent_id not in (folder.get("parents") or []))):
+        folder = None
+    if not folder:
+        # The recorded or reserved ID is unusable: reuse the shared folder on Drive.
+        existing = _find_shared_video_folder(token, parent_id, preferred_ids)
+        if existing:
+            folder_id = str(existing.get("id") or "")
+            state.update(folder_id=folder_id, created=str(existing.get("createdTime") or ""),
+                         folder_url=str(existing.get("webViewLink") or ""))
+            write_json(state_path, state)
+            folder = existing
+        else:
+            # A created but now missing folder needs a new ID; a reserved ID survives a crash.
+            if state.get("created") or state.get("folder_url"):
+                folder_id = _new_id(token)
+                state.update(folder_id=folder_id, created="", folder_url="")
+                write_json(state_path, state)
+            folder = _create_folder(token, VIDEO_FOLDER_NAME, parent_id, folder_id)
+            if str(folder.get("id")) != folder_id:
+                raise RuntimeError("Google Drive 回傳的資料夾 ID 與預先配置的 ID 不符。")
+    state.update(parent_id=parent_id, name=VIDEO_FOLDER_NAME,
+                 created=state.get("created") or datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                 folder_url=str(folder.get("webViewLink") or ""))
+    write_json(state_path, state)
+    return {"folder_id": folder_id, "folder_url": str(folder.get("webViewLink") or "")}
+
+
 def upload_prepared_segments(
     job_dir: Path,
     job_id: str,
@@ -374,6 +533,13 @@ def _upload_prepared_segments(
         cached = None
     token = _access_token()
     parent_id = _env("GOOGLE_DRIVE_FOLDER_ID")
+    if isinstance(cached, dict):
+        # Invalidate ready before remote checks, including checks that fail with 403/5xx.
+        cached = {**cached, "status": "uploading"}
+        write_json(cache_path, cached)
+    folder = _video_folder(token, job_dir.parent / "drive-video-folder.json")
+    folder_id = str(folder["folder_id"])
+    drive_prefix = f"{_safe_name(title)} - {job_id}"
     reusable = (
         isinstance(cached, dict)
         and cached.get("source_fingerprint") == source_fingerprint
@@ -381,38 +547,25 @@ def _upload_prepared_segments(
         and cached.get("parent_id", parent_id) == parent_id
         # Manifests written before source backups existed stay reusable.
         and cached.get("local_source") in (None, local_source)
+        # Manifests that point at a per-job folder are uploaded again into the shared folder.
+        and cached.get("folder_id") == folder_id
     )
+    if reusable and str(cached.get("drive_prefix") or "").strip():
+        # Reused files keep the names they were uploaded with.
+        drive_prefix = str(cached["drive_prefix"]).strip()
     state = cached if reusable else {
         "job_id": job_id, "parent_id": parent_id,
         "source_fingerprint": source_fingerprint,
         "local_segments": local_rows,
         "files": [],
     }
-    # Invalidate ready before remote checks, including checks that fail with 403/5xx.
-    state["status"] = "uploading"
-    write_json(cache_path, state)
-    folder_id = str(state.get("folder_id") or "")
-    folder = _get_file(token, folder_id) if folder_id else None
-    if folder and (folder.get("trashed") or folder.get("mimeType") != FOLDER_MIME
-                   or (parent_id and parent_id not in folder.get("parents", []))):
-        folder = None
-        folder_id = ""
-    if not folder:
-        # A created but now deleted folder needs a new ID; a reserved ID survives a crash.
-        if state.get("folder_created") or state.get("folder_url"):
-            folder_id = ""
-        folder_id = folder_id or _new_id(token)
-        state.update(folder_id=folder_id, folder_created=False, folder_url="", files=[])
-        write_json(cache_path, state)
-        folder = _create_folder(token, f"Video Timeline - {_safe_name(title)} - {job_id}", parent_id, folder_id)
-        if str(folder.get("id")) != folder_id:
-            raise RuntimeError("Google Drive 回傳的資料夾 ID 與預先配置的 ID 不符。")
-    state.update(folder_id=folder_id, folder_created=True,
-                 folder_url=str(folder.get("webViewLink") or ""), parent_id=parent_id)
+    state.update(status="uploading", drive_prefix=drive_prefix, folder_id=folder_id,
+                 folder_url=str(folder.get("folder_url") or ""), parent_id=parent_id)
     write_json(cache_path, state)
     previous = {item["file_name"]: item for item in state.get("files", []) if item.get("file_name")}
     files = []
     for local in local_rows:
+        drive_name = f"{drive_prefix} - {local['filename']}"
         saved = previous.get(local["filename"], {})
         file_id = str(saved.get("file_id") or "")
         remote = _get_file(token, file_id) if file_id else None
@@ -421,33 +574,41 @@ def _upload_prepared_segments(
             if remote or saved.get("verified") or saved.get("url"):
                 file_id = ""
             file_id = file_id or _new_id(token)
-            pending = {"file_id": file_id, "file_name": local["filename"], "verified": False}
+            pending = {"file_id": file_id, "file_name": local["filename"],
+                       "drive_name": drive_name, "verified": False}
             state["files"] = files + [pending] + [previous[r["filename"]] for r in local_rows[len(files)+1:]
                                                   if r["filename"] in previous]
             write_json(cache_path, state)
-            _upload_file(token, job_dir / "segments" / local["filename"], local["filename"], folder_id,
+            _upload_file(token, job_dir / "segments" / local["filename"], drive_name, folder_id,
                          file_id=file_id)
             remote = _get_file(token, file_id)
             if not _matches_file(remote, file_id, local, folder_id):
                 raise RuntimeError("Google Drive 上傳後的檔案大小、SHA-256 或資料夾驗證失敗。")
+        else:
+            # Reused file: report the name it actually has on Drive.
+            saved_name = saved.get("drive_name")
+            if isinstance(saved_name, str) and saved_name.strip():
+                drive_name = saved_name.strip()
         files.append({"file_id": file_id, "url": remote["webViewLink"],
-                      "file_name": local["filename"], "mime_type": "video/mp4",
+                      "file_name": local["filename"], "drive_name": drive_name,
+                      "mime_type": "video/mp4",
                       "size_bytes": local["size_bytes"], "sha256": local["sha256"], "verified": True})
         state["files"] = files + [previous[r["filename"]] for r in local_rows[len(files):]
                                   if r["filename"] in previous]
         write_json(cache_path, state)
     state["files"] = files
     if source_path is not None and local_source is not None:
-        _upload_source_backup(token, state, cache_path, source_path, local_source, folder_id)
+        _upload_source_backup(token, state, cache_path, source_path, local_source, folder_id, drive_prefix)
     state.update(status="drive_ready", files=files)
     write_json(cache_path, state)
     return state
 
 
 def _upload_source_backup(token: str, state: dict, cache_path: Path, source_path: Path,
-                          local_source: dict, folder_id: str) -> None:
+                          local_source: dict, folder_id: str, drive_prefix: str) -> None:
     """Keep a verified copy of the whole source video; never overwrite a changed user file."""
     mime_type = _source_mime(source_path)
+    drive_name = f"{drive_prefix} - {local_source['filename']}"
     saved = state.get("source_file") if isinstance(state.get("source_file"), dict) else {}
     file_id = str(saved.get("file_id") or "")
     remote = _get_file(token, file_id) if file_id else None
@@ -456,16 +617,22 @@ def _upload_source_backup(token: str, state: dict, cache_path: Path, source_path
             file_id = ""
         file_id = file_id or _new_id(token)
         state.update(local_source=local_source,
-                     source_file={"file_id": file_id, "file_name": local_source["filename"], "verified": False})
+                     source_file={"file_id": file_id, "file_name": local_source["filename"],
+                                  "drive_name": drive_name, "verified": False})
         write_json(cache_path, state)
-        _upload_file(token, source_path, local_source["filename"], folder_id, mime_type, file_id=file_id)
+        _upload_file(token, source_path, drive_name, folder_id, mime_type, file_id=file_id)
         remote = _get_file(token, file_id)
         if not _matches_file(remote, file_id, local_source, folder_id, mime_type):
             raise RuntimeError("Google Drive 原片上傳後的大小、SHA-256 或資料夾驗證失敗。")
+    else:
+        # Reused file: report the name it actually has on Drive.
+        saved_name = saved.get("drive_name")
+        if isinstance(saved_name, str) and saved_name.strip():
+            drive_name = saved_name.strip()
     state.update(local_source=local_source, source_file={
         "file_id": file_id, "url": remote["webViewLink"], "file_name": local_source["filename"],
-        "mime_type": mime_type, "size_bytes": local_source["size_bytes"], "sha256": local_source["sha256"],
-        "mtime_ns": local_source["mtime_ns"], "verified": True})
+        "drive_name": drive_name, "mime_type": mime_type, "size_bytes": local_source["size_bytes"],
+        "sha256": local_source["sha256"], "mtime_ns": local_source["mtime_ns"], "verified": True})
     write_json(cache_path, state)
 
 
@@ -611,9 +778,18 @@ def restore_prepared_media(job_dir: Path, state: dict) -> list[str]:
     return restored
 
 
-def _matches_report(remote: dict | None, file_id: str, report: dict, folder_id: str) -> bool:
+def _report_drive_name(segments: dict) -> str:
+    """The A report sits next to the segments; its Drive name carries the job prefix."""
+    prefix = segments.get("drive_prefix")
+    if isinstance(prefix, str) and prefix.strip():
+        return f"{prefix.strip()} - {analysis_report.NAME}"
+    return analysis_report.NAME
+
+
+def _matches_report(remote: dict | None, file_id: str, report: dict, folder_id: str,
+                     expected_name: str) -> bool:
     return bool(remote and str(remote.get("id")) == file_id and not remote.get("trashed")
-                and remote.get("name") == "A_server_analysis.md" and remote.get("mimeType") == "text/markdown"
+                and remote.get("name") == expected_name and remote.get("mimeType") == "text/markdown"
                 and str(remote.get("size")) == str(report["size_bytes"])
                 and remote.get("sha256Checksum") == report["report_sha256"]
                 and remote.get("parents") == [folder_id] and remote.get("webViewLink"))
@@ -673,8 +849,9 @@ def upload_analysis_report(job_dir: Path, report: dict, segments: dict) -> dict:
                 raise ValueError("Original MP4 verification changed; no report write")
         key = hashlib.sha256(json.dumps({k: report[k] for k in ("job_id", "analysis_sha256", "report_sha256")}, sort_keys=True).encode() + folder_id.encode()).hexdigest()
         state_path = path.parent / ("drive-" + key + ".json")
+        drive_name = _report_drive_name(segments)
         binding = {k: report[k] for k in ("job_id", "analysis_sha256", "report_sha256", "source_sha256", "source_fingerprint", "size_bytes")}
-        binding.update(folder_id=folder_id, file_name="A_server_analysis.md", mime_type="text/markdown")
+        binding.update(folder_id=folder_id, file_name=drive_name, mime_type="text/markdown")
         if state_path.exists():
             if state_path.is_symlink():
                 raise ValueError("Report upload state is not owned")
@@ -686,14 +863,14 @@ def upload_analysis_report(job_dir: Path, report: dict, segments: dict) -> dict:
             write_json(state_path, state)  # ID is durable BEFORE any POST/PUT.
         file_id = state["file_id"]
         remote = _get_file(token, file_id)
-        if not _matches_report(remote, file_id, report, folder_id):
+        if not _matches_report(remote, file_id, report, folder_id, drive_name):
             if remote or state.get("verified"):
                 raise ValueError("Existing report was moved, changed or deleted; never overwrite")
             state.update(status="uploading")
             write_json(state_path, state)
-            _upload_file(token, path, "A_server_analysis.md", folder_id, "text/markdown", file_id=file_id)
+            _upload_file(token, path, drive_name, folder_id, "text/markdown", file_id=file_id)
             remote = _get_file(token, file_id)
-            if not _matches_report(remote, file_id, report, folder_id):
+            if not _matches_report(remote, file_id, report, folder_id, drive_name):
                 raise ValueError("Uploaded report identity/bytes/parent verification failed")
         if _sha256(path) != digest or path.stat().st_size != report["size_bytes"]:
             raise ValueError("Report changed during upload")
