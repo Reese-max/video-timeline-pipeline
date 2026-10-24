@@ -1,6 +1,6 @@
 # 04｜實驗：用 `window.openai.uploadFile` 把影片存進 ChatGPT 檔案庫
 
-> 狀態（2026-10-24）：小工具端按鈕、片段時間換算與離線契約測試已整合至本次 v18 候選，真實 ChatGPT 檔案庫及模型讀取仍未實測。`window.openai.uploadFile` 是 ChatGPT 宿主提供給小工具的用戶端 API。
+> 狀態（2026-10-24）：小工具端按鈕、片段時間換算與離線契約測試已整合；媒體分支 v19 先取得並核對 ingestion 回執再公開模型 ID。真實 ChatGPT 檔案庫及模型讀取仍未實測。`window.openai.uploadFile` 是 ChatGPT 宿主提供給小工具的用戶端 API。
 
 ## 1. 目的
 

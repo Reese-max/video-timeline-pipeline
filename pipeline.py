@@ -3082,6 +3082,38 @@ def video_timestamps_cover_duration(observations: list[dict[str, Any]], duration
     return min(duration - 30.0, duration * 0.5) <= peak <= duration + 30.0
 
 
+def _validate_video_timestamps(
+    observations: list[dict[str, Any]], duration: float | None,
+    *, gaps: list[tuple[float, float]] | None = None,
+) -> None:
+    """Apply the same source-time checks to each provider response before merging."""
+    known_duration = duration is not None and math.isfinite(duration) and duration > 0
+    for observation in observations:
+        stamp = observation["timestamp"]
+        if not known_duration:
+            observation["timestamp"] = max(0.0, stamp)
+            observation["timestamp_reliable"] = False
+            observation["timestamp_issue"] = "缺少影片長度，無法驗證時間碼"
+        elif stamp < 0 or stamp > duration:
+            observation["timestamp"] = max(0.0, min(stamp, duration))
+            if stamp < 0 or stamp > duration + 1.0:
+                observation["timestamp_reliable"] = False
+                observation["timestamp_issue"] = f"原始時間碼 {observation['timestamp_original']} 超出影片範圍，已夾住"
+    # ponytail: concentration flags suspicious times; exact alignment requires source-frame review.
+    if known_duration and duration >= 60:
+        # A gap entirely in the front tenth naturally produces only early events.
+        distribution = observations if gaps is None else [
+            row for row in observations
+            if any(start < row["timestamp"] < end and end > duration * 0.1 for start, end in gaps)
+        ]
+        front = [row for row in distribution if row["timestamp"] <= duration * 0.1]
+        if len(distribution) >= 5 and len(front) / len(distribution) >= 0.8:
+            for observation in front:
+                observation["timestamp_reliable"] = False
+                if not observation.get("timestamp_issue"):
+                    observation["timestamp_issue"] = "時間碼疑似被壓縮，需覆核原片"
+
+
 def _parse_video_mp4_events(parsed: dict[str, Any]) -> list[dict[str, Any]]:
     """Build observations from a video_url chat response; drop bad timestamps."""
     events = parsed.get("events") if isinstance(parsed.get("events"), list) else []
@@ -3121,13 +3153,21 @@ VIDEO_EVENT_FIELD_RULES = (
 )
 # Prompt contract for whole-video answers: no stretch of the video may go this long without an event.
 VIDEO_EVENT_MAX_GAP_SECONDS = 30.0
+# Version 3 enforces the same bound at the tail; earlier proposals exempted it.
+VIDEO_EVENT_GAP_CHECK_VERSION = 3
 # A gap-fill event this close to one already listed describes the same screen.
 VIDEO_EVENT_DUPLICATE_SECONDS = 1.0
+# Invalidate caches that bypassed requested-window timestamp validation.
+VIDEO_TIMESTAMP_VALIDATION_VERSION = 4
 
 
 def gap_checked_video_config(config: Any) -> bool:
-    """CLI visual.json written before gap filling must be analysed again, not reused."""
-    return isinstance(config, dict) and config.get("visual_event_gap_seconds") == VIDEO_EVENT_MAX_GAP_SECONDS
+    """CLI visual.json requires gap filling and per-response timestamp validation."""
+    return (
+        isinstance(config, dict)
+        and config.get("visual_event_gap_seconds") == VIDEO_EVENT_MAX_GAP_SECONDS
+        and config.get("visual_timestamp_validation_version") == VIDEO_TIMESTAMP_VALIDATION_VERSION
+    )
 
 
 def video_event_gaps(
@@ -3138,7 +3178,8 @@ def video_event_gaps(
     """Spans longer than max_gap with no visual event, measured from 0 to the end of the video."""
     if duration is None or not math.isfinite(duration) or duration <= 0:
         return []
-    stamps = sorted(max(0.0, min(float(row["timestamp"]), duration)) for row in observations)
+    stamps = sorted(max(0.0, min(float(row["timestamp"]), duration)) for row in observations
+                    if row.get("timestamp_reliable") is not False)
     edges = [0.0, *stamps, float(duration)]
     return [(start, end) for start, end in zip(edges, edges[1:]) if end - start > max_gap]
 
@@ -3198,11 +3239,14 @@ def _fill_video_event_gaps(
     added: list[dict[str, Any]] = []
     for row in found:
         stamp = row["timestamp"]
-        if any(start < stamp < end for start, end in gaps) and all(
+        # The printed prompt windows are closed; preserve real endpoint events.
+        # Dedupe still removes events already present at a boundary.
+        if any(start <= stamp <= end for start, end in gaps) and all(
             abs(stamp - other) >= VIDEO_EVENT_DUPLICATE_SECONDS for other in taken
         ):
             taken.append(stamp)
             added.append(row)
+    _validate_video_timestamps(added, duration, gaps=gaps)
     print(f"· 畫面事件補漏：{len(gaps)} 段超過 {VIDEO_EVENT_MAX_GAP_SECONDS:.0f} 秒的空檔，新增 {len(added)} 筆")
     if not added:
         return observations
@@ -3222,10 +3266,18 @@ class VideoMp4UnavailableError(RuntimeError):
     """The video could not be handed to MiniMax even after compression; there is no frame fallback."""
 
 
+def visual_gaps_pending(observations: list[dict[str, Any]] | None) -> bool:
+    return any(isinstance(row, dict) and "unanswered_gap_windows" in row
+               and (not isinstance(row["unanswered_gap_windows"], list) or bool(row["unanswered_gap_windows"]))
+               for row in observations or [])
+
+
 def reusable_video_artifact(observations: Any) -> bool:
-    """MP4 caches require per-event validation; frame-sampled results are never reused."""
-    return isinstance(observations, list) and bool(observations) and all(
+    """Reuse only versioned, fully gap-checked MP4 evidence."""
+    return isinstance(observations, list) and bool(observations) and not visual_gaps_pending(observations) and all(
         usable_visual_observation(item)
+        and item.get("video_gap_check_version") == VIDEO_EVENT_GAP_CHECK_VERSION
+        and isinstance(item.get("unanswered_gap_windows"), list)
         and isinstance(item.get("timestamp_reliable"), bool)
         and item.get("analysis_method") in WHOLE_VIDEO_ANALYSIS_METHODS
         for item in observations
@@ -3420,26 +3472,7 @@ def _analyze_video_mp4_core(
             )
             return incomplete, parsed if isinstance(parsed, dict) else None, file_id
 
-    known_duration = duration_hint is not None and math.isfinite(duration_hint) and duration_hint > 0
-    for observation in observations:
-        stamp = observation["timestamp"]
-        if not known_duration:
-            observation["timestamp"] = max(0.0, stamp)
-            observation["timestamp_reliable"] = False
-            observation["timestamp_issue"] = "缺少影片長度，無法驗證時間碼"
-        elif stamp < 0 or stamp > duration_hint:
-            observation["timestamp"] = max(0.0, min(stamp, duration_hint))
-            if stamp < 0 or stamp > duration_hint + 1.0:
-                observation["timestamp_reliable"] = False
-                observation["timestamp_issue"] = f"原始時間碼 {observation['timestamp_original']} 超出影片範圍，已夾住"
-    # ponytail: concentration flags suspicious times; exact alignment requires source-frame review.
-    if known_duration and duration_hint >= 60 and len(observations) >= 5:
-        front = [row for row in observations if row["timestamp"] <= duration_hint * 0.1]
-        if len(front) / len(observations) >= 0.8:
-            for observation in front:
-                observation["timestamp_reliable"] = False
-                if not observation.get("timestamp_issue"):
-                    observation["timestamp_issue"] = "時間碼疑似被壓縮，需覆核原片"
+    _validate_video_timestamps(observations, duration_hint)
     if from_events:
         # After the first answer's own checks, so added events never dilute its warnings.
         observations = _fill_video_event_gaps(
@@ -3459,7 +3492,8 @@ def _analyze_video_mp4_core(
         analysis_method=analysis_method,
         source_video=source_video,
         file_id=file_id,
-        extra=extra_meta,
+        extra={**(extra_meta or {}), "video_gap_check_version": VIDEO_EVENT_GAP_CHECK_VERSION,
+               "unanswered_gap_windows": [list(gap) for gap in video_event_gaps(observations, duration_hint)]},
     )
     return observations, parsed if isinstance(parsed, dict) else None, file_id
 
@@ -3582,7 +3616,8 @@ def _analyze_video_mp4_single(
     if cache_dir is not None:
         identity = dict(cache_identity or {})
         material = {
-            "version": 2,
+            "version": VIDEO_TIMESTAMP_VALIDATION_VERSION,
+            "gap_check_version": VIDEO_EVENT_GAP_CHECK_VERSION,
             "mode": "video_mp4",
             "max_event_gap_seconds": VIDEO_EVENT_MAX_GAP_SECONDS,
             "model": model,
@@ -3645,9 +3680,7 @@ def _analyze_video_mp4_single(
         parsed: dict[str, Any] | None,
         file_id: str | None,
     ) -> tuple[list[dict[str, Any]], dict[str, Any] | None, str | None]:
-        if cache_path is not None and parsed is not None and all(
-            usable_visual_observation(item) for item in observations
-        ):
+        if cache_path is not None and parsed is not None and reusable_video_artifact(observations):
             write_json(
                 cache_path,
                 {
@@ -3946,6 +3979,7 @@ def _analyze_video_mp4_chunked(
             cache_dir,
             {
                 "version": 3,
+                "gap_check_version": VIDEO_EVENT_GAP_CHECK_VERSION,
                 "mode": "video_mp4_chunked",
                 "max_event_gap_seconds": VIDEO_EVENT_MAX_GAP_SECONDS,
                 "model": model,
@@ -4037,9 +4071,12 @@ def _analyze_video_mp4_chunked(
                     f"{format_media_clock(chunk.end)}）：{summary.strip()}"
                 )
         merged.sort(key=_observation_sort_key)
-        if cache_path is not None and merged and all(
-            usable_visual_observation(item) for item in merged
-        ):
+        # Two allowed 30-second chunk margins can form a 60-second gap at a
+        # join. Recheck the original timeline after applying every offset.
+        unanswered = [list(gap) for gap in video_event_gaps(merged, duration)]
+        for observation in merged:
+            observation["unanswered_gap_windows"] = unanswered
+        if cache_path is not None and reusable_video_artifact(merged):
             write_json(
                 cache_path,
                 {
@@ -4597,7 +4634,7 @@ def render_knowledge_markdown(
 
     visual_complete = bool(observations) and all(
         usable_visual_observation(item) for item in observations
-    )
+    ) and not visual_gaps_pending(observations)
     minimax_checked = any(
         item.get("analysis_method") != "local_uniformity_check" for item in observations
     )
@@ -10143,6 +10180,7 @@ def run_pipeline(args: argparse.Namespace) -> Path:
             "workers": min(max(args.workers, 1), 4),
             "vision_workers": min(max(args.vision_workers, 1), 8),
             "visual_event_gap_seconds": VIDEO_EVENT_MAX_GAP_SECONDS,
+            "visual_timestamp_validation_version": VIDEO_TIMESTAMP_VALIDATION_VERSION,
             "language": language,
             "groq_model": args.groq_model,
             "word_timestamps": args.word_timestamps,
@@ -10411,6 +10449,7 @@ def run_pipeline(args: argparse.Namespace) -> Path:
         # Provider 未完整完成時，整體流程仍可保存逐字稿與部分結果，但視覺狀態須明確。
         manifest["visual_status"] = (
             "complete" if observations and all(usable_visual_observation(item) for item in observations)
+            and not visual_gaps_pending(observations)
             else "incomplete"
         )
         # 記下每個階段實際由誰產生：換模型後回頭看產物才知道該不該重跑

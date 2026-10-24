@@ -412,10 +412,10 @@ def completion_snapshot(root: Path, job_dir: Path, manifest: dict[str, Any]) -> 
     visual = data.get("visual", [])
     if not isinstance(visual, list):
         raise ValueError("Invalid visual artifact")
-    from pipeline import usable_visual_observation, whole_video_observation
+    from pipeline import usable_visual_observation, whole_video_observation, visual_gaps_pending
 
     if visual:
-        if not all(usable_visual_observation(row) and whole_video_observation(row) for row in visual):
+        if visual_gaps_pending(visual) or not all(usable_visual_observation(row) and whole_video_observation(row) for row in visual):
             raise ValueError("Incomplete visual evidence")
     elif (manifest.get("models") or {}).get("visual") or any(
             stream.get("codec_type") == "video" for stream in (manifest.get("video") or {}).get("streams", [])):
@@ -431,6 +431,8 @@ def completion_snapshot(root: Path, job_dir: Path, manifest: dict[str, Any]) -> 
         elif event.get("type") != "visual" or not (
                 usable_visual_observation(event.get("data")) and whole_video_observation(event["data"])):
             raise ValueError("Invalid timeline visual evidence")
+        elif visual_gaps_pending([event["data"]]):
+            raise ValueError("Incomplete timeline visual coverage")
     data["visual"] = visual  # Missing and empty visual evidence are identical for audio/captions jobs.
     revision = _hash({"format": REVISION_FORMAT, "schema_version": manifest.get("schema_version"),
                       "models": {key: value for key, value in (manifest.get("models") or {}).items() if value is not None},

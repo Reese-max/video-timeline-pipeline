@@ -282,6 +282,26 @@ class OperationsTests(unittest.TestCase):
                 provider.assert_not_called()
                 self.assertFalse((self.root / "operations.db").exists())
 
+    def test_unanswered_visual_windows_cannot_become_completed_outbox_evidence(self):
+        job, manifest = self.job()
+        visual = {"timestamp": 0, "screen_type": "影片", "visual_summary": "screen",
+                  "visible_text": [], "important_details": [], "confidence": 0.9,
+                  "analysis_method": "minimax_video", "completion_status": "complete",
+                  "unanswered_gap_windows": [[30.0, 120.0]]}
+        for location in ("visual", "timeline"):
+            with self.subTest(location=location):
+                manifest["artifacts"].pop("visual", None)
+                if location == "visual":
+                    pipeline.write_json(job / "visual.json", [visual])
+                    manifest["artifacts"]["visual"] = str((job / "visual.json").relative_to(self.root))
+                    pipeline.write_json(job / "timeline.json", [{"timestamp": 0, "type": "speech", "text": "hello"}])
+                else:
+                    pipeline.write_json(job / "timeline.json", [{"timestamp": 0, "type": "visual", "data": visual}])
+                with patch("notifications.get_configured_provider") as provider:
+                    self.assertIsNone(notifications.record_pipeline_completed_event(self.root, job, manifest))
+                    provider.assert_not_called()
+                self.assertFalse((self.root / "operations.db").exists())
+
     def test_invalid_timestamp_does_not_abort_digest_or_reconciliation(self):
         import operations as ops
         job, manifest = self.job()

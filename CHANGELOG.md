@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- 修正 #56／#105：補漏事件先驗證原片時間碼，保留提示時段端點；每段與合併後的時間軸都維持最長 30 秒的覆蓋間隔，片尾無豁免。未補完的範圍持久標記為 partial，拒絕重用／寫入完整快取及完成 outbox。舊 receipt 失效。
+- 整合 PR #95 的 #23 原生檔案引用契約：嚴格有限起訖範圍、正式 output schema 與 busy 狀態；明確按鈕先等待相符 ingestion 回執再發送模型讀檔要求。widget 升為 v19，保留上傳範圍快照；真實宿主可讀性仍待驗收。
+
 - 整合 PR #94／#96／#97：F0 與選用 Dashboard 共用 migration registry、library identity、typed filters、RRF 與 grounding。Web 初始化原子套用第 5 版 schema；唯讀請求不遷移，過期 task 不重播已提交工作。Ask 缺模型／key 時在付費檢索前停下，保留原始來源核對身分後才遮蔽公開引用。新增跨功能與安全回歸；人工語意、真實 browser／provider／正式資料驗收另列。
 
 - 整合既有 PR #92／#90／#89 的小範圍修正：ASR 補轉缺少時間碼時不再捏造時間；A 取消／恢復／刷新不停止獨立 Drive 交接輪詢；檔案庫實驗按上傳當下的原片範圍換算驗證點。小工具升為 v18，保留 v16／v17 URI 相容；#55／#57／#59 的真實媒體與 host 驗收仍待完成。

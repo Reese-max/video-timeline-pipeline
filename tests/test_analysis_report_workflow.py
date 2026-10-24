@@ -227,8 +227,11 @@ class AnalysisReportTests(unittest.TestCase):
 
     def assert_raw_binding_workflow(self, peak, scope):
         # Use the real coverage gate, clamp and placeholder stamping; only transport/gap filling are inert.
+        # Positive report cases retain bounded coverage while exercising the
+        # raw clamp; the early-only negative still fails timestamp coverage.
+        stamps = (0, peak) if peak < 50 else (0, 25, 50, 75, *([95] if peak > 100 else []), peak)
         events = [{'timestamp':stamp, 'visual_summary':'owned video event', 'confidence':0.9}
-                  for stamp in (0, peak)]
+                  for stamp in stamps]
         source = self.job/'source.mp4'
         with patch.object(server.pipeline, 'minimax_reusable_upload', return_value=('inert-file', False)), \
              patch.object(server.pipeline, 'minimax_chat', return_value=json.dumps({'events':events})), \
