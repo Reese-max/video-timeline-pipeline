@@ -1944,6 +1944,14 @@ def transcribe_all(
     hits = 0
     misses = 0
 
+    actual_duration = 0.0
+    if source_path is not None:
+        try:
+            probe = probe_video(Path(source_path))
+            actual_duration = video_duration(probe)
+        except Exception:
+            actual_duration = 0.0
+
     def one(chunk: dict[str, Any]) -> tuple[int, dict[str, Any], str, bool, float]:
         path = Path(str(chunk["path"]))
         limit_mb = float(os.getenv("GROQ_MAX_UPLOAD_MB", "25"))
@@ -1997,6 +2005,8 @@ def transcribe_all(
         chunk = chunks[index]
         offset = float(chunk["source_start"])
         chunk_duration = max(0.0, float(chunk["source_end"]) - offset)
+        if actual_duration > 0:
+            chunk_duration = min(chunk_duration, max(0.0, actual_duration - offset))
         raw_segments = result.get("segments") or []
         if not raw_segments and result.get("text"):
             raw_segments = [{"start": 0, "end": chunk_duration, "text": result["text"]}]

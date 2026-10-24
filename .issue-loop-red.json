@@ -1,0 +1,7 @@
+{
+  "repo": "Reese-max/video-timeline-pipeline",
+  "issue": 131,
+  "base_sha": "7c3ba8073afcc218fe34f8b6dd49276788071315",
+  "command": "python -X utf8 -B -m pytest tests/test_transcript_gaps.py -v -k 'test_backfills_issue55_gap' && python -X utf8 -B -c \"import sys; sys.path.insert(0,'.'); from pathlib import Path; from pipeline import transcribe_all, video_duration, probe_video; import pipeline, tempfile; video_path = Path('.')/'tests'/'fixtures'/'cutspec'/'cfr_24.mp4'; chunks = [{'index':0,'path':str(video_path),'source_start':0.0,'source_end':100.0,'size_bytes':video_path.stat().st_size,'sha256':'dummy'}]; t=transcribe_all(chunks,'key','whisper-large-v3','auto',1,Path(tempfile.mkdtemp()),source_path=video_path); max_end=max(s['end'] for s in t['segments']); assert max_end <= video_duration(probe_video(video_path)) + 0.1, f'Bug: max_end={max_end} > actual_duration'\"",
+  "exit": 1
+}
