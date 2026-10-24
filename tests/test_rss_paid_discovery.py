@@ -216,5 +216,90 @@ class PaidDiscoveryIntervalTests(unittest.TestCase):
             self.assertNotIn("paid_discovery_at", saved(root)["fb-apify"], "no call was made, so no cooldown")
 
 
+class PaidDiscoveryAddStampTests(unittest.TestCase):
+    """新增訂閱的付費盤點也必須寫入 paid_discovery_at，間隔內的排程刷新才不會再付費一次（issue #128）。"""
+    ENV = {"RSS_PAID_DISCOVERY": "apify", "RSS_PAID_DISCOVERY_MIN_HOURS": "20"}
+    FB_ID = pipeline.job_key("facebook-author", "somepage")
+    IG_ID = pipeline.job_key("instagram-author", "someone")
+
+    @staticmethod
+    def facebook_feed(author: str, provider: str) -> dict:
+        return {"title": f"Facebook {author}", "items": [], "raw_items": [],
+                "facebook": {"provider": provider, "page_id": author,
+                             "author_url": f"https://www.facebook.com/{author}",
+                             "since": "365d", "snapshot_id": "", "fetched_at": ""},
+                "not_modified": False}
+
+    @staticmethod
+    def instagram_feed(username: str) -> dict:
+        return {"title": f"Instagram @{username}", "items": [], "raw_items": [],
+                "instagram": {"provider": "brightdata", "username": username,
+                              "author_url": f"https://www.instagram.com/{username}/",
+                              "since": "365d", "snapshot_id": "sd_add", "fetched_at": ""},
+                "not_modified": False}
+
+    def test_a_paid_add_stamps_before_the_call_and_the_schedule_defers(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            paid_calls: list[str] = []
+            stamp_on_disk: list[bool] = []
+
+            def facebook(author, since, provider, *, allow_paid=False, **kwargs):
+                paid_calls.append("facebook")
+                stamp_on_disk.append(bool(
+                    saved(root).get(self.FB_ID, {}).get("paid_discovery_at")))
+                return self.facebook_feed(author, provider)
+
+            def instagram(username, since, *, allow_paid=False, **kwargs):
+                paid_calls.append("instagram")
+                return self.instagram_feed(username)
+
+            with mock.patch.dict(pipeline.os.environ, self.ENV), \
+                 mock.patch.object(pipeline, "fetch_facebook_author", side_effect=facebook), \
+                 mock.patch.object(pipeline, "fetch_instagram_author", side_effect=instagram):
+                pipeline.add_facebook_subscription(root, "somepage", since="365d",
+                                                   provider="apify", allow_paid=True)
+                pipeline.add_instagram_subscription(root, "someone", since="365d",
+                                                    max_items=5, allow_paid=True)
+                self.assertEqual(stamp_on_disk, [True],
+                                 "the stamp must be on disk before the billable call")
+                totals = pipeline.refresh_rss(root, allow_paid=False)
+            self.assertEqual(paid_calls, ["facebook", "instagram"],
+                             "the scheduled refresh must not pay again within the interval")
+            self.assertEqual(totals["deferred"], 2)
+            self.assertEqual(totals["failed"], 0)
+            subscriptions = saved(root)
+            self.assertIn("paid_discovery_at", subscriptions[self.FB_ID])
+            self.assertIn("paid_discovery_at", subscriptions[self.IG_ID])
+
+    def test_without_an_interval_a_paid_add_writes_no_stamp(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            with mock.patch.dict(pipeline.os.environ, {"RSS_PAID_DISCOVERY": "apify"}), \
+                 mock.patch.object(pipeline, "fetch_facebook_author",
+                                   side_effect=lambda *a, **k: self.facebook_feed("somepage", "apify")), \
+                 mock.patch.object(pipeline, "fetch_instagram_author",
+                                   side_effect=lambda *a, **k: self.instagram_feed("someone")):
+                pipeline.add_facebook_subscription(root, "somepage", since="365d",
+                                                   provider="apify", allow_paid=True)
+                pipeline.add_instagram_subscription(root, "someone", since="365d",
+                                                    max_items=5, allow_paid=True)
+            for subscription in pipeline.load_rss_state(root)["subscriptions"]:
+                self.assertNotIn("paid_discovery_at", subscription)
+
+    def test_an_add_that_never_pays_is_never_stamped(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            with mock.patch.dict(pipeline.os.environ, self.ENV):
+                with self.assertRaisesRegex(RuntimeError, "--allow-batch-cloud"):
+                    pipeline.add_facebook_subscription(root, "somepage", since="365d",
+                                                       provider="apify", allow_paid=False)
+                with self.assertRaisesRegex(RuntimeError, "--allow-batch-cloud"):
+                    pipeline.add_instagram_subscription(root, "someone", since="365d",
+                                                        max_items=5, allow_paid=False)
+            self.assertEqual(pipeline.load_rss_state(root)["subscriptions"], [],
+                             "a refused add must not leave a subscription behind")
+
+
 if __name__ == "__main__":
     unittest.main()

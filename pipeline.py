@@ -6947,6 +6947,21 @@ def add_facebook_subscription(
     def select_posts_mode() -> None:
         subscription["facebook_brightdata_mode"] = "posts"
 
+    # 與 refresh_rss 的 stamp_paid_attempt 相同：付費盤點送出前先把 paid_discovery_at 存檔，
+    # 讓 RSS_PAID_DISCOVERY_MIN_HOURS 間隔內的排程刷新不再重複付費。送出前先寫入也涵蓋了
+    # 在付費呼叫期間被中斷的情況；若盤點失敗，訂閱仍留在 state（該次間隔照樣消耗，收費
+    # 供應商只在 allow_paid 時才會被 add 送出）。
+    stamped = False
+    if allow_paid and provider in {"apify", "brightdata"} and paid_discovery_min_hours():
+        subscription["paid_discovery_at"] = rss_now()
+        state["subscriptions"].append(subscription)
+        try:
+            save_rss_state(root, state)
+        except Exception:
+            state["subscriptions"].pop()
+            subscription.pop("paid_discovery_at", None)
+            raise
+        stamped = True
     feed = fetch_facebook_author(page_id, since, provider, allow_paid=allow_paid,
         brightdata_mode=brightdata_mode,
         **({"max_items": max_items, "root": root, "on_mode_switch": select_posts_mode}
@@ -6960,7 +6975,12 @@ def add_facebook_subscription(
         "facebook_last_discovery": snapshot.name,
     })
     remember_facebook_posts(subscription, feed)
-    state["subscriptions"].append(subscription)
+    if stamped:
+        # 付費盤點完整跑完後，把時鐘重設為完成時間（與 refresh_rss 送出後的更新一致）。
+        subscription["last_checked"] = rss_now()
+        subscription["paid_discovery_at"] = subscription["last_checked"]
+    else:
+        state["subscriptions"].append(subscription)
     counts = queue_rss_items(state, subscription, list(feed["items"]))
     save_rss_state(root, state)
     return subscription, counts, snapshot
@@ -6987,30 +7007,74 @@ def add_instagram_subscription(
         for item in state["subscriptions"]
     ):
         raise RuntimeError("這個 Instagram 作者已經訂閱。")
+    # 付費訂閱資料先以最小欄位寫入 state 並存檔（帶 paid_discovery_at），與 refresh_rss 的
+    # stamp_paid_attempt 一樣在送出付費呼叫前就開始計時；盤點成功後再補齊抓回的欄位。
+    # 收費呼叫只會在 allow_paid 時送出；盤點失敗時訂閱仍留在 state（該次間隔照樣消耗）。
+    stamped = False
+    if allow_paid and paid_discovery_min_hours():
+        subscription = {
+            "id": job_key("instagram-author", username.casefold()),
+            "kind": "instagram-author",
+            "url": "",
+            "instagram_username": username,
+            "instagram_since": since,
+            "instagram_max_items": max_items,
+            "instagram_last_published": "",
+            "instagram_last_discovery": "",
+            "instagram_last_snapshot_id": "",
+            "name": name.strip(),
+            "enabled": True,
+            "latest_only": latest_only,
+            "keywords": keywords or [],
+            "tags": tags or [],
+            "last_checked": rss_now(),
+            "last_error": "",
+            "paid_discovery_at": rss_now(),
+        }
+        state["subscriptions"].append(subscription)
+        try:
+            save_rss_state(root, state)
+        except Exception:
+            state["subscriptions"].pop()
+            subscription.pop("paid_discovery_at", None)
+            raise
+        stamped = True
     feed = fetch_instagram_author(
         username, since, max_items=max_items, allow_paid=allow_paid, root=root
     )
     newest = next((item["published"] for item in feed["items"] if item.get("published")), "")
     snapshot = write_instagram_discovery(root, feed)
-    subscription = {
-        "id": job_key("instagram-author", username.casefold()),
-        "kind": "instagram-author",
-        "url": str(feed["instagram"]["author_url"]),
-        "instagram_username": username,
-        "instagram_since": since,
-        "instagram_max_items": max_items,
-        "instagram_last_published": newest,
-        "instagram_last_discovery": snapshot.name,
-        "instagram_last_snapshot_id": feed["instagram"]["snapshot_id"],
-        "name": name.strip() or str(feed["title"]),
-        "enabled": True,
-        "latest_only": latest_only,
-        "keywords": keywords or [],
-        "tags": tags or [],
-        "last_checked": rss_now(),
-        "last_error": "",
-    }
-    state["subscriptions"].append(subscription)
+    if stamped:
+        subscription.update({
+            "url": str(feed["instagram"]["author_url"]),
+            "name": name.strip() or str(feed["title"]),
+            "instagram_last_published": newest,
+            "instagram_last_discovery": snapshot.name,
+            "instagram_last_snapshot_id": feed["instagram"]["snapshot_id"],
+            # 付費盤點完整跑完後，把時鐘重設為完成時間（與 refresh_rss 送出後的更新一致）。
+            "last_checked": rss_now(),
+            "paid_discovery_at": rss_now(),
+        })
+    else:
+        subscription = {
+            "id": job_key("instagram-author", username.casefold()),
+            "kind": "instagram-author",
+            "url": str(feed["instagram"]["author_url"]),
+            "instagram_username": username,
+            "instagram_since": since,
+            "instagram_max_items": max_items,
+            "instagram_last_published": newest,
+            "instagram_last_discovery": snapshot.name,
+            "instagram_last_snapshot_id": feed["instagram"]["snapshot_id"],
+            "name": name.strip() or str(feed["title"]),
+            "enabled": True,
+            "latest_only": latest_only,
+            "keywords": keywords or [],
+            "tags": tags or [],
+            "last_checked": rss_now(),
+            "last_error": "",
+        }
+        state["subscriptions"].append(subscription)
     counts = queue_rss_items(state, subscription, list(feed["items"]))
     save_rss_state(root, state)
     return subscription, counts, snapshot
