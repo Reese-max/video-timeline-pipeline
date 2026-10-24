@@ -68,19 +68,19 @@ def hours_ago(hours: float) -> str:
 
 class PaidDiscoveryAllowlistTests(unittest.TestCase):
     def test_without_the_setting_a_scheduled_refresh_pays_for_nothing(self) -> None:
-        self.assertEqual(refresh({"RSS_PAID_DISCOVERY": ""}, False), {"apify": False, "brightdata": False})
+        self.assertEqual(refresh({"RSS_PAID_DISCOVERY": ""}, False), {})
 
     def test_named_provider_is_allowed_and_the_other_stays_blocked(self) -> None:
-        self.assertEqual(refresh({"RSS_PAID_DISCOVERY": " Apify "}, False), {"apify": True, "brightdata": False})
+        self.assertEqual(refresh({"RSS_PAID_DISCOVERY": " Apify "}, False), {"apify": True})
 
     def test_allow_batch_cloud_still_allows_every_provider(self) -> None:
         self.assertEqual(refresh({"RSS_PAID_DISCOVERY": ""}, True), {"apify": True, "brightdata": True})
 
     def test_unknown_names_allow_nothing(self) -> None:
-        self.assertEqual(refresh({"RSS_PAID_DISCOVERY": "all,*,yes"}, False), {"apify": False, "brightdata": False})
+        self.assertEqual(refresh({"RSS_PAID_DISCOVERY": "all,*,yes"}, False), {})
 
     def test_each_name_only_allows_itself(self) -> None:
-        self.assertEqual(refresh({"RSS_PAID_DISCOVERY": "brightdata"}, False), {"apify": False, "brightdata": True})
+        self.assertEqual(refresh({"RSS_PAID_DISCOVERY": "brightdata"}, False), {"brightdata": True})
         self.assertEqual(refresh({"RSS_PAID_DISCOVERY": "apify,brightdata"}, False), {"apify": True, "brightdata": True})
 
     def test_free_meta_provider_is_not_affected(self) -> None:
@@ -99,7 +99,8 @@ class PaidDiscoveryIntervalTests(unittest.TestCase):
         seen = refresh(self.ENV, False, last={"fb-apify": six_hours_ago}, out=out)
         self.assertNotIn("apify", seen, "Apify must not be called again within 20 hours")
         self.assertEqual(out["totals"]["deferred"], 1)
-        self.assertEqual(out["totals"]["failed"], 1, "only the blocked Bright Data subscription fails")
+        self.assertEqual(out["totals"]["failed"], 0, "a provider excluded by policy is not a failed feed")
+        self.assertEqual(out["totals"]["skipped"], 1)
         self.assertEqual(out["subscriptions"]["fb-apify"]["paid_discovery_at"], six_hours_ago)
         self.assertNotIn("last_checked", out["subscriptions"]["fb-apify"])
 
@@ -143,7 +144,8 @@ class PaidDiscoveryIntervalTests(unittest.TestCase):
             self.assertEqual(run_refresh(root, self.ENV, True), {"apify": True, "brightdata": True})
             out: dict = {}
             self.assertEqual(run_refresh(root, self.ENV, False, out), {}, "both paid subscriptions wait after the manual run")
-            self.assertEqual(out["totals"]["deferred"], 2)
+            self.assertEqual(out["totals"]["deferred"], 1)
+            self.assertEqual(out["totals"]["skipped"], 1)
 
     def test_without_an_interval_nothing_extra_is_saved_before_the_call(self) -> None:
         out: dict = {}

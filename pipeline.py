@@ -2092,23 +2092,18 @@ def transcribe_all(
                     }
                 )
                 gap_segments = backfill_result.get("segments") or []
-                if not gap_segments and backfill_result.get("text"):
-                    gap_segments = [
-                        {
-                            "start": 0,
-                            "end": window_end - window_start,
-                            "text": backfill_result["text"],
-                        }
-                    ]
+                # Untimed context cannot prove that speech inside the gap was recovered.
                 for gap_segment in gap_segments:
                     if not isinstance(gap_segment, dict):
                         continue  # 供應商／快取回應混入非段落元素：跳過，不整批作廢
                     gap_text = str(gap_segment.get("text", "")).strip()
                     if not gap_text or is_silence(gap_segment.get("no_speech_prob"), gap_segment.get("avg_logprob"), gap_text):
                         continue
+                    if isinstance(gap_segment.get("start"), bool) or isinstance(gap_segment.get("end"), bool):
+                        continue  # JSON booleans are not timestamps, despite float(True) being valid Python.
                     try:
-                        raw_start = float(gap_segment.get("start", 0))
-                        raw_end = float(gap_segment.get("end", window_end - window_start))
+                        raw_start = float(gap_segment.get("start"))
+                        raw_end = float(gap_segment.get("end"))
                     except (TypeError, ValueError):
                         continue  # 壞了一個段落的時間戳：跳過，不整批作廢
                     if not (math.isfinite(raw_start) and math.isfinite(raw_end) and 0 <= raw_start < raw_end):
@@ -3838,36 +3833,48 @@ def split_video_mp4_into_chunks(
     # when the muxer did not report a usable end.
     fixed: list[VideoMp4Chunk] = []
     for index, chunk in enumerate(chunks):
+        known_duration = duration is not None and math.isfinite(duration) and duration > 0
+        if known_duration and chunk.start >= duration:
+            continue  # Audio/encoder padding beyond the source timeline is not a visual chunk.
         end = chunk.end
         if index + 1 < len(chunks):
             end = max(end, chunks[index + 1].start)
         elif duration is not None and duration > chunk.start:
             end = max(end, float(duration))
+        if known_duration:
+            end = min(end, float(duration))
         fixed.append(chunk._replace(end=max(end, chunk.start)))
     return fixed
 
 
-def offset_chunk_timestamps(observations: list[dict[str, Any]], offset: float) -> None:
+def offset_chunk_timestamps(observations: list[dict[str, Any]], offset: float,
+                            duration: float | None = None) -> None:
     """Move a chunk's timestamps onto the original video timeline.
 
     `timestamp_original` keeps the model's own answer: it belongs to the
     segment, and `chunk_start` already says where that segment began, so the
     original value stays comparable with the raw segment answer.
     """
-    if not offset:
-        return
     for observation in observations:
-        _offset_timestamp_field(observation, "timestamp", offset)
+        _offset_timestamp_field(observation, "timestamp", offset, duration)
         data = observation.get("data")
         if isinstance(data, dict):
-            _offset_timestamp_field(data, "timestamp", offset)
+            _offset_timestamp_field(data, "timestamp", offset, duration)
 
 
-def _offset_timestamp_field(container: dict[str, Any], key: str, offset: float) -> None:
+def _offset_timestamp_field(container: dict[str, Any], key: str, offset: float,
+                            duration: float | None = None) -> None:
     value = container.get(key)
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return
-    container[key] = float(value) + offset
+    absolute = float(value) + offset
+    if duration is not None and math.isfinite(duration) and duration > 0:
+        bounded = max(0.0, min(absolute, duration))
+        if abs(bounded - absolute) > 1e-6:
+            container["timestamp_reliable"] = False
+            container["timestamp_issue"] = "偏移後時間碼超出原片範圍，已夾住，需覆核原片"
+        absolute = bounded
+    container[key] = absolute
 
 
 def _observation_sort_key(observation: dict[str, Any]) -> float:
@@ -3916,7 +3923,7 @@ def _analyze_video_mp4_chunked(
         cache_path = _video_mp4_cache_path(
             cache_dir,
             {
-                "version": 2,
+                "version": 3,
                 "mode": "video_mp4_chunked",
                 "max_event_gap_seconds": VIDEO_EVENT_MAX_GAP_SECONDS,
                 "model": model,
@@ -3991,7 +3998,7 @@ def _analyze_video_mp4_chunked(
                     "chunk_end": round(chunk.end, 3),
                 },
             )
-            offset_chunk_timestamps(observations, chunk.start)
+            offset_chunk_timestamps(observations, chunk.start, duration)
             for observation in observations:
                 observation["chunk_index"] = index
                 observation["chunk_start"] = chunk.start
@@ -6454,7 +6461,9 @@ def fetch_social_post(url: str, cache_root: Path, *, allow_paid: bool = False) -
         if not re.fullmatch(r"sd?_[A-Za-z0-9_-]+", snapshot):
             raise RuntimeError("快取 snapshot_id 無效。")
         progress = get_json(f"{BRIGHTDATA_API_ROOT}/progress/{snapshot}", headers)
-        status = progress.get("status") if isinstance(progress, dict) else None
+        status = str(progress.get("status") or "").lower() if isinstance(progress, dict) else ""
+        if status in {"canceled", "cancelled"}:
+            raise RuntimeError(f"Bright Data snapshot {snapshot} 已取消；保留 snapshot，不自動重建計費工作。")
         if status == "failed":
             raise RuntimeError("Bright Data 採集失敗；保留 snapshot，不自動重建計費工作。")
         if status != "ready":
@@ -6493,6 +6502,8 @@ def brightdata_author_snapshot(folder: Path, trigger_url: str, headers: dict[str
         while True:
             progress = get_json(f"{BRIGHTDATA_API_ROOT}/progress/{snapshot_id}", headers)
             status = str(progress.get("status") or "").lower() if isinstance(progress, dict) else ""
+            if status in {"canceled", "cancelled"}:
+                raise RuntimeError(f"Bright Data snapshot {snapshot_id} 已取消；不自動重建計費工作。")
             if status == "failed":
                 raise RuntimeError(f"Bright Data snapshot {snapshot_id} 執行失敗。")
             if status == "ready":
@@ -6902,6 +6913,22 @@ def add_rss_subscription(
     return subscription, counts
 
 
+def reserve_initial_paid_discovery(root: Path, state: dict[str, Any],
+                                   subscription: dict[str, Any], allow_paid: bool) -> bool:
+    """Persist the initial paid attempt before dispatch, including interrupted adds.
+
+    A pending subscription can be refreshed after its cooldown; retrying add
+    must not create a second billable discovery for the same author.
+    """
+    if not paid_discovery_provider(subscription) or not allow_paid or not paid_discovery_min_hours():
+        return False
+    subscription["paid_discovery_at"] = rss_now()
+    subscription["last_error"] = "首次付費盤點尚未完成；請於盤點間隔後刷新訂閱。"
+    state["subscriptions"].append(subscription)
+    save_rss_state(root, state)
+    return True
+
+
 def add_facebook_subscription(
     root: Path,
     author: str,
@@ -6947,6 +6974,7 @@ def add_facebook_subscription(
     def select_posts_mode() -> None:
         subscription["facebook_brightdata_mode"] = "posts"
 
+    reserved = reserve_initial_paid_discovery(root, state, subscription, allow_paid)
     feed = fetch_facebook_author(page_id, since, provider, allow_paid=allow_paid,
         brightdata_mode=brightdata_mode,
         **({"max_items": max_items, "root": root, "on_mode_switch": select_posts_mode}
@@ -6960,7 +6988,9 @@ def add_facebook_subscription(
         "facebook_last_discovery": snapshot.name,
     })
     remember_facebook_posts(subscription, feed)
-    state["subscriptions"].append(subscription)
+    subscription["last_error"] = ""
+    if not reserved:
+        state["subscriptions"].append(subscription)
     counts = queue_rss_items(state, subscription, list(feed["items"]))
     save_rss_state(root, state)
     return subscription, counts, snapshot
@@ -6987,22 +7017,16 @@ def add_instagram_subscription(
         for item in state["subscriptions"]
     ):
         raise RuntimeError("這個 Instagram 作者已經訂閱。")
-    feed = fetch_instagram_author(
-        username, since, max_items=max_items, allow_paid=allow_paid, root=root
-    )
-    newest = next((item["published"] for item in feed["items"] if item.get("published")), "")
-    snapshot = write_instagram_discovery(root, feed)
     subscription = {
         "id": job_key("instagram-author", username.casefold()),
         "kind": "instagram-author",
-        "url": str(feed["instagram"]["author_url"]),
+        "url": instagram_author_url(username),
         "instagram_username": username,
         "instagram_since": since,
         "instagram_max_items": max_items,
-        "instagram_last_published": newest,
-        "instagram_last_discovery": snapshot.name,
-        "instagram_last_snapshot_id": feed["instagram"]["snapshot_id"],
-        "name": name.strip() or str(feed["title"]),
+        "instagram_last_published": "",
+        "instagram_last_snapshot_id": "",
+        "name": name.strip() or f"Instagram {username}",
         "enabled": True,
         "latest_only": latest_only,
         "keywords": keywords or [],
@@ -7010,7 +7034,21 @@ def add_instagram_subscription(
         "last_checked": rss_now(),
         "last_error": "",
     }
-    state["subscriptions"].append(subscription)
+    reserved = reserve_initial_paid_discovery(root, state, subscription, allow_paid)
+    feed = fetch_instagram_author(
+        username, since, max_items=max_items, allow_paid=allow_paid, root=root
+    )
+    snapshot = write_instagram_discovery(root, feed)
+    subscription.update({
+        "url": str(feed["instagram"]["author_url"]),
+        "name": name.strip() or str(feed["title"]),
+        "instagram_last_published": next((item["published"] for item in feed["items"] if item.get("published")), ""),
+        "instagram_last_discovery": snapshot.name,
+        "instagram_last_snapshot_id": feed["instagram"]["snapshot_id"],
+        "last_error": "",
+    })
+    if not reserved:
+        state["subscriptions"].append(subscription)
     counts = queue_rss_items(state, subscription, list(feed["items"]))
     save_rss_state(root, state)
     return subscription, counts, snapshot
@@ -7059,10 +7097,14 @@ def refresh_rss(root: Path, workers: int = 4, allow_paid: bool = False) -> dict[
         return bool(min_hours and paid_discovery_provider(item) and last <= now + 60
                     and now - last < min_hours * 3600)
 
-    due = [item for item in enabled if not waiting(item)]
+    blocked = [item for item in enabled if paid_discovery_provider(item)
+               and not paid_discovery_allowed(paid_discovery_provider(item), allow_paid)]
+    permitted = [item for item in enabled if item not in blocked]
+    due = [item for item in permitted if not waiting(item)]
     totals = {
         "feeds": len(enabled), "unchanged": 0, "failed": 0,
-        "queued": 0, "filtered": 0, "skipped": 0, "updated": 0, "deferred": len(enabled) - len(due),
+        "queued": 0, "filtered": 0, "skipped": len(blocked), "updated": 0,
+        "deferred": len(permitted) - len(due),
     }
     stamp_lock = threading.Lock()
     dispatched: set[int] = set()

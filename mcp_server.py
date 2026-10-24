@@ -66,7 +66,7 @@ MCP_PUBLIC_BASE_URL = (
 MCP_MEDIA_BASE_URL = (
     os.getenv("MCP_MEDIA_BASE_URL", "") or MCP_PUBLIC_BASE_URL
 ).rstrip("/")
-WIDGET_VERSION = 17
+WIDGET_VERSION = 18
 
 
 def ui_uri(version: int) -> str:
@@ -896,6 +896,33 @@ def _count_segment_list_rows(path: Path) -> int:
     return sum(1 for row in _read_segment_csv(path) if len(row) >= 3)
 
 
+def _remove_nonvisual_tail(segment_dir: Path, list_path: Path) -> None:
+    """Discard only trailing muxer outputs that contain no usable visual interval."""
+    rows = _read_segment_csv(list_path)
+    changed = False
+    while rows:
+        row = rows[-1]
+        if len(row) != 3 or not re.fullmatch(r"segment_\d{3,}\.mp4", row[0]):
+            break
+        path = segment_dir / row[0]
+        try:
+            probe = pipeline.probe_video(path, segment_dir / ".tail-probe.json")
+            invalid = not any(s.get("codec_type") == "video" for s in probe.get("streams", []))
+        except (DeadlineExceeded, ExecutionCancelled):
+            raise
+        except (RuntimeError, OSError, ValueError):
+            break  # Unreadable/corrupt video is still a validation error.
+        if not invalid:
+            # A broken CSV interval is not evidence that real frames can be
+            # discarded. Leave visual media for normal validation/rebuilding.
+            break
+        path.unlink(missing_ok=True)
+        rows.pop()
+        changed = True
+    if changed:
+        pipeline.write_text(list_path, "".join(",".join(row) + "\n" for row in rows))
+
+
 def _completed_segment_rows(
     segment_dir: Path, rows: list[list[str]], first_index: int = 0,
     min_start: float = 0.0, max_start: float = 1.0
@@ -1029,14 +1056,20 @@ def split_video(video_path: Path, segment_dir: Path, segment_seconds: int,
     preset = split_x264_preset()
     settings = {"max_long_side": long_side, "x264_preset": preset}
     segment_dir.mkdir(parents=True, exist_ok=True)
-    if duration is None:
-        # 呼叫端沒給長度時自行 probe；probe 失敗退回「無法判斷是否全部完成」的原行為。
-        try:
-            duration = pipeline.video_duration(pipeline.probe_video(video_path))
-        except (DeadlineExceeded, ExecutionCancelled):
-            raise
-        except Exception:
-            duration = None
+    try:
+        probe = pipeline.probe_video(video_path, segment_dir / ".source-probe.json" if duration is not None else None)
+        # Container duration can include an audio-only tail. Split coverage is
+        # about frames, so validate against the selected visual stream's end.
+        visual = next((s for s in probe.get("streams", []) if s.get("codec_type") == "video"), {})
+        visual_duration = float(visual.get("duration") or 0)
+        if math.isfinite(visual_duration) and visual_duration > 0:
+            duration = visual_duration
+        elif duration is None:
+            duration = pipeline.video_duration(probe)
+    except (DeadlineExceeded, ExecutionCancelled):
+        raise
+    except (RuntimeError, ValueError):
+        pass  # Preserve the caller's known duration if stream probing is unavailable.
     if mode == "transcode":
         return _split_with_encoder(video_path, segment_dir, segment_seconds, duration,
                                    split_encoder_args(), "transcode",
@@ -1070,6 +1103,16 @@ def _split_with_encoder(video_path: Path, segment_dir: Path, segment_seconds: in
         saved = json.loads(marker_path.read_text(encoding="utf-8"))
     except (OSError, ValueError):
         saved = None
+    if saved == params:
+        _remove_nonvisual_tail(segment_dir, list_path)
+        _remove_nonvisual_tail(segment_dir, resume_path)
+        if not resume and duration is not None and math.isfinite(duration) and duration > 0:
+            try:
+                # A complete copy can be reused; an incomplete copy still
+                # starts from zero because keyframe seeks cannot be resumed.
+                return _validated_segments(segment_dir, duration, SPLIT_TAIL_TOLERANCE_COPY)
+            except (RuntimeError, OSError, ValueError):
+                pass
     completed: list[tuple[str, float, float]] = []
     if resume and saved == params:
         # 參數一致：以 segments.csv 為準保留已完成分段，上次續切留下的暫存清單先救回，
@@ -1181,6 +1224,7 @@ def _split_with_encoder(video_path: Path, segment_dir: Path, segment_seconds: in
             _write_segment_csv(list_path, completed)
             resume_path.unlink(missing_ok=True)
     try:
+        _remove_nonvisual_tail(segment_dir, list_path)
         if mode == "copy":
             _clamp_copy_first_segment_start(segment_dir)
         result = _validated_segments(segment_dir, duration, tail_tolerance)

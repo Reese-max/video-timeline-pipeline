@@ -93,6 +93,7 @@ UI URI 升為 `ui://video-timeline-pipeline/v16-<媒體網址 hash>.html`，並�
 ### v15：背景工作、可核對證據與儲存管理
 
 準備／分析／Drive 工具支援 `background=true`；可用 `get_video_job` 查進度，`cancel_video_job` 取消，`resume_video_job` 續跑，`get_prepared_video` 恢復結果及更新下載網址。新介面使用背景模式，舊客戶端的同步預設仍相容。準備完成後 widget 自動同時送出分析與 Drive 背景工作（Drive 先送；paired worker 允許同一 job 的分析與 Drive 片段上傳並行，最多兩個 worker；其他工作依佇列排程）；未設定 Drive 時只自動跑分析。兩路互不等待、失敗隔離；手動按鈕保留重試入口。交接內容只放檔案 ID／網址／大小與原片分段時間，不含任何 A 的結果，並提供「一鍵複製」與「開新一般對話」。
+取消或恢復 A 只調整 A 的輪詢，Drive 交接仍繼續；重新取得狀態會獨立恢復兩路輪詢，純讀取不會重新送出分析或上傳。
 
 A 分析完成時，本機產生 `A_server_analysis.md`（逐字稿、畫面時間軸、品質與待整理摘要），widget 自動取得報告快照並提示等待 ChatGPT 整理摘要。「交給 ChatGPT 整理」要求 ChatGPT 先讀取目前證據與報告綁定，再呼叫 `finalize_analysis_report` 提交摘要及來源註記；也可在 widget 明確填寫後提交。影片片段已在 Drive 且兩路 worker 已停止時，排入獨立的報告上傳工作，放進同一個 Drive 資料夾：分析證據完整且不需覆核（`evidence_status=complete`、`quality.status=evidence_available`）時不必等摘要，直接上傳純證據版；畫面分析失敗但語音完整可靠（`visual_status=error`、`audio_status=complete`、`speech_reliable=true`、逐字稿無缺口）時標 `evidence_scope=speech_only`，報告開頭註明只含語音，同樣免摘要上傳；其餘情況仍要先有 `summary_status=caller_submitted`。之後再提交摘要會另外上傳一份同名新版（只差摘要段）。B 交接內容已含第二步：B 先獨立輸出，再自行讀取同資料夾的 A 報告合併；A 尚未就緒才需要貼合併指令。合併規則：畫面文字與數字採 B，A 的不同讀法放附錄；講話內容採 A，A 的 `quality.speech_reliable=false`（逐字稿只有低信心的片尾套語〔avg_logprob < -0.3〕、只有符號或沒有語音）時寫「沒有可信的語音內容」、A 的語音文字只列附錄，並在分析結果提示建議加跑 B（`quality.route_b_reasons` 列出缺少的是語音、逐字稿或畫面）。可免摘要上傳的報告在快照中顯示 `awaiting_segments`，widget 會自動追蹤到上傳完成。widget 追蹤 queued／running 報告；`report_ready` 且 `verified` 時顯示「A 已完成」並啟用「複製合併指令」。指令以「合併：」開頭，保留 file_id、SHA-256 與未獨立驗證聲明。
 
@@ -107,6 +108,7 @@ v15 修正摘要早於 Drive 上傳完成時的狀態追蹤：`caller_submitted`
 UI URI 曾升為 `ui://video-timeline-pipeline/v15-<媒體網址 hash>.html`（現行版本見上方 v16）。以下 v8–v14 段落保留歷史修復紀錄。
 
 v14 的可收合「實驗：存到 ChatGPT 檔案庫（#59）」只在使用者點擊分段按鈕後下載 MP4，再以宿主 `uploadFile(file, { library: true })` 上傳；一般上傳備援也必須另行點擊，不自動重送。這是選用的用戶端路徑，主流程維持既有伺服器分析。畫面顯示 fileId、大小、耗時、現算 SHA-256 與是否取得下載網址，不顯示或保存簽章網址。另按「請模型讀這個檔案」才將檔案 ID 加入模型可見狀態並送出追問；缺少宿主 API 時顯示能力診斷。成功回傳不代表檔案已出現在檔案庫或模型能讀取：大小／型別上限、真實錯誤格式及 library 不可用時的行為均未驗證，需在真實 ChatGPT 工作階段測試。
+v18 的實驗題目使用上傳當下保存的片段範圍，把原片 0:30、1:05、2:10 換算為片段相對秒數（保留毫秒）；範圍未知就明說無法核對指定點。題目不含標準答案或已知雜湊，也不把追問已送出當成模型已讀到影片。
 
 ### MCP 影音暫存保留 7 天（有 Drive 完整備份時改為分析後清理）
 
@@ -198,7 +200,7 @@ python scripts/migrate_drive_single_folder.py --jobs-root mcp_jobs --apply --tra
 
 **A1 主機（2 OCPU）實測**（25.5 分鐘 VP9 1080x1920 影片）：重新編碼（veryfast、crf 28）需約 14–15 分鐘；**stream copy（`-c copy -f segment -segment_time 120`）只要 1.1 秒**，13 段、邊界在 120 秒倍數，VP9 分段可正常產生預覽圖。若必須重新編碼：長邊縮到 1280 為 2.63 倍速、檔案小 39%（現行 1080p 為 1.82 倍速）；`ultrafast` 沒有更快且檔案大 3 倍。
 
-**注意**：copy 的分段維持原編碼（例如 VP9），部分瀏覽器與 iOS 無法播放；分段時間以 `segments.csv` 的實際值為準（copy 不能強制關鍵畫面，切點落在下一個關鍵畫面）。copy 與 transcode 都用 `-avoid_negative_ts disabled`，分段沿用來源時間軸、切點與播放時間軸一致，同樣以 `segments.csv` 的實際值為準。**需要到處都能播放的 H.264 分段：設 `MCP_SEGMENT_MODE=transcode`**。copy 模式不做續跑（重切只要幾秒；`-ss` 會對齊到關鍵畫面，偏移合併不可靠），遇到中斷殘留一律清空重切；transcode 模式保留中斷續切。模式或設定改變時，舊分段會全部重切（參數記在 `segments/.split-params.json`）。
+**注意**：copy 的分段維持原編碼（例如 VP9），部分瀏覽器與 iOS 無法播放；分段時間以 `segments.csv` 的實際值為準（copy 不能強制關鍵畫面，切點落在下一個關鍵畫面）。copy 與 transcode 都用 `-avoid_negative_ts disabled`，分段沿用來源時間軸、切點與播放時間軸一致，同樣以 `segments.csv` 的實際值為準。**需要到處都能播放的 H.264 分段：設 `MCP_SEGMENT_MODE=transcode`**。相同來源與設定的完整 copy 分段可直接重用；copy 模式不續切中斷片段（`-ss` 會對齊到關鍵畫面，偏移合併不可靠），未完成時清空重切。transcode 模式保留中斷續切。尾段覆蓋以影像串流長度驗證，較長的純音訊尾段不會使準備失敗；續切殘留的純音訊輸出會移除，含影像但時間清單損壞的檔案仍交由正常驗證。模式或設定改變時，舊分段會全部重切（參數記在 `segments/.split-params.json`）。
 
 容量保護是事前檢查：下載前預留來源上限，切割／分析前至少再預留一份來源大小與最低剩餘空間；轉碼大小不固定，這不是磁碟配額保證。準備、分析、Drive 上傳共用單程序工作鎖；忙碌時立即回傳可重試錯誤，不讓背景執行緒無限排隊。仍採同步處理；持久化長片佇列、Drive 配額管理、定期刪除未實作。沒有保留天數授權時不刪除任何既有影片。
 
@@ -279,7 +281,9 @@ python pipeline.py --facebook-author 'https://www.facebook.com/<PUBLIC_PAGE>/' -
 Apify Token 一律放在 `Authorization` header，不放 URL、輸出或 Git。Actor 只負責發現公開貼文，`captionText=false`，實際影音仍由 yt-dlp 下載並交給 Groq 轉錄、MiniMax 整理。官方目前的輸入 schema 明載此 Actor 只支援公開 Page、不支援 personal profile，因此個人帳號仍列為未保證支援；私人／登入限定內容不處理。`APIFY_FACEBOOK_RESULTS_LIMIT` 是 Actor 必填的單次結果預算，本工具取回資料集時會持續分頁、不另行截斷；Actor 的結果完整性仍受 Facebook 可見性與供應商能力限制。請參考 [Actor 輸入](https://apify.com/apify/facebook-posts-scraper/input-schema)、[API](https://apify.com/apify/facebook-posts-scraper/api) 與 [計價](https://apify.com/apify/facebook-posts-scraper/pricing)。
 
 排程刷新（沒加 `--allow-batch-cloud` 的 `--rss-refresh`）預設不跑任何付費盤點。`RSS_PAID_DISCOVERY` 以逗號列出排程可自行使用的供應商（`apify`、`brightdata`），例如 `RSS_PAID_DISCOVERY=brightdata` 即可讓 Facebook Bright Data 與 Instagram 作者訂閱自動刷新，不必在排程加 `--allow-batch-cloud`；`RSS_PAID_DISCOVERY=apify` 則只放行 Apify。每次 Apify run 仍以 `APIFY_MAX_TOTAL_CHARGE_USD` 封頂，供應商方案的每月上限才是最終上限。
+允許清單排除的付費訂閱記為 `skipped`，不呼叫供應商、不覆寫既有錯誤，也不使刷新失敗；已允許供應商的 API／網路錯誤仍記為失敗。
 `RSS_PAID_DISCOVERY_MIN_HOURS`（小時，預設 0＝不限）讓這類排程自行放行的付費盤點每個訂閱至少間隔指定時間：例如排程每天跑 3 次時設 `20`，正常排程下每個 Apify 粉專約每天盤點一次（這是最短間隔、不是日曆日：停機後補跑可能同一天兩次；也是每個訂閱各自計算，不是帳戶總額上限）；未到間隔的訂閱記為 `deferred`、不算失敗，免費的 RSS／YouTube 照常每次刷新。間隔從每次付費嘗試起算，且在送出前就先存檔（失敗或中途被中斷的 run 也可能已計費）；明確加 `--allow-batch-cloud` 不受限，但仍會重設起算時間。
+設定間隔後，手動新增 Facebook／Instagram 付費訂閱也會在初次盤點前保存訂閱與起算時間。初次盤點中斷時保留「尚未完成」狀態；稍後刷新既有訂閱即可，重新新增同一作者會被擋下。未設定間隔時不新增這個起算欄位。
 
 公開 Facebook Page 也可用 Bright Data，支援 Reels by profile URL（dataset `gd_lyclm3ey2q6rww027t`）與 Pages Posts by profile URL（dataset `gd_lkaxegm826bjpoo9m5`）兩種模式：
 
@@ -533,6 +537,7 @@ python pipeline.py --url '...' --transcribe-backend local --whisper-model small
 turbo 不只聽錯關鍵字，還把 "in front of" 縮成 "one of"，整句語意都變了。慢一倍換全對，對「處理一次、往後反覆查詢」的知識庫划算，所以預設用非 turbo 版。
 
 切段邊界漏轉會自動補轉（issue #55）：Groq 轉錄合併後若出現超過 5 秒的內部斷層（片頭片尾除外），會對斷層前後各取 15 秒上下文補轉一次再合併；補轉結果同樣走快取，重跑不再付費。逐字稿內的 `gap_check.remaining` 即為驗收狀態（空陣列＝無斷層）。單次最多補 8 個斷層（先補最大的）。單一斷層補轉失敗不丟整份逐字稿，只記在 `backfill_errors`；預算／取消／超時照常中斷。
+補轉回應必須有合法的 start/end 才能縮小缺口；只有文字或缺少時間欄位時保留未補狀態，不替模型捏造覆蓋整段的時間。
 
 預設跑 CPU。`device="cuda"` 在建構時不會報錯，缺 `cublas64_12.dll` 要等真的開始轉錄才炸，那時音訊已經切完、時間也花掉了——所以要用 GPU 得明確設 `WHISPER_DEVICE=cuda`（另需 CUDA runtime 與 cuDNN）。
 

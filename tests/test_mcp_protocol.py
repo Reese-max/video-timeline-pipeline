@@ -10,6 +10,11 @@ import mcp_server as server
 
 
 class ProtocolSmokeTests(unittest.TestCase):
+    def test_checkpoint_and_polling_fixes_use_fresh_widget_cache_key(self):
+        released_uri = server.ui_uri(17)
+        self.assertNotEqual(server.UI_URI, released_uri)
+        self.assertIn(released_uri, server.LEGACY_UI_URIS)
+
     def test_initialize_tools_resource_and_runtime_health_without_providers(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory).resolve()
@@ -44,7 +49,7 @@ class ProtocolSmokeTests(unittest.TestCase):
                     self.assertEqual([item['uri'] for item in resources], [server.UI_URI, *server.LEGACY_UI_URIS])
                     for number, legacy in enumerate(server.LEGACY_UI_URIS, 5):
                         self.assertEqual(call('resources/read', {'uri': legacy}, number)['contents'][0]['text'], contents[0]['text'])
-                    self.assertEqual([uri.split('/')[-1].split('-')[0] for uri in server.LEGACY_UI_URIS], ['v15', 'v16'])
+                    self.assertEqual([uri.split('/')[-1].split('-')[0] for uri in server.LEGACY_UI_URIS], ['v16', 'v17'])
                     self.assertEqual(tools['prepare_video_for_chatgpt']['_meta']['openai/outputTemplate'], server.UI_URI)
                     health = client.get('/health').json()
                     deadline = time.monotonic() + 3
@@ -55,9 +60,9 @@ class ProtocolSmokeTests(unittest.TestCase):
                     self.assertFalse(health['writer_busy'])
                     self.assertFalse(health['deployment_draining'])
                     self.assertEqual(health['runtime_sha256'], server.RUNTIME_SHA256)
-                    self.assertEqual(health['version'], 17)
-                    self.assertIn('/v17-', str(resource['uri']))
-                    self.assertIn('version: "17"', contents[0]['text'])
+                    self.assertEqual(health['version'], 18)
+                    self.assertIn('/v18-', str(resource['uri']))
+                    self.assertIn('version: "18"', contents[0]['text'])
                 finally:
                     if server._QUEUE is not None:
                         server._QUEUE.close()

@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- 整合既有 PR #92／#90／#89 的小範圍修正：ASR 補轉缺少時間碼時不再捏造時間；A 取消／恢復／刷新不停止獨立 Drive 交接輪詢；檔案庫實驗按上傳當下的原片範圍換算驗證點。小工具升為 v18，保留 v16／v17 URI 相容；#55／#57／#59 的真實媒體與 host 驗收仍待完成。
+
+- 修正 #126–#131：首次 RSS Drive 上傳重讀完整資料夾 metadata；付費供應商排除項正常略過、新增訂閱在初次付費前保存間隔起算；Bright Data 已取消工作立即終止並保留既有費用預留；分段尾段按影像串流長度驗證並清理純音訊殘留；分段分析時間碼限制在原片範圍並更新合併快取版本。
+
 - 新增：YouTube 改走家用網路出口。A1 實測所有 YouTube 影片（連 `jNQXAC9IVRw`）都回「Sign in to confirm you're not a bot」，yt-dlp 2026.8.19 與 2026.10.21 相同，同一支影片從家用 IP 不帶 cookie 可抓。新增環境變數 `YTDLP_YOUTUBE_PROXY`：有設定時只有 YouTube 網址（`pipeline.is_youtube_url`：`youtube.com`、`www.`／`m.`／`music.`、`youtu.be`、`youtube-nocookie.com`）的下載與字幕抓取加上 `--proxy`，其他網站不變。新增 `scripts/youtube-egress/egress_proxy.py`（標準庫 HTTP CONNECT proxy：只回應允許的來源 IP、只接受 CONNECT 到 YouTube／Google 網域的 443 埠、拒絕 IP 字面值與解析到非公開位址的網域）與 Windows 安裝腳本 `install-windows.ps1`（開機排程工作＋只允許 A1 的防火牆規則，`-Uninstall` 移除）。新增 `tests/test_youtube_egress.py`；說明見 `docs/gitops.md`。
 
 - 變更：yt-dlp 下限從 `2026.8.19` 提高到 `2026.10.21`，並新增 `.github/dependabot.yml`（每週檢查，只管 yt-dlp，有新版就開 PR 提高下限）。原因：A1 自動部署只在 `requirements.txt` 改變時才更新套件，CI 卻每次全新安裝，結果 CI 測的是 2026.10.21、A1 正式環境與 candidate 測試環境都還停在 2026.8.19。
