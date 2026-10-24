@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- 整合 PR #94／#96／#97：F0 與選用 Dashboard 共用 migration registry、library identity、typed filters、RRF 與 grounding。Web 初始化原子套用第 5 版 schema；唯讀請求不遷移，過期 task 不重播已提交工作。Ask 缺模型／key 時在付費檢索前停下，保留原始來源核對身分後才遮蔽公開引用。新增跨功能與安全回歸；人工語意、真實 browser／provider／正式資料驗收另列。
+
 - 整合既有 PR #92／#90／#89 的小範圍修正：ASR 補轉缺少時間碼時不再捏造時間；A 取消／恢復／刷新不停止獨立 Drive 交接輪詢；檔案庫實驗按上傳當下的原片範圍換算驗證點。小工具升為 v18，保留 v16／v17 URI 相容；#55／#57／#59 的真實媒體與 host 驗收仍待完成。
 
 - 修正 #126–#131：首次 RSS Drive 上傳重讀完整資料夾 metadata；付費供應商排除項正常略過、新增訂閱在初次付費前保存間隔起算；Bright Data 已取消工作立即終止並保留既有費用預留；分段尾段按影像串流長度驗證並清理純音訊殘留；分段分析時間碼限制在原片範圍並更新合併快取版本。
@@ -64,6 +66,7 @@
 - 改進 A／B 工作流（依 job e47517f85346 實測）：分析證據完整時，A 報告不必等 ChatGPT 摘要即自動上傳 Drive；B 交接內容改為一次貼上（先獨立輸出，再讀同資料夾 A 報告合併）；合併規則改為畫面文字採 B、A 不同讀法放附錄、語音採 A；逐字稿只有低信心片尾套語（如「ご視聴ありがとうございました」，avg_logprob < -0.3）、只有符號（♪）或沒有語音時，`quality` 標 `speech_reliable=false`、`recommend_route_b=true`。只有證據完整且 `quality.status=evidence_available` 才免摘要上傳；交接內容要求 B 先核對報告 job_id。widget 未改動（報告排程後需手動重新取得狀態）。
 
 - 修正 #58：v15 widget 在摘要已提交但 Drive 片段／worker 尚未完成（`awaiting_segments`）時，以唯讀快照追蹤至報告排程，再接續既有上傳工作輪詢。查詢核對 job、cache signature、分析與報告雜湊；最多 60 次，失敗或逾時停止並提示手動刷新，不重送摘要、分析或上傳。新增提交／通知／恢復、錯誤與綁定不符、等待上限及換影片／關閉的回歸測試；真實 Drive 與 ChatGPT 驗收仍待執行。
+- #7 F0.1／F0.2：統一 operations migration registry、持久 library UUID、內容版本與完成事件原子登記；新增零外部呼叫的 `--ops-reconcile`，歷史補登保留未知時間且不寄送。成本／評分讀取不再隱式建表，Digest 依內容版本與帳本資格選取，完成 hook 排除本機預覽與不完整產物。新增離線回歸及 [路線圖與驗收邊界](docs/ROADMAP.md)。
 
 - 新增 #59：v14 widget 提供可收合的 ChatGPT 檔案庫實驗，每個分段須明確點擊才 fetch／uploadFile；一般上傳亦須另行點擊。顯示上傳資訊、SHA-256 與完整遮蔽網址的錯誤；隔離連點、換 job 及實驗狀態保存失敗，模型讀取要求走既有訊息橋接與統一保存。新增獨立 Node 測試並納入離線檢查，固定既有 CSP／成功媒體 CORS 前提；檔案庫與模型可讀性仍需真實 ChatGPT 驗證。已知限制：上傳卡住時需重新載入介面。
 

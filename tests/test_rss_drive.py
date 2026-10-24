@@ -211,6 +211,10 @@ class CompletionNoticeTests(unittest.TestCase):
             (job_dir / "summary.json").write_text(json.dumps({"short_summary": "這支影片在講測試。" * 40}, ensure_ascii=False), encoding="utf-8")
             manifest = {"source": {"title": "RSS 影片", "url": "https://www.youtube.com/watch?v=abc"},
                         "drive": {"status": "uploaded", "file_id": "file_1", "url": "https://drive.google.com/file/d/file_1/view"}}
+            pipeline.write_json(job_dir / "transcript.json", {"segments": [{"start": 0, "end": 1, "text": "fixture"}]})
+            pipeline.write_json(job_dir / "timeline.json", [{"timestamp": 0, "end": 1, "type": "speech", "text": "fixture"}])
+            manifest.update(status="completed", artifacts={key: str((job_dir / f"{key}.json").relative_to(root))
+                                                           for key in ("transcript", "timeline", "summary")})
             fake = email_providers.FakeProvider(mode="accepted")
             with patch("notifications.get_configured_provider", return_value=fake), \
                  patch.dict("os.environ", {"DISCORD_WEBHOOK_URL": "https://discord.com/api/webhooks/1/x"}):
@@ -226,16 +230,17 @@ class CompletionNoticeTests(unittest.TestCase):
         self.assertNotIn("<img", html_body)
         self.assertIn("&lt;img", html_body)
 
-    def test_notice_without_drive_or_summary_stays_as_before(self):
+    def test_incomplete_job_without_summary_cannot_emit_completion_notice(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             job_dir = make_job(root)
             fake = email_providers.FakeProvider(mode="accepted")
             with patch("notifications.get_configured_provider", return_value=fake), \
                  patch.dict("os.environ", {"DISCORD_WEBHOOK_URL": "https://discord.com/api/webhooks/1/x"}):
-                notifications.record_pipeline_completed_event(root, job_dir, {"source": {"title": "舊影片", "url": ""}})
-            self.assertIn("舊影片", fake.history[0]["text_body"])
-            self.assertNotIn("Drive", fake.history[0]["text_body"])
+                result = notifications.record_pipeline_completed_event(root, job_dir, {"source": {"title": "舊影片", "url": ""}})
+            self.assertIsNone(result)
+            self.assertEqual(fake.history, [])
+            self.assertFalse((root / "operations.db").exists())
 
 
 if __name__ == "__main__":

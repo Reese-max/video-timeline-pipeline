@@ -12,6 +12,8 @@ from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
 
+from operations import completion_snapshot, load_eligibility_index
+
 
 def parse_iso_datetime(value: str | None) -> datetime.datetime | None:
     """Parse ISO datetime string with robust timezone support."""
@@ -73,11 +75,16 @@ def collect_digest_candidates(
     root: Path,
     window_start_utc: datetime.datetime,
     window_end_utc: datetime.datetime,
+    *, include_chapters: bool = True,
 ) -> list[dict[str, Any]]:
     """Scan root/jobs/ for completed video artifacts created inside the time window."""
     jobs_dir = root / "jobs"
     if not jobs_dir.is_dir():
         return []
+
+    eligibility = load_eligibility_index(root)
+    if eligibility is None:
+        return []  # A present but unreadable/old ledger cannot authorize history.
 
     candidates: list[dict[str, Any]] = []
 
@@ -91,7 +98,8 @@ def collect_digest_candidates(
 
         try:
             manifest = json.loads(manifest_file.read_text(encoding="utf-8"))
-            summary = json.loads(summary_file.read_text(encoding="utf-8"))
+            summary_bytes = summary_file.read_bytes()
+            summary = json.loads(summary_bytes)
         except Exception:
             continue
 
@@ -100,22 +108,28 @@ def collect_digest_candidates(
             continue
 
         # Check eligibility timestamp
-        eligible_str = (
-            manifest.get("eligible_at")
-            or manifest.get("created_at")
-            or manifest.get("processing", {}).get("created_at")
-        )
+        revision = manifest.get("analysis_revision", "1")
+        if (root / "operations.db").exists():
+            try:
+                revision, artifact_hashes = completion_snapshot(root, job_path, manifest)
+            except (OSError, ValueError, TypeError, AttributeError):
+                continue
+            if hashlib.sha256(summary_bytes).hexdigest() != artifact_hashes["summary"]:
+                continue
+            eligible_str = eligibility.get((job_path.name, revision))
+        else:
+            # Explicit legacy eligibility is preserved; created_at and filesystem
+            # mtime are not evidence of a first completion.
+            eligible_str = manifest.get("eligible_at")
         eligible_dt = parse_iso_datetime(eligible_str)
         if not eligible_dt:
-            # Fallback to filesystem mtime
-            mtime = manifest_file.stat().st_mtime
-            eligible_dt = datetime.datetime.fromtimestamp(mtime, tz=datetime.timezone.utc)
+            continue
 
         if window_start_utc <= eligible_dt < window_end_utc:
             source = manifest.get("source", {})
             timeline_file = job_path / "timeline.json"
             chapters = []
-            if timeline_file.is_file():
+            if include_chapters and timeline_file.is_file():
                 try:
                     timeline_data = json.loads(timeline_file.read_text(encoding="utf-8"))
                     chapters = timeline_data.get("chapters", [])
@@ -127,11 +141,11 @@ def collect_digest_candidates(
                 "title": source.get("title") or manifest.get("video", {}).get("title") or job_path.name,
                 "url": source.get("url") or source.get("webpage_url") or "",
                 "minutes": round(float(source.get("duration", 0)) / 60.0, 1),
-                "summary": summary.get("brief") or summary.get("summary") or "",
+                "summary": summary.get("brief") or summary.get("summary") or summary.get("short_summary") or "",
                 "terms": summary.get("terms", []),
                 "chapters": chapters,
                 "eligible_at": eligible_dt.isoformat(),
-                "analysis_revision": manifest.get("analysis_revision", "1"),
+                "analysis_revision": revision,
             }
             candidates.append(item)
 

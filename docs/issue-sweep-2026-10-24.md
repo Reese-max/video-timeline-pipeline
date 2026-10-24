@@ -28,12 +28,12 @@
 | #55 | 已移植 PR #92（`6ba1152`）拒絕缺少 start/end 補轉結果的修正，另拒絕 JSON 布林值冒充時間；8 項 schema 回歸通過。 | 原始 166.6 秒媒體重新轉錄，確認 2:00–2:28 字幕實際出現且無超過 5 秒的內部缺口。 |
 | #23 | PR #95（`d10bdc9`）補 file reference 接收與正式 schema，與 main 衝突。 | 真實 host 呼叫 ingestion，收到可核對 file_id/download_url，代表影格可視，不能用 metadata 摘要代替。 |
 | #10 | PR #16（`0faaa19`）只有研究設計；issue 的固定抽幀 baseline 已與 main 的整片 MP4 理解不同。 | 先更新 baseline，再以凍結的 12–20 支素材做 bounded escalation 對照，輸出 BUILD/NARROW/REJECT；schema 或供應商宣稱不能代替研究。 |
-| #7 | PR #94（`113a72f`）有 F0 storage foundation，PR #17 有 roadmap 文件；均與 main 衝突。 | 先整合唯一 migration／library identity，再驗證既有資料遷移、outbox、重啟與重建相容性；roadmap 本身不等於各階段功能已完成。 |
-| #6 | PR #97（`388b998`）有 Dashboard／durable tasks／API 與 UI 測試，與 main 衝突。 | 在共用 storage/search service 整合後重跑安全、恢復、成本與本機 browser 驗收；不自動公開服務或啟用寄送。 |
-| #5 | PR #96（`10f4d69`）有 retrieval、引用身分、cache lifecycle 與 25 題合成評估，與 main 衝突。 | 先解與 main 及 F0 的整合衝突，保留舊向量，再完成有人工 golden evidence 的 baseline/hybrid 對照。 |
+| #7 | 獨立整合分支依序合併 PR #94 → #96 → #97，F0 migration 1–4 與明確啟用的 Web migration 5 共用唯一 registry。索引重建保留帳本 library ID，舊索引 ID 可由首次帳本建立時沿用；衝突 ID 明確拒絕。 | 離線資料遷移／outbox／重啟／重建控制已驗證；仍需正式資料升級驗收，其餘 roadmap 階段不能由 F0 完成推定。 |
+| #6 | 已在整合分支解決共用 schema、唯讀報表、catalog、filter、RRF、引用及 paid Ask 設定檢查；Web 38 項與跨功能 10 項回歸通過。 | 本輪僅 TestClient 與 Node，沒有可用 browser automation 工具；需新鮮本機 browser／手機尺寸與正式資料驗收。不自動公開服務或啟用寄送。 |
+| #5 | 已在整合分支保留 canonical retrieval、舊向量 namespace／adoption、occurrence ID 及過濾語意；Web Ask 在核對來源前保留原始 evidence，輸出才遮蔽網址。 | 合成回播與來源變更控制已驗證；仍需人工 golden evidence 與真模型 baseline/hybrid 品質對照。 |
 
 ## 後續整合順序
 
-先交付 #126–#131 的小範圍修正。既有大 PR 依 F0（#94）→ retrieval（#96）→ Dashboard（#97）的依賴順序逐一重建於最新 main；媒體／host 修補則以各自的回歸測試審查後整合。每層先跑針對性測試，整合完成才跑一次完整 gate；付費、真實媒體、Drive、ChatGPT host 與研究結論使用各自的驗收證據。
+先凍結九項小範圍修正（#126–#131、#55／#57／#59），保留該分支不可變。既有大 PR 已在另一 worktree 依 F0（#94）→ retrieval（#96）→ Dashboard（#97）的依賴順序整合；媒體／host 修補則以各自的回歸測試審查後整合。每層先跑針對性測試，整合完成才跑完整 gate；付費、真實媒體、Drive、ChatGPT host 與研究結論使用各自的驗收證據。
 
 全部 18 筆在本次盤點時仍為 open；此文件不變更 GitHub issue 狀態。
