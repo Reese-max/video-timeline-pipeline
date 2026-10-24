@@ -12,6 +12,8 @@ mcp_jobs/
 loop-*-tests.txt
 loop-*.tar.gz
 .pytest_cache/
+.playwright-cli/
+output/playwright/
 mcp-server.log
 mcp-server.pid
 mcp-supervisor.lock
@@ -22,6 +24,7 @@ batches/
 rss/
 canary/
 library.db
+library.db-*
 operations.db
 operations.db-*
 digest_preview_*.md

@@ -29,7 +29,7 @@ from execution_control import DeadlineExceeded, ExecutionCancelled
 from mcp import types
 from mcp.server.fastmcp import FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 from starlette.requests import Request
 from starlette.responses import FileResponse, JSONResponse, PlainTextResponse
 
@@ -66,7 +66,7 @@ MCP_PUBLIC_BASE_URL = (
 MCP_MEDIA_BASE_URL = (
     os.getenv("MCP_MEDIA_BASE_URL", "") or MCP_PUBLIC_BASE_URL
 ).rstrip("/")
-WIDGET_VERSION = 18
+WIDGET_VERSION = 19
 
 
 def ui_uri(version: int) -> str:
@@ -234,16 +234,36 @@ class OpenAIFileReference(BaseModel):
     file_name: str = ""
 
 
+class VideoSegmentRange(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    start_seconds: float = Field(ge=0, allow_inf_nan=False, strict=True)
+    end_seconds: float = Field(gt=0, allow_inf_nan=False, strict=True)
+
+    @model_validator(mode="after")
+    def ordered(self) -> VideoSegmentRange:
+        if self.end_seconds <= self.start_seconds:
+            raise ValueError("end_seconds 必須大於 start_seconds。")
+        return self
+
+
 class VerifiedFileSummary(BaseModel):
     file_id: str
     mime_type: str | None = None
     file_name: str | None = None
+    start_seconds: float | None = None
+    end_seconds: float | None = None
 
 
 class FileHandoffResult(BaseModel):
     status: Literal["files_received"]
     files_received: int
     files: list[VerifiedFileSummary]
+    limitation: str = (
+        "僅確認收到 file_id 與 HTTPS download_url；模型是否可讀取影格或 MP4 尚未驗證。"
+        "時間範圍由呼叫端提供，未核對媒體。請先讀取實際檔案，再依可驗證畫面／影音分析；"
+        "若宿主不支援或讀取失敗，必須明確回報並停止，不得只依 metadata 產生影片摘要。"
+    )
 
 
 class AnalysisQuality(BaseModel):
@@ -296,7 +316,7 @@ class PreparedVideoSegment(BaseModel):
 
 
 class PreparedVideoResult(BaseModel):
-    status: Literal["ready", "error", "queued", "running", "failed", "cancelled", "expired", "interrupted"]
+    status: Literal["ready", "busy", "error", "queued", "running", "failed", "cancelled", "expired", "interrupted"]
     operation_id: str | None = None
     operation: str | None = None
     progress: dict[str, Any] | None = None
@@ -308,6 +328,7 @@ class PreparedVideoResult(BaseModel):
     segment_seconds: int | None = None
     segments: list[PreparedVideoSegment] | None = None
     error: str | None = None
+    error_code: str | None = None
 
 
 class DriveFileResult(BaseModel):
@@ -1628,6 +1649,8 @@ def visual_observations_incomplete(rows: list[dict[str, Any]] | None) -> bool:
     ``completion_status=incomplete`` / ``finish_reason=timestamp_coverage``.
     Absent markers (healthy observations) count as usable.
     """
+    if pipeline.visual_gaps_pending(rows):
+        return True
     for row in rows or []:
         if not isinstance(row, dict):
             return True
@@ -2681,10 +2704,12 @@ async def collect_social_post(url: str, allow_paid: bool = False) -> dict[str, A
     name="ingest_video_segments",
     title="Receive video segments for analysis",
     description=(
-        "Legacy native-file handoff only; not used by the current server-analysis widget. "
-        "Call this only when ChatGPT has actually uploaded the MP4 segments. "
+        "Optional native-file handoff for the widget's explicit upload experiment; separate from server analysis. "
+        "Call this only when ChatGPT has file references for uploaded MP4 segments or preview images. "
         "Pass the files in the same order as the prepared segment list. "
         "Each item must be the complete OpenAI file object containing file_id and download_url. "
+        "Optionally pass segment_ranges in the same order as files, with start_seconds and end_seconds "
+        "copied from preparation in original-video seconds. These are caller-supplied, not verified media times. "
         "A public segment URL or MCP resource link alone is not proof that ChatGPT received the MP4 "
         "bytes and must be rejected. This tool only confirms file references; read the attached files "
         "before making any visual or audio claims, and fail closed when the references are missing."
@@ -2700,10 +2725,15 @@ async def collect_social_post(url: str, allow_paid: bool = False) -> dict[str, A
 )
 async def ingest_video_segments(
     files: list[OpenAIFileReference],
+    segment_ranges: list[VideoSegmentRange] | None = None,
 ) -> FileHandoffResult:
     references = normalize_file_references(
         [OpenAIFileReference.model_validate(item).model_dump() for item in files]
     )
+    ranges = ([VideoSegmentRange.model_validate(item) for item in segment_ranges]
+              if segment_ranges is not None else None)
+    if ranges is not None and len(ranges) != len(references):
+        raise ValueError("segment_ranges 必須與 files 一一對應。")
     return FileHandoffResult(
         status="files_received",
         files_received=len(references),
@@ -2712,8 +2742,9 @@ async def ingest_video_segments(
                 file_id=item["file_id"],
                 mime_type=item.get("mime_type"),
                 file_name=item.get("file_name"),
+                **(ranges[index].model_dump() if ranges is not None else {}),
             )
-            for item in references
+            for index, item in enumerate(references)
         ],
     )
 

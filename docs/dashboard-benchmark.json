@@ -1,0 +1,620 @@
+{
+  "schema_version": 1,
+  "methodology": {
+    "transport": "FastAPI TestClient against the real ASGI app; HTTP status and bounded rows asserted",
+    "timing": "perf_counter HTTP round trip; one warm-up per route; nearest-rank p95; five concurrent batches of eight",
+    "memory": "OS process lifetime peak RSS in a fresh child per dataset, including imports, fixture build, and HTTP requests",
+    "offline": "Socket/urllib transports, provider functions, and heavy model imports are blocked; only Windows stdlib socketpair loopback IPC is allowed; fixtures are TemporaryDirectory-only",
+    "limitations": [
+      "Synthetic local data and warm filesystem caches; no production latency claim",
+      "In-process ASGI transport excludes browser rendering, network, TLS, LCP, INP, and physical-device acceptance",
+      "No real model or provider operations; vectors are synthetic 384-dimensional zero blobs"
+    ]
+  },
+  "verifications": [
+    {
+      "at": "2026-10-16T16:07:17.136005+00:00",
+      "machine": {
+        "os": "Windows-10-10.0.26300-SP0",
+        "python": "3.11.9 (tags/v3.11.9:de54cf5, Apr  2 2024, 10:12:12) [MSC v.1938 64 bit (AMD64)]",
+        "sqlite": "3.45.1",
+        "cpu": "Intel64 Family 6 Model 186 Stepping 2, GenuineIntel",
+        "logical_cpus": 20,
+        "ram_mib": 65168.3
+      },
+      "datasets": [
+        {
+          "videos": 1000,
+          "fixture": {
+            "videos": 1000,
+            "video_catalog": 1000,
+            "events": 10290,
+            "vectors": 1000,
+            "vector_dimensions": 384,
+            "long_video_events": 300,
+            "database_bytes": 12328960,
+            "long_transcript_bytes": 788376,
+            "build_seconds": 0.339
+          },
+          "before_fixture": {
+            "rss_mib": 60.137,
+            "peak_rss_mib": 60.137
+          },
+          "after_fixture": {
+            "rss_mib": 65.801,
+            "peak_rss_mib": 66.398
+          },
+          "rss_mib": 72.348,
+          "peak_rss_mib": 73.516,
+          "requests": {
+            "home_html": {
+              "samples": 20,
+              "median_ms": 20.036,
+              "p95_ms": 23.241,
+              "max_ms": 24.772
+            },
+            "videos_html": {
+              "samples": 20,
+              "median_ms": 11.839,
+              "p95_ms": 12.974,
+              "max_ms": 16.633
+            },
+            "videos_api": {
+              "samples": 20,
+              "median_ms": 10.658,
+              "p95_ms": 11.914,
+              "max_ms": 14.868
+            },
+            "exact_filter": {
+              "samples": 20,
+              "median_ms": 11.857,
+              "p95_ms": 15.844,
+              "max_ms": 16.847
+            },
+            "local_search": {
+              "samples": 20,
+              "median_ms": 25.833,
+              "p95_ms": 31.068,
+              "max_ms": 32.167
+            },
+            "evidence_html": {
+              "samples": 20,
+              "median_ms": 38.386,
+              "p95_ms": 48.417,
+              "max_ms": 52.63
+            },
+            "evidence_api": {
+              "samples": 20,
+              "median_ms": 40.987,
+              "p95_ms": 55.4,
+              "max_ms": 65.873
+            }
+          },
+          "response_bytes_max": {
+            "home_html": 2861,
+            "videos_html": 38798,
+            "videos_api": 33783,
+            "exact_filter": 16831,
+            "local_search": 10456,
+            "evidence_html": 115088,
+            "evidence_api": 112579
+          },
+          "concurrent_8_requests": {
+            "samples": 40,
+            "median_ms": 51.17,
+            "p95_ms": 113.539,
+            "max_ms": 150.481
+          },
+          "concurrent_8_batch": {
+            "samples": 5,
+            "median_ms": 92.961,
+            "p95_ms": 152.298,
+            "max_ms": 152.298
+          },
+          "network_or_model_attempts": 0,
+          "windows_asyncio_socketpair_ipc": 1,
+          "loaded_model_modules": []
+        },
+        {
+          "videos": 10000,
+          "fixture": {
+            "videos": 10000,
+            "video_catalog": 10000,
+            "events": 100290,
+            "vectors": 10000,
+            "vector_dimensions": 384,
+            "long_video_events": 300,
+            "database_bytes": 102907904,
+            "long_transcript_bytes": 788376,
+            "build_seconds": 2.538
+          },
+          "before_fixture": {
+            "rss_mib": 60.055,
+            "peak_rss_mib": 60.055
+          },
+          "after_fixture": {
+            "rss_mib": 64.941,
+            "peak_rss_mib": 65.195
+          },
+          "rss_mib": 84.086,
+          "peak_rss_mib": 84.59,
+          "requests": {
+            "home_html": {
+              "samples": 20,
+              "median_ms": 48.083,
+              "p95_ms": 60.679,
+              "max_ms": 63.285
+            },
+            "videos_html": {
+              "samples": 20,
+              "median_ms": 28.252,
+              "p95_ms": 34.117,
+              "max_ms": 47.101
+            },
+            "videos_api": {
+              "samples": 20,
+              "median_ms": 22.278,
+              "p95_ms": 27.353,
+              "max_ms": 29.016
+            },
+            "exact_filter": {
+              "samples": 20,
+              "median_ms": 21.327,
+              "p95_ms": 29.265,
+              "max_ms": 36.533
+            },
+            "local_search": {
+              "samples": 20,
+              "median_ms": 246.362,
+              "p95_ms": 493.663,
+              "max_ms": 543.389
+            },
+            "evidence_html": {
+              "samples": 20,
+              "median_ms": 95.321,
+              "p95_ms": 130.075,
+              "max_ms": 132.286
+            },
+            "evidence_api": {
+              "samples": 20,
+              "median_ms": 88.492,
+              "p95_ms": 102.55,
+              "max_ms": 126.95
+            }
+          },
+          "response_bytes_max": {
+            "home_html": 2862,
+            "videos_html": 38800,
+            "videos_api": 33784,
+            "exact_filter": 16832,
+            "local_search": 10456,
+            "evidence_html": 115088,
+            "evidence_api": 112579
+          },
+          "concurrent_8_requests": {
+            "samples": 40,
+            "median_ms": 105.024,
+            "p95_ms": 300.527,
+            "max_ms": 381.574
+          },
+          "concurrent_8_batch": {
+            "samples": 5,
+            "median_ms": 302.582,
+            "p95_ms": 384.248,
+            "max_ms": 384.248
+          },
+          "network_or_model_attempts": 0,
+          "windows_asyncio_socketpair_ipc": 1,
+          "loaded_model_modules": []
+        }
+      ],
+      "limits": {
+        "route_p95_ms": 1000,
+        "concurrent_p95_ms": 2000,
+        "peak_rss_mib": 256
+      },
+      "passed": true
+    },
+    {
+      "at": "2026-10-24T12:58:06.322988+00:00",
+      "machine": {
+        "os": "Linux-6.18.55-x86_64-with-glibc2.41",
+        "python": "3.12.14 (main, Aug 25 2026, 14:00:49) [Clang 22.1.3 ]",
+        "sqlite": "3.53.1",
+        "cpu": "",
+        "logical_cpus": 5,
+        "ram_mib": 18007.9
+      },
+      "datasets": [
+        {
+          "videos": 1000,
+          "fixture": {
+            "videos": 1000,
+            "video_catalog": 1000,
+            "events": 10290,
+            "vectors": 1000,
+            "vector_dimensions": 384,
+            "long_video_events": 300,
+            "database_bytes": 12378112,
+            "long_transcript_bytes": 788376,
+            "build_seconds": 0.123
+          },
+          "before_fixture": {
+            "rss_mib": 43.758,
+            "peak_rss_mib": 43.816
+          },
+          "after_fixture": {
+            "rss_mib": 46.797,
+            "peak_rss_mib": 47.562
+          },
+          "rss_mib": 63.395,
+          "peak_rss_mib": 67.773,
+          "requests": {
+            "home_html": {
+              "samples": 20,
+              "median_ms": 5.485,
+              "p95_ms": 9.552,
+              "max_ms": 9.563
+            },
+            "videos_html": {
+              "samples": 20,
+              "median_ms": 6.401,
+              "p95_ms": 8.645,
+              "max_ms": 17.974
+            },
+            "videos_api": {
+              "samples": 20,
+              "median_ms": 5.707,
+              "p95_ms": 7.154,
+              "max_ms": 7.494
+            },
+            "exact_filter": {
+              "samples": 20,
+              "median_ms": 3.757,
+              "p95_ms": 4.807,
+              "max_ms": 5.282
+            },
+            "local_search": {
+              "samples": 20,
+              "median_ms": 24.278,
+              "p95_ms": 27.319,
+              "max_ms": 30.074
+            },
+            "evidence_html": {
+              "samples": 20,
+              "median_ms": 11.395,
+              "p95_ms": 12.844,
+              "max_ms": 13.051
+            },
+            "evidence_api": {
+              "samples": 20,
+              "median_ms": 10.73,
+              "p95_ms": 11.665,
+              "max_ms": 19.148
+            }
+          },
+          "response_bytes_max": {
+            "home_html": 3024,
+            "videos_html": 38798,
+            "videos_api": 33783,
+            "exact_filter": 16831,
+            "local_search": 15688,
+            "evidence_html": 115088,
+            "evidence_api": 112579
+          },
+          "concurrent_8_requests": {
+            "samples": 40,
+            "median_ms": 52.309,
+            "p95_ms": 85.072,
+            "max_ms": 95.227
+          },
+          "concurrent_8_batch": {
+            "samples": 5,
+            "median_ms": 67.362,
+            "p95_ms": 97.589,
+            "max_ms": 97.589
+          },
+          "network_or_model_attempts": 0,
+          "windows_asyncio_socketpair_ipc": 0,
+          "loaded_model_modules": []
+        },
+        {
+          "videos": 10000,
+          "fixture": {
+            "videos": 10000,
+            "video_catalog": 10000,
+            "events": 100290,
+            "vectors": 10000,
+            "vector_dimensions": 384,
+            "long_video_events": 300,
+            "database_bytes": 102957056,
+            "long_transcript_bytes": 788376,
+            "build_seconds": 1.322
+          },
+          "before_fixture": {
+            "rss_mib": 43.754,
+            "peak_rss_mib": 43.867
+          },
+          "after_fixture": {
+            "rss_mib": 46.762,
+            "peak_rss_mib": 48.145
+          },
+          "rss_mib": 65.703,
+          "peak_rss_mib": 72.383,
+          "requests": {
+            "home_html": {
+              "samples": 20,
+              "median_ms": 11.462,
+              "p95_ms": 13.29,
+              "max_ms": 14.033
+            },
+            "videos_html": {
+              "samples": 20,
+              "median_ms": 11.77,
+              "p95_ms": 16.392,
+              "max_ms": 19.062
+            },
+            "videos_api": {
+              "samples": 20,
+              "median_ms": 9.918,
+              "p95_ms": 11.657,
+              "max_ms": 12.2
+            },
+            "exact_filter": {
+              "samples": 20,
+              "median_ms": 8.038,
+              "p95_ms": 11.178,
+              "max_ms": 11.2
+            },
+            "local_search": {
+              "samples": 20,
+              "median_ms": 184.219,
+              "p95_ms": 209.59,
+              "max_ms": 222.836
+            },
+            "evidence_html": {
+              "samples": 20,
+              "median_ms": 32.44,
+              "p95_ms": 35.404,
+              "max_ms": 42.153
+            },
+            "evidence_api": {
+              "samples": 20,
+              "median_ms": 38.187,
+              "p95_ms": 53.245,
+              "max_ms": 75.21
+            }
+          },
+          "response_bytes_max": {
+            "home_html": 3025,
+            "videos_html": 38800,
+            "videos_api": 33784,
+            "exact_filter": 16832,
+            "local_search": 15688,
+            "evidence_html": 115088,
+            "evidence_api": 112579
+          },
+          "concurrent_8_requests": {
+            "samples": 40,
+            "median_ms": 70.116,
+            "p95_ms": 231.333,
+            "max_ms": 333.996
+          },
+          "concurrent_8_batch": {
+            "samples": 5,
+            "median_ms": 232.207,
+            "p95_ms": 339.55,
+            "max_ms": 339.55
+          },
+          "network_or_model_attempts": 0,
+          "windows_asyncio_socketpair_ipc": 0,
+          "loaded_model_modules": []
+        }
+      ],
+      "limits": {
+        "route_p95_ms": 1000,
+        "concurrent_p95_ms": 2000,
+        "peak_rss_mib": 256
+      },
+      "passed": true
+    }
+  ],
+  "baseline": {
+    "at": "2026-10-16T16:06:07.706102+00:00",
+    "machine": {
+      "os": "Windows-10-10.0.26300-SP0",
+      "python": "3.11.9 (tags/v3.11.9:de54cf5, Apr  2 2024, 10:12:12) [MSC v.1938 64 bit (AMD64)]",
+      "sqlite": "3.45.1",
+      "cpu": "Intel64 Family 6 Model 186 Stepping 2, GenuineIntel",
+      "logical_cpus": 20,
+      "ram_mib": 65168.3
+    },
+    "datasets": [
+      {
+        "videos": 1000,
+        "fixture": {
+          "videos": 1000,
+          "video_catalog": 1000,
+          "events": 10290,
+          "vectors": 1000,
+          "vector_dimensions": 384,
+          "long_video_events": 300,
+          "database_bytes": 12328960,
+          "long_transcript_bytes": 788376,
+          "build_seconds": 0.362
+        },
+        "before_fixture": {
+          "rss_mib": 60.461,
+          "peak_rss_mib": 60.461
+        },
+        "after_fixture": {
+          "rss_mib": 66.148,
+          "peak_rss_mib": 66.148
+        },
+        "rss_mib": 72.91,
+        "peak_rss_mib": 73.445,
+        "requests": {
+          "home_html": {
+            "samples": 20,
+            "median_ms": 23.734,
+            "p95_ms": 26.879,
+            "max_ms": 27.167
+          },
+          "videos_html": {
+            "samples": 20,
+            "median_ms": 12.207,
+            "p95_ms": 15.447,
+            "max_ms": 15.792
+          },
+          "videos_api": {
+            "samples": 20,
+            "median_ms": 11.175,
+            "p95_ms": 14.468,
+            "max_ms": 15.993
+          },
+          "exact_filter": {
+            "samples": 20,
+            "median_ms": 10.074,
+            "p95_ms": 11.405,
+            "max_ms": 11.417
+          },
+          "local_search": {
+            "samples": 20,
+            "median_ms": 23.685,
+            "p95_ms": 29.221,
+            "max_ms": 32.669
+          },
+          "evidence_html": {
+            "samples": 20,
+            "median_ms": 35.494,
+            "p95_ms": 48.35,
+            "max_ms": 53.963
+          },
+          "evidence_api": {
+            "samples": 20,
+            "median_ms": 39.438,
+            "p95_ms": 56.644,
+            "max_ms": 58.264
+          }
+        },
+        "response_bytes_max": {
+          "home_html": 2861,
+          "videos_html": 38798,
+          "videos_api": 33783,
+          "exact_filter": 16831,
+          "local_search": 10456,
+          "evidence_html": 115088,
+          "evidence_api": 112579
+        },
+        "concurrent_8_requests": {
+          "samples": 40,
+          "median_ms": 52.859,
+          "p95_ms": 97.459,
+          "max_ms": 98.339
+        },
+        "concurrent_8_batch": {
+          "samples": 5,
+          "median_ms": 99.049,
+          "p95_ms": 100.353,
+          "max_ms": 100.353
+        },
+        "network_or_model_attempts": 0,
+        "windows_asyncio_socketpair_ipc": 1,
+        "loaded_model_modules": []
+      },
+      {
+        "videos": 10000,
+        "fixture": {
+          "videos": 10000,
+          "video_catalog": 10000,
+          "events": 100290,
+          "vectors": 10000,
+          "vector_dimensions": 384,
+          "long_video_events": 300,
+          "database_bytes": 102907904,
+          "long_transcript_bytes": 788376,
+          "build_seconds": 2.515
+        },
+        "before_fixture": {
+          "rss_mib": 60.141,
+          "peak_rss_mib": 60.141
+        },
+        "after_fixture": {
+          "rss_mib": 65.246,
+          "peak_rss_mib": 66.309
+        },
+        "rss_mib": 77.055,
+        "peak_rss_mib": 83.652,
+        "requests": {
+          "home_html": {
+            "samples": 20,
+            "median_ms": 31.533,
+            "p95_ms": 36.38,
+            "max_ms": 40.17
+          },
+          "videos_html": {
+            "samples": 20,
+            "median_ms": 19.569,
+            "p95_ms": 20.963,
+            "max_ms": 21.276
+          },
+          "videos_api": {
+            "samples": 20,
+            "median_ms": 17.935,
+            "p95_ms": 20.506,
+            "max_ms": 21.872
+          },
+          "exact_filter": {
+            "samples": 20,
+            "median_ms": 17.673,
+            "p95_ms": 20.42,
+            "max_ms": 24.915
+          },
+          "local_search": {
+            "samples": 20,
+            "median_ms": 202.008,
+            "p95_ms": 239.887,
+            "max_ms": 306.647
+          },
+          "evidence_html": {
+            "samples": 20,
+            "median_ms": 83.68,
+            "p95_ms": 95.712,
+            "max_ms": 106.922
+          },
+          "evidence_api": {
+            "samples": 20,
+            "median_ms": 90.723,
+            "p95_ms": 113.133,
+            "max_ms": 120.241
+          }
+        },
+        "response_bytes_max": {
+          "home_html": 2862,
+          "videos_html": 38800,
+          "videos_api": 33784,
+          "exact_filter": 16832,
+          "local_search": 10456,
+          "evidence_html": 115088,
+          "evidence_api": 112579
+        },
+        "concurrent_8_requests": {
+          "samples": 40,
+          "median_ms": 112.642,
+          "p95_ms": 392.819,
+          "max_ms": 422.01
+        },
+        "concurrent_8_batch": {
+          "samples": 5,
+          "median_ms": 394.795,
+          "p95_ms": 426.752,
+          "max_ms": 426.752
+        },
+        "network_or_model_attempts": 0,
+        "windows_asyncio_socketpair_ipc": 1,
+        "loaded_model_modules": []
+      }
+    ]
+  },
+  "baseline_sha256": "9cc591a85d013f1d3609c95c6acc6be994c22c4e8d888b4595c286ee5844527d"
+}

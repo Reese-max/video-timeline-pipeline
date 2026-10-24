@@ -238,7 +238,7 @@ const safeURL = value => {
   catch { return null; }
 };
 const current = version => !closed && version === generation;
-function checkCurrent(version) { if (!current(version)) throw new Error("影片已切換，忽略舊工作結果。"); }
+function checkCurrent(version, epoch) { if (!current(version) || (epoch !== undefined && epoch !== libraryEpoch)) throw new Error("影片已切換或檔案已失效，忽略舊工作結果。"); }
 function status(message) { $("status").textContent = message; }
 function followUpKey() { return data?.job_id ? `${data.job_id}:${analysisResult?.cache_signature || analysisResult?.source_sha256 || "unverified"}` : ""; }
 function buildState() {
@@ -287,26 +287,26 @@ function request(method, params) {
 function ensureBridge() {
   if (!bridgePromise) bridgePromise = request("ui/initialize", {
     protocolVersion: "2026-01-26", appCapabilities: {},
-    appInfo: { name: "video-timeline-pipeline", version: "18" },
+    appInfo: { name: "video-timeline-pipeline", version: "19" },
   }).then(result => {
     window.parent.postMessage({ jsonrpc: "2.0", method: "ui/notifications/initialized", params: {} }, "*");
     return result;
   });
   return bridgePromise;
 }
-async function invoke(method, params, fallback, version) {
-  checkCurrent(version);
+async function invoke(method, params, fallback, version, epoch) {
+  checkCurrent(version, epoch);
   try { await ensureBridge(); }
-  catch (error) { checkCurrent(version); if (fallback) return fallback(); throw error; }
-  checkCurrent(version);
+  catch (error) { checkCurrent(version, epoch); if (fallback) return fallback(); throw error; }
+  checkCurrent(version, epoch);
   // An ambiguous tool/message failure must never be retried via another transport.
   try { return await request(method, params); }
-  catch (error) { if (error.code === -32601 && fallback) { checkCurrent(version); return fallback(); } throw error; }
+  catch (error) { if (error.code === -32601 && fallback) { checkCurrent(version, epoch); return fallback(); } throw error; }
 }
-async function callTool(name, args, version) {
+async function callTool(name, args, version, epoch) {
   const result = await invoke("tools/call", { name, arguments: args },
-    host()?.callTool ? () => host().callTool(name, args) : null, version);
-  checkCurrent(version);
+    host()?.callTool ? () => host().callTool(name, args) : null, version, epoch);
+  checkCurrent(version, epoch);
   const payload = normalize(result);
   if (result?.isError || payload.status === "error" || payload.status === "busy") {
     throw new Error(errorText(payload.error || result?.content?.find(item => item.type === "text")?.text));
@@ -425,6 +425,22 @@ async function askAboutLibraryFile() {
   librarySending = true; updateButtons();
   const previous = libraryModel;
   try {
+    if (typeof host()?.getFileDownloadUrl !== "function") throw new Error("此宿主缺少 getFileDownloadUrl，無法完成檔案交接。");
+    const download = await host().getFileDownloadUrl({ fileId: result.fileId });
+    checkCurrent(version, epoch);
+    const downloadUrl = safeURL(download?.downloadUrl);
+    if (!downloadUrl) throw new Error("宿主未提供 download_url，無法完成檔案交接。");
+    const url = new URL(downloadUrl);
+    if (url.protocol !== "https:" || url.username || url.password) throw new Error("宿主未提供有效的 HTTPS download_url，無法完成檔案交接。");
+    const handoff = {
+      files: [{ file_id: result.fileId, download_url: downloadUrl, mime_type: "video/mp4", file_name: result.filename }],
+    };
+    const rangeStart = numericTime(result.start_seconds), rangeEnd = numericTime(result.end_seconds);
+    if (rangeStart !== null && rangeEnd !== null && rangeStart >= 0 && rangeEnd > rangeStart)
+      handoff.segment_ranges = [{ start_seconds: rangeStart, end_seconds: rangeEnd }];
+    const receipt = await callTool("ingest_video_segments", handoff, version, epoch);
+    checkCurrent(version, epoch);
+    if (receipt.status !== "files_received" || receipt.files_received !== 1 || receipt.files?.length !== 1 || receipt.files[0]?.file_id !== result.fileId) throw new Error("未確認收到相符的檔案引用，停止模型分析要求。");
     libraryModel = { fileId: result.fileId, filename: result.filename, size: result.size };
     try { await saveState(true); }
     catch (error) {
@@ -436,8 +452,7 @@ async function askAboutLibraryFile() {
       }
       throw error;
     }
-    checkCurrent(version);
-    if (epoch !== libraryEpoch) return;
+    checkCurrent(version, epoch);
     const start = numericTime(result.start_seconds), end = numericTime(result.end_seconds);
     const knownRange = start !== null && end !== null && end > start;
     const checkpoints = knownRange ? [30, 65, 130].filter(seconds => seconds >= start && seconds < end) : [];
@@ -446,9 +461,8 @@ async function askAboutLibraryFile() {
       ? "回答" + checkpoints.map(seconds => `片段第 ${Number((seconds - start).toFixed(3))} 秒（原片 ${formatTime(seconds, true)}）`).join("、") + "的畫面文字"
       : "說明是否能讀取；片段時間範圍未知，無法核對指定時間點";
     const prompt = `這是 #59 實驗。我剛按下按鈕上傳影片片段 ${result.filename}（fileId=${result.fileId}，${result.size} bytes，library:${result.library}）；尚未確認已進 ChatGPT 檔案庫。請不要呼叫任何工具。若能讀取這個檔案，${question}；若看不到或讀不到，直接回答「看不到」，不要猜測。SHA-256 由小工具在本機計算並另行核對，不要求模型猜測雜湊。`;
-    const acknowledgment = await invoke("ui/message", { role: "user", content: [{ type: "text", text: prompt }] }, host()?.sendFollowUpMessage ? () => host().sendFollowUpMessage({ prompt }) : null, version);
-    checkCurrent(version);
-    if (epoch !== libraryEpoch) return;
+    const acknowledgment = await invoke("ui/message", { role: "user", content: [{ type: "text", text: prompt }] }, host()?.sendFollowUpMessage ? () => host().sendFollowUpMessage({ prompt }) : null, version, epoch);
+    checkCurrent(version, epoch);
     if (acknowledgment?.isError) throw new Error(errorText(acknowledgment.content?.find(item => item.type === "text")?.text));
     $("library-message").textContent = "已送出檔案讀取實驗要求；尚未確認模型可讀取。";
   } catch (error) { if (current(version) && epoch === libraryEpoch) $("library-message").textContent = "檔案實驗要求未確認送達，未自動重送。請先檢查對話。\n" + libraryError(error) + (libraryStateUncertain ? "\n宿主狀態回復未確認，已停用重試；請重新載入並核對檔案狀態。" : ""); }

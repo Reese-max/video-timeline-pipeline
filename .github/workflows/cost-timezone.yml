@@ -18,6 +18,10 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
+        with:
+          # The fixed retrieval replay loads its admitted baseline by commit SHA.
+          # A shallow merge checkout omits that object on both hosted OS images.
+          fetch-depth: 0
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
@@ -35,6 +39,7 @@ jobs:
       - name: Install Python dependencies
         run: |
           python -X utf8 -m pip install -r requirements.txt
+          python -X utf8 -m pip install -r requirements-web.txt
       - name: Verify Windows synchronization fixtures
         if: runner.os == 'Windows'
         shell: pwsh
