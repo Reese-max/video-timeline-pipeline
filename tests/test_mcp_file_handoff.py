@@ -27,7 +27,7 @@ class FileHandoffContractTests(unittest.TestCase):
         self.assertEqual(tool.inputSchema["required"], ["files"])
         self.assertIn("start_seconds", tool.outputSchema["$defs"]["VerifiedFileSummary"]["properties"])
         self.assertIn("end_seconds", tool.outputSchema["$defs"]["VerifiedFileSummary"]["properties"])
-        self.assertIn("/v19-", server.UI_URI)
+        self.assertIn("/v20-", server.UI_URI)
 
     def test_ingestion_retains_identity_mime_names_and_fractional_times(self):
         files = self.files()

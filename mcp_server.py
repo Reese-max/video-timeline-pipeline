@@ -66,7 +66,7 @@ MCP_PUBLIC_BASE_URL = (
 MCP_MEDIA_BASE_URL = (
     os.getenv("MCP_MEDIA_BASE_URL", "") or MCP_PUBLIC_BASE_URL
 ).rstrip("/")
-WIDGET_VERSION = 19
+WIDGET_VERSION = 20
 
 
 def ui_uri(version: int) -> str:
