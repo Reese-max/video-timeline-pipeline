@@ -46,7 +46,7 @@ function harness({ output = job('first'), saved = {}, snapshot, respond, bridge 
     Promise.resolve().then(async () => {
       try {
         if (!bridge) throw Object.assign(new Error('Unsupported bridge'), { code: -32601 });
-        if (message.method === 'ui/initialize') { assert.equal(message.params.appInfo?.name, 'video-timeline-pipeline'); assert.equal(message.params.appInfo?.version, '19'); assert.equal(message.params.protocolVersion, '2026-01-26'); assert.equal(typeof message.params.appCapabilities, 'object'); }
+        if (message.method === 'ui/initialize') { assert.equal(message.params.appInfo?.name, 'video-timeline-pipeline'); assert.equal(message.params.appInfo?.version, '20'); assert.equal(message.params.protocolVersion, '2026-01-26'); assert.equal(typeof message.params.appCapabilities, 'object'); }
         if (message.method === 'ui/message') { assert.equal(message.params.role, 'user'); assert(Array.isArray(message.params.content)); }
         const result = message.method === 'tools/call' ? await callTool(message.params.name, message.params.arguments) : message.method === 'ui/message' ? await send(message.params.content[0].text) : {};
         notify({ id: message.id, result });
@@ -81,7 +81,8 @@ async function test(name, run) { try { await run(); count++; console.log('ok ' +
     assert.deepEqual(h.fallbackCalls,[],'standard MCP bridge, not the window.openai fallback');
   });
   await test('only explicit summary+provenance submission sends exact current analysis binding', async () => {
-    const h=setup(r(),(name,args)=>name==='get_prepared_video'?{prepared:job('first'),analysis:a(),report:r()}:({...r('queued'),summary_status:'caller_submitted'}));
+    let stored=r();
+    const h=setup(stored,name=>name==='get_prepared_video'?{prepared:job('first'),analysis:a(),report:stored}:(stored={...r('queued'),summary_status:'caller_submitted'}));
     await h.flush();h.elements.get('report-summary').value='user source text';h.elements.get('report-provenance').value='unknown author';await h.click('finalize-report');
     const sent=h.calls.find(x=>x.name==='finalize_analysis_report');assert.deepEqual(sent.args,{job_id:'first',cache_signature:'a'.repeat(64),analysis_sha256:'b'.repeat(64),summary_text:'user source text',provenance_note:'unknown author'});
     assert.equal(h.calls.filter(x=>x.name==='finalize_analysis_report').length,1);assert.match(h.elements.get('report-state').textContent,/queued/);
@@ -89,6 +90,151 @@ async function test(name, run) { try { await run(); count++; console.log('ok ' +
   await test('unverified or stale report never enables merge copy', async () => {
     const h=setup({...r('report_ready'),verified:false,file_id:'fixture',merge_text:'must not copy'});await h.flush();assert.equal(h.elements.get('copy-merge').disabled,true);
     h.notifyTool({...r('report_ready'),cache_signature:'f'.repeat(64),verified:true,file_id:'fixture',merge_text:'stale'});await h.flush();assert.equal(h.elements.get('copy-merge').disabled,true);
+  });
+  await test('a delayed older report notification cannot replace the current queued summary', async () => {
+    const latest={...r('queued'),report_sha256:'d'.repeat(64),summary_status:'caller_submitted',operation:pending('new-report','report')};
+    const h=setup(latest,name=>{
+      assert.equal(name,'get_prepared_video');return {prepared:job('first'),analysis:a(),report:latest};
+    });
+    await h.flush();
+    h.notifyTool({...r('report_ready'),verified:true,file_id:'old-report',merge_text:'OLD SUMMARY MERGE'});
+    await h.flush();
+    assert.equal(h.elements.get('copy-merge').disabled,true);
+    assert.match(h.elements.get('report-state').textContent,/queued/);
+    assert.equal(h.calls.filter(x=>x.name==='get_prepared_video').length,2);
+    assert(h.calls.every(x=>x.name==='get_prepared_video'));assert.equal(h.prompts.length,0);
+  });
+  await test('a new ChatGPT report notification is reconciled with the saved report before enabling copy', async () => {
+    let latest=r();
+    const h=setup(latest,name=>{
+      assert.equal(name,'get_prepared_video');return {prepared:job('first'),analysis:a(),report:latest};
+    });
+    await h.flush();
+    latest={...r('queued'),report_sha256:'d'.repeat(64),summary_status:'caller_submitted',operation:pending('new-report','report')};
+    h.notifyTool(latest);await h.flush();assert.equal(h.elements.get('copy-merge').disabled,true);
+    latest={...latest,status:'report_ready',verified:true,file_id:'new-report',merge_text:'CURRENT SUMMARY MERGE'};
+    h.notifyTool(latest);await h.flush();assert.equal(h.elements.get('copy-merge').disabled,false);
+    const copies=[];h.context.navigator={clipboard:{writeText:async text=>copies.push(text)}};
+    await h.click('copy-merge');assert.deepEqual(copies,['CURRENT SUMMARY MERGE']);
+    assert.equal(h.calls.filter(x=>x.name==='get_prepared_video').length,3);
+    assert(h.calls.every(x=>x.name==='get_prepared_video'));
+  });
+  await test('an older in-flight report refresh cannot overwrite a newer authoritative refresh', async () => {
+    const queued=(digest,id)=>({...r('queued'),report_sha256:digest.repeat(64),operation:pending(id,'report')});
+    const first=queued('d','report-d'),latest=queued('e','report-e');let reads=0,release;
+    const h=setup(first,name=>{
+      assert.equal(name,'get_prepared_video');reads++;
+      if(reads===2) return new Promise(resolve=>{release=()=>resolve({prepared:job('first'),analysis:a(),report:{...first,status:'report_ready',verified:true,file_id:'old-report',merge_text:'OLD MERGE'}});});
+      return {prepared:job('first'),analysis:a(),report:reads>=3?latest:first};
+    });
+    await h.flush();h.notifyTool({...first,status:'report_ready',verified:true,file_id:'old-report',merge_text:'OLD MERGE'});await h.flush();
+    assert.equal(typeof release,'function');
+    h.notifyTool(latest);await h.flush();release();await h.flush();
+    assert.equal(h.elements.get('copy-merge').disabled,true);assert.match(h.elements.get('report-state').textContent,/queued/);
+    assert.equal(reads,3);assert.equal(h.prompts.length,0);
+  });
+  for(const oldOperation of [false,true]) await test('a stale manual restore cannot revive an old report'+(oldOperation?' through a completed operation':''), async () => {
+    const old={...r('report_ready'),verified:true,file_id:'old-report',merge_text:'OLD C MERGE'};
+    const latest={...r('queued'),report_sha256:'d'.repeat(64),operation:pending('report-d','report')};let reads=0,release;
+    const oldSnapshot={prepared:job('first'),analysis:a(),report:old,
+      ...(oldOperation?{latest_operation:reportCompleted(old)}:{})};
+    const h=setup(old,name=>{
+      assert.equal(name,'get_prepared_video');reads++;
+      if(reads===2) return new Promise(resolve=>{release=()=>resolve(oldSnapshot);});
+      return {prepared:job('first'),analysis:a(),report:reads>=3?latest:old};
+    });
+    await h.flush();const restoring=h.elements.get('refresh').fire('click');await h.flush();
+    h.notifyTool(latest);await h.flush();assert.equal(h.elements.get('copy-merge').disabled,true);
+    release();await restoring;await h.flush();assert.equal(h.elements.get('copy-merge').disabled,true);
+    assert.match(h.elements.get('report-state').textContent,/queued/);
+    const copies=[];h.context.navigator={clipboard:{writeText:async text=>copies.push(text)}};
+    await h.elements.get('copy-merge').fire('click');assert.deepEqual(copies,[]);
+    assert.equal(reads,3);assert(h.calls.every(x=>x.name==='get_prepared_video'));
+  });
+  await test('the saved current report wins over an older latest completed queue operation', async () => {
+    const old={...r('report_ready'),verified:true,file_id:'old-report',merge_text:'OLD C MERGE'};
+    const latest={...r('awaiting_segments'),report_sha256:'d'.repeat(64),summary_status:'caller_submitted'};
+    const h=setup(latest,()=>({prepared:job('first'),analysis:a(),report:latest,latest_operation:reportCompleted(old)}));
+    await h.flush();assert.equal(h.elements.get('copy-merge').disabled,true);
+    assert.match(h.elements.get('report-state').textContent,/awaiting_segments/);
+    assert(h.calls.every(x=>x.name==='get_prepared_video'));assert.equal(h.prompts.length,0);
+  });
+  await test('a newer notification during the post-submission read supersedes that older response', async () => {
+    const own={...r('queued'),report_sha256:'d'.repeat(64),summary_status:'caller_submitted',operation:pending('report-d','report')};
+    const ready={...own,status:'report_ready',verified:true,file_id:'old-d',merge_text:'OLD D MERGE'};
+    const latest={...own,report_sha256:'e'.repeat(64),operation:pending('report-e','report')};let reads=0,release;
+    const h=setup(r(),name=>{
+      if(name==='finalize_analysis_report') return own;
+      assert.equal(name,'get_prepared_video');reads++;
+      if(reads===2) return new Promise(resolve=>{release=()=>resolve({prepared:job('first'),analysis:a(),report:ready});});
+      return {prepared:job('first'),analysis:a(),report:reads>2?latest:r()};
+    });
+    await h.flush();h.elements.get('report-summary').value='explicit text';h.elements.get('report-provenance').value='owned fixture';
+    const submission=h.elements.get('finalize-report').fire('click');await h.flush();assert.equal(typeof release,'function');
+    h.notifyTool(latest);await h.flush();release();await submission;await h.flush();
+    assert.equal(h.elements.get('copy-merge').disabled,true);assert.match(h.elements.get('report-state').textContent,/queued/);
+    assert.equal(reads,3);assert.equal(h.calls.filter(x=>x.name==='finalize_analysis_report').length,1);
+    const copies=[];h.context.navigator={clipboard:{writeText:async text=>copies.push(text)}};
+    await h.elements.get('copy-merge').fire('click');assert.deepEqual(copies,[]);assert.equal(h.prompts.length,0);
+  });
+  await test('notifications during the pending write are reconciled by the mandatory post-acknowledgment read', async () => {
+    const own={...r('queued'),report_sha256:'d'.repeat(64),summary_status:'caller_submitted'};
+    const latest={...own,report_sha256:'e'.repeat(64)};let stored=r(),reads=0,release;
+    const h=setup(stored,name=>{
+      if(name==='finalize_analysis_report') return new Promise(resolve=>{release=()=>resolve(own);});
+      assert.equal(name,'get_prepared_video');reads++;return {prepared:job('first'),analysis:a(),report:stored};
+    });
+    await h.flush();h.elements.get('report-summary').value='explicit text';h.elements.get('report-provenance').value='owned fixture';
+    const submission=h.elements.get('finalize-report').fire('click');await h.flush();
+    stored=latest;h.notifyTool(latest);await h.flush();assert.equal(reads,1);
+    release();await submission;await h.flush();assert.equal(reads,2);
+    assert.equal(h.elements.get('copy-merge').disabled,true);assert.match(h.elements.get('report-state').textContent,/queued/);
+    assert.equal(h.calls.filter(x=>x.name==='finalize_analysis_report').length,1);
+  });
+  await test('an old job submission cannot release a new job pending-write guard', async () => {
+    let releaseFirst,releaseSecond,secondSubmitted=false,reads=0;
+    const secondReport=()=>({...r(secondSubmitted?'queued':'summary_pending'),job_id:'second'});
+    const h=setup(r(),(name,args)=>{
+      if(name==='get_prepared_video') {reads++;return {prepared:job(args.job_id),analysis:{...a(),job_id:args.job_id},report:args.job_id==='second'?secondReport():r()};}
+      assert.equal(name,'finalize_analysis_report');
+      return new Promise(resolve=>{
+        if(args.job_id==='first') releaseFirst=()=>resolve({...r('queued'),summary_status:'caller_submitted'});
+        else {secondSubmitted=true;releaseSecond=()=>resolve(secondReport());}
+      });
+    });
+    await h.flush();h.elements.get('report-summary').value='first';h.elements.get('report-provenance').value='fixture';
+    const first=h.elements.get('finalize-report').fire('click');await h.flush();
+    h.notifyTool(job('second'));await h.flush();h.elements.get('report-summary').value='second';
+    const second=h.elements.get('finalize-report').fire('click');await h.flush();
+    releaseFirst();await first;await h.flush();const before=reads;
+    h.notifyTool(secondReport());await h.flush();assert.equal(reads,before);
+    assert.equal(h.elements.get('finalize-report').disabled,true);
+    releaseSecond();await second;await h.flush();
+    assert.equal(h.calls.filter(x=>x.name==='finalize_analysis_report').length,2);
+    assert.equal(h.elements.get('copy-merge').disabled,true);
+  });
+  await test('an absent authoritative report clears a previously enabled merge instruction', async () => {
+    const ready={...r('report_ready'),verified:true,file_id:'old-report',merge_text:'OLD MERGE'};let reads=0;
+    const h=setup(ready,name=>{
+      assert.equal(name,'get_prepared_video');return {prepared:job('first'),analysis:a(),report:++reads===1?ready:null};
+    });
+    await h.flush();assert.equal(h.elements.get('copy-merge').disabled,false);
+    h.notifyTool(ready);await h.flush();
+    assert.equal(h.elements.get('copy-merge').disabled,true);assert.equal(h.elements.get('analysis-report').hidden,true);
+    assert.equal(reads,2);
+  });
+  await test('a failed authoritative notification refresh blocks old merge copy without replaying a write', async () => {
+    const ready={...r('report_ready'),verified:true,file_id:'old-report',merge_text:'OLD MERGE'};let reads=0;
+    const h=setup(ready,name=>{
+      assert.equal(name,'get_prepared_video');
+      if(++reads>1) throw new Error('REPORT_READ: offline fixture');
+      return {prepared:job('first'),analysis:a(),report:ready};
+    });
+    await h.flush();h.notifyTool(ready);await h.flush();
+    assert.equal(h.elements.get('copy-merge').disabled,true);assert.match(h.elements.get('status').textContent,/REPORT_READ: offline fixture/);
+    const copies=[];h.context.navigator={clipboard:{writeText:async text=>copies.push(text)}};
+    await h.elements.get('copy-merge').fire('click');assert.deepEqual(copies,[]);
+    assert(h.calls.every(x=>x.name==='get_prepared_video'));assert.equal(h.prompts.length,0);
   });
   await test('verified same-analysis report copies literal conflict-aware instruction only on click', async () => {
     const merge='合併：讀取同資料夾的 A_server_analysis.md，和你剛才的分析合併成一份摘要。講話內容以 A 為主，畫面上的文字和數字以你讀到的為主；兩邊不一致的地方列成衝突清單，不要自己選一邊。';const h=setup({...r('report_ready'),verified:true,file_id:'fixture-report',merge_text:merge});await h.flush();
@@ -108,7 +254,7 @@ async function test(name, run) { try { await run(); count++; console.log('ok ' +
   for(const origin of ['submission','notification','restore']) await test(origin+' follows a submitted report while its Drive prerequisites finish', async () => {
     let reads=0;
     const h=setup(origin==='restore'?awaitingReport():r(),name=> {
-      if(name==='get_prepared_video') return {prepared:job('first'),analysis:a(),report:++reads===1?(origin==='restore'?awaitingReport():r()):reads===2?awaitingReport():queuedReport()};
+      if(name==='get_prepared_video') return {prepared:job('first'),analysis:a(),report:++reads===1?(origin==='restore'?awaitingReport():r()):reads<=(origin==='restore'?2:3)?awaitingReport():queuedReport()};
       if(name==='finalize_analysis_report') return awaitingReport();
       if(name==='get_video_job') return reportCompleted();
       throw new Error('Unexpected '+name);
@@ -121,7 +267,7 @@ async function test(name, run) { try { await run(); count++; console.log('ok ' +
       assert(!h.elements.get('report-state').textContent.includes('已放進 Drive'));
       await h.poll();
     }
-    assert.equal(reads,3);assert.equal(h.elements.get('copy-merge').disabled,false);
+    assert.equal(reads,origin==='restore'?3:4);assert.equal(h.elements.get('copy-merge').disabled,false);
     assert.match(h.elements.get('report-state').textContent,/A 已完成/);
     assert.equal(h.calls.filter(x=>x.name==='finalize_analysis_report').length,origin==='submission'?1:0);
     assert(h.calls.every(x=>['get_prepared_video','get_video_job','finalize_analysis_report'].includes(x.name)));
@@ -182,6 +328,20 @@ async function test(name, run) { try { await run(); count++; console.log('ok ' +
     assert(!h.elements.get('report-state').textContent.includes('已放進 Drive'));assert.equal(h.elements.get('copy-merge').disabled,true);
     assert.equal(h.calls.filter(x=>x.name==='finalize_analysis_report').length,0);
   });
+  await test('complete evidence completion does not tell the user to wait for an optional summary', async () => {
+    let reads=0;
+    const h=harness({respond(name,args) {
+      if(name==='get_prepared_video') return {prepared:job('first'),analysis:++reads===1?null:a(),report:reads===1?null:{...r('awaiting_segments'),evidence_scope:'complete'}};
+      if(name==='analyze_prepared_video') return pending();
+      if(name==='get_video_job') return completed(a());
+      throw new Error('Unexpected '+name);
+    }});
+    await h.flush();await h.click('analyze');await h.poll();
+    assert.match(h.elements.get('report-state').textContent,/自動放進 Drive（不需摘要）/);
+    assert(!h.elements.get('status').textContent.includes('等待 ChatGPT 整理摘要後才會上傳'));
+    assert.equal(h.calls.filter(x=>x.name==='analyze_prepared_video').length,1);
+    assert.equal(h.calls.filter(x=>x.name==='finalize_analysis_report').length,0);
+  });
   await test('report snapshot read failure displays full error without replaying A', async () => {
     let reads=0;
     const h=harness({respond(name) {
@@ -195,8 +355,8 @@ async function test(name, run) { try { await run(); count++; console.log('ok ' +
     assert.equal(h.elements.get('findings').hidden,false);assert.equal(h.calls.filter(x=>x.name==='analyze_prepared_video').length,1);
   });
   await test('summary submission polls queued and running report with bounded backoff then enables spec merge', async () => {
-    let polls=0;
-    const h=setup(r(),(name,args)=>name==='get_prepared_video'?{prepared:job('first'),analysis:a(),report:r()}:name==='finalize_analysis_report'?queuedReport('queued'):name==='get_video_job'?(++polls<4?pending('report-1','report','running'):reportCompleted()):null);
+    let polls=0,stored=r();
+    const h=setup(stored,name=>name==='get_prepared_video'?{prepared:job('first'),analysis:a(),report:stored}:name==='finalize_analysis_report'?(stored=queuedReport('queued')):name==='get_video_job'?(++polls<4?pending('report-1','report','running'):reportCompleted()):null);
     await h.flush();fillSummary(h);await h.click('finalize-report');
     const delays=[];
     for(let i=0;i<4;i++) {
@@ -212,8 +372,9 @@ async function test(name, run) { try { await run(); count++; console.log('ok ' +
   });
   await test('ChatGPT finalize notification and restored running report adopt polling without resubmission', async () => {
     for(const restored of [false,true]) {
-      const h=setup(restored?queuedReport():r(),name=>name==='get_prepared_video'?{prepared:job('first'),analysis:a(),report:restored?queuedReport():r()}:reportCompleted());
-      await h.flush();if(!restored) h.notifyTool(queuedReport());await h.flush();await h.poll();
+      let stored=restored?queuedReport():r();
+      const h=setup(stored,name=>name==='get_prepared_video'?{prepared:job('first'),analysis:a(),report:stored}:reportCompleted());
+      await h.flush();if(!restored) {stored=queuedReport();h.notifyTool(stored);}await h.flush();await h.poll();
       assert.equal(h.elements.get('copy-merge').disabled,false);assert.equal(h.calls.filter(x=>x.name==='finalize_analysis_report').length,0);
     }
   });
