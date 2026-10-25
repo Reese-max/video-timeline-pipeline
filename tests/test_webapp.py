@@ -20,6 +20,7 @@ from unittest.mock import patch
 import pipeline
 import digests
 import web_services as services
+import cost_tracker
 from email_providers import FakeProvider, ResendProvider
 import notifications
 
@@ -612,6 +613,32 @@ class HTTPTests(Dataset):
         self.assertIn('name="viewport"', page.text)
         self.assertNotIn(self.token, page.text)
         self.assertIn("影片資料庫", page.text)
+
+    def test_cost_context_uses_own_period_timezone_and_as_of_in_week_view(self):
+        with patch.dict(os.environ, {"COST_TIMEZONE": "UTC"}):
+            cost_tracker.record_usage(self.root, "owned-fixture", "synthetic-only", actual_micro_usd=1000000)
+            cost = services.costs(self.root)
+            for path in ("/?window=week&timezone=Asia/Taipei", "/costs"):
+                page = self.client.get(path)
+                self.assertEqual(page.status_code, 200, page.text)
+                context = page.text.split('class="caption cost-context">', 1)[-1].split("</p>", 1)[0]
+                self.assertIn("成本期間：每日", context)
+                self.assertIn(cost["report"]["period"], context)
+                self.assertIn("時區 UTC", context)
+                self.assertIn("資料時間", context)
+                self.assertRegex(context, r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}")
+                self.assertIn("本程式帳本", context)
+
+    def test_unavailable_cost_context_does_not_invent_a_period_or_timestamp(self):
+        unavailable = {"state": "unavailable", "actual": None, "estimated": None, "unknown": None,
+                       "scope": "local_program_ledger"}
+        with patch.object(services, "costs", return_value=unavailable):
+            page = self.client.get("/?window=week")
+        self.assertEqual(page.status_code, 200, page.text)
+        context = page.text.split('class="caption cost-context">', 1)[-1].split("</p>", 1)[0]
+        self.assertIn("成本期間：unavailable", context)
+        self.assertIn("資料時間 unavailable", context)
+        self.assertNotIn("時區 UTC", context)
 
     def test_remote_bind_requires_all_security_gates(self):
         from webapp import create_app

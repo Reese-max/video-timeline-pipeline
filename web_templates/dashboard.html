@@ -1,3 +1,6 @@
+{% macro cost_context(cost) -%}
+<p class="caption cost-context">成本期間：{% if cost.report and cost.report.period %}{{ '每日' if cost.report.period_type == 'daily' else '每月' if cost.report.period_type == 'monthly' else cost.report.period_type }} {{ cost.report.period }} · 時區 {{ cost.report.accounting_timezone }}{% else %}unavailable{% endif %} · 資料時間 {{ cost.as_of if cost.as_of else 'unavailable' }} · 本程式帳本</p>
+{%- endmacro %}
 <!doctype html>
 <html lang="zh-Hant">
 <head>
@@ -33,6 +36,7 @@
 </section>
 <h2>目前工作</h2><dl class="facts">{% for key in ['queued','running','failed','unknown','blocked'] %}<div><dt>{{ key }}</dt><dd>{{ data.counts.get(key, 0) }}</dd></div>{% endfor %}</dl>
 <p><a href="/costs">成本與用量</a>：{{ data.costs.state }} · 實際 {{ data.costs.actual if data.costs.actual is not none else 'unavailable' }} USD · 估計小計 {{ data.costs.estimated if data.costs.estimated is not none else 'unavailable' }} USD。金額僅涵蓋本程式紀錄，估計小計不是完整帳單。</p>
+{{ cost_context(data.costs) }}
 {% endif %}
 {% if page == '影片資料庫' %}
 <form method="get" class="filters" aria-label="影片篩選">
@@ -66,6 +70,7 @@
 {% endif %}
 {% if page == '成本與預算' and data %}
 <p>本程式可見範圍 · {{ data.state }}。供應商配額、Token Plan 包含額度與完整帳單可能無法取得。</p>
+{{ cost_context(data) }}
 <dl class="facts">{% for field, label in [('actual','實際金額 USD'),('estimated','估計小計 USD'),('unknown','價格未知筆數'),('confirmed_included','已確認含在方案內筆數'),('outstanding_reservations','未結清預留 USD')] %}<div><dt>{{ label }}</dt><dd>{{ data[field] if data[field] is defined and data[field] is not none else 'unavailable' }}</dd></div>{% endfor %}</dl>
 {% if data.budget %}<h2>每日預算</h2><p>已用 {{ data.budget.spent_usd }} USD · 未結清 {{ data.budget.outstanding_usd }} USD · 可用 {{ data.budget.remaining_usd if data.budget.remaining_usd is not none else '未設定上限' }} USD</p><p>{{ data.budget.accounting_timezone }} · {{ data.budget.period }} · 今日阻擋 {{ data.budget.blocked_operations_today }} 筆</p>{% endif %}
 {% endif %}
