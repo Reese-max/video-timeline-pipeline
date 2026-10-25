@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- 修正：付費新增訂閱預存前先驗證期間、模式與結果預算，避免無效參數留下壞訂閱；OPML 的停用狀態會一併預存，盤點失敗後不會意外啟用。失敗後保留的 Instagram 訂閱補上作者 URL，避免 OPML 匯入時遺失。
+
 - 修正：新增 Apify／Bright Data 付費訂閱（`--facebook-author`×`--facebook-provider apify`／`brightdata`、`--instagram-author`，含 OPML 匯入）完成付費盤點時不會寫入 `paid_discovery_at`，導致 `RSS_PAID_DISCOVERY_MIN_HOURS` 間隔內的排程刷新把同一位作者再付費盤點一次（該欄位原本只在 `--rss-refresh` 的送出前存檔寫入）。現在設定間隔時，`add_facebook_subscription` 與 `add_instagram_subscription` 在付費呼叫**送出前**就把 `paid_discovery_at` 寫入並存檔（涵蓋呼叫中斷），盤點完整完成後再重設為完成時間（與 refresh 一致）；付費盤點失敗時訂閱仍留在訂閱清單，間隔照樣起算、不重複扣款。未設定間隔、免費盤點（`provider="meta"`）或未加 `--allow-batch-cloud` 的行為不變（不多寫欄位、失敗不建訂閱）。新增回歸測試 `tests/test_rss_paid_discovery.py::PaidDiscoveryAddStampTests`（送出前 payload 已在磁碟、新增後立刻 `refresh_rss` deferred 且不再送供應商呼叫、未設間隔不寫欄位、被拒絕的付費新增不留訂閱）。README 同步說明。
 
 - 新增：YouTube 改走家用網路出口。A1 實測所有 YouTube 影片（連 `jNQXAC9IVRw`）都回「Sign in to confirm you're not a bot」，yt-dlp 2026.8.19 與 2026.10.21 相同，同一支影片從家用 IP 不帶 cookie 可抓。新增環境變數 `YTDLP_YOUTUBE_PROXY`：有設定時只有 YouTube 網址（`pipeline.is_youtube_url`：`youtube.com`、`www.`／`m.`／`music.`、`youtu.be`、`youtube-nocookie.com`）的下載與字幕抓取加上 `--proxy`，其他網站不變。新增 `scripts/youtube-egress/egress_proxy.py`（標準庫 HTTP CONNECT proxy：只回應允許的來源 IP、只接受 CONNECT 到 YouTube／Google 網域的 443 埠、拒絕 IP 字面值與解析到非公開位址的網域）與 Windows 安裝腳本 `install-windows.ps1`（開機排程工作＋只允許 A1 的防火牆規則，`-Uninstall` 移除）。新增 `tests/test_youtube_egress.py`；說明見 `docs/gitops.md`。

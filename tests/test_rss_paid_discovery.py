@@ -300,6 +300,78 @@ class PaidDiscoveryAddStampTests(unittest.TestCase):
             self.assertEqual(pipeline.load_rss_state(root)["subscriptions"], [],
                              "a refused add must not leave a subscription behind")
 
+    def test_invalid_add_options_leave_state_unchanged(self) -> None:
+        cases = [("facebook", {"provider": "apify", "since": "invalid"}),
+                 ("facebook", {"provider": "apify", "brightdata_mode": "posts"}),
+                 ("facebook", {"provider": "brightdata", "brightdata_mode": "invalid", "max_items": 5})]
+        for platform in ("facebook", "instagram"):
+            options = {"provider": "brightdata"} if platform == "facebook" else {}
+            cases.extend((platform, dict(options, max_items=budget))
+                         for budget in (None, 0, -1, True, "5", 1.5))
+            cases.append((platform, dict(options, max_items=5, since="invalid")))
+        for platform, options in cases:
+            with self.subTest(platform=platform, options=options), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                pipeline.secure_rss_directory(root)
+                before = pipeline.load_rss_state(root)
+                with mock.patch.dict(pipeline.os.environ, {
+                    **self.ENV, "APIFY_API_TOKEN": "offline-token", "APIFY_MAX_TOTAL_CHARGE_USD": "1",
+                    "BRIGHTDATA_API_TOKEN": "offline-token",
+                }, clear=True), mock.patch.object(pipeline, "request_json", side_effect=AssertionError("no HTTP")) as submit, \
+                     mock.patch.object(pipeline, "get_json", side_effect=AssertionError("no HTTP")) as read:
+                    add = getattr(pipeline, f"add_{platform}_subscription")
+                    with self.assertRaises(ValueError):
+                        add(root, "example", allow_paid=True, **options)
+                submit.assert_not_called()
+                read.assert_not_called()
+                self.assertEqual(pipeline.load_rss_state(root), before,
+                                 "invalid options must not persist an unusable subscription or cooldown")
+
+    def test_failed_disabled_opml_add_stays_disabled_before_and_after_the_call(self) -> None:
+        for platform, provider in (("facebook", "apify"), ("facebook", "brightdata"), ("instagram", "brightdata")):
+            with self.subTest(platform=platform, provider=provider), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                source = root / "disabled.opml"
+                source.write_text(
+                    f'<opml version="2.0"><body><outline xmlUrl="https://www.{platform}.com/example/" '
+                    f'vidbeeKind="{platform}-author" vidbeeEnabled="false" '
+                    f'vidbeeFacebookProvider="{provider}" vidbeeFacebookMaxItems="5" '
+                    'vidbeeInstagramMaxItems="5" /></body></opml>', encoding="utf-8")
+                enabled_at_call = []
+
+                def failed_fetch(*args, **kwargs):
+                    enabled_at_call.append(pipeline.load_rss_state(root)["subscriptions"][0]["enabled"])
+                    raise RuntimeError("provider outcome unknown")
+
+                with mock.patch.dict(pipeline.os.environ, self.ENV), \
+                     mock.patch.object(pipeline, f"fetch_{platform}_author", side_effect=failed_fetch) as fetch:
+                    self.assertEqual(pipeline.import_rss_opml(root, source, allow_paid=True),
+                                     {"added": 0, "existing": 0, "failed": 1})
+                    state = pipeline.load_rss_state(root)
+                    self.assertEqual(enabled_at_call, [False], "persist the OPML permission before dispatch")
+                    self.assertFalse(state["subscriptions"][0]["enabled"])
+                    state["subscriptions"][0]["paid_discovery_at"] = hours_ago(21)
+                    pipeline.save_rss_state(root, state)
+                    fetch.reset_mock()
+                    self.assertEqual(pipeline.refresh_rss(root)["feeds"], 0)
+                    fetch.assert_not_called()
+
+    def test_failed_paid_add_retains_an_exportable_subscription(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            with mock.patch.dict(pipeline.os.environ, self.ENV), \
+                 mock.patch.object(pipeline, "fetch_instagram_author", side_effect=RuntimeError("provider timeout")):
+                with self.assertRaisesRegex(RuntimeError, "provider timeout"):
+                    pipeline.add_instagram_subscription(root, "someone", max_items=5, allow_paid=True)
+            subscription = pipeline.load_rss_state(root)["subscriptions"][0]
+            self.assertTrue(subscription["enabled"])
+            self.assertTrue(subscription["paid_discovery_at"])
+            output = root / "subscriptions.opml"
+            self.assertEqual(pipeline.export_rss_opml(root, output), 1)
+            outline = pipeline.ET.fromstring(output.read_text(encoding="utf-8")).find(".//outline")
+            self.assertEqual(outline.attrib["xmlUrl"], pipeline.instagram_author_url("someone"),
+                             "OPML imports silently skip retained subscriptions with an empty xmlUrl")
+
 
 if __name__ == "__main__":
     unittest.main()

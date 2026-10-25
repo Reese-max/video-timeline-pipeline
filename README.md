@@ -281,6 +281,8 @@ Apify Token 一律放在 `Authorization` header，不放 URL、輸出或 Git。A
 排程刷新（沒加 `--allow-batch-cloud` 的 `--rss-refresh`）預設不跑任何付費盤點。`RSS_PAID_DISCOVERY` 以逗號列出排程可自行使用的供應商（`apify`、`brightdata`），例如 `RSS_PAID_DISCOVERY=brightdata` 即可讓 Facebook Bright Data 與 Instagram 作者訂閱自動刷新，不必在排程加 `--allow-batch-cloud`；`RSS_PAID_DISCOVERY=apify` 則只放行 Apify。每次 Apify run 仍以 `APIFY_MAX_TOTAL_CHARGE_USD` 封頂，供應商方案的每月上限才是最終上限。
 `RSS_PAID_DISCOVERY_MIN_HOURS`（小時，預設 0＝不限）讓這類排程自行放行的付費盤點每個訂閱至少間隔指定時間：例如排程每天跑 3 次時設 `20`，正常排程下每個 Apify 粉專約每天盤點一次（這是最短間隔、不是日曆日：停機後補跑可能同一天兩次；也是每個訂閱各自計算，不是帳戶總額上限）；未到間隔的訂閱記為 `deferred`、不算失敗，免費的 RSS／YouTube 照常每次刷新。間隔從每次付費嘗試起算，且在送出前就先存檔（失敗或中途被中斷的 run 也可能已計費）；明確加 `--allow-batch-cloud` 不受限，但仍會重設起算時間。新增付費訂閱（`--facebook-author`／`--instagram-author` 含 OPML 匯入）的付費盤點同樣在送出前先寫入 `paid_discovery_at`，訂閱加入後的前一段時間排程刷新不會重複付費；未設定間隔或免費盤點不會多寫這個欄位。設定間隔時的新增若付費盤點失敗，訂閱仍會留在訂閱清單（間隔照樣起算），排程刷新會在間隔後自動重試。
 
+新增前會先驗證作者的期間、模式與結果預算；無效參數不會留下訂閱或冷卻時間。OPML 匯入的啟停狀態會在付費呼叫前存檔，盤點失敗也不會把停用訂閱改為啟用；保留的 Instagram 訂閱仍有作者 URL，可正常匯出 OPML。
+
 公開 Facebook Page 也可用 Bright Data，支援 Reels by profile URL（dataset `gd_lyclm3ey2q6rww027t`）與 Pages Posts by profile URL（dataset `gd_lkaxegm826bjpoo9m5`）兩種模式：
 
 ```powershell
