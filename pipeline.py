@@ -1052,9 +1052,9 @@ def file_fingerprint(path: Path) -> str:
     return f"{stat.st_size}:{stat.st_mtime_ns}"
 
 
-def probe_video(video_path: Path, cache_path: Path | None = None) -> dict[str, Any]:
+def probe_video(video_path: Path, cache_path: Path | None = None, *, local_mp4_only: bool = False) -> dict[str, Any]:
     fingerprint = file_fingerprint(video_path)
-    if cache_path is not None:
+    if cache_path is not None and not local_mp4_only:
         cached = reuse_artifact(cache_path)
         if (
             isinstance(cached, dict)
@@ -1071,6 +1071,7 @@ def probe_video(video_path: Path, cache_path: Path | None = None) -> dict[str, A
             "json",
             "-show_format",
             "-show_streams",
+            *(["-protocol_whitelist", "file", "-format_whitelist", "mov"] if local_mp4_only else []),
             str(video_path),
         ]
     )

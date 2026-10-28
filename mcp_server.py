@@ -12,6 +12,7 @@ import os
 import re
 import shutil
 import socket
+import tempfile
 import threading
 import time
 import atexit
@@ -25,7 +26,7 @@ import drive_storage
 import analysis_report
 from job_queue import JobQueue, JobBusyError, report_progress, TERMINAL, validate_parent_writer_lease
 from media_lifecycle import StoragePolicy, MediaSigner
-from execution_control import DeadlineExceeded, ExecutionCancelled
+from execution_control import DeadlineExceeded, ExecutionCancelled, OperationBudget
 from mcp import types
 from mcp.server.fastmcp import FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
@@ -374,7 +375,10 @@ def normalize_file_references(files: list[dict]) -> list[dict]:
         if file_id in seen_ids:
             raise ValueError(f"files[{index}].file_id 重複。")
         download_url = str(item.get("download_url") or "").strip()
-        parsed = urlsplit(download_url)
+        try:
+            parsed = urlsplit(download_url)
+        except ValueError:
+            raise ValueError(f"files[{index}].download_url 必須是有效的 HTTPS 網址。") from None
         if parsed.scheme.lower() != "https" or not parsed.netloc:
             raise ValueError(f"files[{index}].download_url 必須是 HTTPS URL。")
         if parsed.username or parsed.password:
@@ -389,6 +393,70 @@ def normalize_file_references(files: list[dict]) -> list[dict]:
             }
         )
     return normalized
+
+
+def validate_upload_url(url: str) -> str:
+    try:
+        parsed = urlsplit(url)
+        port = parsed.port
+    except ValueError:
+        raise ValueError("上傳檔案下載網址格式無效；請使用 HTTPS／443。") from None
+    if parsed.scheme.lower() != "https" or not parsed.hostname:
+        raise ValueError("上傳檔案下載網址必須是 HTTPS URL。")
+    if parsed.username or parsed.password or port not in (None, 443):
+        raise ValueError("上傳檔案下載網址不可包含帳號、密碼或非 HTTPS 連接埠。")
+    allowed = {host.strip().lower() for host in
+               os.getenv("UPLOAD_ALLOWED_HOSTS", "files.oaiusercontent.com").split(",") if host.strip()}
+    if parsed.hostname.lower() not in allowed:
+        raise ValueError("上傳檔案下載主機不在 UPLOAD_ALLOWED_HOSTS 允許清單內。")
+    return url
+
+
+def download_uploaded_video(url: str, target: Path) -> str:
+    """Stream a signed file URL without ambient credentials or redirect cookies."""
+    budget = OperationBudget("上傳影片下載", 900, "VIDEO_API_TIMEOUT_SECONDS")
+    digest = hashlib.sha256()
+    size = 0
+    try:
+        with requests.Session() as session:
+            session.trust_env = False  # Disable .netrc credentials and environment proxies.
+            for _ in range(6):
+                url = validate_upload_url(url)
+                session.cookies.clear()
+                with session.get(url, stream=True, allow_redirects=False,
+                                 timeout=(budget.remaining(10), budget.remaining(30))) as response:
+                    if response.status_code in (301, 302, 303, 307, 308):
+                        location = response.headers.get("Location")
+                        if not location:
+                            raise ValueError("上傳檔案重新導向缺少目的網址。")
+                        url = validate_upload_url(urljoin(url, location))
+                        continue
+                    if response.status_code != 200:
+                        raise RuntimeError(f"上傳檔案下載失敗：HTTP {response.status_code}。")
+                    declared_size = response.headers.get("Content-Length")
+                    try:
+                        declared_size = int(declared_size) if declared_size is not None else None
+                    except ValueError:
+                        raise ValueError("上傳檔案回應的 Content-Length 無效。") from None
+                    if declared_size is not None and declared_size < 0:
+                        raise ValueError("上傳檔案回應的 Content-Length 無效。")
+                    if declared_size is not None and declared_size > MCP_MAX_SOURCE_BYTES:
+                        raise ValueError("上傳影片超過 MCP_MAX_SOURCE_MB 大小上限。")
+                    with target.open("xb") as output:
+                        for chunk in response.iter_content(chunk_size=64 * 1024):
+                            budget.check()
+                            size += len(chunk)
+                            if size > MCP_MAX_SOURCE_BYTES:
+                                raise ValueError("上傳影片超過 MCP_MAX_SOURCE_MB 大小上限。")
+                            output.write(chunk)
+                            digest.update(chunk)
+                    if not size:
+                        raise ValueError("上傳影片檔案是空的。")
+                    return digest.hexdigest()
+        raise ValueError("上傳檔案重新導向次數超過上限。")
+    except requests.RequestException:
+        # Request errors can contain the complete signed URL; never expose it.
+        raise RuntimeError("上傳檔案下載失敗或逾時；請重新上傳影片後再試。") from None
 
 
 def address_is_public(address: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
@@ -1340,6 +1408,76 @@ def prepare_video_sync(url: str, segment_seconds: int, max_segments: int | None)
             max_filesize=MCP_MAX_SOURCE_BYTES,
             max_duration=(segment_seconds * max_segments if max_segments is not None else None),
         )
+    return prepare_local_video(video_path, job_dir, job_id, source_url, segment_seconds, max_segments)
+
+
+def prepare_uploaded_video_sync(file: dict, segment_seconds: int, max_segments: int | None) -> dict:
+    reference = normalize_file_references([OpenAIFileReference.model_validate(file).model_dump()])[0]
+    validate_upload_url(reference["download_url"])
+    segment_bounds(1, segment_seconds, max_segments)
+    if MCP_MAX_SEGMENTS > 0 and max_segments is None:
+        max_segments = MCP_MAX_SEGMENTS
+    # Upload preparation holds the shared writer lock; only reap old crash leftovers.
+    root = MCP_JOBS_ROOT.resolve()
+    cutoff = time.time() - max(900, MCP_JOB_TIMEOUT)
+    for stale in MCP_JOBS_ROOT.glob(".upload-*"):
+        if (not stale.is_symlink() and stale.resolve() == root / stale.name
+                and stale.is_dir() and stale.stat().st_mtime < cutoff):
+            shutil.rmtree(stale)
+    require_disk_space(MCP_MAX_SOURCE_BYTES)
+    # Reserve against the total quota before the content-derived job ID is known.
+    check_job_capacity(pipeline.job_key("upload-staging"), MCP_MAX_SOURCE_BYTES)
+    with tempfile.TemporaryDirectory(prefix=".upload-", dir=MCP_JOBS_ROOT) as staging:
+        temporary = Path(staging) / "source.mp4"
+        report_progress("download", 10, "下載使用者上傳的影片")
+        sha256 = download_uploaded_video(reference["download_url"], temporary)
+        try:
+            probe = pipeline.probe_video(temporary, local_mp4_only=True)
+        except (DeadlineExceeded, ExecutionCancelled):
+            raise
+        except (RuntimeError, ValueError, OSError):
+            raise ValueError("上傳檔案不是可讀取的 MP4 影片。") from None
+        if (not isinstance(probe, dict) or not isinstance(probe.get("streams", []), list)
+                or any(not isinstance(stream, dict) for stream in probe.get("streams", []))):
+            raise ValueError("上傳檔案不是可讀取的 MP4 影片。")
+        if not any(stream.get("codec_type") == "video" for stream in probe.get("streams", [])):
+            raise ValueError("上傳檔案沒有視訊串流。")
+        segment_bounds(pipeline.video_duration(probe), segment_seconds, max_segments)
+        source_url = f"upload://{sha256}"
+        job_id = pipeline.job_key(source_url)
+        job_dir = MCP_JOBS_ROOT / job_id
+        video_path = job_dir / "source.mp4"
+        if video_path.exists():
+            if pipeline.file_sha256(video_path) != sha256:
+                raise RuntimeError("上傳影片工作識別碼與既有內容不符；未覆寫原檔。")
+        else:
+            check_job_capacity(job_id, temporary.stat().st_size)
+            new_job = not job_dir.exists()
+            job_dir.mkdir(parents=True, exist_ok=True)
+            try:
+                temporary.replace(video_path)
+            except OSError:
+                if new_job:
+                    job_dir.rmdir()
+                raise
+        storage_policy().mark_managed(job_id)
+        info_path = job_dir / "source.info.json"
+        if not info_path.exists():
+            pipeline.write_json(info_path, {
+                "title": reference["file_name"] or "上傳影片",
+                "source_type": "upload", "file_name": reference["file_name"],
+                "file_id": reference["file_id"], "sha256": sha256,
+            })
+        provenance = pipeline.reuse_artifact(info_path)
+        pipeline.write_json(job_dir / "source.probe.json", {
+            "fingerprint": pipeline.file_fingerprint(video_path), "probe": probe})
+        return prepare_local_video(video_path, job_dir, job_id, source_url, segment_seconds,
+                                   max_segments, provenance)
+
+
+def prepare_local_video(video_path: Path, job_dir: Path, job_id: str, source_url: str,
+                        segment_seconds: int, max_segments: int | None,
+                        provenance: dict | None = None) -> dict:
     if video_path.stat().st_size > MCP_MAX_SOURCE_BYTES:
         raise RuntimeError(f"影片超過 MCP_MAX_SOURCE_MB={MCP_MAX_SOURCE_BYTES // 1024 // 1024}。")
 
@@ -1391,6 +1529,7 @@ def prepare_video_sync(url: str, segment_seconds: int, max_segments: int | None)
         "status": "ready",
         "job_id": job_id,
         "source": {
+            **(provenance or {}),
             "url": pipeline.public_url(source_url),
             "title": pipeline.source_title(job_dir, video_path),
             "duration_seconds": round(duration, 3),
@@ -2297,7 +2436,8 @@ async def probe_video_source(url: str) -> dict[str, Any]:
         "in parallel without waiting for button presses. "
         "Do not call analysis concurrently with the widget. Supports public URLs accepted by the pipeline. "
         "Call probe_video_source first when a source might be private or unsupported. "
-        "When error_code is present, relay user_message and next_steps; do not speculate about causes."
+        "When error_code is present, relay user_message and next_steps; do not speculate about causes. "
+        "For private/login-required videos, ask the user to upload the MP4 and use prepare_uploaded_video."
     ),
     annotations=types.ToolAnnotations(
         readOnlyHint=False,
@@ -2325,6 +2465,46 @@ async def prepare_video_for_chatgpt(
         manifest = await asyncio.to_thread(prepare_video_locked, url, segment_seconds, max_segments)
     except Exception as error:
         return tool_error_result(error, url)
+    return tool_result(manifest)
+
+
+@mcp.tool(
+    name="prepare_uploaded_video",
+    title="準備使用者上傳的影片",
+    description=(
+        "影片無法透過網址下載（例如私人 Facebook 影片或需要登入）且使用者已上傳 MP4 時使用。"
+        "file 必須是包含 file_id 與 download_url 的完整 OpenAI 檔案引用物件，"
+        "可附 file_name 與 mime_type。伺服器下載、驗證並分段後，呼叫 analyze_prepared_video"
+        "取得語音與畫面證據，再由 ChatGPT 整理；可選擇存到已設定的 Google Drive。"
+        "建議 background=true，使用 get_video_job 輪詢；widget 會自動啟動分析，請勿重複呼叫。"
+    ),
+    annotations=types.ToolAnnotations(readOnlyHint=False, destructiveHint=False,
+                                     idempotentHint=True, openWorldHint=True),
+    meta={**FILE_HANDOFF_META, **TOOL_META, "openai/fileParams": ["file"]},
+    structured_output=True,
+)
+async def prepare_uploaded_video(
+    file: OpenAIFileReference,
+    segment_seconds: int = 120,
+    max_segments: int | None = None,
+    background: bool = False,
+) -> Annotated[types.CallToolResult, PreparedVideoResult]:
+    try:
+        reference = normalize_file_references([OpenAIFileReference.model_validate(file).model_dump()])[0]
+        validate_upload_url(reference["download_url"])
+        segment_bounds(1, segment_seconds, max_segments)
+        if background:
+            return operation_tool_result(get_queue().submit("prepare", {
+                "file": reference, "segment_seconds": segment_seconds, "max_segments": max_segments}))
+        manifest = await asyncio.to_thread(run_job, prepare_uploaded_video_sync, reference,
+                                          segment_seconds, max_segments)
+    except Exception as error:
+        result = tool_error_result(error)
+        if result.isError:
+            result.content = [types.TextContent(type="text", text=(
+                f"影片準備失敗：{result.structuredContent['error']}\n"
+                "請確認檔案是含視訊串流的 MP4、下載主機在允許清單內；網址過期時請重新上傳。"))]
+        return result
     return tool_result(manifest)
 
 

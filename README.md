@@ -104,6 +104,31 @@ python pipeline.py --root 'C:\Data\VideoLibrary' --web-worker
 
 `mcp_server.py` 是 ChatGPT Apps/MCP 入口：公開影片 URL → 既有下載器 → FFmpeg 分段 → Groq 語音辨識／MiniMax 整支影片畫面分析 → ChatGPT 根據工具證據整理時間軸。v14 widget 在準備完成後自動同時啟動伺服器分析（A）與 Drive 上傳（B，已設定時），兩者互不等待；再由「交給 ChatGPT 整理」送出整理要求；重新開啟不會自動重跑或重送。CLI 的 MiniMax 摘要流程不變；MCP 不另呼叫 MiniMax 產生摘要。影片放在 Git 忽略的 `mcp_jobs\`，工作佇列及簽章金鑰在私有 `.video-state/`。
 
+### 私人影片：上傳 MP4 後由伺服器分析
+
+Facebook 私人影片或登入牆導致網址無法下載時，先把 MP4 上傳至 ChatGPT，再呼叫 `prepare_uploaded_video`；`file` 使用與 `ingest_video_segments` 相同的 OpenAI 檔案參數機制（`openai/fileParams: ["file"]`），必須傳入宿主提供的完整引用，不能拿公開影片網址冒充：
+
+```json
+{
+  "file": {
+    "file_id": "file-由宿主提供",
+    "download_url": "https://files.oaiusercontent.com/由宿主提供的暫時下載路徑",
+    "file_name": "私人影片.mp4",
+    "mime_type": "video/mp4"
+  },
+  "segment_seconds": 120,
+  "background": true
+}
+```
+
+`file_name`／`mime_type` 可省略，`max_segments` 預設不限（仍受伺服器設定限制）。背景呼叫沿用既有 `prepare` 工作佇列，先回 `operation_id`，用 `get_video_job` 輪詢；下載完成並算出內容 SHA-256 後才會有 `job_id`。完成後以該 ID 呼叫 `analyze_prepared_video`，取得 ASR 與 MiniMax 畫面證據，再交給 ChatGPT 整理；已開啟 widget 時由 widget 自動啟動，避免重複呼叫。選用 Drive 與 `get_prepared_video` 還原流程均沿用原入口。`ingest_video_segments` 仍只確認檔案引用，不執行這條伺服器分析流程。
+
+下載只接受 HTTPS／443，主機名稱必須**完整相符**於 `UPLOAD_ALLOWED_HOSTS`（逗號分隔、不支援萬用字元或自動包含子網域）；既有引用正規化沒有主機清單，因此保守預設僅 `files.oaiusercontent.com`。若宿主使用其他下載主機，管理者須明確將該可信主機加入，例如 `UPLOAD_ALLOWED_HOSTS=files.oaiusercontent.com,另一個可信主機`；每次重新導向都重新核對，最多 5 次。不傳送 Cookie、帳密或環境中的代理／`.netrc` 憑證。連線逾時 10 秒、單次讀取逾時 30 秒，整體下載沿用 `VIDEO_API_TIMEOUT_SECONDS`（預設 900 秒）與背景工作期限。
+
+影片串流寫入 `mcp_jobs/.upload-*` 暫存目錄，沿用 `MCP_MAX_SOURCE_MB`（預設 **512 MiB**）硬上限及儲存空間檢查，失敗會清掉當次暫存檔。行程中斷遺留的暫存目錄會在下次上傳的容量檢查前，於既有寫入鎖內清理；僅處理超過 `max(900, MCP_JOB_TIMEOUT_SECONDS)` 秒且未連結至其他路徑的 `.upload-*` 目錄。容量不足或原片搬移失敗不會留下新建的空工作目錄。格式異常的下載網址與 ffprobe JSON 會回傳繁體中文錯誤。伺服器以 ffprobe 限定本機 MP4/MOV 容器並確認有視訊串流，音軌可省略；不依副檔名或 MIME 宣稱判定成功。內容 SHA-256 經 `pipeline.job_key("upload://<sha256>")` 產生既有格式的 12 碼 job ID：相同 bytes 即使檔名／file ID 不同也共用工作，同樣分段設定重用完成產物；修改分段設定會在同一工作重建分段。每次新引用仍須下載 bytes 才能核對內容。
+
+`source.mp4`、`source.info.json`、`source.probe.json`、分段、預覽與 manifest 與網址工作相容；來源記為 `upload://<sha256>`，不是公開可瀏覽網址。`source.info.json` 與 manifest 的 `source` 保存首次準備的 `source_type="upload"`、原始 `file_name`、`file_id`、`sha256`，不保存暫時下載網址。背景佇列的私人 `.video-state/` 會保存下載引用以便執行／續跑；網址過期時須重新上傳並重新準備。正式 ChatGPT 檔案交接與線上供應商分析仍需部署後驗收。
+
 ### v17：介面視覺更新
 
 widget 改為卡片式版面：標題區、主要動作按鈕（「交給 ChatGPT 整理」為主按鈕）、狀態提示框、缺漏提醒框，證據列的時間碼改為可點的標籤，逐字稿／畫面觀察以不同顏色區分；淺色、深色（依 ChatGPT 的 `window.openai.theme`，沒有時依系統設定）與 320px 手機寬度都可讀。Drive 原片交接區把「一鍵複製」與「開新一般對話」合成主按鈕「複製並開新一般對話」：先複製，再嘗試開新分頁並顯示開新對話連結（瀏覽器擋下分頁時按連結）；複製失敗時不開分頁，改全選交接內容並顯示同一個連結；保留次要的「只複製」。其餘元素 id、按鈕文字與證據列子元素順序不變，行為與 v16 相同。UI URI 升為 `ui://video-timeline-pipeline/v17-<媒體網址 hash>.html`，保留 v15、v16 URI 回傳目前的 widget。
