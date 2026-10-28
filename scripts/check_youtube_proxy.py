@@ -54,7 +54,7 @@ def probe(proxy: str) -> bool:
         return False
 
 
-def notify(root: Path, status: str, transition_id: str) -> None:
+def notify(root: Path, status: str, transition_id: str) -> dict[str, str]:
     """Reuse the notification outbox, targeted claim, provider and delivery audit."""
     webhook = next((os.getenv(key, "").strip() for key in
                     ("DISCORD_WEBHOOK_URL", "NOTIFY_WEBHOOK_URL", "RSS_NOTIFY_WEBHOOK")
@@ -65,29 +65,46 @@ def notify(root: Path, status: str, transition_id: str) -> None:
                          (provider_name not in {"smtp", "resend"} or not os.getenv("EMAIL_FROM")
                           or not os.getenv("SMTP_HOST" if provider_name == "smtp" else "RESEND_API_KEY"))):
         print("未完整設定通知 provider／收件者；略過通知。")
-        return
+        return {"stage": "configuration", "status": "skipped"}
     text = "YouTube Proxy 已恢復正常。" if status == "healthy" else "YouTube Proxy 連續檢查失敗，請檢查家用代理連線。"
-    notifications.bind_cost_root(root)
-    provider = notifications.get_configured_provider("webhook" if webhook else provider_name)
-    with closing(notifications.get_operations_db(root)) as conn:
-        event_id = notifications.record_event(conn, "proxy." + status, None, None, None,
-                                              {"status": status, "text": text}, transition_id)
-        delivery_id = notifications.enqueue_delivery(conn, event_id, "webhook" if webhook else "email",
-                                                     recipient, provider.__class__.__name__, transition_id)
-        claimed = notifications.claim_pending_deliveries(conn, f"proxy_{os.getpid()}", limit=1,
-                                                         delivery_id=delivery_id)
-        if not claimed:
-            return
-        target = claimed[0]
-        started = notifications._utc_now_iso()
-        try:
-            result = provider.send(recipient=recipient, subject="【YouTube Proxy】連線狀態變更",
-                                   text_body=text, html_body=None,
-                                   idempotency_key=target["provider_idempotency_key"])
-        except Exception:
-            result = notifications.DeliveryResult(status="unknown", safe_error="請人工核對通知是否送達")
-        notifications.update_delivery_status(conn, delivery_id, target["lease_token"], result, 1, started)
-        print(f"通知結果：{result.status}")
+    stage = "provider"
+    try:
+        notifications.bind_cost_root(root)
+        provider = notifications.get_configured_provider("webhook" if webhook else provider_name)
+        stage = "outbox"
+        with closing(notifications.get_operations_db(root)) as conn:
+            event_id = notifications.record_event(conn, "proxy." + status, None, None, None,
+                                                  {"status": status, "text": text}, transition_id)
+            delivery_id = notifications.enqueue_delivery(conn, event_id, "webhook" if webhook else "email",
+                                                         recipient, provider.__class__.__name__, transition_id)
+            stage = "claim"
+            claimed = notifications.claim_pending_deliveries(conn, f"proxy_{os.getpid()}", limit=1,
+                                                             delivery_id=delivery_id)
+            if not claimed:
+                print("通知未取得 delivery lease；略過通知。", file=sys.stderr)
+                return {"stage": stage, "status": "skipped"}
+            target = claimed[0]
+            started = notifications._utc_now_iso()
+            stage = "send"
+            diagnostic = {"stage": stage}
+            try:
+                result = provider.send(recipient=recipient, subject="【YouTube Proxy】連線狀態變更",
+                                       text_body=text, html_body=None,
+                                       idempotency_key=target["provider_idempotency_key"])
+            except Exception as error:
+                diagnostic["error_type"] = type(error).__name__
+                print(f"通知失敗（階段：{stage}；{type(error).__name__}）。", file=sys.stderr)
+                result = notifications.DeliveryResult(status="unknown", safe_error="請人工核對通知是否送達")
+            stage = "delivery_audit"
+            notifications.update_delivery_status(conn, delivery_id, target["lease_token"], result, 1, started)
+            diagnostic["status"] = result.status
+            print(f"通知結果（階段：send）：{result.status}",
+                  file=sys.stdout if result.status == "accepted" else sys.stderr)
+            return diagnostic
+    except Exception as error:
+        # Exception text may contain credentials; persist only the stage and type.
+        print(f"通知失敗（階段：{stage}；{type(error).__name__}）。", file=sys.stderr)
+        return {"stage": stage, "status": "error", "error_type": type(error).__name__}
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -120,9 +137,11 @@ def main(argv: list[str] | None = None) -> int:
                   (f"將通知狀態變更為 {status}。" if changed else "沒有狀態變更，不通知。"))
             return code
         # Persist before dispatch: an uncertain send must never be automatically duplicated.
-        pipeline.write_json(path, {"status": status, "failures": failures})
+        state.update(status=status, failures=failures)
+        pipeline.write_json(path, state)
         if changed:
-            notify(path.parent, status, "proxy:" + uuid.uuid4().hex)
+            state["notification"] = notify(path.parent, status, "proxy:" + uuid.uuid4().hex)
+            pipeline.write_json(path, state)
     except Exception as error:
         # Never print exception details: provider/URL errors may contain credentials.
         print(f"無法保存狀態或通知（{type(error).__name__}）；仍回傳連線檢查結果。", file=sys.stderr)

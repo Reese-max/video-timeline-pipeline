@@ -11,7 +11,8 @@ def configured(tmp_path):
     state = tmp_path / "health.json"
     with patch.dict(os.environ, {"YTDLP_YOUTUBE_PROXY": "http://proxy.test:8080",
                                  "YOUTUBE_PROXY_HEALTH_STATE": str(state)}, clear=True), \
-            patch.object(health.pipeline, "load_dotenv"), patch.object(health, "notify") as notify:
+            patch.object(health.pipeline, "load_dotenv"), \
+            patch.object(health, "notify", return_value={"stage": "send", "status": "accepted"}) as notify:
         yield state, notify
 
 
@@ -34,7 +35,8 @@ def test_threshold_and_recovery(configured):
     assert notify.call_args.args[1] == "healthy"
     assert run_probe(True) == 0
     assert notify.call_count == 2
-    assert json.loads(state.read_text()) == {"status": "healthy", "failures": 0}
+    assert json.loads(state.read_text()) == {"status": "healthy", "failures": 0,
+                                           "notification": {"stage": "send", "status": "accepted"}}
 
 
 def test_initial_failure_custom_threshold_and_reset(configured):
@@ -75,17 +77,46 @@ def test_dry_run_preserves_state(configured, capsys):
     notify.assert_not_called()
 
 
-def test_notification_failure_keeps_health_exit(configured):
+def test_missing_state_parents_are_created(configured, tmp_path):
     _, notify = configured
-    notify.side_effect = RuntimeError("secret")
-    with patch.dict(os.environ, {"YOUTUBE_PROXY_HEALTH_FAILURES": "1"}):
+    state = tmp_path / "missing" / "nested" / "health.json"
+    with patch.dict(os.environ, {"YOUTUBE_PROXY_HEALTH_STATE": str(state)}):
+        assert not state.parent.exists()
         assert run_probe(False) == 1
-    assert run_probe(True) == 0
+        assert json.loads(state.read_text())["failures"] == 1
+        assert run_probe(False) == 1
+        assert json.loads(state.read_text())["status"] == "unhealthy"
+    notify.assert_called_once()
+
+
+@pytest.mark.parametrize("target,stage", [("get_configured_provider", "provider"),
+                                        ("get_operations_db", "outbox"),
+                                        ("claim_pending_deliveries", "claim"),
+                                        ("update_delivery_status", "delivery_audit")])
+def test_notification_failure_is_logged_and_persisted(tmp_path, capsys, target, stage):
+    from email_providers import FakeProvider
+    state = tmp_path / "health.json"
+    env = {"YTDLP_YOUTUBE_PROXY": "http://proxy.test:8080", "YOUTUBE_PROXY_HEALTH_STATE": str(state),
+           "YOUTUBE_PROXY_HEALTH_FAILURES": "1", "DISCORD_WEBHOOK_URL": "https://example.test/hook"}
+    with patch.dict(os.environ, env, clear=True), patch.object(health.pipeline, "load_dotenv"), \
+            patch.object(health.notifications, "bind_cost_root"), \
+            patch.object(health.notifications, "get_configured_provider", return_value=FakeProvider()), \
+            patch.object(health.notifications, target, side_effect=RuntimeError("secret")):
+        assert run_probe(False) == 1
+        diagnostic = {"stage": stage, "status": "error", "error_type": "RuntimeError"}
+        assert json.loads(state.read_text())["notification"] == diagnostic
+        # No transition: keep the last failure visible and do not retry the send.
+        assert run_probe(False) == 1
+        assert json.loads(state.read_text())["notification"] == diagnostic
+        assert run_probe(True) == 0
+    output = capsys.readouterr()
+    assert stage in output.err and "RuntimeError" in output.err
+    assert "secret" not in output.out + output.err + state.read_text()
 
 
 def test_absent_notification_config_is_safe(tmp_path, capsys):
     with patch.dict(os.environ, {}, clear=True), patch.object(health.notifications, "get_operations_db") as db:
-        health.notify(tmp_path, "unhealthy", "transition")
+        assert health.notify(tmp_path, "unhealthy", "transition") == {"stage": "configuration", "status": "skipped"}
     assert "略過通知" in capsys.readouterr().out
     db.assert_not_called()
 
@@ -117,13 +148,50 @@ def test_invalid_proxy(proxy):
     connect.assert_not_called()
 
 
-def test_notification_reuses_outbox(tmp_path):
+@pytest.mark.parametrize("provider_name,settings", [
+    ("webhook", {"DISCORD_WEBHOOK_URL": "https://example.test/hook"}),
+    ("smtp", {"EMAIL_PROVIDER": "smtp", "EMAIL_TO": "test@example.test", "EMAIL_FROM": "from@example.test", "SMTP_HOST": "smtp.test"}),
+    ("resend", {"EMAIL_PROVIDER": "resend", "EMAIL_TO": "test@example.test", "EMAIL_FROM": "from@example.test", "RESEND_API_KEY": "test-key"})])
+def test_notification_reuses_outbox(tmp_path, provider_name, settings):
+    from email_providers import FakeProvider
     n = health.notifications
-    provider = MagicMock()
-    provider.send.return_value = n.DeliveryResult(status="accepted")
-    with patch.dict(os.environ, {"DISCORD_WEBHOOK_URL": "https://example.test/hook"}, clear=True), \
-            patch.object(n, "get_configured_provider", return_value=provider), patch.object(n, "bind_cost_root"):
-        health.notify(tmp_path, "unhealthy", "transition")
-    provider.send.assert_called_once()
+    provider = FakeProvider()
+    with patch.dict(os.environ, settings, clear=True), \
+            patch.object(n, "get_configured_provider", autospec=True, return_value=provider) as factory, \
+            patch.object(n, "bind_cost_root"):
+        assert health.notify(tmp_path, "unhealthy", "transition") == {"stage": "send", "status": "accepted"}
+    factory.assert_called_once_with(provider_name)
+    assert len(provider.history) == 1
     with n.get_operations_db(tmp_path) as conn:
-        assert conn.execute("SELECT status FROM notification_deliveries").fetchone()[0] == "accepted"
+        delivery = conn.execute("SELECT * FROM notification_deliveries").fetchone()
+        assert delivery["status"] == "accepted"
+        assert provider.history[0]["idempotency_key"] == delivery["provider_idempotency_key"]
+        assert conn.execute("SELECT outcome FROM delivery_attempts").fetchone()[0] == "accepted"
+
+
+@pytest.mark.parametrize("outcome", ["accepted", "retryable_not_accepted", "permanent_failure", "unknown", "exception"])
+def test_provider_send_outcome_is_recorded(tmp_path, capsys, outcome):
+    from email_providers import FakeProvider
+    provider = FakeProvider(mode=outcome if outcome != "exception" else "unknown",
+                            crash_before_return=outcome == "exception", safe_error="secret")
+    state = tmp_path / "health.json"
+    env = {"YTDLP_YOUTUBE_PROXY": "http://proxy.test:8080", "YOUTUBE_PROXY_HEALTH_STATE": str(state),
+           "YOUTUBE_PROXY_HEALTH_FAILURES": "1", "DISCORD_WEBHOOK_URL": "https://example.test/hook"}
+    with patch.dict(os.environ, env, clear=True), patch.object(health.pipeline, "load_dotenv"), \
+            patch.object(health.notifications, "get_configured_provider", return_value=provider), \
+            patch.object(health.notifications, "bind_cost_root"):
+        assert run_probe(False) == 1
+        expected = {"stage": "send", "status": "unknown" if outcome == "exception" else outcome}
+        if outcome == "exception":
+            expected["error_type"] = "OSError"
+        assert json.loads(state.read_text())["notification"] == expected
+        assert run_probe(False) == 1
+        assert len(provider.history) == 1
+    with health.notifications.get_operations_db(tmp_path) as conn:
+        assert conn.execute("SELECT outcome FROM delivery_attempts").fetchone()[0] == expected["status"]
+    output = capsys.readouterr()
+    if outcome != "accepted":
+        assert "send" in output.err
+    if outcome == "exception":
+        assert "OSError" in output.err
+    assert "secret" not in output.out + output.err + state.read_text()

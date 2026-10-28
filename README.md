@@ -424,7 +424,7 @@ FB 回應的 `content` 是貼文文字；`attachments` 的照片與影片分開�
 
 ### 下載解析度偏好（選用）
 
-`YTDLP_MAX_HEIGHT=720` 讓共用 yt-dlp 下載命令加上 `-S res:720`，各 extractor（含 YouTube、Facebook、Instagram）優先選擇不超過 720 的解析度；沒有符合格式時仍保留較高畫質的 fallback。這是格式偏好，**不是嚴格的輸出高度上限**，也不會重新編碼或影響既有下載快取。Threads 的原生下載路徑不使用 yt-dlp。未設定或留白維持原行為；非正整數在使用下載功能時回報繁體中文錯誤。排序語意見 [yt-dlp 格式排序](https://github.com/yt-dlp/yt-dlp#sorting-formats)。
+`YTDLP_MAX_HEIGHT=720` 讓共用 yt-dlp 下載命令加上 `-S res:720`，各 extractor（含 YouTube、Facebook、Instagram）優先選擇不超過 720 的解析度；沒有符合格式時仍保留較高畫質的 fallback。這是格式偏好，**不是嚴格的輸出高度上限**，也不會重新編碼或影響既有下載快取。Threads 的原生下載路徑不使用 yt-dlp。未設定或留白維持原行為；設定值須為 1–4320 的正整數（至多 4 位 ASCII 數字），否則在使用下載功能時回報繁體中文錯誤，各 Python 版本驗證一致。排序語意見 [yt-dlp 格式排序](https://github.com/yt-dlp/yt-dlp#sorting-formats)。
 
 ### 維運護欄（選用，未安裝／未啟用）
 
@@ -437,7 +437,7 @@ FB 回應的 `content` 是貼文文字；`attachments` 的照片與影片分開�
 
 退出碼：`0` 正常、`1` 異常、`2` 未設定 `YTDLP_YOUTUBE_PROXY`。`YOUTUBE_PROXY_HEALTH_FAILURES` 預設 `2`，連續失敗達門檻才通知一次，恢復時再通知一次；初始狀態視為正常，首次正常不通知，首次連續失敗也會告警。正常檢查會清零失敗次數。`YOUTUBE_PROXY_HEALTH_STATE` 可指定狀態檔，預設 `~/.local/state/video-timeline-pipeline/youtube-proxy.json`；相鄰 `operations.db` 保存通知 outbox 與成本紀錄，不使用正式資料庫。請以同一個 systemd service 序列執行，避免手動並行探測同一狀態檔。
 
-通知重用 `notifications.py` 的 provider、定向 claim、delivery audit 與成本防護。優先使用 `DISCORD_WEBHOOK_URL`／`NOTIFY_WEBHOOK_URL`／`RSS_NOTIFY_WEBHOOK`；否則需 `EMAIL_PROVIDER=smtp|resend`、`EMAIL_TO`、`EMAIL_FROM`，以及 `SMTP_HOST` 或 `RESEND_API_KEY`（其餘 SMTP 設定沿用既有機制）。缺設定或寄送失敗只記錄訊息，仍回傳健康退出碼。狀態先落盤再通知，未知寄送結果不自動重送；通知設定缺漏時該次轉換不會補寄。狀態檔損壞／無法寫入會記錄錯誤，不自動重設或寄送。`--dry-run` 僅印出本次是否會通知，**不寫狀態、不寄送**；重複 dry-run 不累計失敗次數。
+通知重用 `notifications.py` 的 provider、定向 claim、delivery audit 與成本防護。優先使用 `DISCORD_WEBHOOK_URL`／`NOTIFY_WEBHOOK_URL`／`RSS_NOTIFY_WEBHOOK`；否則需 `EMAIL_PROVIDER=smtp|resend`、`EMAIL_TO`、`EMAIL_FROM`，以及 `SMTP_HOST` 或 `RESEND_API_KEY`（其餘 SMTP 設定沿用既有機制）。缺設定或寄送失敗仍回傳健康退出碼；狀態檔的 `notification` 保存最近一次轉換的通知階段與結果，例外另記 `error_type` 並寫入 stderr，不輸出可能包含憑證的例外訊息。後續未轉換的檢查保留該紀錄。狀態先落盤再通知，未知寄送結果不自動重送；通知設定缺漏時該次轉換不會補寄。狀態檔父目錄會自動建立；狀態檔損壞／無法寫入會記錄錯誤，不自動重設或寄送。`--dry-run` 僅印出本次是否會通知，**不寫狀態、不寄送**；重複 dry-run 不累計失敗次數。
 
 `scripts/ytdlp_canary_update.sh` 在臨時 venv 安裝 PyPI 最新穩定版（`--nightly` 加 pip `--pre` 選取預發行版本），逐一執行 `--simulate`，不下載媒體。網址檔 `scripts/ytdlp-canary-urls.txt` 每行一筆、可用 `#` 註解；已放兩支公開 YouTube 測試影片，**必須先將 Facebook 佔位網址換成目前可公開播放的影片**，否則退出 `2`，不建立候選環境或升級。
 
@@ -447,14 +447,14 @@ bash scripts/ytdlp_canary_update.sh --venv /home/ubuntu/video-timeline-pipeline/
 bash scripts/ytdlp_canary_update.sh --nightly --dry-run --urls /path/to/canaries.txt
 ```
 
-`--venv`／`YTDLP_APP_VENV` 預設 repo 的 `.venv`；`--urls`／`YTDLP_CANARY_URLS` 預設上述網址檔。需要 Linux Bash、`flock`、venv／pip、網路及 app venv 內既有 yt-dlp。YouTube canary 共用 `.env` loader 與 `youtube_proxy_options()`；Facebook 使用 Chrome impersonation，所有 canary 都停用 cookies，因此請選公開影片，不會讀 `YTDLP_FACEBOOK_COOKIE_FILE`。可選解析度偏好也會套用。單支 canary 最多 120 秒，錯誤只印項目編號與退出碼，避免洩漏簽章網址或 proxy 憑證。
+`--venv`／`YTDLP_APP_VENV` 預設 repo 的 `.venv`；`--urls`／`YTDLP_CANARY_URLS` 預設上述網址檔。需要 Linux Bash、`flock`、venv／pip、網路及 app venv 內既有 yt-dlp 與專案相依套件。Canary 協調程式一律由 app venv 執行，僅 yt-dlp 子程序使用當次被測的候選／app interpreter。YouTube canary 共用 `.env` loader 與 `youtube_proxy_options()`；Facebook 使用 Chrome impersonation，所有 canary 都停用 cookies，因此請選公開影片，不會讀 `YTDLP_FACEBOOK_COOKIE_FILE`。可選解析度偏好也會套用。單支 canary 最多 120 秒，錯誤只印項目編號與退出碼，避免洩漏簽章網址或 proxy 憑證。
 
 候選全部通過後，先下載新舊 yt-dlp wheel 作離線回復，再**只替換 app venv 的 yt-dlp 套件**（不更新相依套件），然後用 app venv 重跑同一批 canary；失敗或一般中斷會離線回復原版本並核對版本。相依套件不相容也應使 app canary 失敗並回復；需更新相依套件時另行安排。`--dry-run` 仍建候選環境、跑 canary 並準備回復 wheel，但不寫 app venv。每次印更新前／候選／成功後或回復版本，臨時環境離開即清理；同一使用者的更新器透過 `flock` 避免並行。
 
 | 退出碼 | 意義 |
 | --- | --- |
 | `0` | 更新後 canary 通過，或 dry-run 通過 |
-| `1` | 建環境／pip／其他準備步驟失敗，尚未變更 app venv |
+| `1` | 建環境／pip／其他準備步驟失敗，或升級前收到 INT／TERM，尚未變更 app venv |
 | `2` | 參數／venv／網址設定錯誤，或已有更新器執行 |
 | `3` | 候選 canary 失敗，未變更 app venv |
 | `4` | 升級或 app canary 失敗／中斷，已回復並核對原版本 |

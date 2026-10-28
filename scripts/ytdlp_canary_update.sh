@@ -51,10 +51,10 @@ cleanup() {
     exit "$result"
 }
 trap cleanup EXIT
-trap 'exit 4' INT TERM
+trap 'exit 1' INT TERM
 
 canaries() {
-    "$1" - "$repo" "$urls" "${2:-run}" <<'PY'
+    "$app" - "$repo" "$urls" "${2:-run}" "$1" <<'PY'
 import os
 from pathlib import Path
 import subprocess
@@ -73,7 +73,7 @@ if any(not url.startswith(("https://", "http://")) for url in urls):
 if sys.argv[3] == "validate":
     sys.exit(0)
 for index, url in enumerate(urls, 1):
-    command = [sys.executable, "-m", "yt_dlp", "--ignore-config", "--no-playlist",
+    command = [sys.argv[4], "-m", "yt_dlp", "--ignore-config", "--no-playlist",
                "--no-cookies", "--no-cookies-from-browser", "--simulate", "--quiet", "--no-warnings",
                "--socket-timeout", "15", "--retries", "1", "--extractor-retries", "1"]
     command += pipeline.ytdlp_resolution_options() + pipeline.youtube_proxy_options(url)

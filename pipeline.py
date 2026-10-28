@@ -370,12 +370,9 @@ def ytdlp_resolution_options() -> list[str]:
     raw = os.getenv("YTDLP_MAX_HEIGHT", "").strip()
     if not raw:
         return []
-    try:
-        height = int(raw) if re.fullmatch(r"[0-9]+", raw) else 0
-    except ValueError:
-        height = 0
-    if height <= 0:
-        raise ValueError("YTDLP_MAX_HEIGHT 必須是正整數，或留白以維持原本畫質。")
+    height = int(raw) if re.fullmatch(r"[0-9]{1,4}", raw) else 0
+    if not 1 <= height <= 4320:
+        raise ValueError("YTDLP_MAX_HEIGHT 必須是正整數（1–4320），或留白以維持原本畫質。")
     # A sort preference retains formats above the limit when no smaller format exists.
     return ["-S", f"res:{height}"]
 
