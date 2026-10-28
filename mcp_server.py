@@ -329,6 +329,10 @@ class PreparedVideoResult(BaseModel):
     segments: list[PreparedVideoSegment] | None = None
     error: str | None = None
     error_code: str | None = None
+    retryable: bool | None = None
+    user_message: str | None = None
+    next_steps: list[str] | None = None
+    raw_error: str | None = None
 
 
 class DriveFileResult(BaseModel):
@@ -1508,20 +1512,20 @@ def tool_result(manifest: dict) -> types.CallToolResult:
     )
 
 
-def tool_error_result(error: Exception) -> types.CallToolResult:
+def tool_error_result(error: Exception, source_url: str = "") -> types.CallToolResult:
     if isinstance(error, JobBusyError):
         return job_busy_result(error)
     detail = str(error).strip() or error.__class__.__name__
+    classified = pipeline.classify_download_error(detail, source_url)
     return types.CallToolResult(
         isError=True,
-        structuredContent={"status": "error", "error": detail},
+        structuredContent={"status": "error", "error": detail, **classified},
         content=[
             types.TextContent(
                 type="text",
                 text=(
                     f"影片準備失敗：{detail}\n"
-                    "尚未產生影片分段；請確認來源可由無登入的公開 yt-dlp 下載，"
-                    "以及 MCP 服務目前仍在線。"
+                    + classified["user_message"] + "\n" + "\n".join(classified["next_steps"])
                 ),
             )
         ],
@@ -2263,6 +2267,27 @@ for legacy_uri in LEGACY_UI_URIS:
 
 
 @mcp.tool(
+    name="probe_video_source",
+    title="Probe video source",
+    description=(
+        "Read-only metadata check; call before prepare_video_for_chatgpt when a source might be private or unsupported. "
+        "No media download or job files are created; yt-dlp cache and cookie writes are disabled. "
+        "External JavaScript runtimes may maintain their own caches. Uses the download network options with a bounded timeout. "
+        "Metadata success does not guarantee media bytes can be downloaded. "
+        "When error_code is present, relay user_message and next_steps; do not speculate about causes."
+    ),
+    annotations=types.ToolAnnotations(readOnlyHint=True, destructiveHint=False, openWorldHint=True),
+)
+async def probe_video_source(url: str) -> dict[str, Any]:
+    try:
+        source_url = await asyncio.to_thread(validate_source_url, url)
+        return await asyncio.to_thread(pipeline.probe_video_source, source_url)
+    except Exception as error:
+        detail = str(error).strip() or error.__class__.__name__
+        return {"status": "error", "error": detail, **pipeline.classify_download_error(detail, url)}
+
+
+@mcp.tool(
     name="prepare_video_for_chatgpt",
     title="Prepare video for ChatGPT",
     description=(
@@ -2270,7 +2295,9 @@ for legacy_uri in LEGACY_UI_URIS:
         "Download and split MP4 segments. Prefer background=true and poll get_video_job. After preparation "
         "completes, the widget automatically starts analyze_prepared_video and upload_prepared_video_to_drive "
         "in parallel without waiting for button presses. "
-        "Do not call analysis concurrently with the widget. Supports public URLs accepted by the pipeline."
+        "Do not call analysis concurrently with the widget. Supports public URLs accepted by the pipeline. "
+        "Call probe_video_source first when a source might be private or unsupported. "
+        "When error_code is present, relay user_message and next_steps; do not speculate about causes."
     ),
     annotations=types.ToolAnnotations(
         readOnlyHint=False,
@@ -2297,7 +2324,7 @@ async def prepare_video_for_chatgpt(
                 "url": source_url, "segment_seconds": segment_seconds, "max_segments": effective_max}, job_id))
         manifest = await asyncio.to_thread(prepare_video_locked, url, segment_seconds, max_segments)
     except Exception as error:
-        return tool_error_result(error)
+        return tool_error_result(error, url)
     return tool_result(manifest)
 
 
@@ -2600,7 +2627,9 @@ def refreshed_operation(operation_id: str) -> dict:
           annotations=types.ToolAnnotations(readOnlyHint=True, destructiveHint=False, openWorldHint=False),
           meta=ANALYSIS_META)
 async def get_video_job(operation_id: str) -> dict[str, Any]:
-    """Poll a durable job; completed.result contains prepared/analysis/drive evidence. No work is started."""
+    """Poll a durable job; completed.result contains prepared/analysis/drive evidence. No work is started.
+    When error_code is present, relay user_message and next_steps; do not speculate about causes.
+    """
     return await asyncio.to_thread(refreshed_operation, operation_id)
 
 

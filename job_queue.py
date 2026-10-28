@@ -240,6 +240,9 @@ class JobQueue:
             except (OSError, ValueError): pass
             if row["status"] in {"queued", "running"}: payload["retry_after_seconds"] = 2
             if row["error"]: payload["error"] = row["error"]
+            if row["operation"] == "prepare" and row["error"] and row["status"] in {"failed", "expired"}:
+                from pipeline import classify_download_error
+                payload.update(classify_download_error(row["error"], json.loads(row["inputs"]).get("url", "")))
         if row["deadline"]: payload["deadline_at"] = row["deadline"]
         return payload
 
