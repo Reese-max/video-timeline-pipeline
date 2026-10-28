@@ -8,6 +8,8 @@
 
 - 新增 `prepare_uploaded_video`：私人／需登入影片上傳 MP4 後，可經 OpenAI 檔案參數進入既有準備、背景佇列、ASR／MiniMax 分析與選用 Drive 流程。HTTPS 精確主機白名單（`UPLOAD_ALLOWED_HOSTS`）、逐跳重新導向驗證、串流大小上限與本機 ffprobe 驗證；內容 SHA-256 穩定識別工作，來源以 `upload://<sha256>` 保存上傳出處。新增離線安全、重用與分析／還原回歸測試。
 
+- 修正維運護欄：canary 協調程式固定使用 app venv，候選 interpreter 僅執行 yt-dlp；升級前中斷退出 `1`，回復成功才退出 `4`。Proxy 通知失敗階段與例外類型記入狀態檔及紀錄；解析度偏好限制為 1–4320，避免 Python 版本造成超長整數驗證差異。補上缺少狀態目錄與通知／canary 回歸測試。
+- 新增選用維運護欄：YouTube Proxy TCP／CONNECT 健康檢查、連續失敗與恢復通知，以及隔離環境的 yt-dlp canary 更新器（正式環境複驗失敗即離線回復）。附未安裝的 systemd timer 範本，更新預設 dry-run；新增 `YTDLP_MAX_HEIGHT` 格式偏好與驗證、PO Token provider 選用說明及離線回歸測試。未設定解析度時維持既有下載行為。
 - 修正 #56／#105：補漏事件先驗證原片時間碼，保留提示時段端點；每段與合併後的時間軸都維持最長 30 秒的覆蓋間隔，片尾無豁免。未補完的範圍持久標記為 partial，拒絕重用／寫入完整快取及完成 outbox。舊 receipt 失效。
 - 整合 PR #95 的 #23 原生檔案引用契約：嚴格有限起訖範圍、正式 output schema 與 busy 狀態；明確按鈕先等待相符 ingestion 回執再發送模型讀檔要求。widget 升為 v19，保留上傳範圍快照；真實宿主可讀性仍待驗收。
 
