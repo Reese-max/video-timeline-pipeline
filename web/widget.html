@@ -804,8 +804,9 @@ async function restoreJob() {
 async function autoStartParallel(version) {
   // Both requests are dispatched without waiting for the other's acknowledgement.
   // The queue permits only this same-job analyze/Drive pair to share a writer lease.
-  if (!current(version) || !data?.segments?.length || analysisResult) return;
-  if (isPending(activeOperation) || isPending(driveOperation)) return;
+  if (!current(version) || !data?.segments?.length) return;
+  const needsDrive = driveConfigured && !driveOperation && !$("drive-prompt").value;
+  const needsAnalysis = !analysisResult && (!activeOperation || activeOperation.operation === "prepare");
   if (autoStartedJobs.has(data.job_id)) return;
   autoStartedJobs.add(data.job_id);
   const startDrive = async () => {
@@ -819,7 +820,7 @@ async function autoStartParallel(version) {
       if (current(version)) { stopDrivePolling(); status("Drive 自動上傳未啟動（分析仍會繼續）：" + error.message); }
     } finally { if (current(version)) { driveActing = false; updateButtons(); } }
   };
-  if (!driveConfigured && current(version)) {
+  if (!driveConfigured && needsAnalysis && current(version)) {
     status("準備完成，自動啟動分析；Drive 未設定，僅執行伺服器分析，設定後可手動上傳。");
   }
   const startAnalysis = async () => {
@@ -832,7 +833,7 @@ async function autoStartParallel(version) {
     } catch (error) { if (current(version)) { uncertainStart = true; status(error.message + " 請先重新取得狀態；未自動重送工作。"); } }
     finally { if (current(version)) { acting = false; updateButtons(); } }
   };
-  await Promise.all([driveConfigured ? startDrive() : Promise.resolve(), startAnalysis()]);
+  await Promise.all([needsDrive ? startDrive() : Promise.resolve(), needsAnalysis ? startAnalysis() : Promise.resolve()]);
 }
 async function startOperation(kind) {
   if (!data || acting || driveActing || restoring || uncertainStart || activeOperation?.error_code === "MEDIA_EXPIRED") return;

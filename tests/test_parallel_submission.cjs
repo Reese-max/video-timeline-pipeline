@@ -102,5 +102,35 @@ async function test(name, run) { await run(); console.log('ok ' + (++count) + ' 
       assert.equal(h.prompts.length, 0);
     } finally { releaseAnalysis?.(pending('analysis-1', 'analyze')); await h.flush(); }
   });
+  for (const existing of ['analyze', 'drive']) await test('prepare starts the missing sibling when ' + existing + ' is already running', async () => {
+    const operation = pending(existing + '-existing', existing, 'running');
+    const h = harness({ output: { ...pending('prepare-1', 'prepare'), job_id: undefined }, respond(name, args) {
+      if (name === 'get_video_job') return args.operation_id === 'prepare-1' ? completed(job('first'), 'prepared', 'prepare-1') : operation;
+      if (name === 'get_prepared_video') return { prepared: job('first'), analysis: null, drive_configured: true,
+        active_operation: operation, latest_operation: operation, pending_operations: [operation] };
+      if (name === 'upload_prepared_video_to_drive') return pending('drive-new', 'drive');
+      if (name === 'analyze_prepared_video') return pending('analyze-new', 'analyze');
+      throw new Error('Unexpected ' + name);
+    } });
+    await h.flush(); await h.poll(); await h.flush();
+    const writes = h.calls.filter(call => ['analyze_prepared_video', 'upload_prepared_video_to_drive'].includes(call.name));
+    assert.deepEqual(writes.map(call => call.name), [existing === 'analyze' ? 'upload_prepared_video_to_drive' : 'analyze_prepared_video']);
+    assert.equal(writes[0].args.background, true); assert.equal(h.prompts.length, 0);
+  });
+  for (const existing of ['analysis', 'drive']) await test('prepare reuses completed ' + existing + ' and starts only the missing sibling', async () => {
+    const h = harness({ output: { ...pending('prepare-1', 'prepare'), job_id: undefined }, respond(name) {
+      if (name === 'get_video_job') return completed(job('first'), 'prepared', 'prepare-1');
+      if (name === 'get_prepared_video') return { prepared: job('first'), analysis: existing === 'analysis' ? analysis('first') : null,
+        drive: existing === 'drive' ? drive('first') : null, drive_configured: true, active_operation: null, latest_operation: null };
+      if (name === 'upload_prepared_video_to_drive') return pending('drive-new', 'drive');
+      if (name === 'analyze_prepared_video') return pending('analyze-new', 'analyze');
+      throw new Error('Unexpected ' + name);
+    } });
+    await h.flush(); await h.poll(); await h.flush();
+    const writes = h.calls.filter(call => ['analyze_prepared_video', 'upload_prepared_video_to_drive'].includes(call.name));
+    assert.deepEqual(writes.map(call => call.name), [existing === 'analysis' ? 'upload_prepared_video_to_drive' : 'analyze_prepared_video']);
+    if (existing === 'drive') assert.equal(h.elements.get('drive-handoff').hidden, false);
+    assert.equal(h.prompts.length, 0);
+  });
   console.log('PASS: ' + count + ' inert submission controls; actual queue worker timing belongs to separate owned-process tests.');
 })().catch(error => { console.error(error); process.exitCode = 1; });
