@@ -412,7 +412,7 @@ def classify_download_error(error: str, source_host: str = "") -> dict[str, Any]
 
 
 def video_download_options(url: str) -> list[str]:
-    return ["--no-playlist", "--merge-output-format", "mp4", *youtube_proxy_options(url)]
+    return ["--no-playlist", "--merge-output-format", "mp4", *ytdlp_resolution_options(), *youtube_proxy_options(url)]
 
 
 def facebook_download_options(diagnostics: dict[str, Any]) -> list[str]:
@@ -541,6 +541,17 @@ def probe_video_source(url: str) -> dict[str, Any]:
             "webpage_url": public_url(info.get("webpage_url") or url),
             "selected_format": {key: selected.get(key) for key in ("format_id", "format", "ext", "width", "height", "vcodec", "acodec")},
             "estimated_filesize_bytes": estimated_size}
+
+
+def ytdlp_resolution_options() -> list[str]:
+    raw = os.getenv("YTDLP_MAX_HEIGHT", "").strip()
+    if not raw:
+        return []
+    height = int(raw) if re.fullmatch(r"[0-9]{1,4}", raw) else 0
+    if not 1 <= height <= 4320:
+        raise ValueError("YTDLP_MAX_HEIGHT 必須是正整數（1–4320），或留白以維持原本畫質。")
+    # A sort preference retains formats above the limit when no smaller format exists.
+    return ["-S", f"res:{height}"]
 
 
 def threads_post_id(url: str) -> str:
@@ -1002,6 +1013,7 @@ def download_video(
     max_filesize: int | None = None,
     max_duration: int | None = None,
 ) -> Path:
+    resolution_options = ytdlp_resolution_options()
     # 只信任完整標記：中斷會留下 source.f<id>.mp4 之類的分軌檔，
     # 直接復用會拿到無音訊的純視訊軌。重跑 yt-dlp 會自行續傳並清掉分軌。
     done = job_dir / ".download-complete"
@@ -1052,9 +1064,9 @@ def file_fingerprint(path: Path) -> str:
     return f"{stat.st_size}:{stat.st_mtime_ns}"
 
 
-def probe_video(video_path: Path, cache_path: Path | None = None) -> dict[str, Any]:
+def probe_video(video_path: Path, cache_path: Path | None = None, *, local_mp4_only: bool = False) -> dict[str, Any]:
     fingerprint = file_fingerprint(video_path)
-    if cache_path is not None:
+    if cache_path is not None and not local_mp4_only:
         cached = reuse_artifact(cache_path)
         if (
             isinstance(cached, dict)
@@ -1071,6 +1083,7 @@ def probe_video(video_path: Path, cache_path: Path | None = None) -> dict[str, A
             "json",
             "-show_format",
             "-show_streams",
+            *(["-protocol_whitelist", "file", "-format_whitelist", "mov"] if local_mp4_only else []),
             str(video_path),
         ]
     )

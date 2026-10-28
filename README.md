@@ -104,6 +104,31 @@ python pipeline.py --root 'C:\Data\VideoLibrary' --web-worker
 
 `mcp_server.py` 是 ChatGPT Apps/MCP 入口：公開影片 URL → 既有下載器 → FFmpeg 分段 → Groq 語音辨識／MiniMax 整支影片畫面分析 → ChatGPT 根據工具證據整理時間軸。v14 widget 在準備完成後自動同時啟動伺服器分析（A）與 Drive 上傳（B，已設定時），兩者互不等待；再由「交給 ChatGPT 整理」送出整理要求；重新開啟不會自動重跑或重送。CLI 的 MiniMax 摘要流程不變；MCP 不另呼叫 MiniMax 產生摘要。影片放在 Git 忽略的 `mcp_jobs\`，工作佇列及簽章金鑰在私有 `.video-state/`。
 
+### 私人影片：上傳 MP4 後由伺服器分析
+
+Facebook 私人影片或登入牆導致網址無法下載時，先把 MP4 上傳至 ChatGPT，再呼叫 `prepare_uploaded_video`；`file` 使用與 `ingest_video_segments` 相同的 OpenAI 檔案參數機制（`openai/fileParams: ["file"]`），必須傳入宿主提供的完整引用，不能拿公開影片網址冒充：
+
+```json
+{
+  "file": {
+    "file_id": "file-由宿主提供",
+    "download_url": "https://files.oaiusercontent.com/由宿主提供的暫時下載路徑",
+    "file_name": "私人影片.mp4",
+    "mime_type": "video/mp4"
+  },
+  "segment_seconds": 120,
+  "background": true
+}
+```
+
+`file_name`／`mime_type` 可省略，`max_segments` 預設不限（仍受伺服器設定限制）。背景呼叫沿用既有 `prepare` 工作佇列，先回 `operation_id`，用 `get_video_job` 輪詢；下載完成並算出內容 SHA-256 後才會有 `job_id`。完成後以該 ID 呼叫 `analyze_prepared_video`，取得 ASR 與 MiniMax 畫面證據，再交給 ChatGPT 整理；已開啟 widget 時由 widget 自動啟動，避免重複呼叫。選用 Drive 與 `get_prepared_video` 還原流程均沿用原入口。`ingest_video_segments` 仍只確認檔案引用，不執行這條伺服器分析流程。
+
+下載只接受 HTTPS／443，主機名稱必須**完整相符**於 `UPLOAD_ALLOWED_HOSTS`（逗號分隔、不支援萬用字元或自動包含子網域）；既有引用正規化沒有主機清單，因此保守預設僅 `files.oaiusercontent.com`。若宿主使用其他下載主機，管理者須明確將該可信主機加入，例如 `UPLOAD_ALLOWED_HOSTS=files.oaiusercontent.com,另一個可信主機`；每次重新導向都重新核對，最多 5 次。不傳送 Cookie、帳密或環境中的代理／`.netrc` 憑證。連線逾時 10 秒、單次讀取逾時 30 秒，整體下載沿用 `VIDEO_API_TIMEOUT_SECONDS`（預設 900 秒）與背景工作期限。
+
+影片串流寫入 `mcp_jobs/.upload-*` 暫存目錄，沿用 `MCP_MAX_SOURCE_MB`（預設 **512 MiB**）硬上限及儲存空間檢查，失敗會清掉當次暫存檔。行程中斷遺留的暫存目錄會在下次上傳的容量檢查前，於既有寫入鎖內清理；僅處理超過 `max(900, MCP_JOB_TIMEOUT_SECONDS)` 秒且未連結至其他路徑的 `.upload-*` 目錄。容量不足或原片搬移失敗不會留下新建的空工作目錄。格式異常的下載網址與 ffprobe JSON 會回傳繁體中文錯誤。伺服器以 ffprobe 限定本機 MP4/MOV 容器並確認有視訊串流，音軌可省略；不依副檔名或 MIME 宣稱判定成功。內容 SHA-256 經 `pipeline.job_key("upload://<sha256>")` 產生既有格式的 12 碼 job ID：相同 bytes 即使檔名／file ID 不同也共用工作，同樣分段設定重用完成產物；修改分段設定會在同一工作重建分段。每次新引用仍須下載 bytes 才能核對內容。
+
+`source.mp4`、`source.info.json`、`source.probe.json`、分段、預覽與 manifest 與網址工作相容；來源記為 `upload://<sha256>`，不是公開可瀏覽網址。`source.info.json` 與 manifest 的 `source` 保存首次準備的 `source_type="upload"`、原始 `file_name`、`file_id`、`sha256`，不保存暫時下載網址。背景佇列的私人 `.video-state/` 會保存下載引用以便執行／續跑；網址過期時須重新上傳並重新準備。正式 ChatGPT 檔案交接與線上供應商分析仍需部署後驗收。
+
 ### v17：介面視覺更新
 
 widget 改為卡片式版面：標題區、主要動作按鈕（「交給 ChatGPT 整理」為主按鈕）、狀態提示框、缺漏提醒框，證據列的時間碼改為可點的標籤，逐字稿／畫面觀察以不同顏色區分；淺色、深色（依 ChatGPT 的 `window.openai.theme`，沒有時依系統設定）與 320px 手機寬度都可讀。Drive 原片交接區把「一鍵複製」與「開新一般對話」合成主按鈕「複製並開新一般對話」：先複製，再嘗試開新分頁並顯示開新對話連結（瀏覽器擋下分頁時按連結）；複製失敗時不開分頁，改全選交接內容並顯示同一個連結；保留次要的「只複製」。其餘元素 id、按鈕文字與證據列子元素順序不變，行為與 v16 相同。UI URI 升為 `ui://video-timeline-pipeline/v17-<媒體網址 hash>.html`，保留 v15、v16 URI 回傳目前的 widget。
@@ -446,6 +471,75 @@ FB 回應的 `content` 是貼文文字；`attachments` 的照片與影片分開�
 貼文文字可交給 ChatGPT 整理；`image_urls`／`video_urls` 只是媒體參照，`media_analyzed=false`，不能宣稱已看過畫面。ChatGPT 可再將 `video_urls` 逐支交給既有 `prepare_video_for_chatgpt` → Groq／MiniMax 分析 → ChatGPT 整理，並保留原始貼文網址作為來源；這不是 `download_video` 裡的隱式付費 fallback。圖片尚未自動送入視覺模型，Drive 仍為選用儲存。
 
 不計費回歸：`python -m unittest discover -s tests -p test_social_post.py -v`。測試使用模擬供應商回應，不代表真實 Bright Data 採集、媒體下載或 ChatGPT 網頁端驗收已通過；部署新增工具後須重新整理 ChatGPT 外掛動作。
+
+### 下載解析度偏好（選用）
+
+`YTDLP_MAX_HEIGHT=720` 讓共用 yt-dlp 下載命令加上 `-S res:720`，各 extractor（含 YouTube、Facebook、Instagram）優先選擇不超過 720 的解析度；沒有符合格式時仍保留較高畫質的 fallback。這是格式偏好，**不是嚴格的輸出高度上限**，也不會重新編碼或影響既有下載快取。Threads 的原生下載路徑不使用 yt-dlp。未設定或留白維持原行為；設定值須為 1–4320 的正整數（至多 4 位 ASCII 數字），否則在使用下載功能時回報繁體中文錯誤，各 Python 版本驗證一致。排序語意見 [yt-dlp 格式排序](https://github.com/yt-dlp/yt-dlp#sorting-formats)。
+
+### 維運護欄（選用，未安裝／未啟用）
+
+`scripts/check_youtube_proxy.py` 透過 TCP 連線及 `CONNECT www.youtube.com:443` 檢查 HTTP／HTTPS proxy，連線與讀取各最多 3 秒、整體回應預算 8 秒。不下載媒體，也不代表完整 YouTube 播放驗收。設定來自環境或 repo `.env`，共用 `pipeline.load_dotenv`（非空的 `.env` 值優先）；不輸出 proxy 密碼。
+
+```bash
+.venv/bin/python scripts/check_youtube_proxy.py --dry-run
+.venv/bin/python scripts/check_youtube_proxy.py
+```
+
+退出碼：`0` 正常、`1` 異常、`2` 未設定 `YTDLP_YOUTUBE_PROXY`。`YOUTUBE_PROXY_HEALTH_FAILURES` 預設 `2`，連續失敗達門檻才通知一次，恢復時再通知一次；初始狀態視為正常，首次正常不通知，首次連續失敗也會告警。正常檢查會清零失敗次數。`YOUTUBE_PROXY_HEALTH_STATE` 可指定狀態檔，預設 `~/.local/state/video-timeline-pipeline/youtube-proxy.json`；相鄰 `operations.db` 保存通知 outbox 與成本紀錄，不使用正式資料庫。請以同一個 systemd service 序列執行，避免手動並行探測同一狀態檔。
+
+通知重用 `notifications.py` 的 provider、定向 claim、delivery audit 與成本防護。優先使用 `DISCORD_WEBHOOK_URL`／`NOTIFY_WEBHOOK_URL`／`RSS_NOTIFY_WEBHOOK`；否則需 `EMAIL_PROVIDER=smtp|resend`、`EMAIL_TO`、`EMAIL_FROM`，以及 `SMTP_HOST` 或 `RESEND_API_KEY`（其餘 SMTP 設定沿用既有機制）。缺設定或寄送失敗仍回傳健康退出碼；狀態檔的 `notification` 保存最近一次轉換的通知階段與結果，例外另記 `error_type` 並寫入 stderr，不輸出可能包含憑證的例外訊息。後續未轉換的檢查保留該紀錄。狀態先落盤再通知，未知寄送結果不自動重送；通知設定缺漏時該次轉換不會補寄。狀態檔父目錄會自動建立；狀態檔損壞／無法寫入會記錄錯誤，不自動重設或寄送。`--dry-run` 僅印出本次是否會通知，**不寫狀態、不寄送**；重複 dry-run 不累計失敗次數。
+
+`scripts/ytdlp_canary_update.sh` 在臨時 venv 安裝 PyPI 最新穩定版（`--nightly` 加 pip `--pre` 選取預發行版本），逐一執行 `--simulate`，不下載媒體。網址檔 `scripts/ytdlp-canary-urls.txt` 每行一筆、可用 `#` 註解；已放兩支公開 YouTube 測試影片，**必須先將 Facebook 佔位網址換成目前可公開播放的影片**，否則退出 `2`，不建立候選環境或升級。
+
+```bash
+bash scripts/ytdlp_canary_update.sh --dry-run
+bash scripts/ytdlp_canary_update.sh --venv /home/ubuntu/video-timeline-pipeline/.venv
+bash scripts/ytdlp_canary_update.sh --nightly --dry-run --urls /path/to/canaries.txt
+```
+
+`--venv`／`YTDLP_APP_VENV` 預設 repo 的 `.venv`；`--urls`／`YTDLP_CANARY_URLS` 預設上述網址檔。需要 Linux Bash、`flock`、venv／pip、網路及 app venv 內既有 yt-dlp 與專案相依套件。Canary 協調程式一律由 app venv 執行，僅 yt-dlp 子程序使用當次被測的候選／app interpreter。YouTube canary 共用 `.env` loader 與 `youtube_proxy_options()`；Facebook 使用 Chrome impersonation，所有 canary 都停用 cookies，因此請選公開影片，不會讀 `YTDLP_FACEBOOK_COOKIE_FILE`。可選解析度偏好也會套用。單支 canary 最多 120 秒，錯誤只印項目編號與退出碼，避免洩漏簽章網址或 proxy 憑證。
+
+候選全部通過後，先下載新舊 yt-dlp wheel 作離線回復，再**只替換 app venv 的 yt-dlp 套件**（不更新相依套件），然後用 app venv 重跑同一批 canary；失敗或一般中斷會離線回復原版本並核對版本。相依套件不相容也應使 app canary 失敗並回復；需更新相依套件時另行安排。`--dry-run` 仍建候選環境、跑 canary 並準備回復 wheel，但不寫 app venv。每次印更新前／候選／成功後或回復版本，臨時環境離開即清理；同一使用者的更新器透過 `flock` 避免並行。
+
+| 退出碼 | 意義 |
+| --- | --- |
+| `0` | 更新後 canary 通過，或 dry-run 通過 |
+| `1` | 建環境／pip／其他準備步驟失敗，或升級前收到 INT／TERM，尚未變更 app venv |
+| `2` | 參數／venv／網址設定錯誤，或已有更新器執行 |
+| `3` | 候選 canary 失敗，未變更 app venv |
+| `4` | 升級或 app canary 失敗／中斷，已回復並核對原版本 |
+| `5` | 回復失敗，需人工處理 |
+
+請在無下載工作的維護時段才執行正式升級；套件替換不是原子切換，鎖只保護更新器，**不會停止或重新啟動 `video-mcp.service`**。斷電／SIGKILL 無法執行回復。Metadata canary 通過不保證 GVS 實際媒體下載可用；本次交付未在伺服器執行更新或真實媒體驗收。
+
+systemd 範本在 `deploy/systemd/`：固定 `User=ubuntu`、工作目錄 `/home/ubuntu/video-timeline-pipeline`，proxy 每 10 分鐘檢查；更新器每天主機時間 04:20 執行，**預設為 `--dry-run`**，不追補停機期間的更新。以下是供管理者日後自行執行的命令，本次未執行：
+
+```bash
+sudo install -m 0644 deploy/systemd/video-youtube-proxy-check.{service,timer} /etc/systemd/system/
+sudo install -m 0644 deploy/systemd/video-ytdlp-canary-update.{service,timer} /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now video-youtube-proxy-check.timer video-ytdlp-canary-update.timer
+systemctl list-timers 'video-*'
+journalctl -u video-youtube-proxy-check.service -u video-ytdlp-canary-update.service
+# 停用後不再觸發；已執行中的更新請等候完成與回復。
+sudo systemctl disable --now video-youtube-proxy-check.timer video-ytdlp-canary-update.timer
+```
+
+正式自動更新需管理者在 `sudo systemctl edit video-ytdlp-canary-update.service` 明確覆寫（先驗證 canary 網址與維護時段），保存後 `sudo systemctl daemon-reload`：
+
+```ini
+[Service]
+ExecStart=
+ExecStart=/bin/bash scripts/ytdlp_canary_update.sh
+```
+
+### YouTube PO Token（選用）
+
+YouTube 的部分 client 要求 GVS（Google Video Server）媒體請求附上 PO Token；使用登入 cookies 後選到需要 token 的 client／格式時，缺少或失效的 GVS token 可能使實際下載回 `403`。cookies 本身不等於 PO Token，也不是每個 `403` 都由它引起。詳見 [yt-dlp PO Token Guide](https://github.com/yt-dlp/yt-dlp/wiki/PO-Token-Guide)。目前部署方式以 `YTDLP_YOUTUBE_PROXY` 走家用網路，避免加入 YouTube 登入 cookies；本次不改變此設定。
+
+確有需求時，可自行評估 [bgutil-ytdlp-pot-provider](https://github.com/Brainicism/bgutil-ytdlp-pot-provider)：依上游文件選擇本機 HTTP provider（Docker 或 Node.js／Deno）或按需產生腳本，安裝與 provider 版本相符的 yt-dlp plugin 至同一個 app venv，確認 yt-dlp 能連到 provider，並依上游建議選用需要的 YouTube client。不要把 provider 暴露到公網，也不要把 cookies／token 寫入 Git。這裡僅提供操作方向，沒有安裝 plugin、啟動 provider 或加入 cookies。
+
+驗證時用同一個 app venv 執行 `yt-dlp -v --simulate <公開YouTube網址>`（例如 `.venv/bin/python -m yt_dlp -v --simulate ...`），並明確帶入既有 proxy；yt-dlp CLI 本身不會載入 repo `.env`。檢查 verbose 輸出中的已載入 PO Token provider（如 `bgutil`／`bgutil:http`）及 token 取得訊息，再由管理者另行測試實際媒體下載；僅看到 plugin 檔名不等於已取得有效 token。輸出可能含敏感資訊，分享前請遮蔽。Provider 並不保證排除所有 `403` 或 bot 檢查；細節以所連結上游版本文件為準。
 
 ### Instagram 下載與診斷
 
