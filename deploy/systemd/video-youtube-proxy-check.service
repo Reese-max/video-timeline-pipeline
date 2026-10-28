@@ -1,0 +1,15 @@
+[Unit]
+Description=Video Timeline YouTube proxy health check
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=ubuntu
+WorkingDirectory=/home/ubuntu/video-timeline-pipeline
+Environment=HOME=/home/ubuntu
+Environment=PYTHONDONTWRITEBYTECODE=1
+ExecStart=/home/ubuntu/video-timeline-pipeline/.venv/bin/python scripts/check_youtube_proxy.py
+SuccessExitStatus=2
+UMask=0077
+TimeoutStartSec=60

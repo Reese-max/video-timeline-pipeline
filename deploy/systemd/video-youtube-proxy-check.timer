@@ -1,0 +1,9 @@
+[Unit]
+Description=Check the YouTube proxy every ten minutes
+
+[Timer]
+OnCalendar=*:0/10
+Unit=video-youtube-proxy-check.service
+
+[Install]
+WantedBy=timers.target

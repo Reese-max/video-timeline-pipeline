@@ -366,6 +366,20 @@ def youtube_proxy_options(url: str) -> list[str]:
     return ["--proxy", proxy] if proxy and is_youtube_url(url) else []
 
 
+def ytdlp_resolution_options() -> list[str]:
+    raw = os.getenv("YTDLP_MAX_HEIGHT", "").strip()
+    if not raw:
+        return []
+    try:
+        height = int(raw) if re.fullmatch(r"[0-9]+", raw) else 0
+    except ValueError:
+        height = 0
+    if height <= 0:
+        raise ValueError("YTDLP_MAX_HEIGHT 必須是正整數，或留白以維持原本畫質。")
+    # A sort preference retains formats above the limit when no smaller format exists.
+    return ["-S", f"res:{height}"]
+
+
 def threads_post_id(url: str) -> str:
     value = require_http_url(url, "Threads URL")
     parsed = urllib.parse.urlsplit(value)
@@ -861,6 +875,7 @@ def download_video(
     max_filesize: int | None = None,
     max_duration: int | None = None,
 ) -> Path:
+    resolution_options = ytdlp_resolution_options()
     # 只信任完整標記：中斷會留下 source.f<id>.mp4 之類的分軌檔，
     # 直接復用會拿到無音訊的純視訊軌。重跑 yt-dlp 會自行續傳並清掉分軌。
     done = job_dir / ".download-complete"
@@ -894,7 +909,7 @@ def download_video(
     if max_duration is not None:
         # "<=?" lets direct-file URLs without duration metadata through; prepare re-checks the probed duration.
         command += ["--match-filter", f"duration <=? {max_duration}"]
-    command += youtube_proxy_options(url)
+    command += resolution_options + youtube_proxy_options(url)
     command.append(url)
     hostname = (urllib.parse.urlsplit(url).hostname or "").lower()
     if hostname in {"instagram.com", "www.instagram.com", "m.instagram.com"}:

@@ -422,6 +422,75 @@ FB 回應的 `content` 是貼文文字；`attachments` 的照片與影片分開�
 
 不計費回歸：`python -m unittest discover -s tests -p test_social_post.py -v`。測試使用模擬供應商回應，不代表真實 Bright Data 採集、媒體下載或 ChatGPT 網頁端驗收已通過；部署新增工具後須重新整理 ChatGPT 外掛動作。
 
+### 下載解析度偏好（選用）
+
+`YTDLP_MAX_HEIGHT=720` 讓共用 yt-dlp 下載命令加上 `-S res:720`，各 extractor（含 YouTube、Facebook、Instagram）優先選擇不超過 720 的解析度；沒有符合格式時仍保留較高畫質的 fallback。這是格式偏好，**不是嚴格的輸出高度上限**，也不會重新編碼或影響既有下載快取。Threads 的原生下載路徑不使用 yt-dlp。未設定或留白維持原行為；非正整數在使用下載功能時回報繁體中文錯誤。排序語意見 [yt-dlp 格式排序](https://github.com/yt-dlp/yt-dlp#sorting-formats)。
+
+### 維運護欄（選用，未安裝／未啟用）
+
+`scripts/check_youtube_proxy.py` 透過 TCP 連線及 `CONNECT www.youtube.com:443` 檢查 HTTP／HTTPS proxy，連線與讀取各最多 3 秒、整體回應預算 8 秒。不下載媒體，也不代表完整 YouTube 播放驗收。設定來自環境或 repo `.env`，共用 `pipeline.load_dotenv`（非空的 `.env` 值優先）；不輸出 proxy 密碼。
+
+```bash
+.venv/bin/python scripts/check_youtube_proxy.py --dry-run
+.venv/bin/python scripts/check_youtube_proxy.py
+```
+
+退出碼：`0` 正常、`1` 異常、`2` 未設定 `YTDLP_YOUTUBE_PROXY`。`YOUTUBE_PROXY_HEALTH_FAILURES` 預設 `2`，連續失敗達門檻才通知一次，恢復時再通知一次；初始狀態視為正常，首次正常不通知，首次連續失敗也會告警。正常檢查會清零失敗次數。`YOUTUBE_PROXY_HEALTH_STATE` 可指定狀態檔，預設 `~/.local/state/video-timeline-pipeline/youtube-proxy.json`；相鄰 `operations.db` 保存通知 outbox 與成本紀錄，不使用正式資料庫。請以同一個 systemd service 序列執行，避免手動並行探測同一狀態檔。
+
+通知重用 `notifications.py` 的 provider、定向 claim、delivery audit 與成本防護。優先使用 `DISCORD_WEBHOOK_URL`／`NOTIFY_WEBHOOK_URL`／`RSS_NOTIFY_WEBHOOK`；否則需 `EMAIL_PROVIDER=smtp|resend`、`EMAIL_TO`、`EMAIL_FROM`，以及 `SMTP_HOST` 或 `RESEND_API_KEY`（其餘 SMTP 設定沿用既有機制）。缺設定或寄送失敗只記錄訊息，仍回傳健康退出碼。狀態先落盤再通知，未知寄送結果不自動重送；通知設定缺漏時該次轉換不會補寄。狀態檔損壞／無法寫入會記錄錯誤，不自動重設或寄送。`--dry-run` 僅印出本次是否會通知，**不寫狀態、不寄送**；重複 dry-run 不累計失敗次數。
+
+`scripts/ytdlp_canary_update.sh` 在臨時 venv 安裝 PyPI 最新穩定版（`--nightly` 加 pip `--pre` 選取預發行版本），逐一執行 `--simulate`，不下載媒體。網址檔 `scripts/ytdlp-canary-urls.txt` 每行一筆、可用 `#` 註解；已放兩支公開 YouTube 測試影片，**必須先將 Facebook 佔位網址換成目前可公開播放的影片**，否則退出 `2`，不建立候選環境或升級。
+
+```bash
+bash scripts/ytdlp_canary_update.sh --dry-run
+bash scripts/ytdlp_canary_update.sh --venv /home/ubuntu/video-timeline-pipeline/.venv
+bash scripts/ytdlp_canary_update.sh --nightly --dry-run --urls /path/to/canaries.txt
+```
+
+`--venv`／`YTDLP_APP_VENV` 預設 repo 的 `.venv`；`--urls`／`YTDLP_CANARY_URLS` 預設上述網址檔。需要 Linux Bash、`flock`、venv／pip、網路及 app venv 內既有 yt-dlp。YouTube canary 共用 `.env` loader 與 `youtube_proxy_options()`；Facebook 使用 Chrome impersonation，所有 canary 都停用 cookies，因此請選公開影片，不會讀 `YTDLP_FACEBOOK_COOKIE_FILE`。可選解析度偏好也會套用。單支 canary 最多 120 秒，錯誤只印項目編號與退出碼，避免洩漏簽章網址或 proxy 憑證。
+
+候選全部通過後，先下載新舊 yt-dlp wheel 作離線回復，再**只替換 app venv 的 yt-dlp 套件**（不更新相依套件），然後用 app venv 重跑同一批 canary；失敗或一般中斷會離線回復原版本並核對版本。相依套件不相容也應使 app canary 失敗並回復；需更新相依套件時另行安排。`--dry-run` 仍建候選環境、跑 canary 並準備回復 wheel，但不寫 app venv。每次印更新前／候選／成功後或回復版本，臨時環境離開即清理；同一使用者的更新器透過 `flock` 避免並行。
+
+| 退出碼 | 意義 |
+| --- | --- |
+| `0` | 更新後 canary 通過，或 dry-run 通過 |
+| `1` | 建環境／pip／其他準備步驟失敗，尚未變更 app venv |
+| `2` | 參數／venv／網址設定錯誤，或已有更新器執行 |
+| `3` | 候選 canary 失敗，未變更 app venv |
+| `4` | 升級或 app canary 失敗／中斷，已回復並核對原版本 |
+| `5` | 回復失敗，需人工處理 |
+
+請在無下載工作的維護時段才執行正式升級；套件替換不是原子切換，鎖只保護更新器，**不會停止或重新啟動 `video-mcp.service`**。斷電／SIGKILL 無法執行回復。Metadata canary 通過不保證 GVS 實際媒體下載可用；本次交付未在伺服器執行更新或真實媒體驗收。
+
+systemd 範本在 `deploy/systemd/`：固定 `User=ubuntu`、工作目錄 `/home/ubuntu/video-timeline-pipeline`，proxy 每 10 分鐘檢查；更新器每天主機時間 04:20 執行，**預設為 `--dry-run`**，不追補停機期間的更新。以下是供管理者日後自行執行的命令，本次未執行：
+
+```bash
+sudo install -m 0644 deploy/systemd/video-youtube-proxy-check.{service,timer} /etc/systemd/system/
+sudo install -m 0644 deploy/systemd/video-ytdlp-canary-update.{service,timer} /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now video-youtube-proxy-check.timer video-ytdlp-canary-update.timer
+systemctl list-timers 'video-*'
+journalctl -u video-youtube-proxy-check.service -u video-ytdlp-canary-update.service
+# 停用後不再觸發；已執行中的更新請等候完成與回復。
+sudo systemctl disable --now video-youtube-proxy-check.timer video-ytdlp-canary-update.timer
+```
+
+正式自動更新需管理者在 `sudo systemctl edit video-ytdlp-canary-update.service` 明確覆寫（先驗證 canary 網址與維護時段），保存後 `sudo systemctl daemon-reload`：
+
+```ini
+[Service]
+ExecStart=
+ExecStart=/bin/bash scripts/ytdlp_canary_update.sh
+```
+
+### YouTube PO Token（選用）
+
+YouTube 的部分 client 要求 GVS（Google Video Server）媒體請求附上 PO Token；使用登入 cookies 後選到需要 token 的 client／格式時，缺少或失效的 GVS token 可能使實際下載回 `403`。cookies 本身不等於 PO Token，也不是每個 `403` 都由它引起。詳見 [yt-dlp PO Token Guide](https://github.com/yt-dlp/yt-dlp/wiki/PO-Token-Guide)。目前部署方式以 `YTDLP_YOUTUBE_PROXY` 走家用網路，避免加入 YouTube 登入 cookies；本次不改變此設定。
+
+確有需求時，可自行評估 [bgutil-ytdlp-pot-provider](https://github.com/Brainicism/bgutil-ytdlp-pot-provider)：依上游文件選擇本機 HTTP provider（Docker 或 Node.js／Deno）或按需產生腳本，安裝與 provider 版本相符的 yt-dlp plugin 至同一個 app venv，確認 yt-dlp 能連到 provider，並依上游建議選用需要的 YouTube client。不要把 provider 暴露到公網，也不要把 cookies／token 寫入 Git。這裡僅提供操作方向，沒有安裝 plugin、啟動 provider 或加入 cookies。
+
+驗證時用同一個 app venv 執行 `yt-dlp -v --simulate <公開YouTube網址>`（例如 `.venv/bin/python -m yt_dlp -v --simulate ...`），並明確帶入既有 proxy；yt-dlp CLI 本身不會載入 repo `.env`。檢查 verbose 輸出中的已載入 PO Token provider（如 `bgutil`／`bgutil:http`）及 token 取得訊息，再由管理者另行測試實際媒體下載；僅看到 plugin 檔名不等於已取得有效 token。輸出可能含敏感資訊，分享前請遮蔽。Provider 並不保證排除所有 `403` 或 bot 檢查；細節以所連結上游版本文件為準。
+
 ### Instagram 下載與診斷
 
 在執行 Pipeline 的虛擬環境安裝／更新：`python -m pip install -U "yt-dlp[default,curl-cffi]"`。虛擬環境內已安裝的套件優先於 PATH／VidBee 的獨立執行檔，避免更新了錯誤的版本。依 [yt-dlp 官方更新通道與 impersonation 文件](https://github.com/yt-dlp/yt-dlp#update-channels)，如需比較 nightly，請先在獨立測試環境使用 `python -m pip install -U --pre "yt-dlp[default,curl-cffi]"`，不要在每次下載時自動更新。

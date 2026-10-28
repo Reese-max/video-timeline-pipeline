@@ -1,0 +1,5 @@
+# 公開 YouTube canary；每行一個網址，可用 # 加註解。
+https://www.youtube.com/watch?v=jNQXAC9IVRw
+https://www.youtube.com/watch?v=aqz-KE-bpKQ
+# 必須替換成可公開播放的 Facebook 影片；保留佔位網址時更新器會拒絕升級。
+https://www.facebook.com/watch/?v=REPLACE_WITH_PUBLIC_VIDEO_ID
