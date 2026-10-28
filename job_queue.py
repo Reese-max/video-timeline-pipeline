@@ -242,7 +242,12 @@ class JobQueue:
             if row["error"]: payload["error"] = row["error"]
             if row["operation"] == "prepare" and row["error"] and row["status"] in {"failed", "expired"}:
                 from pipeline import classify_download_error
-                payload.update(classify_download_error(row["error"], json.loads(row["inputs"]).get("url", "")))
+                try:
+                    inputs = json.loads(row["inputs"] or "{}")
+                except (TypeError, ValueError):
+                    inputs = {}
+                url = inputs.get("url") if isinstance(inputs, dict) else ""
+                payload.update(classify_download_error(row["error"], url if isinstance(url, str) else ""))
         if row["deadline"]: payload["deadline_at"] = row["deadline"]
         return payload
 

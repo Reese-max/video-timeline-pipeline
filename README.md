@@ -144,9 +144,9 @@ v20 修正同一工作較舊 A 報告的延遲通知覆蓋新版摘要狀態：�
 
 ### 來源檢查與下載錯誤
 
-來源可能不是公開影片或下載器可能不支援時，先呼叫 `probe_video_source(url)`，再決定是否呼叫 `prepare_video_for_chatgpt`。Probe 使用相同 URL 驗證、YouTube 代理設定，以及 Facebook 公開抓取／Chrome impersonation／既有 cookie 授權重試邏輯；不建立工作或下載媒體，停用 yt-dlp 快取與附加檔案輸出，cookie 僅在記憶體中使用。外部 JavaScript runtime 仍可能維護自己的快取，目前沒有作業系統層級的唯讀檔案系統隔離。檢查預算最多 45 秒（`VIDEO_PROCESS_TIMEOUT_SECONDS` 較短時沿用較短時間）。
+來源可能不是公開影片或下載器可能不支援時，先呼叫 `probe_video_source(url)`，再決定是否呼叫 `prepare_video_for_chatgpt`。Probe 使用相同 URL 驗證、YouTube 代理設定，以及 Facebook／Instagram 公開抓取、Chrome impersonation 與既有 cookie 授權重試邏輯；Instagram 也沿用 `YTDLP_INSTAGRAM_USER_AGENT`。不建立工作或下載媒體，停用 yt-dlp 快取與附加檔案輸出，cookie 僅在記憶體中使用且不回寫。外部 JavaScript runtime、外掛或瀏覽器 cookie 擷取仍可能產生自己的檔案，目前沒有作業系統層級的唯讀檔案系統隔離。檢查預算最多 45 秒（`VIDEO_PROCESS_TIMEOUT_SECONDS` 較短時沿用較短時間）。
 
-成功回傳 `status=ok`、`title`、`duration_seconds`、`extractor`、`uploader`、`is_live`／`live_status`、`availability`、`webpage_url`、`selected_format` 與 `estimated_filesize_bytes`。格式沿用實際下載的 yt-dlp 預設選擇；分離影音的大小會合計，缺少大小資訊時回傳 `null`，不猜測。下載與 probe 共用固定選項並忽略主機上的 yt-dlp 設定檔及外掛，避免格式或輸出設定不同。**Metadata 成功不代表實際影音下載成功**，例如 YouTube 仍可能在下載影片資料時回傳 403。
+成功回傳 `status=ok`、`title`、`duration_seconds`、`extractor`、`uploader`、`is_live`／`live_status`、`availability`、`webpage_url`、`selected_format` 與 `estimated_filesize_bytes`。格式沿用實際下載的 yt-dlp 選擇；分離影音的大小會合計，缺少大小資訊時回傳 `null`，不猜測。一般下載與 probe 保留使用者 yt-dlp 設定檔及外掛行為，例如 `~/.config/yt-dlp/config` 中的 `--js-runtimes deno`、格式與代理設定；明確傳入的命令列選項仍優先。Facebook／Instagram 延續既有專用路徑：停用主機設定檔及外掛，先公開檢查，再依各自的 `YTDLP_FACEBOOK_COOKIE_FILE`／`YTDLP_INSTAGRAM_COOKIE_FILE` 重試。**Metadata 成功不代表實際影音下載成功**，例如 YouTube 仍可能在下載影片資料時回傳 403。
 
 Probe 失敗（`status=error`）、同步準備失敗，以及 `get_video_job` 讀取的背景準備失敗，都提供 `error_code`、`retryable`、繁中 `user_message`／`next_steps` 與最多 500 字元的 `raw_error`。原有 `status`／`error` 保留；`retryable=true` 表示環境恢復或等待後可以重試，不會自動重送工作。模型應轉述 `user_message` 與 `next_steps`，不要自行推測原因。
 
