@@ -51,6 +51,7 @@ MEDIA_EXTENSIONS = {
 }
 
 THREADS_HOSTS = {"threads.com", "www.threads.com", "threads.net", "www.threads.net"}
+INSTAGRAM_HOSTS = {"instagram.com", "www.instagram.com", "m.instagram.com"}
 FACEBOOK_HOSTS = {
     "facebook.com", "www.facebook.com", "web.facebook.com", "m.facebook.com",
     "fb.watch", "www.fb.watch",
@@ -364,6 +365,182 @@ def youtube_proxy_options(url: str) -> list[str]:
     YTDLP_YOUTUBE_PROXY (A1: a home connection over Tailscale, scripts/youtube-egress/)."""
     proxy = os.getenv("YTDLP_YOUTUBE_PROXY", "").strip()
     return ["--proxy", proxy] if proxy and is_youtube_url(url) else []
+
+
+def classify_download_error(error: str, source_host: str = "") -> dict[str, Any]:
+    """Classify downloader evidence without inferring a more specific root cause."""
+    text = error.lower()
+    host = source_host.lower().rstrip(".")
+    if "://" in host:
+        try:
+            host = urllib.parse.urlsplit(host).hostname or ""
+        except ValueError:
+            host = ""
+    facebook = is_facebook_url("https://" + host)
+    rules = [
+        ("PROXY_UNREACHABLE", ("unable to connect to proxy", "tunnel connection failed", "proxyerror", "cannot connect to proxy"), True,
+         "目前無法連上下載代理伺服器。", ["請管理員確認代理主機、網路及代理服務已恢復，再重試。"]),
+        ("BOT_CHECK", ("sign in to confirm you’re not a bot", "sign in to confirm you're not a bot", "not a robot", "captcha"), False,
+         "來源網站要求通過機器人驗證，目前無法自動下載。", ["請管理員確認下載網路出口，或直接上傳 MP4。"]),
+        ("AGE_RESTRICTED", ("age-restricted", "age restricted", "confirm your age", "age verification"), False,
+         "來源影片受到年齡驗證限制。", ["請確認你有權使用影片，並直接上傳 MP4。"]),
+        ("GEO_BLOCKED", ("not available in your country", "not available in your region", "geo-restricted", "geo restricted", "geographic restriction"), False,
+         "來源影片受到地區限制，目前下載出口無法存取。", ["請確認來源的地區可用性，或直接上傳 MP4。"]),
+        ("RATE_LIMITED", ("http error 429", "http error 420", "too many requests", "rate limit"), True,
+         "來源網站暫時限制請求頻率。", ["請稍後再試，並降低請求頻率。"]),
+        ("LOGIN_REQUIRED_OR_PRIVATE", ("empty or private data", "private video", "video is private", "login required", "login_required", "login-required", "log in to access this video", "sign in to access this video", "log in to watch", "sign in to watch", "requires authentication", "登入限定", "私人影片") + (("cannot parse data",) if facebook else ()), False,
+         "來源影片可能不是公開內容，或頁面格式已變更。", ["請在無痕視窗確認影片是否不需登入就能播放。", "若無法免登入播放，請直接上傳 MP4。"]),
+        ("FORBIDDEN_403", ("http error 403", "403: forbidden", "403 forbidden"), False,
+         "來源伺服器拒絕影片資料存取（HTTP 403），僅憑此錯誤無法確定原因。", ["請管理員檢查 yt-dlp 的存取要求；YouTube 可能需要 GVS PO token，不能僅憑 403 判定。", "也可直接上傳 MP4。"]),
+        ("UNSUPPORTED_URL", ("unsupported url", "no suitable extractor", "不支援的網址"), False,
+         "下載器不支援這個來源網址。", ["請提供原始影片頁面網址，或直接上傳 MP4。"]),
+        ("VIDEO_UNAVAILABLE", ("video unavailable", "video is unavailable", "video not available", "video is not available", "video has been removed", "video has been deleted", "http error 404", "影片已刪除"), False,
+         "來源網站表示影片目前無法使用。", ["請在無痕視窗確認影片是否仍可公開播放，或直接上傳 MP4。"]),
+        ("FILE_TOO_LARGE", ("larger than max-filesize", "file is larger", "file too large", "maximum file size", "超過大小上限", "超過下載大小上限", "超過 mcp_max_source_mb"), False,
+         "影片大小超過目前允許的上限。", ["請改用較小的影片或縮短片段後上傳。"]),
+        ("TIMEOUT", ("timed out", "timeout", "time budget", "deadline", "逾時"), True,
+         "檢查或下載來源影片時超過等待時間。", ["請稍後再試；若持續逾時，請管理員檢查來源連線。"]),
+    ]
+    for code, patterns, retryable, message, steps in rules:
+        if any(pattern in text for pattern in patterns):
+            break
+    else:
+        code, retryable = "UNKNOWN", False
+        message, steps = "影片處理失敗，目前無法從錯誤訊息判定原因。", ["請將原始錯誤提供給管理員確認，或直接上傳 MP4。"]
+    return {"error_code": code, "retryable": retryable, "user_message": message,
+            "next_steps": steps, "raw_error": error[:500]}
+
+
+def video_download_options(url: str) -> list[str]:
+    return ["--no-playlist", "--merge-output-format", "mp4", *youtube_proxy_options(url)]
+
+
+def facebook_download_options(diagnostics: dict[str, Any]) -> list[str]:
+    options = ["--ignore-config", "--no-plugin-dirs", "--no-cookies", "--no-cookies-from-browser",
+               "--socket-timeout", "20", "--retries", "1", "--extractor-retries", "1"]
+    if diagnostics["chrome_impersonation"]:
+        options += ["--impersonate", "chrome"]
+    return options
+
+
+def facebook_download_cookies(cookie_file: str) -> list[http.cookiejar.Cookie]:
+    path = Path(cookie_file)
+    if not path.is_absolute() or not path.is_file() or path.stat().st_size > 1024 * 1024:
+        raise RuntimeError("YTDLP_FACEBOOK_COOKIE_FILE 必須是既有絕對路徑、至多 1 MiB 的 Netscape cookies 檔。")
+    jar = http.cookiejar.MozillaCookieJar(str(path))
+    try:
+        jar.load(ignore_discard=True)
+    except (OSError, http.cookiejar.LoadError):
+        raise RuntimeError("Facebook cookies 無法讀取或不是 Netscape 格式。") from None
+    cookies = [cookie for cookie in jar if cookie.domain.lstrip(".").lower() == "facebook.com"
+               or cookie.domain.lower().endswith(".facebook.com")
+               or cookie.domain.lstrip(".").lower() in {"fb.com", "fb.watch"}
+               or cookie.domain.lower().endswith((".fb.com", ".fb.watch"))]
+    if not cookies:
+        raise RuntimeError("Facebook cookies 沒有 facebook.com／fb.com 網域項目；請由使用者更新授權檔案。")
+    return cookies
+
+
+def instagram_download_options(diagnostics: dict[str, Any]) -> list[str]:
+    user_agent = os.getenv("YTDLP_INSTAGRAM_USER_AGENT", "").strip()
+    if len(user_agent) > 512 or any(character in user_agent for character in "\r\n"):
+        diagnostics["user_agent"] = "invalid"
+        raise ValueError("YTDLP_INSTAGRAM_USER_AGENT 格式無效。")
+    return facebook_download_options(diagnostics) + (["--user-agent", user_agent] if user_agent else [])
+
+
+def instagram_download_cookies(cookie_file: str) -> list[http.cookiejar.Cookie]:
+    path = Path(cookie_file)
+    if not path.is_absolute() or not path.is_file() or path.stat().st_size > 1024 * 1024:
+        raise RuntimeError("YTDLP_INSTAGRAM_COOKIE_FILE 必須是既有絕對路徑、至多 1 MiB 的 Netscape cookies 檔。")
+    jar = http.cookiejar.MozillaCookieJar(str(path))
+    try:
+        jar.load(ignore_discard=True)
+    except (OSError, http.cookiejar.LoadError):
+        raise RuntimeError("Instagram cookies 無法讀取或不是 Netscape 格式。") from None
+    cookies = [cookie for cookie in jar if cookie.domain.lstrip(".").lower() == "instagram.com"
+               or cookie.domain.lower().endswith(".instagram.com")]
+    if not any(cookie.name == "sessionid" and cookie.value for cookie in cookies):
+        raise RuntimeError("Instagram cookies 沒有未過期的 sessionid；請由使用者更新授權檔案。")
+    return cookies
+
+
+# Run metadata extraction in a bounded child, with cookies in memory and no writable cookie jar.
+SOURCE_PROBE_SCRIPT = """
+import http.cookiejar, json, sys, yt_dlp
+parsed = yt_dlp.parse_options()
+yt_dlp.globals.plugin_dirs.value = parsed.options.plugin_dirs
+options = parsed.ydl_opts
+cookiefile = options.pop('cookiefile', None)
+browser = options.pop('cookiesfrombrowser', None)
+options.update(cachedir=False, cookiefile=None, cookiesfrombrowser=None)
+with yt_dlp.YoutubeDL(options) as ydl:
+    ydl.cookiejar = yt_dlp.cookies.load_cookies(cookiefile, browser, ydl)
+    for cookie in json.load(sys.stdin):
+        ydl.cookiejar.set_cookie(http.cookiejar.Cookie(**cookie))
+    info = ydl.extract_info(sys.argv[-1], download=False)
+    print(json.dumps(ydl.sanitize_info(info)))
+"""
+
+
+def probe_video_source(url: str) -> dict[str, Any]:
+    """Metadata only: no cache, media, sidecars, temporary cookies, or job directory."""
+    budget = OperationBudget("Source probe", 45, "VIDEO_PROCESS_TIMEOUT_SECONDS")
+    options = video_download_options(url) + ["--skip-download", "--no-write-info-json", "--no-write-thumbnail",
+               "--no-write-subs", "--no-write-auto-subs", "--no-cache-dir", "--quiet", "--no-warnings"]
+    instagram = (urllib.parse.urlsplit(url).hostname or "").lower() in INSTAGRAM_HOSTS
+    facebook = is_facebook_url(url)
+    cookie_file = ""
+    if facebook or instagram:
+        cookie_file = os.getenv("YTDLP_INSTAGRAM_COOKIE_FILE" if instagram else "YTDLP_FACEBOOK_COOKIE_FILE", "").strip()
+        builder = instagram_download_options if instagram else facebook_download_options
+        options += builder(instagram_download_diagnostics([sys.executable, "-B", "-m", "yt_dlp", "--no-cache-dir"]))
+    redactions = {url, cookie_file}
+
+    def attempt(cookies: list[http.cookiejar.Cookie]) -> dict[str, Any]:
+        redactions.update(cookie.value for cookie in cookies if cookie.value)
+        try:
+            result = subprocess.run(
+                [sys.executable, "-B", "-c", SOURCE_PROBE_SCRIPT, *options, url],
+                input=json.dumps([{**{key: value for key, value in cookie.__dict__.items() if key != "_rest"},
+                                   "rest": cookie._rest} for cookie in cookies]), capture_output=True,
+                text=True, encoding="utf-8", errors="replace", timeout=budget.remaining(45),
+            )
+        except subprocess.TimeoutExpired:
+            raise DeadlineExceeded("來源檢查逾時。") from None
+        if result.returncode:
+            detail = redact_values(result.stderr.strip(), redactions)
+            detail = re.sub(r"(?im)\b(authorization|cookie|set-cookie):[^\r\n]*", r"\1: <redacted>", detail)
+            raise RuntimeError(sanitize_public_urls(detail) or "來源檢查失敗，下載器未提供錯誤資訊。")
+        return json.loads(result.stdout)
+
+    try:
+        info = attempt([])
+    except (DeadlineExceeded, ExecutionCancelled):
+        raise
+    except RuntimeError as public_error:
+        if not cookie_file:
+            raise
+        try:
+            cookies = instagram_download_cookies(cookie_file) if instagram else facebook_download_cookies(cookie_file)
+            info = attempt(cookies)
+        except (DeadlineExceeded, ExecutionCancelled):
+            raise
+        except (OSError, RuntimeError) as error:
+            detail = redact_values(f"公開檢查失敗：{public_error}\n授權檢查失敗：{error}", redactions)
+            detail = re.sub(r"(?im)\b(authorization|cookie|set-cookie):[^\r\n]*", r"\1: <redacted>", detail)
+            raise RuntimeError(sanitize_public_urls(detail)) from None
+    selected = (info.get("requested_downloads") or [info])[0]
+    tracks = selected.get("requested_formats") or [selected]
+    sizes = [track.get("filesize") or track.get("filesize_approx") for track in tracks]
+    estimated_size = selected.get("filesize") or selected.get("filesize_approx")
+    if estimated_size is None and sizes and all(isinstance(size, (int, float)) for size in sizes):
+        estimated_size = sum(sizes)
+    return {"status": "ok", "title": info.get("title"), "duration_seconds": info.get("duration"),
+            **{key: info.get(key) for key in ("extractor", "uploader", "is_live", "live_status", "availability")},
+            "webpage_url": public_url(info.get("webpage_url") or url),
+            "selected_format": {key: selected.get(key) for key in ("format_id", "format", "ext", "width", "height", "vcodec", "acodec")},
+            "estimated_filesize_bytes": estimated_size}
 
 
 def threads_post_id(url: str) -> str:
@@ -716,15 +893,7 @@ def download_instagram(command: list[str], url: str, job_dir: Path) -> None:
         diagnostics["attempts"].append({"mode": mode, "status": "ok"})
 
     try:
-        if len(user_agent) > 512 or any(character in user_agent for character in "\r\n"):
-            diagnostics["user_agent"] = "invalid"
-            raise ValueError("YTDLP_INSTAGRAM_USER_AGENT 格式無效。")
-        options = ["--ignore-config", "--no-plugin-dirs", "--no-cookies", "--no-cookies-from-browser",
-                   "--socket-timeout", "20", "--retries", "1", "--extractor-retries", "1"]
-        if diagnostics["chrome_impersonation"]:
-            options += ["--impersonate", "chrome"]
-        if user_agent:
-            options += ["--user-agent", user_agent]
+        options = instagram_download_options(diagnostics)
         public_command = command[:-1] + options + [url]
         try:
             attempt(public_command, "public")
@@ -733,18 +902,7 @@ def download_instagram(command: list[str], url: str, job_dir: Path) -> None:
         except RuntimeError:
             if not cookie_file:
                 raise RuntimeError("公開抓取失敗；未設定 YTDLP_INSTAGRAM_COOKIE_FILE，未嘗試登入。") from None
-            path = Path(cookie_file)
-            if not path.is_absolute() or not path.is_file() or path.stat().st_size > 1024 * 1024:
-                raise RuntimeError("YTDLP_INSTAGRAM_COOKIE_FILE 必須是既有絕對路徑、至多 1 MiB 的 Netscape cookies 檔。")
-            jar = http.cookiejar.MozillaCookieJar(str(path))
-            try:
-                jar.load(ignore_discard=True)
-            except (OSError, http.cookiejar.LoadError):
-                raise RuntimeError("Instagram cookies 無法讀取或不是 Netscape 格式。") from None
-            cookies = [cookie for cookie in jar if cookie.domain.lstrip(".").lower() == "instagram.com"
-                       or cookie.domain.lower().endswith(".instagram.com")]
-            if not any(cookie.name == "sessionid" and cookie.value for cookie in cookies):
-                raise RuntimeError("Instagram cookies 沒有未過期的 sessionid；請由使用者更新授權檔案。")
+            cookies = instagram_download_cookies(cookie_file)
             redactions.update(cookie.value for cookie in cookies if cookie.value)
             # yt-dlp writes back its cookie jar. Never modify the supplied credential file.
             with tempfile.TemporaryDirectory(prefix="vtp-instagram-") as directory:
@@ -802,15 +960,8 @@ def download_facebook(command: list[str], url: str, job_dir: Path) -> None:
             raise
         diagnostics["attempts"].append({"mode": mode, "status": "ok"})
 
-    def facebook_cookie_domain(domain: str) -> bool:
-        host = domain.lstrip(".").lower()
-        return host == "facebook.com" or host.endswith(".facebook.com") or host in {"fb.com", "fb.watch"} or host.endswith(".fb.com") or host.endswith(".fb.watch")
-
     try:
-        options = ["--ignore-config", "--no-plugin-dirs", "--no-cookies", "--no-cookies-from-browser",
-                   "--socket-timeout", "20", "--retries", "1", "--extractor-retries", "1"]
-        if diagnostics["chrome_impersonation"]:
-            options += ["--impersonate", "chrome"]
+        options = facebook_download_options(diagnostics)
         public_command = command[:-1] + options + [url]
         try:
             attempt(public_command, "public")
@@ -819,17 +970,7 @@ def download_facebook(command: list[str], url: str, job_dir: Path) -> None:
         except RuntimeError:
             if not cookie_file:
                 raise RuntimeError("公開抓取失敗；未設定 YTDLP_FACEBOOK_COOKIE_FILE，未嘗試登入。") from None
-            path = Path(cookie_file)
-            if not path.is_absolute() or not path.is_file() or path.stat().st_size > 1024 * 1024:
-                raise RuntimeError("YTDLP_FACEBOOK_COOKIE_FILE 必須是既有絕對路徑、至多 1 MiB 的 Netscape cookies 檔。")
-            jar = http.cookiejar.MozillaCookieJar(str(path))
-            try:
-                jar.load(ignore_discard=True)
-            except (OSError, http.cookiejar.LoadError):
-                raise RuntimeError("Facebook cookies 無法讀取或不是 Netscape 格式。") from None
-            cookies = [cookie for cookie in jar if facebook_cookie_domain(cookie.domain)]
-            if not cookies:
-                raise RuntimeError("Facebook cookies 沒有 facebook.com／fb.com 網域項目；請由使用者更新授權檔案。")
+            cookies = facebook_download_cookies(cookie_file)
             redactions.update(cookie.value for cookie in cookies if cookie.value)
             # yt-dlp writes back its cookie jar. Never modify the supplied credential file.
             with tempfile.TemporaryDirectory(prefix="vtp-facebook-") as directory:
@@ -881,11 +1022,8 @@ def download_video(
     command = yt_dlp_command()
     if private_url:
         command += ["--quiet", "--no-warnings"]
-    command += [
-        "--no-playlist",
+    command += video_download_options(url) + [
         "--write-info-json",
-        "--merge-output-format",
-        "mp4",
         "--output",
         str(job_dir / "source.%(ext)s"),
     ]
@@ -894,15 +1032,14 @@ def download_video(
     if max_duration is not None:
         # "<=?" lets direct-file URLs without duration metadata through; prepare re-checks the probed duration.
         command += ["--match-filter", f"duration <=? {max_duration}"]
-    command += youtube_proxy_options(url)
     command.append(url)
     hostname = (urllib.parse.urlsplit(url).hostname or "").lower()
-    if hostname in {"instagram.com", "www.instagram.com", "m.instagram.com"}:
+    if hostname in INSTAGRAM_HOSTS:
         download_instagram(command, url, job_dir)
     elif is_facebook_url(url):
         download_facebook(command, url, job_dir)
     else:
-        run_external(command, stream=not private_url, redact={url} if private_url else None)
+        run_external(command, stream=False, redact={url} if private_url else None)
     if private_url:
         sanitize_download_info(job_dir / "source.info.json")
     video_path = locate_source_video(job_dir)

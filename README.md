@@ -142,6 +142,31 @@ v20 修正同一工作較舊 A 報告的延遲通知覆蓋新版摘要狀態：�
 
 畫面補漏（#56／#105）逐次驗證回應時間碼，保留提示時段兩端的事件，並在合併後重新檢查每個間隔（含片頭、片尾及 chunk 接點）不超過 30 秒。片尾事件不能豁免較長的空檔；不可靠時間碼不能填補覆蓋。剩餘範圍記入 `unanswered_gap_windows`，保留已有畫面但整體標示未完成，不寫入可重用視覺快取，也不登記為完成通知。舊 gap receipt 需重算；這不保證模型的實際畫面／時間對齊，原始媒體驗收另列。
 
+### 來源檢查與下載錯誤
+
+來源可能不是公開影片或下載器可能不支援時，先呼叫 `probe_video_source(url)`，再決定是否呼叫 `prepare_video_for_chatgpt`。Probe 使用相同 URL 驗證、YouTube 代理設定，以及 Facebook／Instagram 公開抓取、Chrome impersonation 與既有 cookie 授權重試邏輯；Instagram 也沿用 `YTDLP_INSTAGRAM_USER_AGENT`。不建立工作或下載媒體，停用 yt-dlp 快取與附加檔案輸出，cookie 僅在記憶體中使用且不回寫。外部 JavaScript runtime、外掛或瀏覽器 cookie 擷取仍可能產生自己的檔案，目前沒有作業系統層級的唯讀檔案系統隔離。檢查預算最多 45 秒（`VIDEO_PROCESS_TIMEOUT_SECONDS` 較短時沿用較短時間）。
+
+成功回傳 `status=ok`、`title`、`duration_seconds`、`extractor`、`uploader`、`is_live`／`live_status`、`availability`、`webpage_url`、`selected_format` 與 `estimated_filesize_bytes`。格式沿用實際下載的 yt-dlp 選擇；分離影音的大小會合計，缺少大小資訊時回傳 `null`，不猜測。一般下載與 probe 保留使用者 yt-dlp 設定檔及外掛行為，例如 `~/.config/yt-dlp/config` 中的 `--js-runtimes deno`、格式與代理設定；明確傳入的命令列選項仍優先。Facebook／Instagram 延續既有專用路徑：停用主機設定檔及外掛，先公開檢查，再依各自的 `YTDLP_FACEBOOK_COOKIE_FILE`／`YTDLP_INSTAGRAM_COOKIE_FILE` 重試。**Metadata 成功不代表實際影音下載成功**，例如 YouTube 仍可能在下載影片資料時回傳 403。
+
+Probe 失敗（`status=error`）、同步準備失敗，以及 `get_video_job` 讀取的背景準備失敗，都提供 `error_code`、`retryable`、繁中 `user_message`／`next_steps` 與最多 500 字元的 `raw_error`。原有 `status`／`error` 保留；`retryable=true` 表示環境恢復或等待後可以重試，不會自動重送工作。模型應轉述 `user_message` 與 `next_steps`，不要自行推測原因。
+
+| error_code | 意義／建議處理 |
+| --- | --- |
+| `LOGIN_REQUIRED_OR_PRIVATE` | 可能非公開、需登入或頁面格式變更；以無痕視窗確認免登入播放，否則上傳 MP4。Facebook 的 `Cannot parse data` 歸此類，不能據此斷言一定是私人影片。 |
+| `BOT_CHECK` | 來源要求機器人驗證；檢查下載出口或上傳 MP4。 |
+| `PROXY_UNREACHABLE` | 代理連線失敗；請管理員確認代理主機及服務恢復後重試。 |
+| `FORBIDDEN_403` | 影片資料存取被拒絕；檢查下載器的存取要求，不能僅憑 403 斷言原因，YouTube 可能需要 GVS PO token。 |
+| `UNSUPPORTED_URL` | 下載器不支援；提供原始影片頁面或上傳 MP4。 |
+| `VIDEO_UNAVAILABLE` | 來源表示影片無法使用；確認公開可用性。 |
+| `AGE_RESTRICTED` | 年齡限制；確認使用權後上傳 MP4。 |
+| `GEO_BLOCKED` | 地區限制；確認來源的地區可用性。 |
+| `RATE_LIMITED` | 來源限制頻率；等待並降低頻率後重試。 |
+| `FILE_TOO_LARGE` | 超過大小上限；縮小影片或縮短片段。 |
+| `TIMEOUT` | 超過等待時間；稍後重試，持續發生時檢查來源連線。 |
+| `UNKNOWN` | 證據不足；保留原始錯誤供管理員檢查。 |
+
+不建議為了私人／登入限定影片將 cookies 新增到伺服器。上述檢查不呼叫 Bright Data／Apify 或其他計費服務。離線回歸：`python -m pytest -q tests/test_source_probe.py`。
+
 ### MCP 影音暫存保留 7 天（有 Drive 完整備份時改為分析後清理）
 
 有設定 Google Drive 時，Drive 是影片的長期保存處：Drive 工作會連同整支原片一起上傳並以大小與 SHA-256 驗證，送出背景分析時也會自動排入 Drive 工作。備份完整的工作不必等 7 天：分析已有結果、播放連結都已過期、最後一次準備／分析超過 `MCP_DRIVE_BACKED_GRACE_SECONDS`（預設 1 小時），且 Drive 端逐檔確認未刪除、位元組相同時，就刪除本機媒體。之後重新準備、分析或上傳報告時會自動從 Drive 取回並驗證，原有分析快取仍可沿用。建議排程每小時執行一次。
