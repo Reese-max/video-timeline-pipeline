@@ -137,6 +137,7 @@ class SourceProbeTests(unittest.TestCase):
         self.enterContext(patch.object(server, "MCP_ROOT", self.root))
         self.enterContext(patch.object(server, "MCP_JOBS_ROOT", self.root / "mcp_jobs"))
         self.enterContext(patch.dict(os.environ, {"YTDLP_YOUTUBE_PROXY": "http://proxy.example:18443"}))
+        self.connect = self.enterContext(patch("socket.create_connection"))
         self.enterContext(patch.object(server, "check_public_host", lambda *args: None))
         self.enterContext(patch.object(server, "validate_share_redirects", lambda *args: None))
 
@@ -163,6 +164,70 @@ class SourceProbeTests(unittest.TestCase):
         self.assertTrue("--ignore-config" not in command and "--no-plugin-dirs" not in command)
         self.assertTrue(0 < run.call_args.kwargs["timeout"] <= 45)
         self.assertEqual(list(probe_environment.iterdir()), [])
+        self.connect.assert_called_once_with(("proxy.example", 18443), timeout=3)
+        self.connect.return_value.__exit__.assert_called_once()
+
+    def test_probe_non_object_json_uses_sanitized_stderr_or_fallback(self):
+        url = "https://www.facebook.com/watch/?v=1441463020884039"
+        message = "ERROR: [facebook] 1441463020884039: Cannot parse data"
+        with patch.object(pipeline, "instagram_download_diagnostics", return_value={"chrome_impersonation": False}), \
+                patch.dict(os.environ, {"YTDLP_FACEBOOK_COOKIE_FILE": ""}):
+            for stdout in ("null", "[]", '"text"', "42"):
+                for stderr, code in ((message, "LOGIN_REQUIRED_OR_PRIVATE"), ("", "UNKNOWN"),
+                                     ("Cookie: SECRET\nAuthorization: Bearer HIDDEN\n" + message,
+                                      "LOGIN_REQUIRED_OR_PRIVATE")):
+                    with self.subTest(stdout=stdout, stderr=stderr), \
+                            patch.object(pipeline.subprocess, "run", return_value=SimpleNamespace(
+                                returncode=0, stdout=stdout, stderr=stderr)):
+                        result = asyncio.run(server.probe_video_source(url))
+                    self.assertEqual(result["status"], "error")
+                    self.assertEqual(result["error_code"], code)
+                    self.assertTrue(result["raw_error"])
+                    self.assertNotIn("NoneType", result["raw_error"])
+                    self.assertNotIn("SECRET", json.dumps(result))
+                    self.assertNotIn("HIDDEN", json.dumps(result))
+                    if stderr:
+                        self.assertIn(message, result["raw_error"])
+        self.connect.assert_not_called()
+
+    def test_probe_unreachable_proxy_fails_before_subprocess(self):
+        for failure in (ConnectionRefusedError("refused"), TimeoutError("timed out")):
+            with self.subTest(failure=failure), \
+                    patch("socket.create_connection", side_effect=failure) as connect, \
+                    patch.object(pipeline.subprocess, "run") as run:
+                result = asyncio.run(server.probe_video_source("https://youtu.be/123"))
+            self.assertEqual(result["error_code"], "PROXY_UNREACHABLE")
+            self.assertIs(result["retryable"], True)
+            connect.assert_called_once_with(("proxy.example", 18443), timeout=3)
+            run.assert_not_called()
+
+    def test_probe_without_proxy_skips_tcp_check(self):
+        with patch.dict(os.environ, {"YTDLP_YOUTUBE_PROXY": ""}), \
+                patch.object(pipeline.subprocess, "run", return_value=SimpleNamespace(
+                    returncode=0, stdout='{"title":"Direct"}', stderr="")) as run:
+            result = asyncio.run(server.probe_video_source("https://youtu.be/123"))
+        self.assertEqual(result["title"], "Direct")
+        self.assertNotIn("--proxy", run.call_args.args[0])
+        self.connect.assert_not_called()
+
+    def test_probe_child_exits_nonzero_on_none(self):
+        import yt_dlp
+        ydl = MagicMock()
+        ydl.extract_info.return_value = None
+        ydl.sanitize_info.side_effect = lambda info: info
+        with patch.object(sys, "argv", ["probe", "https://youtu.be/123"]), \
+                patch.object(sys, "stdin", io.StringIO("[]")), \
+                patch.object(sys, "stdout", io.StringIO()) as output, \
+                patch.object(yt_dlp, "parse_options", return_value=SimpleNamespace(
+                    options=SimpleNamespace(plugin_dirs=[]), ydl_opts={})), \
+                patch.object(yt_dlp.globals.plugin_dirs, "value", []), \
+                patch.object(yt_dlp, "YoutubeDL") as constructor:
+            constructor.return_value.__enter__.return_value = ydl
+            with self.assertRaises(SystemExit) as raised:
+                exec(compile(pipeline.SOURCE_PROBE_SCRIPT, "<probe>", "exec"), {})
+        self.assertNotEqual(raised.exception.code, 0)
+        self.assertEqual(output.getvalue(), "")
+        ydl.sanitize_info.assert_not_called()
 
     def test_probe_failure_without_files(self):
         cases = [
@@ -196,7 +261,7 @@ class SourceProbeTests(unittest.TestCase):
                     ".example.com\tTRUE\t/\tTRUE\t2147483647\tx\tUNRELATED\n")
         cookies.write_text(original, encoding="utf-8")
         self.enterContext(patch.dict(os.environ, {"YTDLP_FACEBOOK_COOKIE_FILE": str(cookies)}))
-        responses = [SimpleNamespace(returncode=1, stdout="", stderr="Cannot parse data"),
+        responses = [SimpleNamespace(returncode=0, stdout="null", stderr="Cannot parse data"),
                      SimpleNamespace(returncode=0, stdout='{"title":"範例"}', stderr="")]
         with patch.object(pipeline, "instagram_download_diagnostics", return_value={"chrome_impersonation": True}), \
                 patch.object(pipeline.subprocess, "run", side_effect=responses) as run, \
