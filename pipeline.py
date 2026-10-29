@@ -24,6 +24,7 @@ import os
 import re
 import shutil
 import signal
+import socket
 import sqlite3
 import subprocess
 import sys
@@ -479,6 +480,8 @@ with yt_dlp.YoutubeDL(options) as ydl:
     for cookie in json.load(sys.stdin):
         ydl.cookiejar.set_cookie(http.cookiejar.Cookie(**cookie))
     info = ydl.extract_info(sys.argv[-1], download=False)
+    if info is None:
+        sys.exit(1)
     print(json.dumps(ydl.sanitize_info(info)))
 """
 
@@ -488,6 +491,18 @@ def probe_video_source(url: str) -> dict[str, Any]:
     budget = OperationBudget("Source probe", 45, "VIDEO_PROCESS_TIMEOUT_SECONDS")
     options = video_download_options(url) + ["--skip-download", "--no-write-info-json", "--no-write-thumbnail",
                "--no-write-subs", "--no-write-auto-subs", "--no-cache-dir", "--quiet", "--no-warnings"]
+    if "--proxy" in options:
+        proxy = options[options.index("--proxy") + 1]
+        timeout = budget.remaining(3)
+        try:
+            parsed = urllib.parse.urlsplit(proxy if "://" in proxy else "//" + proxy)
+            port = parsed.port or (443 if parsed.scheme == "https" else 1080 if parsed.scheme.startswith("socks") else 80)
+            if not parsed.hostname:
+                raise ValueError("Missing proxy host")
+            with socket.create_connection((parsed.hostname, port), timeout=timeout):
+                pass
+        except (OSError, ValueError):
+            raise RuntimeError("Unable to connect to proxy during source probe.") from None
     instagram = (urllib.parse.urlsplit(url).hostname or "").lower() in INSTAGRAM_HOSTS
     facebook = is_facebook_url(url)
     cookie_file = ""
@@ -508,11 +523,12 @@ def probe_video_source(url: str) -> dict[str, Any]:
             )
         except subprocess.TimeoutExpired:
             raise DeadlineExceeded("來源檢查逾時。") from None
-        if result.returncode:
+        info = None if result.returncode else json.loads(result.stdout)
+        if not isinstance(info, dict):
             detail = redact_values(result.stderr.strip(), redactions)
             detail = re.sub(r"(?im)\b(authorization|cookie|set-cookie):[^\r\n]*", r"\1: <redacted>", detail)
             raise RuntimeError(sanitize_public_urls(detail) or "來源檢查失敗，下載器未提供錯誤資訊。")
-        return json.loads(result.stdout)
+        return info
 
     try:
         info = attempt([])

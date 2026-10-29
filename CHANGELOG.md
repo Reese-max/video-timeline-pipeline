@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- 修正：`probe_video_source` 遇到 yt-dlp 回傳 `null` 或非物件 JSON 時，改用清理後的 stderr 回報錯誤（無 stderr 時提供備援訊息），讓 Facebook 私人影片正確分類為 `LOGIN_REQUIRED_OR_PRIVATE`；probe 子程序遇到 `None` 以非零結束碼退出。YouTube probe 使用代理時先以最多 3 秒的 TCP 連線檢查，連線失敗立即回報 `PROXY_UNREACHABLE`，不耗盡 45 秒預算；實際下載流程不變。
 - 新增：下載錯誤共用分類器，提供穩定 `error_code`、是否可重試、繁中說明／下一步與截短原始錯誤；同步準備及背景失敗輪詢保留既有欄位並附上分類。新增唯讀 `probe_video_source`，共用下載格式與網路選項，最多 45 秒檢查 metadata／選定格式與估計大小，不建立工作或媒體，停用 yt-dlp 快取與 cookie 回寫；外部 runtime／外掛／瀏覽器 cookie 擷取的檔案副作用仍是已知限制。一般下載及 probe 保留主機 yt-dlp 設定檔及外掛行為，Facebook／Instagram 延續既有專用選項並共用 cookie 重試邏輯；一般下載改為擷取 stderr，保留分類所需的實際錯誤。工具描述要求轉述分類結果、不推測原因；新增離線回歸與 README 錯誤碼表。
 - 修正：背景準備失敗輪詢可容忍損毀或非物件的 inputs 與非字串 URL；下載分類器縮窄登入／影片不可用的判斷，並共用 Facebook 網域判定，避免無證據推論。
 - 修正上傳 MP4 的異常網址／ffprobe JSON 錯誤訊息；下次上傳會於寫入鎖內清理過期的中斷暫存，容量或搬移失敗不再留下新建空工作。離線分析測試固定 MiniMax 模型，避免依賴主機環境。
