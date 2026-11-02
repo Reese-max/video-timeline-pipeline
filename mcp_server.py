@@ -1947,10 +1947,19 @@ def analyze_prepared_sync(job_id: str) -> dict[str, Any]:
     errors: list[str] = []
     audio_status = "skipped" if not has_audio else "pending"
     visual_status = "pending"
+    progress_lock = threading.Lock()
+    stage_status = {"audio": "處理中" if has_audio else "無音訊", "visual": "準備中"}
+
+    def evidence_progress(part: str, value: str) -> None:
+        # Serialize updates from the concurrent audio and visual branches.
+        with progress_lock:
+            stage_status[part] = value
+            report_progress("evidence", 40,
+                            f"音訊：{stage_status['audio']}；視覺：{stage_status['visual']}")
 
     def visual_stage() -> list[dict[str, Any]]:
         pipeline.visual_mode()  # rejects the removed frame-sampling mode
-        report_progress("upload", 20, "上傳整支影片給 MiniMax 直接理解")
+        evidence_progress("visual", "準備 MP4 分析")
         # The same resolution the pipeline applies, so the recorded fps/detail
         # match the request that is really sent (detail=high is ~3.4x the cost
         # of default; a too-long video is analysed in segments instead of
@@ -1979,7 +1988,7 @@ def analyze_prepared_sync(job_id: str) -> dict[str, Any]:
         check_job_capacity(job_id, 2 * chunk_bytes)
         if plan.chunked:
             require_disk_space(2 * chunk_bytes)
-        report_progress("evidence", 40, "MiniMax 直接讀取 mp4")
+        evidence_progress("visual", "MiniMax 處理中")
         observations = pipeline.analyze_video_mp4(
             video_path,
             minimax_key,
@@ -2040,20 +2049,24 @@ def analyze_prepared_sync(job_id: str) -> dict[str, Any]:
         def safe_transcript() -> None:
             try:
                 transcript_box["value"] = transcript_stage()
+                evidence_progress("audio", "完成")
             except (DeadlineExceeded, ExecutionCancelled):
                 raise
             except Exception as error:
                 transcript_box["error"] = analysis_error(error)
+                evidence_progress("audio", "失敗")
 
         visual_box: dict[str, Any] = {}
 
         def safe_visual() -> None:
             try:
                 visual_box["value"] = visual_stage()
+                evidence_progress("visual", "完成")
             except (DeadlineExceeded, ExecutionCancelled):
                 raise
             except Exception as error:
                 visual_box["error"] = analysis_error(error)
+                evidence_progress("visual", "失敗")
 
         pipeline.run_parallel_stages(safe_transcript, safe_visual)
         if "value" in transcript_box:

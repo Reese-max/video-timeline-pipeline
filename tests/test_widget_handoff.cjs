@@ -67,6 +67,42 @@ function harness({ output = job('first'), saved = {}, snapshot, respond, bridge 
 let count = 0;
 async function test(name, run) { await run(); count++; console.log('ok ' + count + ' - ' + name); }
 (async () => {
+  await test('evidence stage uses indeterminate progress and reports elapsed state', async () => {
+    const running = { ...pending('operation-1', 'analyze', 'running'), progress: { stage: 'evidence', current: 40, total: 100, message: '音訊：完成；視覺：MiniMax 處理中', updated_at: Math.floor(Date.now() / 1000) - 65 } };
+    const h = harness({ snapshot: { prepared: job('first'), analysis: null, active_operation: running } });
+    await h.flush();
+    assert.match(h.elements.get('progress-label').textContent, /音訊：完成；視覺：MiniMax 處理中/);
+    assert.match(h.elements.get('progress-label').textContent, /目前狀態已維持 \d+ 秒/);
+    assert.doesNotMatch(h.elements.get('progress-label').textContent, /40 \/ 100/);
+    assert.equal(h.elements.get('progress').getAttribute('value'), null);
+    await h.poll();
+    assert.equal(h.elements.get('findings').hidden, false);
+    assert.match(h.elements.get('status').textContent, /分析已完成/);
+  });
+  await test('transient poll failure retries only the read and displays completion', async () => {
+    let polls = 0;
+    const running = { ...pending('operation-1', 'analyze', 'running'), progress: { stage: 'evidence', current: 40, total: 100, message: '視覺處理中' } };
+    const h = harness({ respond(name) {
+      if (name === 'get_prepared_video') return { prepared: job('first'), analysis: null, active_operation: running };
+      if (name === 'get_video_job') { if (++polls === 1) throw new Error('temporary'); return completed(analysis('first')); }
+      throw new Error('Unexpected mutation ' + name);
+    } });
+    await h.flush(); await h.poll();
+    assert.match(h.elements.get('status').textContent, /將繼續查詢/);
+    await h.poll();
+    assert.equal(h.elements.get('findings').hidden, false);
+    assert.equal(polls, 2);
+    assert(!h.calls.some(call => call.name === 'analyze_prepared_video'));
+  });
+  await test('partial analysis is not described as complete', async () => {
+    const h = harness({ respond(name, args) {
+      if (name === 'get_prepared_video') return { prepared: job(args.job_id), analysis: null };
+      if (name === 'analyze_prepared_video') return completed(analysis('first', true));
+      throw new Error('Unexpected ' + name);
+    } });
+    await h.flush(); await h.click('analyze');
+    assert.match(h.elements.get('status').textContent, /僅有部分結果/);
+  });
   await test('partial evidence survives remount and permits only explicit analysis retry', async () => {
     const h = harness({ snapshot: { prepared: job('first'), analysis: analysis('first', true) } });
     await h.flush();

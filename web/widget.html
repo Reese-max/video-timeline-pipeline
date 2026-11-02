@@ -473,10 +473,13 @@ function showOperation() {
   if (!activeOperation) return;
   const progress = activeOperation.progress || {}, names = { prepare: "準備影片", analyze: "分析影片", drive: "上傳 Drive" };
   const statuses = { queued: "排隊中", running: "執行中", completed: "已完成", failed: "失敗", cancelled: "已取消", expired: "已過期", interrupted: "執行中斷" };
+  const indeterminate = activeOperation.operation === "analyze" && activeOperation.status === "running" && progress.stage === "evidence";
+  const updated = Number(progress.updated_at);
+  const elapsed = indeterminate && Number.isFinite(updated) && updated > 0 ? `目前狀態已維持 ${Math.max(0, Math.floor(Date.now() / 1000 - updated))} 秒` : null;
   $("operation-title").textContent = names[activeOperation.operation] || "背景工作";
   $("progress-label").textContent = [statuses[activeOperation.status] || activeOperation.status,
-    progress.message || progress.stage, Number.isFinite(progress.current) && Number.isFinite(progress.total) ? `${progress.current} / ${progress.total}` : null].filter(Boolean).join(" · ");
-  if (Number.isFinite(progress.total) && progress.total > 0 && Number.isFinite(progress.current)) $("progress").value = Math.min(100, Math.max(0, progress.current / progress.total * 100));
+    progress.message || progress.stage, elapsed, !indeterminate && Number.isFinite(progress.current) && Number.isFinite(progress.total) ? `${progress.current} / ${progress.total}` : null].filter(Boolean).join(" · ");
+  if (!indeterminate && Number.isFinite(progress.total) && progress.total > 0 && Number.isFinite(progress.current)) $("progress").value = Math.min(100, Math.max(0, progress.current / progress.total * 100));
   else $("progress").removeAttribute("value");
   $("progress").hidden = !isPending(activeOperation);
   updateButtons();
@@ -682,7 +685,10 @@ function acceptOperation(value, version, expectedKind, opts = {}) {
       return;
     }
     else if (value.result_kind === "analysis") {
-      applyAnalysis(value.result); status("A 分析已完成；請以下方報告狀態確認 Drive 上傳與合併指令。");
+      applyAnalysis(value.result);
+      status(value.result?.status === "complete"
+        ? "A 分析已完成；請以下方報告狀態確認 Drive 上傳與合併指令。"
+        : "A 分析僅有部分結果，請先檢查品質與缺漏。");
       if (!opts.fromRestore) refreshReport(version);
     }
     else if (value.result_kind === "report") refreshReport(version);
@@ -705,7 +711,8 @@ async function pollOperation(version = generation, epoch = pollEpoch) {
     return generation;
   } catch (error) {
     if (!current(version) || epoch !== pollEpoch) return;
-    status("暫時無法取得背景工作狀態。伺服器工作可能仍在執行；按「重新取得狀態」繼續查看。" + error.message);
+    status("暫時無法取得背景工作狀態，將繼續查詢；伺服器工作可能仍在執行。" + error.message);
+    if (isPending(activeOperation)) schedulePoll(version, 10);
   }
 }
 function clearExpiredMedia(jobId) {

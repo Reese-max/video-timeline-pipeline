@@ -2635,6 +2635,145 @@ VISUAL_NOT_ANALYZED = "尚未執行 MiniMax 視覺理解。"
 VISUAL_OBSERVATION_SCHEMA_VERSION = 1
 
 
+VIDEO_RESPONSE_DIAGNOSTICS_KEY = "_video_response_diagnostics"
+VIDEO_RESPONSE_REPAIR = "visual_summary_key_separator_v1"
+
+
+class DuplicateJsonKeyError(ValueError):
+    def __init__(self, key: str):
+        super().__init__(f"duplicate JSON key: {key}")
+        self.key = key
+
+
+def _reject_duplicate_json_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    value: dict[str, Any] = {}
+    for key, item in pairs:
+        if key in value:
+            raise DuplicateJsonKeyError(key)
+        value[key] = item
+    return value
+
+
+def _strict_json_text(text: str) -> str:
+    """Strip one complete Markdown JSON fence without accepting surrounding junk."""
+    fenced = re.fullmatch(r"\s*```(?:json)?\s*(.*?)\s*```\s*", text, flags=re.IGNORECASE | re.DOTALL)
+    return fenced.group(1).strip() if fenced else text.strip()
+
+
+def _likely_truncated_json(cleaned: str, error: json.JSONDecodeError) -> bool:
+    stripped = cleaned.rstrip()
+    if not stripped or error.msg == "Extra data":
+        return False
+    if error.msg.startswith("Unterminated string"):
+        return True
+    if stripped.startswith("{") and not stripped.endswith("}"):
+        return True
+    if stripped.startswith("[") and not stripped.endswith("]"):
+        return True
+    return error.pos >= len(cleaned) - 1 and error.msg in {
+        "Expecting ',' delimiter",
+        "Expecting value",
+        "Expecting property name enclosed in double quotes",
+    }
+
+
+def _known_visual_summary_separator_position(cleaned: str) -> int | None:
+    """Locate the one known separator typo only when its token is an object key."""
+    token = '"visual_summary="'
+    positions = [match.start() for match in re.finditer(re.escape(token), cleaned)]
+    if len(positions) != 1:
+        return None
+    position = positions[0]
+    stack: list[str] = []
+    in_string = False
+    escaped = False
+    for char in cleaned[:position]:
+        if in_string:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+            continue
+        if char == '"':
+            in_string = True
+        elif char in "{[":
+            stack.append(char)
+        elif char in "}]":
+            expected = "{" if char == "}" else "["
+            if not stack or stack[-1] != expected:
+                return None
+            stack.pop()
+    if in_string or not stack or stack[-1] != "{":
+        return None
+    previous = position - 1
+    while previous >= 0 and cleaned[previous].isspace():
+        previous -= 1
+    if previous < 0 or cleaned[previous] not in "{,":
+        return None
+    following = position + len(token)
+    while following < len(cleaned) and cleaned[following].isspace():
+        following += 1
+    if following < len(cleaned) and cleaned[following] == ":":
+        return None
+    return position
+
+
+def parse_video_response_json(text: str) -> tuple[dict[str, Any] | None, dict[str, Any]]:
+    """Strictly parse one full video response, allowing one auditable known repair."""
+    cleaned = _strict_json_text(text)
+
+    def load(candidate: str) -> Any:
+        return json.loads(candidate, object_pairs_hook=_reject_duplicate_json_keys)
+
+    try:
+        value = load(cleaned)
+    except DuplicateJsonKeyError as error:
+        return None, {
+            "error_category": "schema",
+            "finish_reason": "json_duplicate_key",
+            "duplicate_key": error.key,
+            "raw": text,
+        }
+    except json.JSONDecodeError as error:
+        truncated = _likely_truncated_json(cleaned, error)
+        repair_position = None if truncated else _known_visual_summary_separator_position(cleaned)
+        if repair_position is not None:
+            token = '"visual_summary="'
+            repaired_text = cleaned[:repair_position] + '"visual_summary":"' + cleaned[repair_position + len(token) :]
+            try:
+                repaired = load(repaired_text)
+            except (json.JSONDecodeError, DuplicateJsonKeyError):
+                repaired = None
+            if isinstance(repaired, dict):
+                diagnostics = {
+                    "json_repaired": True,
+                    "repair": VIDEO_RESPONSE_REPAIR,
+                    "raw": text,
+                    "raw_sha256": hashlib.sha256(text.encode("utf-8")).hexdigest(),
+                }
+                repaired[VIDEO_RESPONSE_DIAGNOSTICS_KEY] = diagnostics
+                return repaired, diagnostics
+        return None, {
+            "error_category": "truncation" if truncated else "json_syntax",
+            "finish_reason": "json_truncated" if truncated else "json_syntax",
+            "json_error": error.msg,
+            "line": error.lineno,
+            "column": error.colno,
+            "position": error.pos,
+            "raw": text,
+        }
+    if not isinstance(value, dict):
+        return None, {
+            "error_category": "schema",
+            "finish_reason": "response_schema",
+            "schema_issue": "top_level_not_object",
+            "raw": text,
+        }
+    return value, {"json_repaired": False}
+
+
 def usable_visual_observation(observation: Any) -> bool:
     """Only a complete, typed visual response can serve as evidence or reusable cache."""
     if not isinstance(observation, dict):
@@ -3242,10 +3381,122 @@ def video_timestamps_cover_duration(observations: list[dict[str, Any]], duration
     if not observations:
         return True
     try:
-        peak = max(float(item.get("timestamp", 0.0)) for item in observations)
+        stamps = [float(item.get("timestamp", 0.0)) for item in observations]
     except (TypeError, ValueError):
         return False
-    return min(duration - 30.0, duration * 0.5) <= peak <= duration + 30.0
+    if any(not math.isfinite(stamp) for stamp in stamps):
+        return False
+    if any(right < left for left, right in zip(stamps, stamps[1:])):
+        return False
+    peak = stamps[-1]
+    if not min(duration - 30.0, duration * 0.5) <= peak <= duration + 30.0:
+        return False
+    boundaries = [0.0, *stamps, duration]
+    max_gap = max((right - left for left, right in zip(boundaries, boundaries[1:])), default=0.0)
+    return max_gap <= max(300.0, duration * 0.8)
+
+
+VIDEO_EVENT_REQUIRED_FIELDS = {
+    "timestamp",
+    "screen_type",
+    "visible_text",
+    "visual_summary",
+    "important_details",
+    "confidence",
+}
+
+
+def video_response_validation_issue(
+    parsed: dict[str, Any], duration: float | None
+) -> dict[str, Any] | None:
+    """Return a precise schema or timeline issue before evidence is accepted."""
+    events = parsed.get("events")
+    if not isinstance(events, list):
+        return {
+            "error_category": "schema",
+            "finish_reason": "response_schema",
+            "schema_issue": "events_not_array",
+        }
+    if not events:
+        overall = parsed.get("overall_summary")
+        if isinstance(overall, str) and overall.strip():
+            return None
+        return {
+            "error_category": "schema",
+            "finish_reason": "response_schema",
+            "schema_issue": "empty_events_without_summary",
+        }
+
+    previous_stamp: float | None = None
+    known_duration = duration is not None and math.isfinite(duration) and duration > 0
+    for index, event in enumerate(events):
+        if not isinstance(event, dict):
+            return {
+                "error_category": "schema",
+                "finish_reason": "response_schema",
+                "schema_issue": "event_not_object",
+                "event_index": index,
+            }
+        missing = sorted(VIDEO_EVENT_REQUIRED_FIELDS.difference(event))
+        if missing:
+            timestamp_only = missing == ["timestamp"]
+            return {
+                "error_category": "timestamp" if timestamp_only else "schema",
+                "finish_reason": "timestamp_schema" if timestamp_only else "response_schema",
+                "schema_issue": "missing_required_fields",
+                "missing_fields": missing,
+                "event_index": index,
+            }
+        stamp = parse_video_timestamp(event.get("timestamp"), allow_negative=True)
+        if stamp is None:
+            return {
+                "error_category": "timestamp",
+                "finish_reason": "timestamp_schema",
+                "timestamp_issue": "invalid_timestamp",
+                "event_index": index,
+            }
+        if stamp < 0 or (known_duration and stamp > duration):
+            return {
+                "error_category": "timestamp",
+                "finish_reason": "timestamp_bounds",
+                "timestamp_issue": "outside_source_duration",
+                "event_index": index,
+                "timestamp": stamp,
+                "duration_seconds": duration,
+            }
+        if previous_stamp is not None and stamp < previous_stamp:
+            return {
+                "error_category": "timestamp",
+                "finish_reason": "timestamp_order",
+                "timestamp_issue": "non_monotonic",
+                "event_index": index,
+                "timestamp": stamp,
+                "previous_timestamp": previous_stamp,
+            }
+        previous_stamp = stamp
+
+        field_types_ok = (
+            isinstance(event.get("screen_type"), str)
+            and bool(event["screen_type"].strip())
+            and isinstance(event.get("visual_summary"), str)
+            and bool(event["visual_summary"].strip())
+            and isinstance(event.get("visible_text"), list)
+            and all(isinstance(value, str) for value in event["visible_text"])
+            and isinstance(event.get("important_details"), list)
+            and all(isinstance(value, str) for value in event["important_details"])
+            and isinstance(event.get("confidence"), (int, float))
+            and not isinstance(event.get("confidence"), bool)
+            and math.isfinite(event["confidence"])
+            and 0 <= event["confidence"] <= 1
+        )
+        if not field_types_ok:
+            return {
+                "error_category": "schema",
+                "finish_reason": "response_schema",
+                "schema_issue": "invalid_event_fields",
+                "event_index": index,
+            }
+    return None
 
 
 def _validate_video_timestamps(
@@ -3500,6 +3751,7 @@ def _analyze_video_mp4_core(
     parsed: dict[str, Any] | None = None
     observations: list[dict[str, Any]] = []
     timestamp_coverage_ok = True
+    last_response: str | None = None
 
     def chat() -> str:
         return minimax_chat(
@@ -3525,6 +3777,39 @@ def _analyze_video_mp4_core(
             max_completion_tokens=max_completion_tokens,
         )
 
+    def incomplete_result(
+        finish_reason: str,
+        *,
+        error_category: str | None = None,
+        raw: str | None = None,
+        details: dict[str, Any] | None = None,
+        parsed_value: dict[str, Any] | None = None,
+    ) -> tuple[list[dict[str, Any]], dict[str, Any] | None, str | None]:
+        row: dict[str, Any] = {
+            "timestamp": 0.0,
+            "screen_type": "video",
+            "visible_text": [],
+            "visual_summary": VISUAL_NOT_ANALYZED,
+            "important_details": [],
+            "confidence": None,
+            "completion_status": "incomplete",
+            "finish_reason": finish_reason,
+        }
+        if error_category:
+            row["error_category"] = error_category
+        if raw is not None:
+            row["raw"] = raw
+        if details:
+            row["response_error"] = {key: value for key, value in details.items() if key != "raw"}
+        incomplete = _stamp_video_observations(
+            [row],
+            analysis_method=analysis_method,
+            source_video=source_video,
+            file_id=file_id,
+            extra=extra_meta,
+        )
+        return incomplete, parsed_value, file_id
+
     for attempt in range(2):
         try:
             try:
@@ -3539,28 +3824,42 @@ def _analyze_video_mp4_core(
                 file_id, reused = minimax_reusable_upload(video_path, api_key, upload_record_dir, fresh=True)
                 response = chat()
             reused = False
-            parsed = parse_json_object(response)
+            last_response = response
+            parsed, parse_diagnostics = parse_video_response_json(response)
         except MiniMaxIncompleteError as error:
-            incomplete = _stamp_video_observations(
-                [
-                    {
-                        "timestamp": 0.0,
-                        "screen_type": "影片",
-                        "visible_text": [],
-                        "visual_summary": VISUAL_NOT_ANALYZED,
-                        "important_details": [],
-                        "confidence": None,
-                        "completion_status": "incomplete",
-                        "finish_reason": error.finish_reason or "missing",
-                    }
-                ],
-                analysis_method=analysis_method,
-                source_video=source_video,
-                file_id=file_id,
-                extra=extra_meta,
+            return incomplete_result(
+                error.finish_reason or "missing",
+                error_category="truncation" if error.finish_reason == "length" else "provider_completion",
             )
-            return incomplete, None, file_id
+        if parsed is None:
+            audit = {"raw": response, VIDEO_RESPONSE_DIAGNOSTICS_KEY: parse_diagnostics}
+            return incomplete_result(
+                str(parse_diagnostics["finish_reason"]),
+                error_category=str(parse_diagnostics["error_category"]),
+                raw=response,
+                details=parse_diagnostics,
+                parsed_value=audit,
+            )
+        validation_issue = video_response_validation_issue(parsed, duration_hint)
+        if validation_issue is not None:
+            parsed[VIDEO_RESPONSE_DIAGNOSTICS_KEY] = {
+                **validation_issue,
+                "raw": response,
+                "raw_sha256": hashlib.sha256(response.encode("utf-8")).hexdigest(),
+            }
+            return incomplete_result(
+                str(validation_issue["finish_reason"]),
+                error_category=str(validation_issue["error_category"]),
+                raw=response,
+                details=validation_issue,
+                parsed_value=parsed,
+            )
         observations = _parse_video_mp4_events(parsed)
+        if parse_diagnostics.get("json_repaired"):
+            for observation in observations:
+                observation["response_repaired"] = True
+                observation["response_repair"] = VIDEO_RESPONSE_REPAIR
+                observation["response_raw_sha256"] = parse_diagnostics["raw_sha256"]
         timestamp_coverage_ok = video_timestamps_cover_duration(observations, duration_hint) and not (
             isinstance(parsed.get("events"), list) and parsed["events"] and not observations
         )
@@ -3577,28 +3876,17 @@ def _analyze_video_mp4_core(
         # Issue #56: compressed timelines are not proportionally rescalable,
         # so fail closed instead of caching bad evidence as complete.
         peak = max((item["timestamp"] for item in observations), default=0.0)
-        incomplete = _stamp_video_observations(
-            [
-                {
-                    "timestamp": 0.0,
-                    "screen_type": "影片",
-                    "visible_text": [],
-                    "visual_summary": VISUAL_NOT_ANALYZED,
-                    "important_details": [],
-                    "confidence": None,
-                    "completion_status": "incomplete",
-                    "finish_reason": "timestamp_coverage",
-                    "max_observed_timestamp": peak,
-                    "duration_seconds": duration_hint,
-                    "raw": parsed.get("raw") or parsed,
-                }
-            ],
-            analysis_method=analysis_method,
-            source_video=source_video,
-            file_id=file_id,
-            extra=extra_meta,
+        return incomplete_result(
+            "timestamp_coverage",
+            error_category="timestamp",
+            raw=last_response,
+            details={
+                "max_observed_timestamp": peak,
+                "duration_seconds": duration_hint,
+                "timestamp_issue": "insufficient_duration_coverage",
+            },
+            parsed_value=parsed,
         )
-        return incomplete, parsed if isinstance(parsed, dict) else None, file_id
 
     from_events = bool(observations)
     if not observations:
@@ -3617,26 +3905,13 @@ def _analyze_video_mp4_core(
                 }
             ]
         else:
-            incomplete = _stamp_video_observations(
-                [
-                    {
-                        "timestamp": 0.0,
-                        "screen_type": "影片",
-                        "visible_text": [],
-                        "visual_summary": VISUAL_NOT_ANALYZED,
-                        "important_details": [],
-                        "confidence": None,
-                        "completion_status": "incomplete",
-                        "finish_reason": "unusable_video_response",
-                        "raw": parsed.get("raw") or parsed,
-                    }
-                ],
-                analysis_method=analysis_method,
-                source_video=source_video,
-                file_id=file_id,
-                extra=extra_meta,
+            return incomplete_result(
+                "response_schema",
+                error_category="schema",
+                raw=last_response,
+                details={"schema_issue": "no_usable_events_or_summary"},
+                parsed_value=parsed,
             )
-            return incomplete, parsed if isinstance(parsed, dict) else None, file_id
 
     _validate_video_timestamps(observations, duration_hint)
     if from_events:
@@ -3847,13 +4122,17 @@ def _analyze_video_mp4_single(
         file_id: str | None,
     ) -> tuple[list[dict[str, Any]], dict[str, Any] | None, str | None]:
         if cache_path is not None and parsed is not None and reusable_video_artifact(observations):
+            payload = {
+                "observations": observations,
+                "overall_summary": parsed.get("overall_summary"),
+                "minimax_file_id": file_id,
+            }
+            response_diagnostics = parsed.get(VIDEO_RESPONSE_DIAGNOSTICS_KEY)
+            if isinstance(response_diagnostics, dict):
+                payload["response_diagnostics"] = response_diagnostics
             write_json(
                 cache_path,
-                {
-                    "observations": observations,
-                    "overall_summary": parsed.get("overall_summary"),
-                    "minimax_file_id": file_id,
-                },
+                payload,
             )
         return observations, parsed, file_id
 
