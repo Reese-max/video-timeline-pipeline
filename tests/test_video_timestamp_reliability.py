@@ -38,27 +38,17 @@ class VideoTimestampReliabilityTests(unittest.TestCase):
         self.assertIs(observations[-1]["timestamp_reliable"], True)
         self.assertIsNone(observations[-1]["timestamp_issue"])
 
-    def test_out_of_range_clamps_both_ends_and_preserves_original(self):
+    def test_out_of_range_timestamps_are_rejected(self):
         observations = self.run_response([-3, -0.00001, "-2.5", "02:50", 90], 166)
-        self.assertEqual([row["timestamp"] for row in observations], [0, 0, 0, 166, 90])
-        self.assertEqual([row["timestamp_original"] for row in observations], [-3, -0.00001, "-2.5", "02:50", 90])
-        for row in observations[:4]:
-            self.assertIs(row["timestamp_reliable"], False)
-            self.assertIn("超出", row["timestamp_issue"])
-            self.assertIn(str(row["timestamp_original"]), row["timestamp_issue"])
-        self.assertIs(observations[-1]["timestamp_reliable"], True)
+        self.assertEqual(len(observations), 1)
+        self.assertEqual(observations[0]["finish_reason"], "timestamp_bounds")
+        self.assertEqual(observations[0]["error_category"], "timestamp")
 
-    def test_rounding_up_to_one_second_clamps_without_losing_reliability(self):
+    def test_any_out_of_range_timestamp_is_rejected(self):
         stamps = ["2:47", 167.6, 167.60001, -0.1]
         observations = self.run_response(stamps, 166.6)
-        self.assertEqual([row["timestamp"] for row in observations], [166.6, 166.6, 166.6, 0])
-        self.assertEqual([row["timestamp_original"] for row in observations], stamps)
-        for row in observations[:2]:
-            self.assertIs(row["timestamp_reliable"], True)
-            self.assertIsNone(row["timestamp_issue"])
-        for row in observations[2:]:
-            self.assertIs(row["timestamp_reliable"], False)
-            self.assertIn("超出", row["timestamp_issue"])
+        self.assertEqual(len(observations), 1)
+        self.assertEqual(observations[0]["finish_reason"], "timestamp_bounds")
 
     def test_stamp_summary_and_incomplete_default_issues(self):
         for method in ("minimax_video", "minimax_video_compressed"):
@@ -94,12 +84,10 @@ class VideoTimestampReliabilityTests(unittest.TestCase):
             self.assertIs(row["timestamp_reliable"], False)
             self.assertEqual(row["timestamp_issue"], "缺少影片長度，無法驗證時間碼")
 
-    def test_unknown_duration_still_clamps_negative_time_to_zero(self):
+    def test_unknown_duration_still_rejects_negative_time(self):
         observations = self.run_response([-3], None)
-        self.assertEqual(observations[0]["timestamp"], 0)
-        self.assertEqual(observations[0]["timestamp_original"], -3)
-        self.assertIs(observations[0]["timestamp_reliable"], False)
-        self.assertEqual(observations[0]["timestamp_issue"], "缺少影片長度，無法驗證時間碼")
+        self.assertEqual(len(observations), 1)
+        self.assertEqual(observations[0]["finish_reason"], "timestamp_bounds")
 
     def test_normal_distribution_preserves_content_and_records_gap_receipt(self):
         stamps = [0, 16.6, 50, 90, "02:46"]
@@ -119,11 +107,8 @@ class VideoTimestampReliabilityTests(unittest.TestCase):
 
     def test_concentration_boundary_preserves_specific_range_issue(self):
         observations = self.run_response([-1, 1, 2, 16.6, 90], 166)
-        self.assertTrue(all(row["timestamp_reliable"] is False for row in observations[:4]))
-        self.assertIn("超出", observations[0]["timestamp_issue"])
-        self.assertNotIn("壓縮", observations[0]["timestamp_issue"])
-        self.assertIn("壓縮", observations[3]["timestamp_issue"])
-        self.assertIs(observations[4]["timestamp_reliable"], True)
+        self.assertEqual(len(observations), 1)
+        self.assertEqual(observations[0]["finish_reason"], "timestamp_bounds")
 
     def test_concentration_requires_duration_count_and_eighty_percent(self):
         for stamps, duration in [([1, 2, 3, 4, 30], 59), ([1, 2, 3, 90], 166),

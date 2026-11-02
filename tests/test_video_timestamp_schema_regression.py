@@ -29,18 +29,19 @@ class VideoTimestampSchemaRegressionTests(unittest.TestCase):
         return {"timestamp": stamp, "screen_type": "Owned frame", "visible_text": [],
                 "visual_summary": "Synthetic frame", "important_details": [], "confidence": 0.9}
 
-    def assert_incomplete(self, result):
+    def assert_incomplete(self, result, reason="timestamp_schema"):
         observations, uploads, chats, compression, cache = result
         self.assertEqual([x for x in observations if pipeline.usable_visual_observation(x)], [])
-        self.assertEqual(observations[0]["finish_reason"], "timestamp_coverage")
-        self.assertEqual((uploads, chats, compression), (1, 2, 0))
+        self.assertEqual(observations[0]["finish_reason"], reason)
+        self.assertEqual((uploads, chats, compression), (1, 1, 0))
         self.assertEqual(cache, [])
 
     def test_missing_timestamp_is_not_fabricated_beside_valid_endpoint(self):
         missing = self.event(0.0)
         del missing["timestamp"]
         result = self.run_response([missing, self.event(137.0)])
-        self.assertEqual([x["timestamp"] for x in result[0]], [137.0])
+        self.assertEqual(result[0][0]["finish_reason"], "timestamp_schema")
+        self.assertEqual([x for x in result[0] if pipeline.usable_visual_observation(x)], [])
         self.assertEqual((result[1], result[2]), (1, 1))
 
     def test_all_invalid_timestamps_cannot_become_cached_summary_at_zero(self):

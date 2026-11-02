@@ -172,8 +172,9 @@ class TimestampCoverageTests(unittest.TestCase):
             },
             ensure_ascii=False,
         )
-        observations, chat = self._run_mp4([payload, payload], 166.6)
-        self.assertEqual(chat.call_count, 2)
+        observations, chat = self._run_mp4([payload], 166.6)
+        self.assertEqual(chat.call_count, 1)
+        self.assertEqual(observations[0]["finish_reason"], "timestamp_bounds")
         usable = [item for item in observations if pipeline.usable_visual_observation(item)]
         self.assertEqual(usable, [])
 
