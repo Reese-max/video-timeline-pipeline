@@ -16,6 +16,9 @@ import uuid
 from contextlib import contextmanager
 
 TERMINAL = {"completed", "failed", "cancelled", "expired", "interrupted"}
+ATOMIC_REPLACE_ATTEMPTS = 5
+ATOMIC_REPLACE_RETRY_SECONDS = 0.02
+WINDOWS_TRANSIENT_REPLACE_ERRORS = {5, 32}  # access denied, sharing violation
 
 
 class JobBusyError(RuntimeError):
@@ -50,12 +53,26 @@ def validate_parent_writer_lease(work: Path, lease: dict, writer_path: Path) -> 
 def atomic_json(path: Path, value: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     temp = path.with_suffix(f".{uuid.uuid4().hex}.tmp")
-    with temp.open("x", encoding="utf-8") as out:
-        if os.name != "nt": os.chmod(temp, 0o600)
-        json.dump(value, out, ensure_ascii=False)
-        out.flush()
-        os.fsync(out.fileno())
-    os.replace(temp, path)
+    try:
+        with temp.open("x", encoding="utf-8") as out:
+            if os.name != "nt": os.chmod(temp, 0o600)
+            json.dump(value, out, ensure_ascii=False)
+            out.flush()
+            os.fsync(out.fileno())
+        for attempt in range(ATOMIC_REPLACE_ATTEMPTS):
+            try:
+                os.replace(temp, path)
+                break
+            except OSError as error:
+                if (getattr(error, "winerror", None) not in WINDOWS_TRANSIENT_REPLACE_ERRORS
+                        or attempt + 1 == ATOMIC_REPLACE_ATTEMPTS):
+                    raise
+                # A queue reader or scanner may briefly hold the destination
+                # without delete sharing on Windows. Keep the retry bounded;
+                # every other error and a persistent collision still fail.
+                time.sleep(ATOMIC_REPLACE_RETRY_SECONDS)
+    finally:
+        temp.unlink(missing_ok=True)
 
 
 def report_progress(stage: str, current: int, message: str) -> None:

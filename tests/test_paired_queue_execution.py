@@ -117,7 +117,8 @@ class PairedQueueExecutionTests(unittest.TestCase):
             with pipeline.file_writer_lock(self.root / "mcp/mcp_jobs/.writer.lock"):
                 pass
         arelease.touch()
-        self.assertEqual(self.await_state(queue, analysis["operation_id"])["status"], "completed")
+        analysis_result = self.await_state(queue, analysis["operation_id"])
+        self.assertEqual(analysis_result["status"], "completed", analysis_result)
 
     def test_both_actual_roles_start_before_either_barrier_is_released(self):
         queue = self.queue()

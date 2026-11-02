@@ -3752,6 +3752,12 @@ def _analyze_video_mp4_core(
     observations: list[dict[str, Any]] = []
     timestamp_coverage_ok = True
     last_response: str | None = None
+    try:
+        duration_endpoint = (
+            _format_video_duration_endpoint(duration_hint) if duration_hint is not None else None
+        )
+    except ValueError:
+        duration_endpoint = None
 
     def chat() -> str:
         return minimax_chat(
@@ -3865,12 +3871,12 @@ def _analyze_video_mp4_core(
         )
         if timestamp_coverage_ok:
             break
-        if attempt == 0 and duration_hint is not None and duration_hint > 0:
+        if attempt == 0 and duration_endpoint is not None:
             peak = max((item["timestamp"] for item in observations), default=0.0)
             current_prompt = (
-                f"{prompt}\n上一次回答的 timestamp 最大只到 {peak:.1f} 秒，"
-                f"但影片長 {duration_hint:.1f} 秒：請把每個事件對應到從 0 起算的"
-                f"原片實際秒數（0 到 {duration_hint:.1f}），依時間遞增重排後只輸出修正後的 JSON object。"
+                f"{prompt}\n上一次回答的 timestamp 最大只到 {repr(float(peak))} 秒，"
+                f"但影片長 {duration_endpoint} 秒：請把每個事件對應到從 0 起算的"
+                f"原片實際秒數（0 到 {duration_endpoint}），依時間遞增重排後只輸出修正後的 JSON object。"
             )
     if not timestamp_coverage_ok:
         # Issue #56: compressed timelines are not proportionally rescalable,
@@ -4003,6 +4009,21 @@ def analyze_video_mp4(
     return observations
 
 
+def _format_video_duration_endpoint(value: float) -> str:
+    """Return a shortest decimal that round-trips to the validated float.
+
+    The text is a hard upper bound in the provider prompt. Display rounding
+    can therefore turn a valid source endpoint such as 8.06 into an invalid
+    instruction to emit 8.1, which the strict response validator must reject.
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError("video duration endpoint must be a finite positive number")
+    endpoint = float(value)
+    if not math.isfinite(endpoint) or endpoint <= 0:
+        raise ValueError("video duration endpoint must be a finite positive number")
+    return repr(endpoint)
+
+
 def _video_mp4_prompt(duration: float | None) -> str:
     """The prompt every whole-video (or per-chunk) request starts from."""
     prompt = (
@@ -4012,10 +4033,14 @@ def _video_mp4_prompt(duration: float | None) -> str:
         "相鄰兩筆間隔不超過 30 秒，不設筆數上限；"
         + VIDEO_EVENT_FIELD_RULES
     )
-    if duration is not None and duration > 0:
+    try:
+        duration_endpoint = _format_video_duration_endpoint(duration) if duration is not None else None
+    except ValueError:
+        duration_endpoint = None
+    if duration_endpoint is not None:
         prompt += (
-            f"\n影片長度約 {duration:.1f} 秒：events 須依 timestamp 遞增覆蓋全片，"
-            f"最後一筆須落在片尾附近（約 {duration:.1f} 秒）。"
+            f"\n影片長度約 {duration_endpoint} 秒：events 須依 timestamp 遞增覆蓋全片，"
+            f"最後一筆須落在片尾附近（約 {duration_endpoint} 秒）。"
         )
     else:
         prompt += "\nevents 須依 timestamp 遞增覆蓋全片直到片尾。"
@@ -4240,7 +4265,11 @@ class VideoMp4Chunk(NamedTuple):
 
     @property
     def duration(self) -> float:
-        return max(0.0, self.end - self.start)
+        # ffmpeg's CSV contains decimal timestamps. Subtract their shortest
+        # decimal spellings so a segment such as 100.0–108.06 remains 8.06
+        # instead of acquiring a binary subtraction artefact in its hard
+        # provider/validator boundary.
+        return max(0.0, float(Decimal(str(self.end)) - Decimal(str(self.start))))
 
 
 def format_media_clock(seconds: float) -> str:
