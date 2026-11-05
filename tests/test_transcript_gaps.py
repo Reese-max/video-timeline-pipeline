@@ -666,5 +666,58 @@ class TranscribeBackfillTest(unittest.TestCase):
                 pipeline._extract_gap_audio = original_extract
 
 
+def test_chunk_duration_capped_at_actual_duration() -> None:
+    """Regression test for issue #131: chunk_duration capped when source_end exceeds container length.
+
+    When source_end in a chunk exceeds the actual media duration, chunk_duration
+    was artificially large, causing segment end times to exceed the container length.
+    This resulted in read becoming empty and media cleanup skipping the entire piece.
+
+    The fix caps chunk_duration at actual_duration - offset when source_path is provided.
+    """
+    import tempfile
+    import pipeline
+    from pathlib import Path
+
+    test_dir = Path(__file__).resolve().parent
+    video_path = test_dir.parent / "tests" / "fixtures" / "cutspec" / "cfr_24.mp4"
+    from pipeline import video_duration, probe_video
+    actual_duration = video_duration(probe_video(video_path))
+
+    chunks = [
+        {
+            "index": 0,
+            "path": str(video_path),
+            "source_start": 0.0,
+            "source_end": 100.0,  # Exceeds the 4s video duration!
+            "size_bytes": video_path.stat().st_size,
+            "sha256": "dummy",
+        }
+    ]
+
+    original_groq = pipeline.groq_transcribe
+
+    def mock_groq_no_segments(audio_path, api_key, model, language, word_timestamps=False):
+        return {
+            "language": "en",
+            "segments": [],  # No segments!
+            "text": "hello world goodbye",
+        }
+
+    pipeline.groq_transcribe = mock_groq_no_segments
+    try:
+        with tempfile.TemporaryDirectory() as temporary:
+            transcript, _ = pipeline.transcribe_all(
+                chunks, "key", "whisper-large-v3", "auto", 1,
+                Path(temporary), source_path=video_path,
+            )
+            max_end = max(seg["end"] for seg in transcript["segments"])
+            assert max_end <= actual_duration + 0.1, (
+                f"Bug: max_end={max_end} exceeds actual_duration={actual_duration}"
+            )
+    finally:
+        pipeline.groq_transcribe = original_groq
+
+
 if __name__ == "__main__":
     unittest.main()
