@@ -429,6 +429,7 @@ class MCPValidationTests(unittest.TestCase):
                 patch.object(mcp_server.pipeline, "create_summary") as create_summary_mock,
                 patch.object(mcp_server.pipeline, "file_sha256", return_value="sha"),
                 patch.object(mcp_server.pipeline, "write_json"),
+                patch.object(mcp_server, "report_progress") as progress_mock,
                 patch.dict(mcp_server.os.environ, {"GROQ_API_KEY": "groq", "ANALYZE_VISUAL_MODE": "video_mp4"}, clear=False),
             ):
                 result = mcp_server.analyze_prepared_sync("0123456789ab")
@@ -439,9 +440,49 @@ class MCPValidationTests(unittest.TestCase):
         self.assertEqual(result["visual_status"], "complete")
         self.assertEqual(result["summary"]["status"], "pending_chatgpt")
         self.assertEqual(result["quality"]["status"], "evidence_available")
+        evidence = [call.args[2] for call in progress_mock.call_args_list if call.args[0] == "evidence"]
+        self.assertIn("音訊：完成；視覺：完成", evidence)
+        self.assertEqual(progress_mock.call_args_list[-1].args[0], "timeline")
         create_summary_mock.assert_not_called()
         analyze_video_mock.assert_called_once()
         self.assertEqual(analyze_video_mock.call_args.kwargs["duration"], 2)
+
+    def test_mp4_progress_reports_audio_failure_and_visual_completion(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_dir:
+            video_path = Path(raw_dir) / "source.mp4"
+            video_path.write_bytes(b"fake-mp4")
+            with (
+                patch.object(mcp_server, "prepared_job_dir", return_value=Path(raw_dir)),
+                patch.object(mcp_server, "read_manifest", return_value={"status": "ready", "source": {}}),
+                patch.multiple(mcp_server, check_job_capacity=MagicMock(), storage_policy=MagicMock()),
+                patch.object(mcp_server.pipeline, "locate_source_video", return_value=video_path),
+                patch.object(mcp_server.pipeline, "file_fingerprint", return_value="7:1"),
+                patch.object(mcp_server.pipeline, "reuse_artifact", return_value=None),
+                patch.object(mcp_server.pipeline, "probe_video", return_value={
+                    "format": {"duration": "2"},
+                    "streams": [{"codec_type": "video"}, {"codec_type": "audio"}],
+                }),
+                patch.object(mcp_server.pipeline, "minimax_model", return_value="fixture"),
+                patch.object(mcp_server.pipeline, "minimax_endpoint", return_value="https://example.invalid/v1"),
+                patch.object(mcp_server.pipeline, "minimax_subscription_key", return_value="fixture"),
+                patch.object(mcp_server.pipeline, "extract_audio", side_effect=RuntimeError("synthetic audio failure")),
+                patch.object(mcp_server.pipeline, "analyze_video_mp4", return_value=[{
+                    "timestamp": 0,
+                    "visual_summary": "fixture",
+                    "confidence": 0.9,
+                    "analysis_method": "minimax_video",
+                }]),
+                patch.object(mcp_server.pipeline, "file_sha256", return_value="sha"),
+                patch.object(mcp_server.pipeline, "write_json"),
+                patch.object(mcp_server, "report_progress") as progress_mock,
+                patch.dict(mcp_server.os.environ, {"ANALYZE_VISUAL_MODE": "video_mp4"}, clear=True),
+            ):
+                result = mcp_server.analyze_prepared_sync("0123456789ab")
+        self.assertEqual(result["status"], "partial")
+        evidence = [call.args[2] for call in progress_mock.call_args_list if call.args[0] == "evidence"]
+        self.assertIn("音訊：失敗；視覺：完成", evidence)
+        self.assertTrue(any("MiniMax 處理中" in message for message in evidence))
+        self.assertEqual(progress_mock.call_args_list[-1].args[0], "timeline")
 
     def test_drive_upload_caches_verified_segment_metadata(self) -> None:
         with tempfile.TemporaryDirectory() as raw_dir:
@@ -466,6 +507,17 @@ class MCPValidationTests(unittest.TestCase):
                 "parents": ["folder_1"],
                 "webViewLink": "https://drive.google.com/file/d/file_1/view",
             }
+            created = {"folder": False}
+
+            def get_file(token, fid):
+                if fid == "folder_1":
+                    return folder if created["folder"] else None
+                return uploaded
+
+            def create_folder(token, name, parent_id, file_id=None):
+                created["folder"] = True
+                return folder
+
             with (
                 patch.dict(
                     drive_storage.os.environ,
@@ -474,8 +526,9 @@ class MCPValidationTests(unittest.TestCase):
                 ),
                 patch.object(drive_storage, "_access_token", return_value="token"),
                 patch.object(drive_storage, "_new_id", side_effect=["folder_1", "file_1"]),
-                patch.object(drive_storage, "_get_file", side_effect=lambda token, fid: folder if fid == "folder_1" else uploaded),
-                patch.object(drive_storage, "_create_folder", return_value=folder) as create_folder,
+                patch.object(drive_storage, "_get_file", side_effect=get_file),
+                patch.object(drive_storage, "_create_folder", side_effect=create_folder) as create_folder,
+                patch.object(drive_storage, "_list_children", return_value=[]),
                 patch.object(drive_storage, "_upload_file", return_value=uploaded) as upload_file,
             ):
                 first = drive_storage.upload_prepared_segments(

@@ -12,7 +12,11 @@ from unittest.mock import MagicMock, patch
 import drive_storage
 import mcp_server as server
 import pipeline
-from test_drive_backup_restore import JOB, build_job
+
+try:  # 測試可以當作 tests.test_mcp_drive_primary 或直接 discover 執行
+    from test_drive_backup_restore import JOB, build_job
+except ImportError:  # pragma: no cover - `python -m unittest tests.…` 的匯入路徑
+    from tests.test_drive_backup_restore import JOB, build_job
 
 
 class DrivePrimaryTests(unittest.TestCase):

@@ -27,6 +27,7 @@ from pathlib import Path
 from typing import Any, Iterator, Literal
 
 from notifications import get_operations_db
+from operations import foundation_status, open_readonly
 
 CostStatus = Literal["actual", "estimated", "confirmed_included", "unknown", "zero_local", "zero_rejected"]
 # The provider answered and refused the request before doing any work (rate limited or
@@ -100,69 +101,10 @@ def is_retryable(category: ErrorTaxonomy) -> bool:
 
 
 def _init_cost_schema(conn: sqlite3.Connection) -> None:
-    """Idempotently initialize usage and budget tables in operations.db."""
-    with conn:
-        conn.executescript(
-            """
-            CREATE TABLE IF NOT EXISTS usage_costs (
-                cost_id TEXT PRIMARY KEY,
-                logical_operation_id TEXT,
-                library_id TEXT,
-                job TEXT,
-                analysis_revision TEXT,
-                provider TEXT NOT NULL,
-                account_scope TEXT DEFAULT 'default',
-                model TEXT,
-                operation TEXT NOT NULL,
-                attempt_no INTEGER DEFAULT 1,
-                request_units INTEGER DEFAULT 0,
-                response_units INTEGER DEFAULT 0,
-                started_at TEXT NOT NULL,
-                finished_at TEXT,
-                latency_ms REAL,
-                cache_hit INTEGER DEFAULT 0,
-                status TEXT NOT NULL,
-                safe_error TEXT,
-                provider_request_id TEXT,
-                billing_basis TEXT,
-                pricing_version TEXT DEFAULT '1',
-                estimated_micro_usd INTEGER DEFAULT 0,
-                actual_micro_usd INTEGER,
-                cost_status TEXT NOT NULL,
-                reservation_id TEXT,
-                created_at TEXT NOT NULL
-            );
+    """Compatibility entry point; the shared registry owns all migrations."""
+    from operations import ensure_foundation_schema
 
-            CREATE TABLE IF NOT EXISTS budget_reservations (
-                reservation_id TEXT PRIMARY KEY,
-                operation_id TEXT NOT NULL,
-                account_scope TEXT DEFAULT 'default',
-                period_id TEXT NOT NULL,
-                max_micro_usd INTEGER NOT NULL,
-                status TEXT NOT NULL,
-                lease_token TEXT,
-                sent_at TEXT,
-                provider_operation_id TEXT,
-                settled_at TEXT,
-                created_at TEXT NOT NULL
-            );
-
-            CREATE INDEX IF NOT EXISTS ix_costs_job ON usage_costs(job, provider);
-            CREATE INDEX IF NOT EXISTS ix_costs_period ON usage_costs(created_at, provider);
-            -- Outstanding reservations are selected by the configured period
-            -- window, so they are indexed by the same columns the filter uses.
-            -- period_id is kept as a stored audit label (reporting, dedup key)
-            -- but is no longer a predicate, so ix_budget_period is not created.
-            CREATE INDEX IF NOT EXISTS ix_budget_reserved_window
-                ON budget_reservations(account_scope, created_at, status);
-            """
-        )
-        # Older operations.db files predate the attempt/reservation link. Keep
-        # their rows intact; only new records receive an explicit link.
-        conn.execute("BEGIN IMMEDIATE")
-        columns = {row[1] for row in conn.execute("PRAGMA table_info(usage_costs)")}
-        if "reservation_id" not in columns:
-            conn.execute("ALTER TABLE usage_costs ADD COLUMN reservation_id TEXT")
+    ensure_foundation_schema(conn)
 
 
 def _utc_now_iso() -> str:
@@ -462,7 +404,7 @@ def _finish_attempt(state: _ActiveAttempt, error: BaseException | None = None) -
         # A failed trigger response does not prove that a remote job was never
         # accepted. Keep the same risk as an uncertain POST timeout.
         remote_trigger = (state.outcome.provider, state.outcome.operation) in {
-            ("apify", "actor.run.start"), ("brightdata", "datasets.trigger")
+            ("apify", "actor.run.start"), ("brightdata", "datasets.trigger"), ("resend", "email.send")
         }
         unresolved = (category in ("timeout", "network", "unknown")
                       or getattr(error, "provider_outcome_unknown", False)
@@ -790,12 +732,14 @@ def record_provider_cache_hit(provider: str, operation: str, *, model: str | Non
         print(f"! 快取成本紀錄失敗（{type(exc).__name__}）：{provider}/{operation}")
 
 
-def get_cost_report(root: Path, period_type: str = "daily") -> dict[str, Any]:
+def get_cost_report(root: Path, period_type: str = "daily", *, readonly: bool = False) -> dict[str, Any]:
     """Compile read-only financial and token usage report."""
     period_id, period_start_utc, period_end_utc, tz_key = _current_period(period_type)
 
-    with closing(get_operations_db(root)) as conn:
-        _init_cost_schema(conn)
+    conn = open_readonly(root)
+    if conn is None:
+        return foundation_status(root)
+    with closing(conn):
 
         cur = conn.cursor()
         cur.execute(
@@ -806,7 +750,9 @@ def get_cost_report(root: Path, period_type: str = "daily") -> dict[str, Any]:
                    SUM(response_units) as total_output_units,
                    SUM(CASE WHEN cache_hit = 1 THEN 1 ELSE 0 END) as cache_hits,
                    SUM(estimated_micro_usd) as total_estimated_uUSD,
-                   SUM(COALESCE(actual_micro_usd, 0)) as total_actual_uUSD
+                   SUM(actual_micro_usd) as total_actual_uUSD,
+                   SUM(CASE WHEN cost_status='unknown' THEN 1 ELSE 0 END) as unknown_count,
+                   SUM(CASE WHEN cost_status='confirmed_included' THEN 1 ELSE 0 END) as included_count
             FROM usage_costs
             WHERE created_at >= ? AND created_at < ? AND status != 'blocked_budget'
             GROUP BY provider
@@ -829,6 +775,9 @@ def get_cost_report(root: Path, period_type: str = "daily") -> dict[str, Any]:
                     "output_units": r["total_output_units"] or 0,
                     "cache_hits": r["cache_hits"],
                     "estimated_usd": est_usd,
+                    "actual_usd": r["total_actual_uUSD"] / 1_000_000.0 if r["total_actual_uUSD"] is not None else None,
+                    "unknown_count": r["unknown_count"],
+                    "confirmed_included_count": r["included_count"],
                 }
             )
 
@@ -841,7 +790,7 @@ def get_cost_report(root: Path, period_type: str = "daily") -> dict[str, Any]:
         }
 
 
-def get_budget_status(root: Path) -> dict[str, Any]:
+def get_budget_status(root: Path, *, readonly: bool = False) -> dict[str, Any]:
     """Return the root ledger's settled spend, outstanding risk and availability."""
     period_id, period_start_utc, period_end_utc, tz_key = _current_period("daily")
     daily_budget = _daily_budget_usd()
@@ -849,8 +798,10 @@ def get_budget_status(root: Path) -> dict[str, Any]:
     daily_budget_micro = int(daily_budget * 1_000_000)
     hard_stop = _hard_stop_enabled()
 
-    with closing(get_operations_db(root)) as conn:
-        _init_cost_schema(conn)
+    conn = open_readonly(root)
+    if conn is None:
+        return foundation_status(root)
+    with closing(conn):
 
         with conn:
             # Both balance reads share one snapshot, including a concurrent
@@ -884,10 +835,12 @@ def get_budget_status(root: Path) -> dict[str, Any]:
         }
 
 
-def get_provider_health(root: Path) -> dict[str, Any]:
+def get_provider_health(root: Path, *, readonly: bool = False) -> dict[str, Any]:
     """Inspect provider error rates and latency stats."""
-    with closing(get_operations_db(root)) as conn:
-        _init_cost_schema(conn)
+    conn = open_readonly(root)
+    if conn is None:
+        return foundation_status(root)
+    with closing(conn):
 
         cur = conn.cursor()
         cur.execute(
@@ -896,7 +849,10 @@ def get_provider_health(root: Path) -> dict[str, Any]:
                    COUNT(*) as total_calls,
                    SUM(CASE WHEN status = 'succeeded' THEN 1 ELSE 0 END) as successes,
                    SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END) as failures,
-                   AVG(latency_ms) as avg_latency_ms
+                   AVG(latency_ms) as avg_latency_ms,
+                   MIN(created_at) as first_sample_at, MAX(created_at) as last_sample_at,
+                   MAX(CASE WHEN status='succeeded' THEN finished_at END) as last_success_at,
+                   SUM(CASE WHEN cache_hit=1 THEN 1 ELSE 0 END) as cache_hits
             FROM usage_costs
             GROUP BY provider
             """
@@ -912,16 +868,22 @@ def get_provider_health(root: Path) -> dict[str, Any]:
                     "success_rate_pct": success_rate,
                     "avg_latency_ms": round(r["avg_latency_ms"] or 0, 1),
                     "status": "healthy" if success_rate >= 90.0 else "degraded",
+                    "successes": r["successes"], "failures": r["failures"],
+                    "first_sample_at": r["first_sample_at"], "last_sample_at": r["last_sample_at"],
+                    "last_success_at": r["last_success_at"],
+                    "cache_hits": r["cache_hits"], "cache_hit_rate_pct": round(r["cache_hits"] / total * 100, 1),
                 }
             )
 
         return {"providers": health}
 
 
-def get_failed_list(root: Path) -> list[dict[str, Any]]:
+def get_failed_list(root: Path, *, readonly: bool = False) -> list[dict[str, Any]] | dict[str, Any]:
     """Return recent failed operations and their safe errors."""
-    with closing(get_operations_db(root)) as conn:
-        _init_cost_schema(conn)
+    conn = open_readonly(root)
+    if conn is None:
+        return foundation_status(root)
+    with closing(conn):
 
         cur = conn.cursor()
         cur.execute(

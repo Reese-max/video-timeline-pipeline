@@ -1,14 +1,20 @@
 {
-  "pr": 17,
-  "head": "6f4d4112d43a7a6d5aa5fe0bf7f07444f97aaac1",
+  "pr": 102,
+  "head": "3b4a4018d1364095180e2033c7b88e456d91254c",
   "findings": [
     {
       "severity": "med",
-      "file": "docs/roadmap-v0.6.md",
-      "line": 19,
-      "issue": "The claimed r2 roadmap snapshot jumps directly to the optional v0.6 backlog, omitting issue #7's F0 prerequisites, delivery dependencies, and v0.3a-v0.5 release gates. Readers cannot determine the Email MVP's prerequisites or acceptance conditions from the repository plan. Restore these existing decisions as unverified planning, without implementing or enabling services."
+      "file": "analysis_report.py",
+      "line": 47,
+      "issue": "Removing every analysis consistency check lets record() render supplied evidence while labeling it with the persisted raw analysis digest. Normal summary finalization changes non-summary evidence through display timestamp normalization, and stale source/transcript/visual snapshots are accepted. Render and bind the same raw read, permitting only timestamp display normalization while retaining evidence consistency checks."
+    },
+    {
+      "severity": "med",
+      "file": "tests/test_analysis_report_workflow.py",
+      "line": 615,
+      "issue": "The added regression test only asserts True and covers none of issue #101's clamped timestamps, timestamp-coverage speech-only placeholder, reliable control, queue scheduling, or summary finalization acceptance paths. It cannot detect a reverted fix or the newly weakened evidence binding."
     }
   ],
   "fixed": true,
-  "summary": "Restored issue #7 r2's F0 prerequisites, delivery dependencies, and v0.3a-v0.5 release gates while preserving their historical, unverified planning status. Both documentation regression tests now pass after failing before the correction. The full suite remains at 31 passed and 8 pre-existing Windows SQLite cleanup failures, reproduced unchanged on parent dc421fe."
+  "summary": "Fixed the raw-analysis/report binding regression and replaced the no-op regression test. Reports now render from the exact persisted evidence they hash, accept only timestamp display normalization, and reject stale source, transcript, and visual snapshots; issue #101's three queue/finalization paths have real regression coverage without invalidating existing paid-analysis caches."
 }

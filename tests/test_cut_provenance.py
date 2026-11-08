@@ -426,6 +426,36 @@ class PipelineSourceBindingTests(unittest.TestCase):
         self.assertEqual(visual[0]["completion_status"], "incomplete")
         self.assertEqual(visual[0]["finish_reason"], "video_unavailable")
 
+    def test_cli_gap_receipt_marks_manifest_and_notes_incomplete(self):
+        self.args.local_only = False
+        observation = {
+            "timestamp": 0.0, "screen_type": "影片片段", "visible_text": [],
+            "visual_summary": "保留的畫面", "important_details": [], "confidence": 0.9,
+            "completion_status": "complete", "analysis_method": "minimax_video",
+            "timestamp_reliable": True, "video_gap_check_version": pipeline.VIDEO_EVENT_GAP_CHECK_VERSION,
+            "unanswered_gap_windows": [[30.0, 120.0]],
+        }
+        with mock.patch.dict(os.environ, {"GROQ_API_KEY": "offline-test-placeholder", "MINIMAX_SUBSCRIPTION_KEY": "offline-test-placeholder"}), \
+             mock.patch.object(pipeline, "minimax_endpoint", return_value="offline"), \
+             mock.patch.object(pipeline, "minimax_model", return_value="offline"), \
+             mock.patch.object(pipeline, "probe_video", return_value={
+                 "format": {"duration": "120"}, "streams": [{"codec_type": "video"}]}), \
+             mock.patch.object(pipeline, "analyze_video_mp4", return_value=[observation]), \
+             mock.patch.object(pipeline, "create_summary", return_value={"status": "skipped", "reason": "test"}), \
+             mock.patch.object(pipeline, "request_json", side_effect=AssertionError("provider call")), \
+             mock.patch("urllib.request.urlopen", side_effect=AssertionError("network")):
+            path = pipeline.run_pipeline(self.args)
+        manifest = json.loads(path.read_text(encoding="utf-8"))
+        self.assertEqual(manifest["visual_status"], "incomplete")
+        visual = json.loads((path.parent / "visual.json").read_text(encoding="utf-8"))
+        self.assertEqual(visual, [observation])
+        self.assertFalse(pipeline.reusable_video_artifact(visual))
+        for name in ("knowledge.md", "notes.md"):
+            with self.subTest(artifact=name):
+                content = (path.parent / name).read_text(encoding="utf-8")
+                self.assertIn("畫面分析：未完成", content)
+                self.assertIn("保留的畫面", content)
+
     def test_legacy_or_stale_cloud_cache_refused_on_consecutive_retries_without_canonical_writes(self):
         self.args.local_only = False
         job = self.root / "jobs" / pipeline.job_key(str(self.video.resolve()))

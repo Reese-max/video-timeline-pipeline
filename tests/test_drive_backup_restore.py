@@ -153,6 +153,7 @@ class SourceUploadTests(unittest.TestCase):
                  patch.object(drive_storage, "_new_id", side_effect=["folder_1", "seg_1", "src_1"]), \
                  patch.object(drive_storage, "_get_file", side_effect=lambda token, fid: remote.get(fid)), \
                  patch.object(drive_storage, "_create_folder", return_value=folder), \
+                 patch.object(drive_storage, "_list_children", return_value=[]), \
                  patch.object(drive_storage, "_upload_file") as upload:
                 args = (job, JOB, "demo", manifest["source"]["fingerprint"], manifest["segments"])
                 first = drive_storage.upload_prepared_segments(*args, source_path=job / "source.mp4")
@@ -165,9 +166,14 @@ class SourceUploadTests(unittest.TestCase):
 
     def test_manifest_from_before_source_backups_keeps_its_folder_and_segments(self):
         with tempfile.TemporaryDirectory() as raw:
-            job, manifest, state = build_job(Path(raw) / "mcp_jobs", now=10**9)
+            root = Path(raw) / "mcp_jobs"
+            job, manifest, state = build_job(root, now=10**9)
             legacy = {k: v for k, v in state.items() if k not in ("source_file",)}
             pipeline.write_json(job / "drive-manifest.json", legacy)
+            # The shared folder already exists; its ID is durable before anything is uploaded.
+            pipeline.write_json(root / "drive-video-folder.json", {"folder_id": "folder_1", "parent_id": "",
+                                                                  "name": "Video Timeline", "created": "",
+                                                                  "folder_url": ""})
             folder = {"id": "folder_1", "mimeType": drive_storage.FOLDER_MIME, "parents": [],
                       "webViewLink": "https://drive.google.com/drive/folders/folder_1"}
             remote = {"folder_1": folder, "seg_1": self._remote("seg_1", job / "segments" / "segment_000.mp4"),
@@ -182,9 +188,11 @@ class SourceUploadTests(unittest.TestCase):
                     job, JOB, "demo", manifest["source"]["fingerprint"], manifest["segments"],
                     source_path=job / "source.mp4")
             create_folder.assert_not_called()
-            self.assertEqual([call.args[2] for call in upload.call_args_list], ["source.mp4"])
+            self.assertEqual([call.args[2] for call in upload.call_args_list],
+                             ["demo - 0123456789ab - source.mp4"])
             self.assertEqual(result["files"][0]["file_id"], "seg_1")
             self.assertEqual(result["source_file"]["file_id"], "src_9")
+            self.assertEqual(result["folder_id"], "folder_1")
 
 
 class LinkExpiryTests(unittest.TestCase):

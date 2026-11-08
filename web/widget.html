@@ -5,47 +5,134 @@
   <meta name="viewport" content="width=device-width,initial-scale=1">
   <title>影片時間軸與證據</title>
   <style>
-    :root { color-scheme: light dark; font-family: system-ui, sans-serif; line-height: 1.5; }
+    /* Light tokens by default; dark from the OS, or from ChatGPT's theme via data-theme (set in the script). */
+    :root {
+      color-scheme: light;
+      --bg: #ffffff; --surface: #f7f7f8; --card: #ffffff; --field: #ffffff;
+      --border: #e3e3e6; --border-strong: #8a8a90; --text: #0d0d0d; --muted: #5f6368;
+      --primary: #0d0d0d; --on-primary: #ffffff; --secondary: #f0f0f2; --secondary-hover: #e6e6e9;
+      --accent: #1764d1; --accent-soft: #e8f0fd;
+      --speech: #1764d1; --speech-soft: #e8f0fd; --visual: #7b3fd4; --visual-soft: #f1eafd;
+      --warn: #a15c00; --warn-soft: #fff6e5; --shadow: 0 1px 2px rgb(0 0 0 / 5%);
+      font-family: system-ui, -apple-system, "Segoe UI", "Noto Sans TC", "PingFang TC", "Microsoft JhengHei", sans-serif;
+      line-height: 1.55;
+    }
+    @media (prefers-color-scheme: dark) {
+      :root:not([data-theme="light"]) {
+        color-scheme: dark;
+        --bg: #212121; --surface: #2a2a2a; --card: #262626; --field: #303030;
+        --border: #3a3a3a; --border-strong: #808086; --text: #ececec; --muted: #a9a9ad;
+        --primary: #ececec; --on-primary: #0d0d0d; --secondary: #333336; --secondary-hover: #3d3d40;
+        --accent: #7cacf8; --accent-soft: #1d2a3f;
+        --speech: #7cacf8; --speech-soft: #1d2a3f; --visual: #c3a1f7; --visual-soft: #2c2340;
+        --warn: #f0b75a; --warn-soft: #3a2e17; --shadow: none;
+      }
+    }
+    :root[data-theme="dark"] {
+      color-scheme: dark;
+      --bg: #212121; --surface: #2a2a2a; --card: #262626; --field: #303030;
+      --border: #3a3a3a; --border-strong: #808086; --text: #ececec; --muted: #a9a9ad;
+      --primary: #ececec; --on-primary: #0d0d0d; --secondary: #333336; --secondary-hover: #3d3d40;
+      --accent: #7cacf8; --accent-soft: #1d2a3f;
+      --speech: #7cacf8; --speech-soft: #1d2a3f; --visual: #c3a1f7; --visual-soft: #2c2340;
+      --warn: #f0b75a; --warn-soft: #3a2e17; --shadow: none;
+    }
     * { box-sizing: border-box; }
-    body { margin: 0; padding: 16px; }
+    body { margin: 0; padding: 16px; background: var(--bg); color: var(--text); }
     main, section, .stack { display: grid; gap: 12px; min-width: 0; }
-    main { max-width: 900px; margin: auto; }
-    h1 { font-size: 1.35rem; } h2 { font-size: 1.1rem; }
+    main { max-width: 900px; margin: auto; gap: 14px; }
+    h1 { font-size: 1.3rem; font-weight: 700; letter-spacing: .01em; line-height: 1.35; }
+    h2 { font-size: 1rem; font-weight: 650; display: flex; align-items: center; gap: 8px; }
+    h2::before { content: ""; width: 4px; height: 1em; border-radius: 2px; background: var(--accent); flex: none; }
     h1, h2, p { margin: 0; }
-    .muted { opacity: .8; font-size: .9rem; }
+    .muted { color: var(--muted); font-size: .9rem; }
+    .eyebrow { font-size: .75rem; font-weight: 600; letter-spacing: .08em; text-transform: uppercase; color: var(--accent); }
+    .hero { display: grid; gap: 4px; }
     .actions { display: flex; gap: 8px; flex-wrap: wrap; }
     button, select, .external { min-height: 44px; font: inherit; }
-    button, select { border: 1px solid #858585; border-radius: 8px; padding: 9px 12px; }
-    select { width: 100%; min-width: 0; max-width: 100%; }
-    button { cursor: pointer; } button:disabled { cursor: default; opacity: .55; }
-    :focus-visible { outline: 3px solid #508bed; outline-offset: 3px; }
+    button { cursor: pointer; border: 1px solid transparent; border-radius: 10px; padding: 9px 16px;
+             background: var(--secondary); color: var(--text); font-weight: 550; transition: background-color .15s, opacity .15s; }
+    button:hover:not(:disabled) { background: var(--secondary-hover); }
+    button:disabled { cursor: default; opacity: .45; }
+    #ask, #open-chat { background: var(--primary); color: var(--on-primary); }
+    #ask:hover:not(:disabled), #open-chat:hover:not(:disabled) { opacity: .88; background: var(--primary); }
+    select { width: 100%; min-width: 0; max-width: 100%; border: 1px solid var(--border-strong); border-radius: 10px;
+             padding: 9px 40px 9px 12px; background: var(--field); color: var(--text); appearance: none;
+             background-image: linear-gradient(45deg, transparent 50%, var(--muted) 50%), linear-gradient(135deg, var(--muted) 50%, transparent 50%);
+             background-position: calc(100% - 20px) 50%, calc(100% - 15px) 50%; background-size: 5px 5px; background-repeat: no-repeat; }
+    label { font-size: .85rem; font-weight: 600; color: var(--muted); }
+    :focus-visible { outline: 3px solid var(--accent); outline-offset: 2px; }
     [hidden] { display: none !important; }
     a, p, li, label, h1, h2 { overflow-wrap: anywhere; }
+    a { color: var(--accent); }
     ol, ul { margin: 0; padding-left: 24px; }
-    #evidence { display: grid; gap: 12px; }
-    #evidence li, #library-list li { padding: 12px; border: 1px solid #858585; border-radius: 8px; }
+    /* Cards */
+    main > section, main > details, #analysis-report {
+      background: var(--card); border: 1px solid var(--border); border-radius: 16px; padding: 16px; box-shadow: var(--shadow); }
+    #analysis-report { display: grid; gap: 12px; max-width: 900px; margin: 14px auto 0; }
+    details > summary { cursor: pointer; font-weight: 600; min-height: 32px; display: flex; align-items: center; gap: 8px;
+                        list-style: none; color: var(--muted); font-size: .9rem; }
+    details > summary::-webkit-details-marker { display: none; }
+    details > summary::before { content: "▸"; transition: transform .15s; }
+    details[open] > summary::before { transform: rotate(90deg); }
+    details { display: grid; gap: 10px; }
+    main > details { background: transparent; border-style: dashed; box-shadow: none; padding: 8px 16px; }
+    #refresh, #copy-handoff { background: transparent; border-color: var(--border-strong); }
+    #refresh:hover:not(:disabled), #copy-handoff:hover:not(:disabled) { background: var(--secondary); }
+    /* Status lines */
+    .hint { font-size: .82rem; }
+    #status:not(:empty) { background: var(--accent-soft); color: var(--text); border-radius: 10px; padding: 10px 14px; font-size: .92rem; }
+    #quality:not(:empty) { font-weight: 600; }
+    #gaps:not(:empty) { list-style: none; padding: 10px 14px; margin: 0; display: grid; gap: 6px; background: var(--warn-soft);
+                        border-radius: 10px; font-size: .88rem; }
+    #gaps li::before { content: "⚠ "; color: var(--warn); }
+    /* Evidence timeline */
+    #evidence { display: grid; gap: 10px; list-style: none; padding: 0; }
+    #evidence li, #library-list li { padding: 12px 14px; border: 1px solid var(--border); border-radius: 12px; background: var(--surface); }
+    #evidence li > button:first-child, #evidence li > span:first-child {
+      min-height: 32px; padding: 4px 12px; border-radius: 999px; background: var(--accent-soft); color: var(--accent);
+      font-variant-numeric: tabular-nums; font-weight: 650; font-size: .88rem; display: inline-flex; align-items: center; }
+    #evidence li > button:first-child::before { content: "▶"; font-size: .65rem; margin-right: 6px; }
+    #evidence li > span:first-child { background: transparent; border: 1px dashed var(--border-strong); color: var(--muted); }
     #library-list { list-style: none; padding: 0; display: grid; gap: 12px; }
     #library-list p { white-space: pre-wrap; }
-    #evidence p { white-space: pre-wrap; margin-top: 6px; }
-    .badge { font-size: .85rem; margin-left: 8px; }
-    video { width: 100%; max-height: 360px; border-radius: 8px; background: #111; }
-    textarea { width: 100%; min-height: 180px; font: inherit; }
-    progress { width: 100%; height: 16px; }
-    .external { display: inline-flex; align-items: center; }
-    @media (max-width: 480px) { body { padding: 12px; } .actions > button { flex: 1 1 140px; } }
+    #evidence p { white-space: pre-wrap; margin-top: 8px; line-height: 1.6; }
+    #evidence p.muted { margin-top: 6px; font-size: .84rem; }
+    .badge { font-size: .78rem; font-weight: 650; margin-left: 8px; padding: 3px 10px; border-radius: 999px;
+             background: var(--speech-soft); color: var(--speech); vertical-align: middle; }
+    .badge.visual { background: var(--visual-soft); color: var(--visual); }
+    #more { width: 100%; }
+    /* Media */
+    video { width: 100%; max-height: 360px; border-radius: 12px; background: #000; }
+    .external { display: inline-flex; align-items: center; gap: 4px; font-weight: 550; text-decoration: none; min-height: 32px; }
+    .external::after { content: "↗"; font-size: .85em; }
+    .external:hover { text-decoration: underline; }
+    textarea { width: 100%; min-height: 160px; font: inherit; font-size: .88rem; color: var(--text); background: var(--field);
+               border: 1px solid var(--border-strong); border-radius: 10px; padding: 10px 12px; resize: vertical; }
+    progress { width: 100%; height: 8px; border: 0; border-radius: 999px; overflow: hidden; background: var(--secondary); accent-color: var(--accent); }
+    progress[value] { appearance: none; }
+    progress[value]::-webkit-progress-bar { background: var(--secondary); border-radius: 999px; }
+    progress[value]::-webkit-progress-value { background: var(--accent); border-radius: 999px; }
+    progress[value]::-moz-progress-bar { background: var(--accent); border-radius: 999px; }
+    #report-link { justify-self: start; }
+    @media (max-width: 480px) { body { padding: 12px; } .actions > button { flex: 1 1 140px; }
+      main > section, main > details, #analysis-report { padding: 14px; border-radius: 14px; } }
   </style>
 </head>
 <body>
 <main aria-labelledby="title">
-  <h1 id="title">影片時間軸</h1>
-  <p id="summary" class="muted">等待影片分段資料…</p>
+  <header class="hero">
+    <p class="eyebrow">Video Timeline</p>
+    <h1 id="title">影片時間軸</h1>
+    <p id="summary" class="muted">等待影片分段資料…</p>
+  </header>
   <div class="actions">
     <button id="analyze" type="button" disabled>開始分析</button>
     <button id="ask" type="button" disabled>交給 ChatGPT 整理</button>
     <button id="drive" type="button" disabled>上傳到我的 Drive（選用）</button>
     <button id="refresh" type="button">重新取得狀態</button>
   </div>
-  <p class="muted">準備完成後自動同時開始伺服器分析與 Drive 上傳（已設定時），兩者互不等待；重新開啟不會自動重跑或送出追問。</p>
+  <p class="muted hint">準備完成後自動同時開始伺服器分析與 Drive 上傳（已設定時），兩者互不等待；重新開啟不會自動重跑或送出追問。</p>
   <p id="status" role="status" aria-live="polite" aria-atomic="true"></p>
   <p id="persistence" class="muted" hidden></p>
   <section id="operation" aria-labelledby="operation-title" hidden>
@@ -77,12 +164,12 @@
   </section>
   <section id="drive-handoff" aria-labelledby="drive-title" hidden>
     <h2 id="drive-title">Drive 原片交接</h2>
-    <p>已上傳不代表 ChatGPT 已讀取原片。若目前對話無法使用官方 Google Drive，請開啟一般對話、選擇 Google Drive，再貼上以下內容。</p>
+    <p>已上傳不代表 ChatGPT 已讀取原片。按「複製並開新一般對話」會先複製以下內容，再嘗試開新對話（沒開啟就按隨後出現的連結）；在新對話選擇 Google Drive 後貼上即可。</p>
     <label for="drive-prompt">交接內容（可選取並複製）</label>
     <textarea id="drive-prompt" readonly></textarea>
     <div class="actions">
-      <button id="copy-handoff" type="button" disabled>一鍵複製交接內容</button>
-      <button id="open-chat" type="button" disabled>開新一般對話</button>
+      <button id="open-chat" type="button" disabled>複製並開新一般對話</button>
+      <button id="copy-handoff" type="button" disabled>只複製</button>
     </div>
     <a id="open-chat-link" class="external" href="https://chatgpt.com/" target="_blank" rel="noopener noreferrer" hidden>開啟 ChatGPT，建立一般對話</a>
   </section>
@@ -96,8 +183,8 @@
   </details>
 </main>
 <section id="analysis-report" hidden aria-label="A summary and report">
-  <h2>A 摘要／報告（未独立驗證作者或原片）</h2><p id="report-state" role="status"></p>
-  <a id="report-link" hidden download="A_server_analysis.md">下載实际 A_server_analysis.md</a>
+  <h2>A 摘要／報告（未獨立驗證作者或原片）</h2><p id="report-state" role="status"></p>
+  <a id="report-link" hidden download="A_server_analysis.md">下載實際 A_server_analysis.md</a>
   <label>明確提交的摘要<textarea id="report-summary"></textarea></label>
   <label>來源／未知註記<textarea id="report-provenance"></textarea></label>
   <button id="finalize-report" type="button">保存 caller_submitted 摘要</button>
@@ -108,6 +195,13 @@
 "use strict";
 const $ = id => document.getElementById(id);
 const host = () => window.openai;
+// Follow ChatGPT's light/dark theme even when it differs from the OS setting.
+const applyTheme = () => {
+  const theme = host()?.theme, root = document.documentElement;
+  if (!root?.dataset) return;
+  if (theme === "light" || theme === "dark") root.dataset.theme = theme; else delete root.dataset.theme;  // fall back to the OS setting
+};
+applyTheme(); window.addEventListener?.("openai:set_globals", applyTheme);
 const normalize = value => value?.structuredContent || value || {};
 const pendingRequests = new Map();
 let nextRequestId = 1, bridgePromise, generation = 0, pollEpoch = 0, pollTimer, drivePollEpoch = 0, drivePollTimer;
@@ -131,18 +225,20 @@ const terminal = new Set(["failed", "cancelled", "expired", "interrupted"]);
 const isPending = value => ["queued", "running"].includes(value?.status);
 const errorText = value => typeof value === "string" ? value : value?.message || "未提供錯誤說明";
 const numericTime = value => typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : null;
-const formatTime = seconds => {
-  const value = numericTime(seconds);
-  if (value === null) return "時間未知";
+const formatTime = (seconds, milliseconds = false) => {
+  const raw = numericTime(seconds);
+  if (raw === null) return "時間未知";
+  const value = milliseconds ? Number(raw.toFixed(3)) : raw;
+  const fraction = milliseconds ? (value % 1).toFixed(3).slice(1).replace(/\.?0+$/, "") : "";
   const hours = Math.floor(value / 3600), minutes = Math.floor(value / 60) % 60;
-  return (hours ? hours + ":" + String(minutes).padStart(2, "0") : String(minutes)) + ":" + String(Math.floor(value % 60)).padStart(2, "0");
+  return (hours ? hours + ":" + String(minutes).padStart(2, "0") : String(minutes)) + ":" + String(Math.floor(value % 60)).padStart(2, "0") + fraction;
 };
 const safeURL = value => {
   try { const url = new URL(value); return ["https:", "http:"].includes(url.protocol) ? url.href : null; }
   catch { return null; }
 };
 const current = version => !closed && version === generation;
-function checkCurrent(version) { if (!current(version)) throw new Error("影片已切換，忽略舊工作結果。"); }
+function checkCurrent(version, epoch) { if (!current(version) || (epoch !== undefined && epoch !== libraryEpoch)) throw new Error("影片已切換或檔案已失效，忽略舊工作結果。"); }
 function status(message) { $("status").textContent = message; }
 function followUpKey() { return data?.job_id ? `${data.job_id}:${analysisResult?.cache_signature || analysisResult?.source_sha256 || "unverified"}` : ""; }
 function buildState() {
@@ -191,26 +287,26 @@ function request(method, params) {
 function ensureBridge() {
   if (!bridgePromise) bridgePromise = request("ui/initialize", {
     protocolVersion: "2026-01-26", appCapabilities: {},
-    appInfo: { name: "video-timeline-pipeline", version: "16" },
+    appInfo: { name: "video-timeline-pipeline", version: "20" },
   }).then(result => {
     window.parent.postMessage({ jsonrpc: "2.0", method: "ui/notifications/initialized", params: {} }, "*");
     return result;
   });
   return bridgePromise;
 }
-async function invoke(method, params, fallback, version) {
-  checkCurrent(version);
+async function invoke(method, params, fallback, version, epoch) {
+  checkCurrent(version, epoch);
   try { await ensureBridge(); }
-  catch (error) { checkCurrent(version); if (fallback) return fallback(); throw error; }
-  checkCurrent(version);
+  catch (error) { checkCurrent(version, epoch); if (fallback) return fallback(); throw error; }
+  checkCurrent(version, epoch);
   // An ambiguous tool/message failure must never be retried via another transport.
   try { return await request(method, params); }
-  catch (error) { if (error.code === -32601 && fallback) { checkCurrent(version); return fallback(); } throw error; }
+  catch (error) { if (error.code === -32601 && fallback) { checkCurrent(version, epoch); return fallback(); } throw error; }
 }
-async function callTool(name, args, version) {
+async function callTool(name, args, version, epoch) {
   const result = await invoke("tools/call", { name, arguments: args },
-    host()?.callTool ? () => host().callTool(name, args) : null, version);
-  checkCurrent(version);
+    host()?.callTool ? () => host().callTool(name, args) : null, version, epoch);
+  checkCurrent(version, epoch);
   const payload = normalize(result);
   if (result?.isError || payload.status === "error" || payload.status === "busy") {
     throw new Error(errorText(payload.error || result?.content?.find(item => item.type === "text")?.text));
@@ -312,7 +408,7 @@ async function saveSegmentToLibrary(index, library = true) {
       check();
     }
     const ms = Math.round(nowMs() - started), mismatch = Number.isFinite(segment.size_bytes) && segment.size_bytes !== blob.size;
-    libraryResults.delete(index); libraryResults.set(index, { fileId, filename, size: blob.size, ms, sha256, library, hasDownloadUrl });
+    libraryResults.delete(index); libraryResults.set(index, { fileId, filename, size: blob.size, ms, sha256, library, hasDownloadUrl, start_seconds: segment.start_seconds, end_seconds: segment.end_seconds });
     output.textContent = `fileId：${fileId}\n大小：${blob.size} bytes${mismatch ? "（與分段資料大小不符）" : ""}\n耗時：${ms} ms\nlibrary:${library}\n下載網址：${hasDownloadUrl ? "已取得" : "未取得"}\nSHA-256：${sha256}${downloadError}\n尚未確認檔案庫介面或模型可讀取。`;
   } catch (error) {
     if (isCurrent()) {
@@ -329,6 +425,22 @@ async function askAboutLibraryFile() {
   librarySending = true; updateButtons();
   const previous = libraryModel;
   try {
+    if (typeof host()?.getFileDownloadUrl !== "function") throw new Error("此宿主缺少 getFileDownloadUrl，無法完成檔案交接。");
+    const download = await host().getFileDownloadUrl({ fileId: result.fileId });
+    checkCurrent(version, epoch);
+    const downloadUrl = safeURL(download?.downloadUrl);
+    if (!downloadUrl) throw new Error("宿主未提供 download_url，無法完成檔案交接。");
+    const url = new URL(downloadUrl);
+    if (url.protocol !== "https:" || url.username || url.password) throw new Error("宿主未提供有效的 HTTPS download_url，無法完成檔案交接。");
+    const handoff = {
+      files: [{ file_id: result.fileId, download_url: downloadUrl, mime_type: "video/mp4", file_name: result.filename }],
+    };
+    const rangeStart = numericTime(result.start_seconds), rangeEnd = numericTime(result.end_seconds);
+    if (rangeStart !== null && rangeEnd !== null && rangeStart >= 0 && rangeEnd > rangeStart)
+      handoff.segment_ranges = [{ start_seconds: rangeStart, end_seconds: rangeEnd }];
+    const receipt = await callTool("ingest_video_segments", handoff, version, epoch);
+    checkCurrent(version, epoch);
+    if (receipt.status !== "files_received" || receipt.files_received !== 1 || receipt.files?.length !== 1 || receipt.files[0]?.file_id !== result.fileId) throw new Error("未確認收到相符的檔案引用，停止模型分析要求。");
     libraryModel = { fileId: result.fileId, filename: result.filename, size: result.size };
     try { await saveState(true); }
     catch (error) {
@@ -340,12 +452,17 @@ async function askAboutLibraryFile() {
       }
       throw error;
     }
-    checkCurrent(version);
-    if (epoch !== libraryEpoch) return;
-    const prompt = `這是 #59 實驗。我剛按下按鈕上傳影片片段 ${result.filename}（fileId=${result.fileId}，${result.size} bytes，library:${result.library}）；尚未確認已進 ChatGPT 檔案庫。請不要呼叫任何工具。若能讀取這個檔案，回答第 10 秒的畫面文字；若看不到或讀不到，直接回答「看不到」，不要猜測。SHA-256 由小工具在本機計算並另行核對，不要求模型猜測雜湊。`;
-    const acknowledgment = await invoke("ui/message", { role: "user", content: [{ type: "text", text: prompt }] }, host()?.sendFollowUpMessage ? () => host().sendFollowUpMessage({ prompt }) : null, version);
-    checkCurrent(version);
-    if (epoch !== libraryEpoch) return;
+    checkCurrent(version, epoch);
+    const start = numericTime(result.start_seconds), end = numericTime(result.end_seconds);
+    const knownRange = start !== null && end !== null && end > start;
+    const checkpoints = knownRange ? [30, 65, 130].filter(seconds => seconds >= start && seconds < end) : [];
+    if (knownRange && !checkpoints.length) checkpoints.push(start + Math.min(10, (end - start) / 2));
+    const question = checkpoints.length
+      ? "回答" + checkpoints.map(seconds => `片段第 ${Number((seconds - start).toFixed(3))} 秒（原片 ${formatTime(seconds, true)}）`).join("、") + "的畫面文字"
+      : "說明是否能讀取；片段時間範圍未知，無法核對指定時間點";
+    const prompt = `這是 #59 實驗。我剛按下按鈕上傳影片片段 ${result.filename}（fileId=${result.fileId}，${result.size} bytes，library:${result.library}）；尚未確認已進 ChatGPT 檔案庫。請不要呼叫任何工具。若能讀取這個檔案，${question}；若看不到或讀不到，直接回答「看不到」，不要猜測。SHA-256 由小工具在本機計算並另行核對，不要求模型猜測雜湊。`;
+    const acknowledgment = await invoke("ui/message", { role: "user", content: [{ type: "text", text: prompt }] }, host()?.sendFollowUpMessage ? () => host().sendFollowUpMessage({ prompt }) : null, version, epoch);
+    checkCurrent(version, epoch);
     if (acknowledgment?.isError) throw new Error(errorText(acknowledgment.content?.find(item => item.type === "text")?.text));
     $("library-message").textContent = "已送出檔案讀取實驗要求；尚未確認模型可讀取。";
   } catch (error) { if (current(version) && epoch === libraryEpoch) $("library-message").textContent = "檔案實驗要求未確認送達，未自動重送。請先檢查對話。\n" + libraryError(error) + (libraryStateUncertain ? "\n宿主狀態回復未確認，已停用重試；請重新載入並核對檔案狀態。" : ""); }
@@ -356,10 +473,13 @@ function showOperation() {
   if (!activeOperation) return;
   const progress = activeOperation.progress || {}, names = { prepare: "準備影片", analyze: "分析影片", drive: "上傳 Drive" };
   const statuses = { queued: "排隊中", running: "執行中", completed: "已完成", failed: "失敗", cancelled: "已取消", expired: "已過期", interrupted: "執行中斷" };
+  const indeterminate = activeOperation.operation === "analyze" && activeOperation.status === "running" && progress.stage === "evidence";
+  const updated = Number(progress.updated_at);
+  const elapsed = indeterminate && Number.isFinite(updated) && updated > 0 ? `目前狀態已維持 ${Math.max(0, Math.floor(Date.now() / 1000 - updated))} 秒` : null;
   $("operation-title").textContent = names[activeOperation.operation] || "背景工作";
   $("progress-label").textContent = [statuses[activeOperation.status] || activeOperation.status,
-    progress.message || progress.stage, Number.isFinite(progress.current) && Number.isFinite(progress.total) ? `${progress.current} / ${progress.total}` : null].filter(Boolean).join(" · ");
-  if (Number.isFinite(progress.total) && progress.total > 0 && Number.isFinite(progress.current)) $("progress").value = Math.min(100, Math.max(0, progress.current / progress.total * 100));
+    progress.message || progress.stage, elapsed, !indeterminate && Number.isFinite(progress.current) && Number.isFinite(progress.total) ? `${progress.current} / ${progress.total}` : null].filter(Boolean).join(" · ");
+  if (!indeterminate && Number.isFinite(progress.total) && progress.total > 0 && Number.isFinite(progress.current)) $("progress").value = Math.min(100, Math.max(0, progress.current / progress.total * 100));
   else $("progress").removeAttribute("value");
   $("progress").hidden = !isPending(activeOperation);
   updateButtons();
@@ -424,7 +544,7 @@ function renderEvidence() {
     const item = document.createElement("li"), time = document.createElement(canSeek ? "button" : "span");
     time.textContent = formatTime(row.timestamp) + (row.end !== null ? "–" + formatTime(row.end) : "") + (row.timestamp_reliable === false ? "（時間碼不可靠）" : "");
     if (canSeek) { time.type = "button"; time.setAttribute("aria-label", `核對原片 ${time.textContent}`); time.addEventListener("click", () => seekEvidence(row.timestamp)); }
-    const badge = document.createElement("span"); badge.className = "badge"; badge.textContent = row.type === "speech" ? "逐字稿" : "畫面觀察";
+    const badge = document.createElement("span"); badge.className = "badge " + row.type; badge.textContent = row.type === "speech" ? "逐字稿" : "畫面觀察";
     item.append(time, badge);
     const text = document.createElement("p"); text.textContent = row.text || "此筆沒有可顯示的內容。"; item.append(text);
     if (row.detail) { const detail = document.createElement("p"); detail.className = "muted"; detail.textContent = row.detail; item.append(detail); }
@@ -565,10 +685,13 @@ function acceptOperation(value, version, expectedKind, opts = {}) {
       return;
     }
     else if (value.result_kind === "analysis") {
-      applyAnalysis(value.result); status("A 分析已完成，等待 ChatGPT 整理摘要後才會上傳 A_server_analysis.md。");
+      applyAnalysis(value.result);
+      status(value.result?.status === "complete"
+        ? "A 分析已完成；請以下方報告狀態確認 Drive 上傳與合併指令。"
+        : "A 分析僅有部分結果，請先檢查品質與缺漏。");
       if (!opts.fromRestore) refreshReport(version);
     }
-    else if (value.result_kind === "report") applyReport(value.result);
+    else if (value.result_kind === "report") refreshReport(version);
     else if (value.result_kind === "drive") applyDrive(value.result);
     else throw new Error("工作完成，但結果類型無法辨識。");
   } else if (terminal.has(value.status)) {
@@ -588,7 +711,8 @@ async function pollOperation(version = generation, epoch = pollEpoch) {
     return generation;
   } catch (error) {
     if (!current(version) || epoch !== pollEpoch) return;
-    status("暫時無法取得背景工作狀態。伺服器工作可能仍在執行；按「重新取得狀態」繼續查看。" + error.message);
+    status("暫時無法取得背景工作狀態，將繼續查詢；伺服器工作可能仍在執行。" + error.message);
+    if (isPending(activeOperation)) schedulePoll(version, 10);
   }
 }
 function clearExpiredMedia(jobId) {
@@ -606,6 +730,8 @@ function clearExpiredMedia(jobId) {
 }
 async function restoreJob() {
   const version = generation, id = data?.job_id || saved.jobId;
+  let reportRead = ++reportRefreshEpoch;
+  stopReportPolling(); reportRefreshing = true; $("copy-merge").disabled = true;
   const allowAutoStart = autoStartArmed;
   autoStartArmed = false;
   let viewVersion = version;
@@ -620,6 +746,7 @@ async function restoreJob() {
     }
     const snapshot = await callTool("get_prepared_video", { job_id: id }, version);
     checkCurrent(version);
+    if (reportRead !== reportRefreshEpoch) return;
     driveConfigured = snapshot.drive_configured !== false;
     if (snapshot.error_code === "MEDIA_EXPIRED") {
       // Expiry invalidates evidence even if an operation prepares the same deterministic job ID.
@@ -641,6 +768,7 @@ async function restoreJob() {
     else { analysisResult = null; evidenceRows = []; $("findings").hidden = true; }
     if (snapshot.report) applyReport(snapshot.report);
     else clearReport();
+    reportRead = reportRefreshEpoch;
     if (snapshot.drive) {
       try { applyDrive(snapshot.drive); }
       catch (error) { status("已存 Drive 交接與目前分段不符，請重新上傳。" + error.message); }
@@ -652,19 +780,24 @@ async function restoreJob() {
     const driveOp = candidates.find(item => item.operation === "drive");
     const latest = snapshot.latest_operation;
     let operation = snapshot.active_operation || (snapshot.analysis_invalidated && latest?.status === "completed" && latest?.result_kind === "analysis" ? null : latest);
-    if (operation?.operation === "report" && operation.operation_id === reportResult?.operation?.operation_id) operation = null;
+    // Queue history may still name the previous summary. The saved report
+    // pointer above owns report identity and its independent polling loop.
+    if (operation?.operation === "report") operation = null;
     if (operation?.operation === "drive") {
       // 主槽讓給同工作的分析（若有）；Drive 另行追蹤，兩路互不等待。
       await adoptDriveOperation(operation, restoredVersion);
+      if (reportRead !== reportRefreshEpoch) return;
       operation = candidates.find(item => item !== operation && item.operation === "analyze") || null;
     }
     if (driveOp && driveOp !== snapshot.active_operation && driveOp !== operation) await adoptDriveOperation(driveOp, restoredVersion);
+    if (reportRead !== reportRefreshEpoch) return;
     if (operation) await acceptOperation(operation, restoredVersion, undefined, { fromRestore: true });
     else if (restoredOperationId && !Object.hasOwn(snapshot, "active_operation") && !Object.hasOwn(snapshot, "latest_operation") && !snapshot.analysis_invalidated && (!data || saved.jobId === data.job_id)) await pollOperation(restoredVersion);
     else {
       activeOperation = null; restoredOperationId = null; stopPolling(); showOperation(); saveState();
       status(snapshot.analysis ? "已恢復分析結果；沒有重新分析或自動送出追問。" : snapshot.analysis_invalidated ? "來源或分析設定已更新，舊分析不再使用。請點選「開始分析」產生新證據。" : "影片已準備完成，點選「開始分析」執行背景分析。");
     }
+    if (reportRead !== reportRefreshEpoch) return;
     if (allowAutoStart && current(viewVersion)) {
       // The authoritative snapshot is adopted; mutation acknowledgements have
       // their own acting flags and must not hold ready Drive handoff actions.
@@ -672,7 +805,7 @@ async function restoreJob() {
       await autoStartParallel(viewVersion);
     }
     updateButtons();
-  } catch (error) { if (current(viewVersion)) status("無法恢復工作狀態：" + error.message + "。未自動重新分析或上傳。"); }
+  } catch (error) { if (current(viewVersion) && reportRead === reportRefreshEpoch) status("無法恢復工作狀態：" + error.message + "。未自動重新分析或上傳。"); }
   finally { if (current(viewVersion)) { restoring = false; updateButtons(); } }
 }
 async function autoStartParallel(version) {
@@ -729,7 +862,9 @@ async function changeOperation(action) {
   const target = [activeOperation, driveOperation].find(op => op?.operation_id && op.error_code !== "MEDIA_EXPIRED" && (action === "cancel" ? isPending(op) : terminal.has(op.status)));
   if (!target || acting || driveActing || restoring || uncertainStart) return;
   const version = generation, id = target.operation_id;
-  acting = true; stopPolling(); stopDrivePolling(); updateButtons();
+  acting = true;
+  if (target.operation === "drive") stopDrivePolling(); else stopPolling();
+  updateButtons();
   try { acceptOperation(await callTool(action === "cancel" ? "cancel_video_job" : "resume_video_job", { operation_id: id }, version), version); }
   catch (error) { if (current(version)) status(error.message + " 請重新取得伺服器狀態，確認工作是否已接受操作。"); }
   finally { if (current(version)) { acting = false; updateButtons(); } }
@@ -752,17 +887,22 @@ async function copyHandoff() {
   if (current(version)) status(copied ? "交接內容已複製。請在一般對話貼上，讓 ChatGPT 開始分析（B）。" : MANUAL_COPY);
 }
 function openNewChat() {
-  const url = "https://chatgpt.com/";
-  let opened = null;
-  try { if (typeof window.open === "function") opened = window.open(url, "_blank", "noopener"); }
-  catch { opened = null; }
-  if (opened) {
-    status("已開啟新對話入口；請確認是不含 developer MCP 的一般對話，再貼上交接內容。");
-    return;
-  }
-  const link = $("open-chat-link");
-  if (link && typeof link.click === "function") link.click();
-  else status("已準備交接內容；請手動開啟 https://chatgpt.com/ 建立一般對話（不要啟用 developer MCP），再貼上交接內容。");
+  // window.open with "noopener" returns null even when the tab opens, and the click's activation may have
+  // expired while the clipboard answered; always show the real link instead of guessing or clicking it twice.
+  $("open-chat-link").hidden = false;
+  status("交接內容已複製；若沒有自動開啟新分頁，請按下方連結開新一般對話（不要啟用 developer MCP），選擇 Google Drive 後貼上。");
+  try { if (typeof window.open === "function") window.open("https://chatgpt.com/", "_blank", "noopener"); }
+  catch {}
+}
+// Copy first: opening a tab moves focus away and the clipboard needs a focused page.
+async function copyAndOpenChat() {
+  const text = $("drive-prompt").value, version = generation;
+  if (!text) { status("目前沒有可複製的交接內容。"); return; }
+  const copied = await copyText(text, $("drive-prompt"), version);
+  if (copied === null || !current(version)) return;
+  if (copied) { openNewChat(); return; }
+  $("open-chat-link").hidden = false;
+  status(MANUAL_COPY + " 複製後按下方連結開新一般對話。");
 }
 async function askChatGPT() {
   const key = followUpKey();
@@ -790,7 +930,10 @@ function receiveToolResult(value, initial = false) {
     const changed = renderPrepared(payload);
     // 初次掛載不自動啟動；只有開著介面時新完成的 prepare 才自動並行 A＋B。
     if (changed) { restoredOperationId = saved.jobId === payload.job_id ? saved.operationId : null; autoStartArmed = !initial; restoreJob(); }
-  } else if ((payload.report_sha256 || payload.status === "report_invalid") && payload.job_id === data?.job_id) { applyReport(payload);
+  } else if ((payload.report_sha256 || payload.status === "report_invalid") && payload.job_id === data?.job_id) {
+    // A delayed notification may describe an older summary for this same analysis.
+    // Read the current report pointer before adopting a completion or enabling copy.
+    if (!reportWritePending) refreshReport(generation);
   } else if (payload.operation === "prepare" && payload.operation_id) {
     if (supersededPrepares.has(payload.operation_id)) return;
     // Poll responses are consumed by their request, never by an out-of-order child notification.
@@ -829,16 +972,23 @@ window.addEventListener("message", event => {
   } else if (message.method === "ui/notifications/tool-result") receiveToolResult(message.params);
 });
 window.addEventListener("openai:set_globals", event => { if (event.detail?.globals?.toolOutput) receiveToolResult(event.detail.globals.toolOutput); });
-let reportResult = null, reportSubmitting = false, reportPollEpoch = 0, reportPollTimer;
+let reportResult = null, reportSubmitting = false, reportWritePending = false, reportPollEpoch = 0, reportPollTimer, reportRefreshEpoch = 0, reportRefreshing = false;
 function stopReportPolling() { reportPollEpoch++; clearTimeout(reportPollTimer); }
 async function refreshReport(version) {
-  const id = data?.job_id;
+  const id = data?.job_id, refresh = ++reportRefreshEpoch;
+  stopReportPolling(); reportRefreshing = true; $("copy-merge").disabled = true;
   try {
     const snapshot = await callTool("get_prepared_video", { job_id: id }, version);
     checkCurrent(version);
+    if (refresh !== reportRefreshEpoch) return false;
     if (snapshot.prepared?.job_id !== id) throw new Error("報告快照回傳工作不符。");
     if (snapshot.report && !applyReport(snapshot.report)) throw new Error("報告快照綁定不符；請重新取得狀態。");
-  } catch (error) { if (current(version)) status("A 分析已完成，但無法取得報告狀態：" + error.message); }
+    if (!snapshot.report) clearReport();
+    return true;
+  } catch (error) {
+    if (current(version) && refresh === reportRefreshEpoch) status("A 分析已完成，但無法取得報告狀態；未重新提交或上傳：" + error.message);
+    return false;
+  }
 }
 function scheduleReportPoll(version, seconds, remaining = 60) {
   const epoch = reportPollEpoch, delay = Math.min(10, Math.max(1, Number(seconds) || 2));
@@ -875,9 +1025,10 @@ async function pollReportOperation(version, epoch, delay, remaining) {
     status("無法取得 A 報告上傳狀態；未自動重送，請重新取得狀態。" + error.message);
   }
 }
-function clearReport() { stopReportPolling(); reportSubmitting = false; reportResult = null; $("analysis-report").hidden = true; $("report-link").hidden = true; $("copy-merge").disabled = true; }
+function clearReport() { reportRefreshEpoch++; reportRefreshing = false; stopReportPolling(); reportSubmitting = false; reportWritePending = false; reportResult = null; $("analysis-report").hidden = true; $("report-link").hidden = true; $("copy-merge").disabled = true; }
 function applyReport(result, seconds = result?.operation?.retry_after_seconds, remaining = 60) {
   if (!analysisResult || result?.job_id !== data?.job_id || result.cache_signature !== analysisResult.cache_signature) return false;
+  reportRefreshing = false;
   stopReportPolling(); reportResult = result;
   $("analysis-report").hidden = false;
   const ready = result.status === "report_ready" && result.verified === true && result.file_id && result.merge_text && result.report_sha256;
@@ -910,18 +1061,23 @@ async function submitReportSummary() {
   const version = generation, expected = reportResult.analysis_sha256;
   const summary = $("report-summary").value, provenance = $("report-provenance").value;
   if (!summary.trim() || !provenance.trim()) { status("請明確填入摘要及來源註記；MCP 不會推定作者。"); return; }
-  reportSubmitting = true; $("finalize-report").disabled = true;
+  reportSubmitting = true; reportWritePending = true; reportRefreshEpoch++; stopReportPolling(); reportRefreshing = true;
+  $("finalize-report").disabled = true; $("copy-merge").disabled = true;
   try {
     const result = await callTool("finalize_analysis_report", { job_id: data.job_id, cache_signature: reportResult.cache_signature,
       analysis_sha256: expected, summary_text: summary, provenance_note: provenance }, version);
     checkCurrent(version);
-    if (reportResult?.analysis_sha256 !== expected || !applyReport(result)) throw new Error("報告回傳綁定不符；請重新取得狀態。");
-    status("已保存明確提交的摘要；上傳狀態如下。未獨立驗證 ChatGPT／圖庫或原片。");
+    reportWritePending = false;
+    if (reportResult?.analysis_sha256 !== expected || result?.job_id !== data.job_id
+        || result.cache_signature !== analysisResult?.cache_signature || result.analysis_sha256 !== expected) throw new Error("報告回傳綁定不符；請重新取得狀態。");
+    if (await refreshReport(version)) status("已保存明確提交的摘要；目前報告狀態如下。未獨立驗證 ChatGPT／圖庫或原片。");
   } catch (error) { if (current(version)) status("摘要／報告送達狀態不明；未自動重送。請先重新取得狀態。" + error.message); }
-  finally { reportSubmitting = false; if (current(version)) $("finalize-report").disabled = false; }
+  finally {
+    if (current(version)) { reportSubmitting = false; reportWritePending = false; $("finalize-report").disabled = reportRefreshing || !reportResult?.analysis_sha256; }
+  }
 }
 async function copyMerge() {
-  if (!reportResult || reportResult.cache_signature !== analysisResult?.cache_signature || reportResult.status !== "report_ready"
+  if (reportRefreshing || !reportResult || reportResult.cache_signature !== analysisResult?.cache_signature || reportResult.status !== "report_ready"
       || reportResult.verified !== true || !reportResult.file_id || !reportResult.merge_text) return;
   const version = generation, copied = await copyText(reportResult.merge_text, $("merge-prompt"), version);
   if (current(version)) status(copied ? "已複製已核對報告的合併指令；A/B 衝突與未知需明列。" : MANUAL_COPY);
@@ -932,14 +1088,16 @@ $("copy-merge").addEventListener("click", copyMerge);
 $("analyze").addEventListener("click", () => startOperation("analyze"));
 $("drive").addEventListener("click", () => startOperation("drive"));
 $("copy-handoff").addEventListener("click", copyHandoff);
-$("open-chat").addEventListener("click", openNewChat);
+$("open-chat").addEventListener("click", copyAndOpenChat);
 $("ask").addEventListener("click", askChatGPT);
 $("library-ask").addEventListener("click", askAboutLibraryFile);
 $("cancel").addEventListener("click", () => changeOperation("cancel"));
 $("resume").addEventListener("click", () => changeOperation("resume"));
 $("refresh").addEventListener("click", () => {
   stopPolling();
-  return uncertainStart || (data && !isPending(activeOperation)) || !activeOperation?.operation_id ? restoreJob() : pollOperation();
+  if (uncertainStart || (data && !isPending(activeOperation)) || !activeOperation?.operation_id) return restoreJob();
+  stopDrivePolling();
+  return Promise.all([pollOperation(), isPending(driveOperation) ? pollDriveOperation() : null]);
 });
 $("segment").addEventListener("change", () => selectSegment(Number($("segment").value)));
 $("player").addEventListener("loadedmetadata", () => { if (pendingSeek !== null) { $("player").currentTime = pendingSeek; pendingSeek = null; } });

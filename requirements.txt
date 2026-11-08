@@ -1,6 +1,7 @@
 # FFmpeg 與 ffprobe 需另行安裝或由系統提供。
 mcp>=1.20,<2
-yt-dlp[default,curl-cffi]>=2026.8.19
+# Raise this floor for each yt-dlp release (Dependabot opens the PR): A1 only upgrades packages when this file changes.
+yt-dlp[default,curl-cffi]>=2026.10.21
 Pillow
 # IANA timezone database fallback for zoneinfo on Windows and other systems without system data.
 tzdata
