@@ -43,6 +43,7 @@ F0 由首個基礎 PR 負責，在 #2/#3/#4 開始寫 DB 前完成，不各自�
 - **F0.2 穩定身分**：持久保存 `library_id` UUID，`analysis_revision` 綁實際內容與版本，
   不綁路徑或執行時間。`processed_revisions` 完成登記與 deterministic outbox event
   在同一 `operations.db` 交易提交，漏登記由 reconciliation 補掃；歷史 backfill 時間未知就標未知，預設不寄。
+  同一資料集的原資料及任何備份副本不得同時啟動兩個獨立寄送 worker；須明確部署身分／root 鎖與操作權。
 - **F0.3 交易與恢復**：每個 worker 獨立 connection、短交易與 rollback，網路在交易外；
   lease 帶 owner/fencing token，送出前持久化 attempt。已送但結果不明保留 `unknown`，
   lease 過期不授權重送；以 SQLite backup API 或停寫備份，還原後先停外送並對帳。
@@ -58,16 +59,17 @@ F0 由首個基礎 PR 負責，在 #2/#3/#4 開始寫 DB 前完成，不各自�
 ```text
 基準盤點／測試樣本＋F0 持久化契約
   → #4 C0–C3 最小用量／預算介面與 fake
-      ├─ #2 N0–N5 本機 Digest 預覽
-      │    → #2 N2 單一 provider＋N6 故障處置＋N8 排程 → Email MVP
-      └─ #4 C4–C8 各 provider 接入（可平行）
-  → #3 S0–S7 評分／校準／shadow mode
+  → 平行工作：
+      #2 N0–N5 本機 Digest 預覽 → #2 N2 單一 provider＋N6 故障處置＋N8 排程 → Email MVP
+      #4 C4–C8 各 provider 接入
+  → 兩線匯合 → #3 S0–S7 評分／校準／shadow mode
   → #2 N7 高重要性與聚合告警
   → #5 A0–A10 搜尋與可核對問答
   → #6 W0＋W8 安全基礎 → 只讀 UI
   → #6 W7 持久化任務 → Ask／重試／Digest 送出
 ```
 
+此規劃在 Email MVP 與 #4 C4–C8 兩條工作線匯合後才進入 #3。
 只讀預覽可與成本工作平行。真實寄送需要該 provider 的授權、用量／未知成本政策與安全 retry，
 不必等待其他所有 provider 或 #3/#5；Scoring 先用既有 FTS adapter，避免與 #5 循環相依。
 W8 必須在 Web 副作用功能之前完成，不能因 UI 排在後面而延後安全基礎。
@@ -85,7 +87,8 @@ W8 必須在 Web 副作用功能之前完成，不能因 UI 排在後面而延�
 
 ## Phase 2 / v0.6 backlog（不阻擋 MVP）
 
-1. 跨平台去重（URL canonicalization → 音訊/影格指紋）
+1. 跨平台去重（URL canonicalization／metadata → 音訊/影格指紋）；近似內容保留改版與不同時間映射，不得誤刪。
+   逐字稿相似度只能在轉錄後判斷，不能節省第一次 ASR。
 2. Entities/Actions 型別化（不從零重寫摘要）
 3. Delta 摘要（對凍結歷史證據比較新增/修改/衝突）
 4. Quality-aware routing（任何降級須獨立 opt-in + 品質評估）

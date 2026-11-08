@@ -33,6 +33,28 @@ class RoadmapSnapshotTests(unittest.TestCase):
             with self.subTest(contract=contract):
                 self.assertIn(contract, storage.group(1))
 
+    def test_backups_do_not_authorize_independent_sending_workers(self) -> None:
+        roadmap = (Path(__file__).resolve().parents[1] / "docs/roadmap-v0.6.md").read_text(encoding="utf-8")
+        identity = re.search(r"(?ms)^- \*\*F0\.2\b(.*?)(?=^- \*\*F0\.|^## |\Z)", roadmap)
+        self.assertIsNotNone(identity)
+        self.assertIn("備份副本不得同時啟動兩個獨立寄送 worker", identity.group(1))
+        self.assertIn("部署身分／root 鎖與操作權", identity.group(1))
+
+    def test_parallel_work_streams_join_before_scoring(self) -> None:
+        roadmap = (Path(__file__).resolve().parents[1] / "docs/roadmap-v0.6.md").read_text(encoding="utf-8")
+        delivery = re.search(r"(?ms)^## [^\n]*依賴[^\n]*\n(.*?)(?=^## |\Z)", roadmap)
+        self.assertIsNotNone(delivery)
+        self.assertRegex(delivery.group(1), r"Email MVP 與 #4 C4–C8[^\n]*匯合後[^\n]*#3")
+        self.assertIn("不必等待其他所有 provider", delivery.group(1))
+
+    def test_deduplication_preserves_distinct_evidence(self) -> None:
+        roadmap = (Path(__file__).resolve().parents[1] / "docs/roadmap-v0.6.md").read_text(encoding="utf-8")
+        dedup = re.search(r"(?ms)^1\. 跨平台去重(.*?)(?=^2\.|^## |\Z)", roadmap)
+        self.assertIsNotNone(dedup)
+        for contract in ("改版", "不同時間映射", "不得誤刪", "不能節省第一次 ASR"):
+            with self.subTest(contract=contract):
+                self.assertIn(contract, dedup.group(1))
+
     def test_foundation_and_delivery_dependencies_are_preserved(self) -> None:
         roadmap = (Path(__file__).resolve().parents[1] / "docs/roadmap-v0.6.md").read_text(encoding="utf-8")
         self.assertRegex(roadmap, r"(?m)^## F0\b")
