@@ -7444,6 +7444,13 @@ def fetch_facebook_author_apify(author: str, since: str) -> dict[str, Any]:
     }
 
 
+def validate_facebook_discovery_options(provider: str, brightdata_mode: str) -> None:
+    if brightdata_mode not in {"auto", "reels", "posts"}:
+        raise ValueError("--facebook-brightdata-mode 只接受 auto、reels 或 posts。")
+    if provider != "brightdata" and brightdata_mode != "auto":
+        raise ValueError("--facebook-brightdata-mode 只適用於 brightdata。")
+
+
 def fetch_facebook_author(
     author: str, since: str = "365d", provider: str = "meta", *, allow_paid: bool = False,
     max_items: int | None = None, exclude_ids: list[str] | None = None,
@@ -7452,10 +7459,7 @@ def fetch_facebook_author(
     brightdata_mode: str = "auto", on_mode_switch: Callable[[], None] | None = None,
     seen_post_ids: list[str] | None = None,
 ) -> dict[str, Any]:
-    if brightdata_mode not in {"auto", "reels", "posts"}:
-        raise ValueError("--facebook-brightdata-mode 只接受 auto、reels 或 posts。")
-    if provider != "brightdata" and brightdata_mode != "auto":
-        raise ValueError("--facebook-brightdata-mode 只適用於 brightdata。")
+    validate_facebook_discovery_options(provider, brightdata_mode)
     fallback = os.getenv("RSS_FACEBOOK_FALLBACK_PROVIDER", "").strip()
     if fallback not in {"", "apify"}:
         raise ValueError("RSS_FACEBOOK_FALLBACK_PROVIDER 只接受空值或 apify。")
@@ -8005,6 +8009,17 @@ def remember_facebook_posts(subscription: dict[str, Any], feed: dict[str, Any]) 
     subscription["facebook_seen_post_ids"] = list(dict.fromkeys(reversed(combined)))[::-1][-500:]
 
 
+def validate_brightdata_author_budget(max_items: int | None, platform: str) -> None:
+    if max_items is None:
+        raise ValueError(
+            f"{platform.title()}/Bright Data 付費盤點需要有限的結果預算：請用 --{platform}-max-items "
+            "指定正整數；--allow-batch-cloud 只代表允許雲端花費，不代表花費上限。"
+            f"--{platform}-since 只是在本機依發佈時間篩選，不會限制供應商計費範圍。"
+        )
+    if isinstance(max_items, bool) or not isinstance(max_items, int) or max_items <= 0:
+        raise ValueError(f"--{platform}-max-items 必須是正整數。")
+
+
 def fetch_facebook_author_brightdata(
     author: str, since: str = "365d", *, max_items: int | None = None,
     exclude_ids: list[str] | None = None, allow_paid: bool = False,
@@ -8015,11 +8030,7 @@ def fetch_facebook_author_brightdata(
         raise ValueError("Facebook Bright Data mode 必須是 reels 或 posts。")
     if not allow_paid:
         raise RuntimeError("Bright Data 可能計費；確認帳戶額度後加上 --allow-batch-cloud。")
-    if max_items is None:
-        raise ValueError("Facebook/Bright Data 付費盤點需要有限的結果預算：請用 --facebook-max-items 指定正整數；"
-                         "--facebook-since 只是在本機依發佈時間篩選，不會限制供應商計費範圍。")
-    if isinstance(max_items, bool) or not isinstance(max_items, int) or max_items <= 0:
-        raise ValueError("--facebook-max-items 必須是正整數。")
+    validate_brightdata_author_budget(max_items, "facebook")
     token = os.getenv("BRIGHTDATA_API_TOKEN", "").strip()
     if not token:
         raise RuntimeError("缺少 BRIGHTDATA_API_TOKEN；請在專案 .env 本機填入。")
@@ -8101,14 +8112,7 @@ def fetch_instagram_author(
 ) -> dict[str, Any]:
     if not allow_paid:
         raise RuntimeError("Bright Data 可能計費；確認帳戶額度後加上 --allow-batch-cloud。")
-    if max_items is None:
-        raise ValueError(
-            "Instagram/Bright Data 付費盤點需要有限的結果預算：請用 --instagram-max-items "
-            "指定正整數（例如 20）；--allow-batch-cloud 只代表允許雲端花費，不代表花費上限。"
-            "--instagram-since 只是在本機依發佈時間篩選，不會限制供應商計費範圍。"
-        )
-    if isinstance(max_items, bool) or not isinstance(max_items, int) or max_items <= 0:
-        raise ValueError("--instagram-max-items 必須是正整數。")
+    validate_brightdata_author_budget(max_items, "instagram")
     token = os.getenv("BRIGHTDATA_API_TOKEN", "").strip()
     if not token:
         raise RuntimeError("缺少 BRIGHTDATA_API_TOKEN；請在專案 .env 本機填入。")
@@ -8311,10 +8315,22 @@ def reserve_initial_paid_discovery(root: Path, state: dict[str, Any],
     """
     if not paid_discovery_provider(subscription) or not allow_paid or not paid_discovery_min_hours():
         return False
+    missing = object()
+    previous_stamp = subscription.get("paid_discovery_at", missing)
+    previous_error = subscription.get("last_error", missing)
     subscription["paid_discovery_at"] = rss_now()
     subscription["last_error"] = "首次付費盤點尚未完成；請於盤點間隔後刷新訂閱。"
     state["subscriptions"].append(subscription)
-    save_rss_state(root, state)
+    try:
+        save_rss_state(root, state)
+    except BaseException:
+        state["subscriptions"].pop()
+        for key, previous in (("paid_discovery_at", previous_stamp), ("last_error", previous_error)):
+            if previous is missing:
+                subscription.pop(key, None)
+            else:
+                subscription[key] = previous
+        raise
     return True
 
 
@@ -8331,6 +8347,7 @@ def add_facebook_subscription(
     keywords: list[str] | None = None,
     tags: list[str] | None = None,
     latest_only: bool = False,
+    enabled: bool = True,
 ) -> tuple[dict[str, Any], dict[str, int], Path]:
     root.mkdir(parents=True, exist_ok=True)
     page_id = facebook_page_identifier(author)
@@ -8353,7 +8370,7 @@ def add_facebook_subscription(
         "facebook_last_snapshot_id": "",
         "facebook_last_published": "",
         "name": name.strip() or f"Facebook {page_id}",
-        "enabled": True,
+        "enabled": enabled,
         "latest_only": latest_only,
         "keywords": keywords or [],
         "tags": tags or [],
@@ -8362,7 +8379,14 @@ def add_facebook_subscription(
     }
     def select_posts_mode() -> None:
         subscription["facebook_brightdata_mode"] = "posts"
+        if reserved:
+            save_rss_state(root, state)
 
+    if allow_paid and provider in {"apify", "brightdata"} and paid_discovery_min_hours():
+        validate_facebook_discovery_options(provider, brightdata_mode)
+        parse_facebook_since(since)
+        if provider == "brightdata":
+            validate_brightdata_author_budget(max_items, "facebook")
     reserved = reserve_initial_paid_discovery(root, state, subscription, allow_paid)
     feed = fetch_facebook_author(page_id, since, provider, allow_paid=allow_paid,
         brightdata_mode=brightdata_mode,
@@ -8378,7 +8402,11 @@ def add_facebook_subscription(
     })
     remember_facebook_posts(subscription, feed)
     subscription["last_error"] = ""
-    if not reserved:
+    if reserved:
+        # Keep the interval anchored to completion after a successful add.
+        subscription["last_checked"] = rss_now()
+        subscription["paid_discovery_at"] = subscription["last_checked"]
+    else:
         state["subscriptions"].append(subscription)
     counts = queue_rss_items(state, subscription, list(feed["items"]))
     save_rss_state(root, state)
@@ -8396,6 +8424,7 @@ def add_instagram_subscription(
     keywords: list[str] | None = None,
     tags: list[str] | None = None,
     latest_only: bool = False,
+    enabled: bool = True,
 ) -> tuple[dict[str, Any], dict[str, int], Path]:
     root.mkdir(parents=True, exist_ok=True)
     username = instagram_username(author)
@@ -8414,15 +8443,19 @@ def add_instagram_subscription(
         "instagram_since": since,
         "instagram_max_items": max_items,
         "instagram_last_published": "",
+        "instagram_last_discovery": "",
         "instagram_last_snapshot_id": "",
         "name": name.strip() or f"Instagram {username}",
-        "enabled": True,
+        "enabled": enabled,
         "latest_only": latest_only,
         "keywords": keywords or [],
         "tags": tags or [],
         "last_checked": rss_now(),
         "last_error": "",
     }
+    if allow_paid and paid_discovery_min_hours():
+        parse_instagram_since(since)
+        validate_brightdata_author_budget(max_items, "instagram")
     reserved = reserve_initial_paid_discovery(root, state, subscription, allow_paid)
     feed = fetch_instagram_author(
         username, since, max_items=max_items, allow_paid=allow_paid, root=root
@@ -8436,7 +8469,10 @@ def add_instagram_subscription(
         "instagram_last_snapshot_id": feed["instagram"]["snapshot_id"],
         "last_error": "",
     })
-    if not reserved:
+    if reserved:
+        subscription["last_checked"] = rss_now()
+        subscription["paid_discovery_at"] = subscription["last_checked"]
+    else:
         state["subscriptions"].append(subscription)
     counts = queue_rss_items(state, subscription, list(feed["items"]))
     save_rss_state(root, state)
@@ -8853,6 +8889,7 @@ def import_rss_opml(root: Path, source: Path, allow_paid: bool = False) -> dict[
                 "latest_only": str(outline.attrib.get("vidbeeLatestOnly") or "false").lower() == "true",
             }
             kind = str(outline.attrib.get("vidbeeKind") or "rss")
+            enabled = str(outline.attrib.get("vidbeeEnabled") or "true").lower() != "false"
             if kind == "facebook-author":
                 raw_max_items = str(outline.attrib.get("vidbeeFacebookMaxItems") or "").strip()
                 subscription, _, _ = add_facebook_subscription(
@@ -8863,6 +8900,7 @@ def import_rss_opml(root: Path, source: Path, allow_paid: bool = False) -> dict[
                     brightdata_mode=str(outline.attrib.get("vidbeeFacebookBrightdataMode") or "auto"),
                     max_items=int(raw_max_items) if raw_max_items else None,
                     allow_paid=allow_paid,
+                    enabled=enabled,
                     **options,
                 )
             elif kind == "instagram-author":
@@ -8873,11 +8911,12 @@ def import_rss_opml(root: Path, source: Path, allow_paid: bool = False) -> dict[
                     since=str(outline.attrib.get("vidbeeInstagramSince") or "365d"),
                     max_items=int(raw_max_items) if raw_max_items else None,
                     allow_paid=allow_paid,
+                    enabled=enabled,
                     **options,
                 )
             else:
                 subscription, _ = add_rss_subscription(root, url, **options)
-            if str(outline.attrib.get("vidbeeEnabled") or "true").lower() == "false":
+            if not enabled:
                 update_rss_subscription(root, str(subscription["id"]), enabled=False)
             totals["added"] += 1
         except (RuntimeError, ValueError) as exc:

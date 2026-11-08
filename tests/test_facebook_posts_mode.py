@@ -382,6 +382,45 @@ class FacebookPostsModeTests(unittest.TestCase):
         meta = json.loads((self.root / "rss" / subscription["facebook_last_discovery"]).read_text(encoding="utf-8"))["facebook"]
         self.assertEqual(meta["switched_from"], "reels")
 
+    def test_retained_add_saves_posts_before_failure_and_resumes_without_reels(self):
+        self.results[POSTS] = RuntimeError("posts failed")
+        modes_at_posts = []
+        def trigger(url, headers, **kwargs):
+            if POSTS in url:
+                modes_at_posts.append(self.saved()["facebook_brightdata_mode"])
+            return self.trigger(url, headers, **kwargs)
+        self.submit.side_effect = trigger
+        with patch.dict(os.environ, {"RSS_PAID_DISCOVERY_MIN_HOURS": "20", "RSS_PAID_DISCOVERY": "brightdata"}):
+            with self.assertRaisesRegex(RuntimeError, "posts failed"):
+                pipeline.add_facebook_subscription(self.root, "NASA", provider="brightdata", max_items=5, allow_paid=True)
+            self.assertEqual(modes_at_posts, ["posts"])
+            self.assertEqual(self.saved()["facebook_brightdata_mode"], "posts")
+            self.assertEqual(pipeline.refresh_rss(self.root)["deferred"], 1)
+            state = pipeline.load_rss_state(self.root)
+            state["subscriptions"][0]["paid_discovery_at"] = "2000-01-01T00:00:00Z"
+            pipeline.save_rss_state(self.root, state)
+            self.snapshots["sd_1"] = [record()]
+            def only_posts(url, headers):
+                if "/snapshot/sd_0" in url:
+                    raise AssertionError("the failed Reels snapshot must not be fetched again")
+                return self.download(url, headers)
+            self.read.side_effect = only_posts
+            self.assertEqual(pipeline.refresh_rss(self.root)["failed"], 0)
+            self.assertEqual(self.datasets(), [REELS, POSTS])
+
+    def test_retained_add_does_not_trigger_posts_when_mode_cannot_be_saved(self):
+        save = pipeline.save_rss_state
+        def fail_posts_mode(root, state):
+            if state["subscriptions"][0]["facebook_brightdata_mode"] == "posts":
+                raise OSError("disk full")
+            return save(root, state)
+        with patch.dict(os.environ, {"RSS_PAID_DISCOVERY_MIN_HOURS": "20"}), \
+                patch.object(pipeline, "save_rss_state", side_effect=fail_posts_mode):
+            with self.assertRaisesRegex(OSError, "disk full"):
+                pipeline.add_facebook_subscription(self.root, "NASA", provider="brightdata", max_items=5, allow_paid=True)
+        self.assertEqual(self.datasets(), [REELS])
+        self.assertEqual(self.saved()["facebook_brightdata_mode"], "auto")
+
     def test_add_switch_failure_leaves_no_subscription_and_retry_reuses_both_receipts(self):
         self.results[POSTS] = RuntimeError("posts failed")
         with patch.object(pipeline, "save_rss_state", wraps=pipeline.save_rss_state) as save:

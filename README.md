@@ -364,7 +364,9 @@ Apify Token 一律放在 `Authorization` header，不放 URL、輸出或 Git。A
 
 排程刷新（沒加 `--allow-batch-cloud` 的 `--rss-refresh`）預設不跑任何付費盤點。`RSS_PAID_DISCOVERY` 以逗號列出排程可自行使用的供應商（`apify`、`brightdata`），例如 `RSS_PAID_DISCOVERY=brightdata` 即可讓 Facebook Bright Data 與 Instagram 作者訂閱自動刷新，不必在排程加 `--allow-batch-cloud`；`RSS_PAID_DISCOVERY=apify` 則只放行 Apify。每次 Apify run 仍以 `APIFY_MAX_TOTAL_CHARGE_USD` 封頂，供應商方案的每月上限才是最終上限。
 允許清單排除的付費訂閱記為 `skipped`，不呼叫供應商、不覆寫既有錯誤，也不使刷新失敗；已允許供應商的 API／網路錯誤仍記為失敗。
-`RSS_PAID_DISCOVERY_MIN_HOURS`（小時，預設 0＝不限）讓這類排程自行放行的付費盤點每個訂閱至少間隔指定時間：例如排程每天跑 3 次時設 `20`，正常排程下每個 Apify 粉專約每天盤點一次（這是最短間隔、不是日曆日：停機後補跑可能同一天兩次；也是每個訂閱各自計算，不是帳戶總額上限）；未到間隔的訂閱記為 `deferred`、不算失敗，免費的 RSS／YouTube 照常每次刷新。間隔從每次付費嘗試起算，且在送出前就先存檔（失敗或中途被中斷的 run 也可能已計費）；明確加 `--allow-batch-cloud` 不受限，但仍會重設起算時間。
+`RSS_PAID_DISCOVERY_MIN_HOURS`（小時，預設 0＝不限）讓這類排程自行放行的付費盤點每個訂閱至少間隔指定時間：例如排程每天跑 3 次時設 `20`，正常排程下每個 Apify 粉專約每天盤點一次（這是最短間隔、不是日曆日：停機後補跑可能同一天兩次；也是每個訂閱各自計算，不是帳戶總額上限）；未到間隔的訂閱記為 `deferred`、不算失敗，免費的 RSS／YouTube 照常每次刷新。間隔從每次付費嘗試起算，且在送出前就先存檔（失敗或中途被中斷的 run 也可能已計費）；明確加 `--allow-batch-cloud` 不受限，但仍會重設起算時間。新增付費訂閱（`--facebook-author`／`--instagram-author` 含 OPML 匯入）的付費盤點同樣在送出前先寫入 `paid_discovery_at`，訂閱加入後的前一段時間排程刷新不會重複付費；未設定間隔或免費盤點不會多寫這個欄位。設定間隔時的新增若付費盤點失敗，訂閱仍會留在訂閱清單（間隔照樣起算），排程刷新會在間隔後自動重試。
+
+新增前會先驗證作者的期間、模式與結果預算；無效參數不會留下訂閱或冷卻時間。OPML 匯入的啟停狀態會在付費呼叫前存檔，盤點失敗也不會把停用訂閱改為啟用；保留的 Instagram 訂閱仍有作者 URL，可正常匯出 OPML。
 設定間隔後，手動新增 Facebook／Instagram 付費訂閱也會在初次盤點前保存訂閱與起算時間。初次盤點中斷時保留「尚未完成」狀態；稍後刷新既有訂閱即可，重新新增同一作者會被擋下。未設定間隔時不新增這個起算欄位。
 
 公開 Facebook Page 也可用 Bright Data，支援 Reels by profile URL（dataset `gd_lyclm3ey2q6rww027t`）與 Pages Posts by profile URL（dataset `gd_lkaxegm826bjpoo9m5`）兩種模式：
@@ -378,7 +380,7 @@ python pipeline.py --facebook-author '<PUBLIC_PAGE>' --facebook-provider brightd
 
 `--facebook-brightdata-mode {auto,reels,posts}` 只適用於 Bright Data 的 Facebook 作者新增／盤點及訂閱更新，存為 `facebook_brightdata_mode`，OPML 以 `vidbeeFacebookBrightdataMode` 保留。預設 `auto`（舊訂閱缺欄位亦同）先用 Reels；只有整份 Reels 結果全部為 error record、且每筆 `error_code` 都是 `dead_page` 時，同一次執行才會再預留一次額度並送出 posts trigger。其他錯誤、部分錯誤或空結果都不切換；明確指定 `reels` 也不切換。兩種模式使用分開的回執，重試沿用各自的 snapshot。
 
-既有訂閱刷新時一旦觀察到上述 `dead_page`，會在送出 posts 前保存為 `posts`，之後刷新直接使用 Pages Posts；即使 posts 失敗或額度不足也保留此模式。新增（含 OPML 匯入）只有整次成功才建立訂閱並保存 posts 模式，失敗不留訂閱；重試沿用 Reels 與 posts 各自的回執，不重送已提交的 trigger。`--facebook-discover-only` 沒有訂閱，只在當次執行切換並在輸出標示；可用訂閱更新改回 `auto` 或固定 `reels`。
+既有訂閱刷新時一旦觀察到上述 `dead_page`，會在送出 posts 前保存為 `posts`，之後刷新直接使用 Pages Posts；即使 posts 失敗或額度不足也保留此模式。新增（含 OPML 匯入）在設定付費間隔時會預先保留訂閱，並在送出 posts 前保存模式；失敗後可依間隔刷新，已有 posts 回執時會沿用。未設定間隔時，新增失敗不留訂閱，重試沿用 Reels 與 posts 各自的回執，不重送已提交的 trigger。`--facebook-discover-only` 沒有訂閱，只在當次執行切換並在輸出標示；可用訂閱更新改回 `auto` 或固定 `reels`。
 
 Pages Posts 會採集所有貼文類型，**非影片貼文也計費**，沒有只抓影片的供應商參數；本機只把 `post_type` 為 Reel／Video、或 attachment 為 Video／帶 `video_url` 的項目加入影片佇列，不把會過期的 CDN `video_url` 當影片來源網址。首次自動切換的 Reels 錯誤結果也會計費，posts 另計。盤點輸出顯示實際模式、切換及原始／影片／非影片／錯誤筆數。
 

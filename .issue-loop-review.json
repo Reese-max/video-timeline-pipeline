@@ -1,20 +1,32 @@
 {
-  "pr": 102,
-  "head": "3b4a4018d1364095180e2033c7b88e456d91254c",
+  "pr": 135,
+  "head": "168a5fc9ecdceef7e811c7c9a9bf3d7c1ea0b68a",
   "findings": [
     {
       "severity": "med",
-      "file": "analysis_report.py",
-      "line": 47,
-      "issue": "Removing every analysis consistency check lets record() render supplied evidence while labeling it with the persisted raw analysis digest. Normal summary finalization changes non-summary evidence through display timestamp normalization, and stale source/transcript/visual snapshots are accepted. Render and bind the same raw read, permitting only timestamp display normalization while retaining evidence consistency checks."
+      "file": "pipeline.py",
+      "line": 8380,
+      "issue": "The retained initial Facebook Bright Data subscription switches from auto to posts only in memory. If posts fails or the process is interrupted, later refreshes must read the failed Reels snapshot again before they can resume the posts receipt; an expired or unavailable Reels snapshot prevents recovery. This pre-existing path is exposed by the PR's retained-subscription retry; persist the switch before posts when an initial reservation exists."
     },
     {
-      "severity": "med",
-      "file": "tests/test_analysis_report_workflow.py",
-      "line": 615,
-      "issue": "The added regression test only asserts True and covers none of issue #101's clamped timestamps, timestamp-coverage speech-only placeholder, reliable control, queue scheduling, or summary finalization acceptance paths. It cannot detect a reverted fix or the newly weakened evidence binding."
+      "severity": "low",
+      "file": "tests/test_rss_paid_discovery.py",
+      "line": 282,
+      "issue": "The new no-interval test inherits RSS_PAID_DISCOVERY_MIN_HOURS from the host and fails when the documented setting is enabled. A pre-existing no-interval refresh test has the same isolation problem."
+    },
+    {
+      "severity": "low",
+      "file": "README.md",
+      "line": 383,
+      "issue": "The Facebook auto-mode instructions say a failed add never retains a subscription, contradicting the retained-subscription behavior and the updated paid-discovery documentation. The historical audit README also needed to distinguish the current root review from its archived records."
+    },
+    {
+      "severity": "low",
+      "file": "CHANGELOG.md",
+      "line": 7,
+      "issue": "The added entry attributes the original dispatch-time stamp fix to this PR, although the admitted main base already contains it. The actual change updates the stamp after successful initial discovery."
     }
   ],
   "fixed": true,
-  "summary": "Fixed the raw-analysis/report binding regression and replaced the no-op regression test. Reports now render from the exact persisted evidence they hash, accept only timestamp display normalization, and reject stale source, transcript, and visual snapshots; issue #101's three queue/finalization paths have real regression coverage without invalidating existing paid-analysis caches."
+  "summary": "Fixed retained Facebook subscription mode persistence and isolated the no-interval tests; corrected the conflicting documentation. The original dispatch-time stamp already existed on main. Direct checks passed 1,313 cases (38 Python tests skipped); the nested Windows offline launcher reported two WinError 87 subprocess errors that passed in the full direct suite."
 }
