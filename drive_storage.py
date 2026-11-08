@@ -904,7 +904,12 @@ def _rss_folder(token: str, state_path: Path) -> str:
         state = {"folder_id": _new_id(token), "parent_id": parent_id, "name": RSS_FOLDER_NAME}
         write_json(state_path, state)
     folder_id = state["folder_id"]
-    folder = _get_file(token, folder_id) or _create_folder(token, RSS_FOLDER_NAME, parent_id, folder_id)
+    folder = _get_file(token, folder_id)
+    if folder is None:
+        _create_folder(token, RSS_FOLDER_NAME, parent_id, folder_id)
+        # files.create returns only the requested fields, which omit parents and
+        # trashed. Verify the persisted folder using the complete read contract.
+        folder = _get_file(token, folder_id) or {}
     if (folder.get("trashed") or folder.get("mimeType") != FOLDER_MIME or str(folder.get("id")) != folder_id
             or (parent_id and parent_id not in folder.get("parents", []))):
         raise ValueError("RSS Drive folder was moved, trashed or changed; no write")

@@ -74,9 +74,60 @@ python pipeline.py --video 'D:\path\to\video.mp4' --dry-run --slide-extractor st
 
 `--dry-run` 不會下載、不會上傳、不會呼叫雲端 API，但會用本機 `ffprobe`／`ffmpeg` 產生音訊片段與候選截圖。輸出在 `jobs\<12字元雜湊>\`。
 
+## 本機 Dashboard（選用，#6）
+
+不需要 Node 前端建置；一般 CLI 不需安裝 Web 套件。使用既有資料目錄時，先停止該目錄的寫入工作、備份 `library.db`／`operations.db`，再明確初始化：
+
+```powershell
+python -m pip install -r requirements-web.txt
+python pipeline.py --root 'C:\Data\VideoLibrary' --web-init
+python pipeline.py --root 'C:\Data\VideoLibrary' --serve
+```
+
+開啟 `http://127.0.0.1:8080`。預設唯讀，只查本機索引、原 RSS 狀態及成本帳本；啟動不建立／升級資料庫、不啟動 worker、不下載模型、不分析影片或寄信。不相容索引顯示 `migration_required`。頁面提供今日／本週覆蓋、影片與證據分頁、全文搜尋、成本、工作與摘要。
+
+需要明確排程語意搜尋、Ask、RSS 重排或凍結摘要寄送時，在目前 shell 設定私人 `WEB_TOKEN`（至少 32 字元）及所需 provider／收件者環境變數，再啟動：
+
+```powershell
+python pipeline.py --root 'C:\Data\VideoLibrary' --serve --web-writes
+# 另一個已設定相同 provider 環境變數的 shell：每次只領取一筆後離開。
+python pipeline.py --root 'C:\Data\VideoLibrary' --web-worker
+```
+
+於頁面的「操作授權」輸入自己的權杖；關頁後清除，瀏覽器不持久儲存它。Web 模式只讀取目前程序的環境變數，不自動載入資料目錄的 `.env`。排入成功回傳 202／task ID，必須另行執行 worker；輪詢或重整頁面不執行工作。未知傳輸不自動重送，取消只停止後續步驟，不保證退費。摘要先本機預覽，再確認 `digest_id + revision + payload_hash`；接受僅代表「供應商已接受」。
+
+遠端需同時指定 `--allow-remote`、有效 `WEB_TOKEN`、`--web-origin https://...` 與 `--web-trusted-proxy <確切IP>`，並由管理者設定可信 TLS 反向代理及防火牆。缺少任何條件即拒絕啟動，不能直接開放未加密服務。
+
+[完整操作與驗收](docs/dashboard.md) 包含 API 限制、既有佇列語意、故障恢復、合成資料效能及尚未驗證範圍。
+
 ## ChatGPT 網頁 MCP 影片摘要
 
 `mcp_server.py` 是 ChatGPT Apps/MCP 入口：公開影片 URL → 既有下載器 → FFmpeg 分段 → Groq 語音辨識／MiniMax 整支影片畫面分析 → ChatGPT 根據工具證據整理時間軸。v14 widget 在準備完成後自動同時啟動伺服器分析（A）與 Drive 上傳（B，已設定時），兩者互不等待；再由「交給 ChatGPT 整理」送出整理要求；重新開啟不會自動重跑或重送。CLI 的 MiniMax 摘要流程不變；MCP 不另呼叫 MiniMax 產生摘要。影片放在 Git 忽略的 `mcp_jobs\`，工作佇列及簽章金鑰在私有 `.video-state/`。
+
+### 私人影片：上傳 MP4 後由伺服器分析
+
+Facebook 私人影片或登入牆導致網址無法下載時，先把 MP4 上傳至 ChatGPT，再呼叫 `prepare_uploaded_video`；`file` 使用與 `ingest_video_segments` 相同的 OpenAI 檔案參數機制（`openai/fileParams: ["file"]`），必須傳入宿主提供的完整引用，不能拿公開影片網址冒充：
+
+```json
+{
+  "file": {
+    "file_id": "file-由宿主提供",
+    "download_url": "https://files.oaiusercontent.com/由宿主提供的暫時下載路徑",
+    "file_name": "私人影片.mp4",
+    "mime_type": "video/mp4"
+  },
+  "segment_seconds": 120,
+  "background": true
+}
+```
+
+`file_name`／`mime_type` 可省略，`max_segments` 預設不限（仍受伺服器設定限制）。背景呼叫沿用既有 `prepare` 工作佇列，先回 `operation_id`，用 `get_video_job` 輪詢；下載完成並算出內容 SHA-256 後才會有 `job_id`。完成後以該 ID 呼叫 `analyze_prepared_video`，取得 ASR 與 MiniMax 畫面證據，再交給 ChatGPT 整理；已開啟 widget 時由 widget 自動啟動，避免重複呼叫。選用 Drive 與 `get_prepared_video` 還原流程均沿用原入口。`ingest_video_segments` 仍只確認檔案引用，不執行這條伺服器分析流程。
+
+下載只接受 HTTPS／443，主機名稱必須**完整相符**於 `UPLOAD_ALLOWED_HOSTS`（逗號分隔、不支援萬用字元或自動包含子網域）；既有引用正規化沒有主機清單，因此保守預設僅 `files.oaiusercontent.com`。若宿主使用其他下載主機，管理者須明確將該可信主機加入，例如 `UPLOAD_ALLOWED_HOSTS=files.oaiusercontent.com,另一個可信主機`；每次重新導向都重新核對，最多 5 次。不傳送 Cookie、帳密或環境中的代理／`.netrc` 憑證。連線逾時 10 秒、單次讀取逾時 30 秒，整體下載沿用 `VIDEO_API_TIMEOUT_SECONDS`（預設 900 秒）與背景工作期限。
+
+影片串流寫入 `mcp_jobs/.upload-*` 暫存目錄，沿用 `MCP_MAX_SOURCE_MB`（預設 **512 MiB**）硬上限及儲存空間檢查，失敗會清掉當次暫存檔。行程中斷遺留的暫存目錄會在下次上傳的容量檢查前，於既有寫入鎖內清理；僅處理超過 `max(900, MCP_JOB_TIMEOUT_SECONDS)` 秒且未連結至其他路徑的 `.upload-*` 目錄。容量不足或原片搬移失敗不會留下新建的空工作目錄。格式異常的下載網址與 ffprobe JSON 會回傳繁體中文錯誤。伺服器以 ffprobe 限定本機 MP4/MOV 容器並確認有視訊串流，音軌可省略；不依副檔名或 MIME 宣稱判定成功。內容 SHA-256 經 `pipeline.job_key("upload://<sha256>")` 產生既有格式的 12 碼 job ID：相同 bytes 即使檔名／file ID 不同也共用工作，同樣分段設定重用完成產物；修改分段設定會在同一工作重建分段。每次新引用仍須下載 bytes 才能核對內容。
+
+`source.mp4`、`source.info.json`、`source.probe.json`、分段、預覽與 manifest 與網址工作相容；來源記為 `upload://<sha256>`，不是公開可瀏覽網址。`source.info.json` 與 manifest 的 `source` 保存首次準備的 `source_type="upload"`、原始 `file_name`、`file_id`、`sha256`，不保存暫時下載網址。背景佇列的私人 `.video-state/` 會保存下載引用以便執行／續跑；網址過期時須重新上傳並重新準備。正式 ChatGPT 檔案交接與線上供應商分析仍需部署後驗收。
 
 ### v17：介面視覺更新
 
@@ -93,8 +144,9 @@ UI URI 升為 `ui://video-timeline-pipeline/v16-<媒體網址 hash>.html`，並�
 ### v15：背景工作、可核對證據與儲存管理
 
 準備／分析／Drive 工具支援 `background=true`；可用 `get_video_job` 查進度，`cancel_video_job` 取消，`resume_video_job` 續跑，`get_prepared_video` 恢復結果及更新下載網址。新介面使用背景模式，舊客戶端的同步預設仍相容。準備完成後 widget 自動同時送出分析與 Drive 背景工作（Drive 先送；paired worker 允許同一 job 的分析與 Drive 片段上傳並行，最多兩個 worker；其他工作依佇列排程）；未設定 Drive 時只自動跑分析。兩路互不等待、失敗隔離；手動按鈕保留重試入口。交接內容只放檔案 ID／網址／大小與原片分段時間，不含任何 A 的結果，並提供「一鍵複製」與「開新一般對話」。
+取消或恢復 A 只調整 A 的輪詢，Drive 交接仍繼續；重新取得狀態會獨立恢復兩路輪詢，純讀取不會重新送出分析或上傳。
 
-A 分析完成時，本機產生 `A_server_analysis.md`（逐字稿、畫面時間軸、品質與待整理摘要），widget 自動取得報告快照並提示等待 ChatGPT 整理摘要。「交給 ChatGPT 整理」要求 ChatGPT 先讀取目前證據與報告綁定，再呼叫 `finalize_analysis_report` 提交摘要及來源註記；也可在 widget 明確填寫後提交。影片片段已在 Drive 且兩路 worker 已停止時，排入獨立的報告上傳工作，放進同一個 Drive 資料夾：分析證據完整且不需覆核（`evidence_status=complete`、`quality.status=evidence_available`）時不必等摘要，直接上傳純證據版；畫面分析失敗但語音完整可靠（`visual_status=error`、`audio_status=complete`、`speech_reliable=true`、逐字稿無缺口）時標 `evidence_scope=speech_only`，報告開頭註明只含語音，同樣免摘要上傳；其餘情況仍要先有 `summary_status=caller_submitted`。之後再提交摘要會另外上傳一份同名新版（只差摘要段）。B 交接內容已含第二步：B 先獨立輸出，再自行讀取同資料夾的 A 報告合併；A 尚未就緒才需要貼合併指令。合併規則：畫面文字與數字採 B，A 的不同讀法放附錄；講話內容採 A，A 的 `quality.speech_reliable=false`（逐字稿只有低信心的片尾套語〔avg_logprob < -0.3〕、只有符號或沒有語音）時寫「沒有可信的語音內容」、A 的語音文字只列附錄，並在分析結果提示建議加跑 B（`quality.route_b_reasons` 列出缺少的是語音、逐字稿或畫面）。可免摘要上傳的報告在快照中顯示 `awaiting_segments`，widget 會自動追蹤到上傳完成。widget 追蹤 queued／running 報告；`report_ready` 且 `verified` 時顯示「A 已完成」並啟用「複製合併指令」。指令以「合併：」開頭，保留 file_id、SHA-256 與未獨立驗證聲明。
+A 分析完成時，本機產生 `A_server_analysis.md`（逐字稿、畫面時間軸、品質與待整理摘要），widget 自動取得報告快照，依目前證據與報告狀態顯示自動上傳或待整理摘要。「交給 ChatGPT 整理」要求 ChatGPT 先讀取目前證據與報告綁定，再呼叫 `finalize_analysis_report` 提交摘要及來源註記；也可在 widget 明確填寫後提交。影片片段已在 Drive 且兩路 worker 已停止時，排入獨立的報告上傳工作，放進同一個 Drive 資料夾：分析證據完整且不需覆核（`evidence_status=complete`、`quality.status=evidence_available`）時不必等摘要，直接上傳純證據版；畫面分析失敗但語音完整可靠（`visual_status=error`、`audio_status=complete`、`speech_reliable=true`、逐字稿無缺口）時標 `evidence_scope=speech_only`，報告開頭註明只含語音，同樣免摘要上傳；其餘情況仍要先有 `summary_status=caller_submitted`。之後再提交摘要會另外上傳一份同名新版（只差摘要段）。B 交接內容已含第二步：B 先獨立輸出，再自行讀取同資料夾的 A 報告合併；A 尚未就緒才需要貼合併指令。合併規則：畫面文字與數字採 B，A 的不同讀法放附錄；講話內容採 A，A 的 `quality.speech_reliable=false`（逐字稿只有低信心的片尾套語〔avg_logprob < -0.3〕、只有符號或沒有語音）時寫「沒有可信的語音內容」、A 的語音文字只列附錄，並在分析結果提示建議加跑 B（`quality.route_b_reasons` 列出缺少的是語音、逐字稿或畫面）。可免摘要上傳的報告在快照中顯示 `awaiting_segments`，widget 會自動追蹤到上傳完成。widget 追蹤 queued／running 報告；`report_ready` 且 `verified` 時顯示「A 已完成」並啟用「複製合併指令」。指令以「合併：」開頭，保留 file_id、SHA-256 與未獨立驗證聲明。
 
 報告內容與 `analysis_sha256` 取自同一次讀取的原始 `analysis/result.json`；不可靠時間碼只在 widget／工具顯示時清為 `null`，不改寫原始證據或阻擋報告排隊。提交摘要保留原始逐字稿、畫面時間軸與品質段；核對時僅容許相同的顯示正規化，來源、逐字稿或畫面證據改變時仍拒絕綁定。
 
@@ -107,6 +159,38 @@ v15 修正摘要早於 Drive 上傳完成時的狀態追蹤：`caller_submitted`
 UI URI 曾升為 `ui://video-timeline-pipeline/v15-<媒體網址 hash>.html`（現行版本見上方 v16）。以下 v8–v14 段落保留歷史修復紀錄。
 
 v14 的可收合「實驗：存到 ChatGPT 檔案庫（#59）」只在使用者點擊分段按鈕後下載 MP4，再以宿主 `uploadFile(file, { library: true })` 上傳；一般上傳備援也必須另行點擊，不自動重送。這是選用的用戶端路徑，主流程維持既有伺服器分析。畫面顯示 fileId、大小、耗時、現算 SHA-256 與是否取得下載網址，不顯示或保存簽章網址。另按「請模型讀這個檔案」才將檔案 ID 加入模型可見狀態並送出追問；缺少宿主 API 時顯示能力診斷。成功回傳不代表檔案已出現在檔案庫或模型能讀取：大小／型別上限、真實錯誤格式及 library 不可用時的行為均未驗證，需在真實 ChatGPT 工作階段測試。
+v19 保留 v18 上傳當下保存的片段範圍與驗證點換算，並在「請模型讀這個檔案」取得新的 HTTPS `getFileDownloadUrl`，明確呼叫 `ingest_video_segments`；回執的數量與 ID 必須相符，才公開模型檔案 ID 並送出追問。缺能力、無效引用、失敗或過期工作會停止。UI URI 為 `ui://video-timeline-pipeline/v19-<媒體網址 hash>.html`，保留 v17／v18 URI 相容。這仍不證明模型能讀取 MP4／影格，真實 host 驗收尚未完成。
+
+v20 修正同一工作較舊 A 報告的延遲通知覆蓋新版摘要狀態：通知只觸發 `get_prepared_video` 唯讀核對，目前報告快照確認前不提供舊合併指令；較早發出的快照、已移除報告與讀取失敗都不會恢復舊報告的複製能力。明確提交摘要後也先讀回目前報告，不靠通知順序推定新版。這不重送摘要、分析或 Drive 上傳。UI URI 升為 `ui://video-timeline-pipeline/v20-<媒體網址 hash>.html`，保留 v18／v19 URI 相容。#58 仍需真實 Drive 同資料夾、ChatGPT 完成顯示與實際複製／合併驗收；離線回歸不替代這些條件。
+
+`ingest_video_segments` 的 `files` 使用既有 `openai/fileParams`，每筆必須有 `file_id` 與 HTTPS `download_url`，可附 `mime_type`／`file_name`。選用 `segment_ranges` 依檔案索引對應有限的 `start_seconds`／`end_seconds`，起點不小於零、終點大於起點；缺少範圍時不猜測。回傳只確認引用格式，沒有下載、寄送或付費分析，且不回傳暫時網址。模型仍須讀取實際內容，讀不到就停止，不能以 metadata 摘要代替。
+
+畫面補漏（#56／#105）逐次驗證回應時間碼，保留提示時段兩端的事件，並在合併後重新檢查每個間隔（含片頭、片尾及 chunk 接點）不超過 30 秒。片尾事件不能豁免較長的空檔；不可靠時間碼不能填補覆蓋。剩餘範圍記入 `unanswered_gap_windows`，保留已有畫面但整體標示未完成，不寫入可重用視覺快取，也不登記為完成通知。舊 gap receipt 需重算；這不保證模型的實際畫面／時間對齊，原始媒體驗收另列。
+
+### 來源檢查與下載錯誤
+
+來源可能不是公開影片或下載器可能不支援時，先呼叫 `probe_video_source(url)`，再決定是否呼叫 `prepare_video_for_chatgpt`。Probe 使用相同 URL 驗證、YouTube 代理設定，以及 Facebook／Instagram 公開抓取、Chrome impersonation 與既有 cookie 授權重試邏輯；Instagram 也沿用 `YTDLP_INSTAGRAM_USER_AGENT`。不建立工作或下載媒體，停用 yt-dlp 快取與附加檔案輸出，cookie 僅在記憶體中使用且不回寫。外部 JavaScript runtime、外掛或瀏覽器 cookie 擷取仍可能產生自己的檔案，目前沒有作業系統層級的唯讀檔案系統隔離。檢查預算最多 45 秒（`VIDEO_PROCESS_TIMEOUT_SECONDS` 較短時沿用較短時間）。
+
+成功回傳 `status=ok`、`title`、`duration_seconds`、`extractor`、`uploader`、`is_live`／`live_status`、`availability`、`webpage_url`、`selected_format` 與 `estimated_filesize_bytes`。格式沿用實際下載的 yt-dlp 選擇；分離影音的大小會合計，缺少大小資訊時回傳 `null`，不猜測。一般下載與 probe 保留使用者 yt-dlp 設定檔及外掛行為，例如 `~/.config/yt-dlp/config` 中的 `--js-runtimes deno`、格式與代理設定；明確傳入的命令列選項仍優先。Facebook／Instagram 延續既有專用路徑：停用主機設定檔及外掛，先公開檢查，再依各自的 `YTDLP_FACEBOOK_COOKIE_FILE`／`YTDLP_INSTAGRAM_COOKIE_FILE` 重試。**Metadata 成功不代表實際影音下載成功**，例如 YouTube 仍可能在下載影片資料時回傳 403。
+
+Probe 失敗（`status=error`）、同步準備失敗，以及 `get_video_job` 讀取的背景準備失敗，都提供 `error_code`、`retryable`、繁中 `user_message`／`next_steps` 與最多 500 字元的 `raw_error`。原有 `status`／`error` 保留；`retryable=true` 表示環境恢復或等待後可以重試，不會自動重送工作。模型應轉述 `user_message` 與 `next_steps`，不要自行推測原因。
+
+| error_code | 意義／建議處理 |
+| --- | --- |
+| `LOGIN_REQUIRED_OR_PRIVATE` | 可能非公開、需登入或頁面格式變更；以無痕視窗確認免登入播放，否則上傳 MP4。Facebook 的 `Cannot parse data` 歸此類，不能據此斷言一定是私人影片。 |
+| `BOT_CHECK` | 來源要求機器人驗證；檢查下載出口或上傳 MP4。 |
+| `PROXY_UNREACHABLE` | 代理連線失敗；請管理員確認代理主機及服務恢復後重試。 |
+| `FORBIDDEN_403` | 影片資料存取被拒絕；檢查下載器的存取要求，不能僅憑 403 斷言原因，YouTube 可能需要 GVS PO token。 |
+| `UNSUPPORTED_URL` | 下載器不支援；提供原始影片頁面或上傳 MP4。 |
+| `VIDEO_UNAVAILABLE` | 來源表示影片無法使用；確認公開可用性。 |
+| `AGE_RESTRICTED` | 年齡限制；確認使用權後上傳 MP4。 |
+| `GEO_BLOCKED` | 地區限制；確認來源的地區可用性。 |
+| `RATE_LIMITED` | 來源限制頻率；等待並降低頻率後重試。 |
+| `FILE_TOO_LARGE` | 超過大小上限；縮小影片或縮短片段。 |
+| `TIMEOUT` | 超過等待時間；稍後重試，持續發生時檢查來源連線。 |
+| `UNKNOWN` | 證據不足；保留原始錯誤供管理員檢查。 |
+
+不建議為了私人／登入限定影片將 cookies 新增到伺服器。上述檢查不呼叫 Bright Data／Apify 或其他計費服務。離線回歸：`python -m pytest -q tests/test_source_probe.py`。
 
 ### MCP 影音暫存保留 7 天（有 Drive 完整備份時改為分析後清理）
 
@@ -198,7 +282,7 @@ python scripts/migrate_drive_single_folder.py --jobs-root mcp_jobs --apply --tra
 
 **A1 主機（2 OCPU）實測**（25.5 分鐘 VP9 1080x1920 影片）：重新編碼（veryfast、crf 28）需約 14–15 分鐘；**stream copy（`-c copy -f segment -segment_time 120`）只要 1.1 秒**，13 段、邊界在 120 秒倍數，VP9 分段可正常產生預覽圖。若必須重新編碼：長邊縮到 1280 為 2.63 倍速、檔案小 39%（現行 1080p 為 1.82 倍速）；`ultrafast` 沒有更快且檔案大 3 倍。
 
-**注意**：copy 的分段維持原編碼（例如 VP9），部分瀏覽器與 iOS 無法播放；分段時間以 `segments.csv` 的實際值為準（copy 不能強制關鍵畫面，切點落在下一個關鍵畫面）。copy 與 transcode 都用 `-avoid_negative_ts disabled`，分段沿用來源時間軸、切點與播放時間軸一致，同樣以 `segments.csv` 的實際值為準。**需要到處都能播放的 H.264 分段：設 `MCP_SEGMENT_MODE=transcode`**。copy 模式不做續跑（重切只要幾秒；`-ss` 會對齊到關鍵畫面，偏移合併不可靠），遇到中斷殘留一律清空重切；transcode 模式保留中斷續切。模式或設定改變時，舊分段會全部重切（參數記在 `segments/.split-params.json`）。
+**注意**：copy 的分段維持原編碼（例如 VP9），部分瀏覽器與 iOS 無法播放；分段時間以 `segments.csv` 的實際值為準（copy 不能強制關鍵畫面，切點落在下一個關鍵畫面）。copy 與 transcode 都用 `-avoid_negative_ts disabled`，分段沿用來源時間軸、切點與播放時間軸一致，同樣以 `segments.csv` 的實際值為準。**需要到處都能播放的 H.264 分段：設 `MCP_SEGMENT_MODE=transcode`**。相同來源與設定的完整 copy 分段可直接重用；copy 模式不續切中斷片段（`-ss` 會對齊到關鍵畫面，偏移合併不可靠），未完成時清空重切。transcode 模式保留中斷續切。尾段覆蓋以影像串流長度驗證，較長的純音訊尾段不會使準備失敗；續切殘留的純音訊輸出會移除，含影像但時間清單損壞的檔案仍交由正常驗證。模式或設定改變時，舊分段會全部重切（參數記在 `segments/.split-params.json`）。
 
 容量保護是事前檢查：下載前預留來源上限，切割／分析前至少再預留一份來源大小與最低剩餘空間；轉碼大小不固定，這不是磁碟配額保證。準備、分析、Drive 上傳共用單程序工作鎖；忙碌時立即回傳可重試錯誤，不讓背景執行緒無限排隊。仍採同步處理；持久化長片佇列、Drive 配額管理、定期刪除未實作。沒有保留天數授權時不刪除任何既有影片。
 
@@ -279,9 +363,11 @@ python pipeline.py --facebook-author 'https://www.facebook.com/<PUBLIC_PAGE>/' -
 Apify Token 一律放在 `Authorization` header，不放 URL、輸出或 Git。Actor 只負責發現公開貼文，`captionText=false`，實際影音仍由 yt-dlp 下載並交給 Groq 轉錄、MiniMax 整理。官方目前的輸入 schema 明載此 Actor 只支援公開 Page、不支援 personal profile，因此個人帳號仍列為未保證支援；私人／登入限定內容不處理。`APIFY_FACEBOOK_RESULTS_LIMIT` 是 Actor 必填的單次結果預算，本工具取回資料集時會持續分頁、不另行截斷；Actor 的結果完整性仍受 Facebook 可見性與供應商能力限制。請參考 [Actor 輸入](https://apify.com/apify/facebook-posts-scraper/input-schema)、[API](https://apify.com/apify/facebook-posts-scraper/api) 與 [計價](https://apify.com/apify/facebook-posts-scraper/pricing)。
 
 排程刷新（沒加 `--allow-batch-cloud` 的 `--rss-refresh`）預設不跑任何付費盤點。`RSS_PAID_DISCOVERY` 以逗號列出排程可自行使用的供應商（`apify`、`brightdata`），例如 `RSS_PAID_DISCOVERY=brightdata` 即可讓 Facebook Bright Data 與 Instagram 作者訂閱自動刷新，不必在排程加 `--allow-batch-cloud`；`RSS_PAID_DISCOVERY=apify` 則只放行 Apify。每次 Apify run 仍以 `APIFY_MAX_TOTAL_CHARGE_USD` 封頂，供應商方案的每月上限才是最終上限。
+允許清單排除的付費訂閱記為 `skipped`，不呼叫供應商、不覆寫既有錯誤，也不使刷新失敗；已允許供應商的 API／網路錯誤仍記為失敗。
 `RSS_PAID_DISCOVERY_MIN_HOURS`（小時，預設 0＝不限）讓這類排程自行放行的付費盤點每個訂閱至少間隔指定時間：例如排程每天跑 3 次時設 `20`，正常排程下每個 Apify 粉專約每天盤點一次（這是最短間隔、不是日曆日：停機後補跑可能同一天兩次；也是每個訂閱各自計算，不是帳戶總額上限）；未到間隔的訂閱記為 `deferred`、不算失敗，免費的 RSS／YouTube 照常每次刷新。間隔從每次付費嘗試起算，且在送出前就先存檔（失敗或中途被中斷的 run 也可能已計費）；明確加 `--allow-batch-cloud` 不受限，但仍會重設起算時間。新增付費訂閱（`--facebook-author`／`--instagram-author` 含 OPML 匯入）的付費盤點同樣在送出前先寫入 `paid_discovery_at`，訂閱加入後的前一段時間排程刷新不會重複付費；未設定間隔或免費盤點不會多寫這個欄位。設定間隔時的新增若付費盤點失敗，訂閱仍會留在訂閱清單（間隔照樣起算），排程刷新會在間隔後自動重試。
 
 新增前會先驗證作者的期間、模式與結果預算；無效參數不會留下訂閱或冷卻時間。OPML 匯入的啟停狀態會在付費呼叫前存檔，盤點失敗也不會把停用訂閱改為啟用；保留的 Instagram 訂閱仍有作者 URL，可正常匯出 OPML。
+設定間隔後，手動新增 Facebook／Instagram 付費訂閱也會在初次盤點前保存訂閱與起算時間。初次盤點中斷時保留「尚未完成」狀態；稍後刷新既有訂閱即可，重新新增同一作者會被擋下。未設定間隔時不新增這個起算欄位。
 
 公開 Facebook Page 也可用 Bright Data，支援 Reels by profile URL（dataset `gd_lyclm3ey2q6rww027t`）與 Pages Posts by profile URL（dataset `gd_lkaxegm826bjpoo9m5`）兩種模式：
 
@@ -387,6 +473,75 @@ FB 回應的 `content` 是貼文文字；`attachments` 的照片與影片分開�
 貼文文字可交給 ChatGPT 整理；`image_urls`／`video_urls` 只是媒體參照，`media_analyzed=false`，不能宣稱已看過畫面。ChatGPT 可再將 `video_urls` 逐支交給既有 `prepare_video_for_chatgpt` → Groq／MiniMax 分析 → ChatGPT 整理，並保留原始貼文網址作為來源；這不是 `download_video` 裡的隱式付費 fallback。圖片尚未自動送入視覺模型，Drive 仍為選用儲存。
 
 不計費回歸：`python -m unittest discover -s tests -p test_social_post.py -v`。測試使用模擬供應商回應，不代表真實 Bright Data 採集、媒體下載或 ChatGPT 網頁端驗收已通過；部署新增工具後須重新整理 ChatGPT 外掛動作。
+
+### 下載解析度偏好（選用）
+
+`YTDLP_MAX_HEIGHT=720` 讓共用 yt-dlp 下載命令加上 `-S res:720`，各 extractor（含 YouTube、Facebook、Instagram）優先選擇不超過 720 的解析度；沒有符合格式時仍保留較高畫質的 fallback。這是格式偏好，**不是嚴格的輸出高度上限**，也不會重新編碼或影響既有下載快取。Threads 的原生下載路徑不使用 yt-dlp。未設定或留白維持原行為；設定值須為 1–4320 的正整數（至多 4 位 ASCII 數字），否則在使用下載功能時回報繁體中文錯誤，各 Python 版本驗證一致。排序語意見 [yt-dlp 格式排序](https://github.com/yt-dlp/yt-dlp#sorting-formats)。
+
+### 維運護欄（選用，未安裝／未啟用）
+
+`scripts/check_youtube_proxy.py` 透過 TCP 連線及 `CONNECT www.youtube.com:443` 檢查 HTTP／HTTPS proxy，連線與讀取各最多 3 秒、整體回應預算 8 秒。不下載媒體，也不代表完整 YouTube 播放驗收。設定來自環境或 repo `.env`，共用 `pipeline.load_dotenv`（非空的 `.env` 值優先）；不輸出 proxy 密碼。
+
+```bash
+.venv/bin/python scripts/check_youtube_proxy.py --dry-run
+.venv/bin/python scripts/check_youtube_proxy.py
+```
+
+退出碼：`0` 正常、`1` 異常、`2` 未設定 `YTDLP_YOUTUBE_PROXY`。`YOUTUBE_PROXY_HEALTH_FAILURES` 預設 `2`，連續失敗達門檻才通知一次，恢復時再通知一次；初始狀態視為正常，首次正常不通知，首次連續失敗也會告警。正常檢查會清零失敗次數。`YOUTUBE_PROXY_HEALTH_STATE` 可指定狀態檔，預設 `~/.local/state/video-timeline-pipeline/youtube-proxy.json`；相鄰 `operations.db` 保存通知 outbox 與成本紀錄，不使用正式資料庫。請以同一個 systemd service 序列執行，避免手動並行探測同一狀態檔。
+
+通知重用 `notifications.py` 的 provider、定向 claim、delivery audit 與成本防護。優先使用 `DISCORD_WEBHOOK_URL`／`NOTIFY_WEBHOOK_URL`／`RSS_NOTIFY_WEBHOOK`；否則需 `EMAIL_PROVIDER=smtp|resend`、`EMAIL_TO`、`EMAIL_FROM`，以及 `SMTP_HOST` 或 `RESEND_API_KEY`（其餘 SMTP 設定沿用既有機制）。缺設定或寄送失敗仍回傳健康退出碼；狀態檔的 `notification` 保存最近一次轉換的通知階段與結果，例外另記 `error_type` 並寫入 stderr，不輸出可能包含憑證的例外訊息。後續未轉換的檢查保留該紀錄。狀態先落盤再通知，未知寄送結果不自動重送；通知設定缺漏時該次轉換不會補寄。狀態檔父目錄會自動建立；狀態檔損壞／無法寫入會記錄錯誤，不自動重設或寄送。`--dry-run` 僅印出本次是否會通知，**不寫狀態、不寄送**；重複 dry-run 不累計失敗次數。
+
+`scripts/ytdlp_canary_update.sh` 在臨時 venv 安裝 PyPI 最新穩定版（`--nightly` 加 pip `--pre` 選取預發行版本），逐一執行 `--simulate`，不下載媒體。網址檔 `scripts/ytdlp-canary-urls.txt` 每行一筆、可用 `#` 註解；已放兩支公開 YouTube 測試影片，**必須先將 Facebook 佔位網址換成目前可公開播放的影片**，否則退出 `2`，不建立候選環境或升級。
+
+```bash
+bash scripts/ytdlp_canary_update.sh --dry-run
+bash scripts/ytdlp_canary_update.sh --venv /home/ubuntu/video-timeline-pipeline/.venv
+bash scripts/ytdlp_canary_update.sh --nightly --dry-run --urls /path/to/canaries.txt
+```
+
+`--venv`／`YTDLP_APP_VENV` 預設 repo 的 `.venv`；`--urls`／`YTDLP_CANARY_URLS` 預設上述網址檔。需要 Linux Bash、`flock`、venv／pip、網路及 app venv 內既有 yt-dlp 與專案相依套件。Canary 協調程式一律由 app venv 執行，僅 yt-dlp 子程序使用當次被測的候選／app interpreter。YouTube canary 共用 `.env` loader 與 `youtube_proxy_options()`；Facebook 使用 Chrome impersonation，所有 canary 都停用 cookies，因此請選公開影片，不會讀 `YTDLP_FACEBOOK_COOKIE_FILE`。可選解析度偏好也會套用。單支 canary 最多 120 秒，錯誤只印項目編號與退出碼，避免洩漏簽章網址或 proxy 憑證。
+
+候選全部通過後，先下載新舊 yt-dlp wheel 作離線回復，再**只替換 app venv 的 yt-dlp 套件**（不更新相依套件），然後用 app venv 重跑同一批 canary；失敗或一般中斷會離線回復原版本並核對版本。相依套件不相容也應使 app canary 失敗並回復；需更新相依套件時另行安排。`--dry-run` 仍建候選環境、跑 canary 並準備回復 wheel，但不寫 app venv。每次印更新前／候選／成功後或回復版本，臨時環境離開即清理；同一使用者的更新器透過 `flock` 避免並行。
+
+| 退出碼 | 意義 |
+| --- | --- |
+| `0` | 更新後 canary 通過，或 dry-run 通過 |
+| `1` | 建環境／pip／其他準備步驟失敗，或升級前收到 INT／TERM，尚未變更 app venv |
+| `2` | 參數／venv／網址設定錯誤，或已有更新器執行 |
+| `3` | 候選 canary 失敗，未變更 app venv |
+| `4` | 升級或 app canary 失敗／中斷，已回復並核對原版本 |
+| `5` | 回復失敗，需人工處理 |
+
+請在無下載工作的維護時段才執行正式升級；套件替換不是原子切換，鎖只保護更新器，**不會停止或重新啟動 `video-mcp.service`**。斷電／SIGKILL 無法執行回復。Metadata canary 通過不保證 GVS 實際媒體下載可用；本次交付未在伺服器執行更新或真實媒體驗收。
+
+systemd 範本在 `deploy/systemd/`：固定 `User=ubuntu`、工作目錄 `/home/ubuntu/video-timeline-pipeline`，proxy 每 10 分鐘檢查；更新器每天主機時間 04:20 執行，**預設為 `--dry-run`**，不追補停機期間的更新。以下是供管理者日後自行執行的命令，本次未執行：
+
+```bash
+sudo install -m 0644 deploy/systemd/video-youtube-proxy-check.{service,timer} /etc/systemd/system/
+sudo install -m 0644 deploy/systemd/video-ytdlp-canary-update.{service,timer} /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now video-youtube-proxy-check.timer video-ytdlp-canary-update.timer
+systemctl list-timers 'video-*'
+journalctl -u video-youtube-proxy-check.service -u video-ytdlp-canary-update.service
+# 停用後不再觸發；已執行中的更新請等候完成與回復。
+sudo systemctl disable --now video-youtube-proxy-check.timer video-ytdlp-canary-update.timer
+```
+
+正式自動更新需管理者在 `sudo systemctl edit video-ytdlp-canary-update.service` 明確覆寫（先驗證 canary 網址與維護時段），保存後 `sudo systemctl daemon-reload`：
+
+```ini
+[Service]
+ExecStart=
+ExecStart=/bin/bash scripts/ytdlp_canary_update.sh
+```
+
+### YouTube PO Token（選用）
+
+YouTube 的部分 client 要求 GVS（Google Video Server）媒體請求附上 PO Token；使用登入 cookies 後選到需要 token 的 client／格式時，缺少或失效的 GVS token 可能使實際下載回 `403`。cookies 本身不等於 PO Token，也不是每個 `403` 都由它引起。詳見 [yt-dlp PO Token Guide](https://github.com/yt-dlp/yt-dlp/wiki/PO-Token-Guide)。目前部署方式以 `YTDLP_YOUTUBE_PROXY` 走家用網路，避免加入 YouTube 登入 cookies；本次不改變此設定。
+
+確有需求時，可自行評估 [bgutil-ytdlp-pot-provider](https://github.com/Brainicism/bgutil-ytdlp-pot-provider)：依上游文件選擇本機 HTTP provider（Docker 或 Node.js／Deno）或按需產生腳本，安裝與 provider 版本相符的 yt-dlp plugin 至同一個 app venv，確認 yt-dlp 能連到 provider，並依上游建議選用需要的 YouTube client。不要把 provider 暴露到公網，也不要把 cookies／token 寫入 Git。這裡僅提供操作方向，沒有安裝 plugin、啟動 provider 或加入 cookies。
+
+驗證時用同一個 app venv 執行 `yt-dlp -v --simulate <公開YouTube網址>`（例如 `.venv/bin/python -m yt_dlp -v --simulate ...`），並明確帶入既有 proxy；yt-dlp CLI 本身不會載入 repo `.env`。檢查 verbose 輸出中的已載入 PO Token provider（如 `bgutil`／`bgutil:http`）及 token 取得訊息，再由管理者另行測試實際媒體下載；僅看到 plugin 檔名不等於已取得有效 token。輸出可能含敏感資訊，分享前請遮蔽。Provider 並不保證排除所有 `403` 或 bot 檢查；細節以所連結上游版本文件為準。
 
 ### Instagram 下載與診斷
 
@@ -535,6 +690,7 @@ python pipeline.py --url '...' --transcribe-backend local --whisper-model small
 turbo 不只聽錯關鍵字，還把 "in front of" 縮成 "one of"，整句語意都變了。慢一倍換全對，對「處理一次、往後反覆查詢」的知識庫划算，所以預設用非 turbo 版。
 
 切段邊界漏轉會自動補轉（issue #55）：Groq 轉錄合併後若出現超過 5 秒的內部斷層（片頭片尾除外），會對斷層前後各取 15 秒上下文補轉一次再合併；補轉結果同樣走快取，重跑不再付費。逐字稿內的 `gap_check.remaining` 即為驗收狀態（空陣列＝無斷層）。單次最多補 8 個斷層（先補最大的）。單一斷層補轉失敗不丟整份逐字稿，只記在 `backfill_errors`；預算／取消／超時照常中斷。
+補轉回應必須有合法的 start/end 才能縮小缺口；只有文字或缺少時間欄位時保留未補狀態，不替模型捏造覆蓋整段的時間。
 
 預設跑 CPU。`device="cuda"` 在建構時不會報錯，缺 `cublas64_12.dll` 要等真的開始轉錄才炸，那時音訊已經切完、時間也花掉了——所以要用 GPU 得明確設 `WHISPER_DEVICE=cuda`（另需 CUDA runtime 與 cuDNN）。
 
@@ -604,7 +760,7 @@ python pipeline.py --search '時間軸合併'
 python pipeline.py --search 'ffmpeg' --search-limit 50
 ```
 
-搜尋涵蓋影片標題、逐字稿、畫面觀察與摘要，結果附時間戳與來源 URL。索引用 `trigram` 斷詞：`unicode61` 會把整句中文吃成單一 token，中文查詢一律落空。
+搜尋涵蓋影片標題、逐字稿、畫面觀察與摘要，結果附來源 URL 與可核對的時間。標題／整份摘要是 `source_level`，時間為 null；不提供假的 00:00 跳轉。每次來源出現都有穩定的 `occurrence_id`，同文在不同時間仍保留兩筆，向量則可共用。索引用 `trigram` 斷詞：`unicode61` 會把整句中文吃成單一 token，中文查詢一律落空。
 
 `trigram` 的索引窗口是 3 字元，`AI`、`影片` 這類兩字詞 `MATCH` 必定落空，因此短於 3 字元的查詢會自動回退全表掃描（輸出會標示模式），並依「標題 → 摘要 → 逐字稿／畫面」與命中次數排序。實測 5 萬筆片段約 80 ms、線性成長，沒有效能疑慮：
 
@@ -613,24 +769,34 @@ python pipeline.py --search 'AI'      # 命中 N 筆（全表掃描：查詢短�
 python pipeline.py --search '時間軸'   # 命中 N 筆（索引）
 ```
 
-`library.db` 可直接用任何 SQLite 工具開；`videos` 表一支影片一列，`events` 表是全文索引。
+`library.db` 可直接用任何 SQLite 工具開；`videos` 表一支影片一列，`events` 表是全文索引。查詢、列表與 audit 使用唯讀連線；舊索引只抑制未遷移的視覺事件，請明確執行 `--index` 做本機遷移，不會呼叫 embedding API。
+
+Search 與 Ask 共用 metadata filters；類別是 JSON 完整成員比對。日期預設 `published_at`，也可選 `first_completed_at`／`indexed_at`；`--until YYYY-MM-DD` 包含該 UTC 日。日期未知預設排除，回傳 `unknown_date_count`；明確加 `--include-unknown-dates` 才納入。作者、發布日只從現有 manifest／來源資訊回填，完成日期從既有 manifest、RSS 或完成事件取最早可核對紀錄，全部保留 provenance。
+
+```powershell
+python pipeline.py --search 'AI' --category '資安' --since 2026-09-01 --until 2026-09-30 --json
+python pipeline.py --search '密碼' --author '作者名稱' --platform Youtube --kind speech --search-limit 20
+python pipeline.py --ask '有哪些相關片段？' --job JOB_ID --date-field first_completed_at --until 2026-09-30 --json
+```
 
 ## 問答與總覽
 
-兩者都需要 `MINIMAX_SUBSCRIPTION_KEY`，不需要額外服務。
+雲端回答與總覽需要 `MINIMAX_SUBSCRIPTION_KEY`，不需要額外服務。`--ask --local-only`／`--dry-run` 只讀取本機證據並回傳 `insufficient_evidence`，不要求模型設定，也不呼叫供應商。
 
 ```powershell
 python pipeline.py --ask '這些影片有提過怎麼設定 ffmpeg 嗎？'
 python pipeline.py --digest
 ```
 
-`--ask` 先讓模型把問句拆成檢索詞（整句丟進 FTS5 是 phrase 比對，長問句必定 0 筆），再用檢索到的片段生成答案，並標註 `[1]`、`[2]` 對應到影片標題與時間戳。提示詞限定只能引用片段內容，資訊不足時會直說找不到，不會臆造。
+`--ask` 先讓模型把問句拆成檢索詞，再以輪流取樣保留跨影片證據。內部回答為 `claims`＋`evidence_ids`＋完整原文 `quotes`＋`support_kind`；程式回查目前來源位置、文字、時間與 revision，並產生片名、URL 及 `[1]` 引用。驗證採保守的完整摘錄契約，任意改寫不會被當成已支持；無證據、捏造 ID、刪除否定詞或摘要冒充講者時回傳 `insufficient_evidence`。這是來源核對，不能證明影片說法符合現況；人類輸出會區分講者說法、跨片綜合、模型推論與需外部查證。
+
+上下文保留完整片段，以 UTF-8 bytes 作保守 token 上界，計入問題、指令、metadata 與輸出預留。`--context-tokens 12000 --output-reserve 2048` 可調整；單片問題沒有固定三段上限，省略原因列於 JSON 的 `context.omitted`。來源中的字幕、OCR 與命令視為不可信資料，回答不會執行其動作，也不會無聲再呼叫模型修復答案。
 
 不可靠的畫面時間碼（含未驗證的舊 MP4 觀察）仍可搜尋，但 `--search`／`--ask` 引用顯示「時間碼不可靠」且不提供跳轉；`--show` 與重新產生的知識檔章節／待查證資訊也會抑制落在不可靠整數秒的連結，同秒有可靠事件時保留連結。更新後請先執行 `--index` 重建本機索引。
 
 `--digest` 把各支影片的摘要合成 `digest.md`：主題分群、跨影片反覆出現的術語、建議觀看順序、涵蓋落差。只吃跑過完整流程的 job，`--local-only`／`--dry-run` 的 job 沒有真摘要會被跳過。
 
-> 呼叫 MiniMax 一律不設 `max_tokens`。MiniMax-M3 是 reasoning 模型，`<think>` 會先吃掉配額，設了上限常常在真正的答案輸出前就用完，回傳半截 JSON。
+> Ask 將 `--output-reserve` 同時傳為 `max_completion_tokens`，成本守衛也計入該輸出預留。若 reasoning 用完額度而使輸出截斷，該次明確失敗，不自動付費重試；需要時由使用者調高預留及總 context budget。
 
 ## 語意檢索
 
@@ -646,21 +812,31 @@ python pipeline.py --ask '他對長鼻子有什麼評論？' --semantic
 
 | 後端 | 預設模型 | 需要 | 成本 |
 |---|---|---|---|
-| `openrouter`（預設） | `nvidia/nemotron-3-embed-1b:free`（2048 維） | `OPENROUTER_API_KEY` | **0**（實測 `cost=0`） |
-| `local` | `BAAI/bge-m3`（1024 維） | `sentence-transformers` + `torch` | **0**，且離線、內容不外傳 |
+| `openrouter`（預設） | `nvidia/nemotron-3-embed-1b:free` | `OPENROUTER_API_KEY` | 依目前帳戶與供應商費率；歷史免費測試不保證現在可用 |
+| `local` | `BAAI/bge-m3` | 已快取模型、`sentence-transformers` + `torch` | 本機運算，內容不外傳 |
 
 ```powershell
-python pipeline.py --embed                        # 免費雲端
+python pipeline.py --embed-plan --json           # 唯讀計畫，不呼叫模型
+python pipeline.py --embed                        # 明確執行缺少的雲端嵌入
 python pipeline.py --embed --embed-backend local  # 本機
 ```
 
-其他可用模型：`baai/bge-m3`、`qwen/qwen3-embedding-8b`（皆 US$0.01/M）、`nvidia/llama-nemotron-embed-vl-1b-v2:free`。
+OpenRouter 已有 [embeddings 官方契約](https://openrouter.ai/docs/api_reference/embeddings) 與 [rerank 官方契約](https://openrouter.ai/docs/api/api-reference/rerank/submit-a-rerank-request)。實作驗證回傳數量、input index、維度、有限數值與非零向量，拒絕缺漏或錯序配對；模型的帳戶可用性與價格仍需獨立 canary，這次離線驗收沒有呼叫真實 provider。
 
-OpenRouter 的 `/embeddings` 與 `/rerank` 端點在模型清單裡查不到、官方文件也沒寫，但實測可用。要注意 chat 的 `:free` 清單與 embedding 的模型池是分開的：chat 那些 id 打 embeddings 會回 `does not exist`；而 NVIDIA 那幾顆**必須加 `:free` 後綴**才有 provider，不加會回 `No endpoints found`。
+本機模型須由使用者事先安裝及快取；普通檢索使用 `local_files_only=True`，不自動下載。ML 依賴延遲載入，最多保留一個常駐模型，每批最多 256 段。
 
-本機後端首次使用要下載約 2.2 GB 模型。CPU 實測約 94 筆/秒；裝的若是 `torch+cpu` 就吃不到 GPU，要 GPU 得另外裝 CUDA 版。
+向量契約包含 backend、model、`--embed-revision`、維度及前處理版本；相同完整文字＋契約共用快取，重建 FTS／搬移資料庫不要求重算。新契約先建立 shadow，所有批次通過才啟用，失敗保留舊契約。`--embed-plan` 列出 chunks、可重用及待嵌入數量；必須單獨執行，不能混入寄送或其他寫入命令。`--audit` 顯示 active／shadow 的覆蓋、stale、invalid。
 
-`--embed` 只補算「這個模型還沒算過」的片段：重跑不重複付費，換模型則自動重算。`vectors` 表記錄了模型名稱，查詢時只用相符的向量——混用不同模型的向量算出來的相似度沒有意義。
+舊 `vectors` 表保留原樣，因缺少 provider／revision，不能只憑 model 名稱自動認定相容。確認契約後可先執行 `--adopt-legacy-embeddings --embed-backend local --embed-model MODEL` 本機驗證映射，再看 `--embed-plan`；`requires_embedding=0` 時 `--embed` 只驗證並啟用，不送出請求。
+
+Hybrid 為明確 opt-in：metadata eligible-set → FTS／vector 各取最多 1000 候選 → occurrence 去重 → RRF（k=60，ID 作 tie-break）→ 可選 rerank。保留 `--semantic` 單一路徑；向量掃描使用游標與有界 Top-K。缺能力時可見地降為 FTS；`--search-strict` 改為失敗，預算拒絕一律向上回報。`--explain-ranking` 只呈現本次排名，不另發起 rerank；semantic／hybrid 本身仍會做一次 query embedding。
+
+```powershell
+python pipeline.py --search '厚皮動物' --hybrid --explain-ranking --json
+python pipeline.py --ask '有哪些比較？' --hybrid --search-strict --ask-limit 12 --json
+```
+
+Rerank 預設關閉，只有明確提供 `--rerank-model MODEL` 才啟用 OpenRouter 請求，禁止 provider fallback，走既有成本守衛；沒有做帳戶授權 canary。`--local-only`／`--dry-run` 禁止 query embedding／rerank，保留 FTS 與可見的降級資訊。JSON 模式只允許一個查詢目標。
 
 ### 為什麼不直接嵌入截圖
 
@@ -687,9 +863,9 @@ OpenRouter 的 `/embeddings` 與 `/rerank` 端點在模型清單裡查不到、�
 
 寫死絕對門檻必定誤殺其中一種，所以預設取「最高分的一半」再加一個很低的地板（`SIMILARITY_FLOOR`）。要固定值就用 `--min-similarity`。
 
-輸出會標示相似度分數，低於 `0.35` 的視為不相關直接濾掉（`pipeline.py` 的 `MIN_SIMILARITY`）—— 少了下限，每次查詢都會回傳整個索引，末幾筆只是「最不像的那些」而不是命中。
+預設 cutoff 是 `max(0.10, top_score * 0.5)`；cosine 與 RRF 都只是排名／檢索參數，不能解讀為真實性信心百分比。
 
-`--ask --semantic` 會直接拿問句比對語意，跳過「先抽關鍵詞」那一步：少一次 API 呼叫，命中也更準。
+`--ask --semantic`／`--hybrid` 直接使用問句查向量，跳過抽關鍵詞呼叫。25 題固定離線回播、baseline 比較、驗收對照與限制見 [Issue #5 驗收紀錄](docs/issue-5-retrieval.md)；假向量結果不代表真實語意模型的準確率或效能。
 
 ## Open Notebook 知識庫
 
@@ -735,6 +911,22 @@ OPEN_NOTEBOOK_PASSWORD=不要提交到版本控制
 
 兩個前提：`manifest.json` 不能刪（那是唯一的對應記錄），以及若你在 Open Notebook 介面手動刪過該條目，這次同步會刪不到（404 會被忽略）而新增一份。手動刪掉的孤兒條目只能自己在介面清。
 
+## 共用操作帳本與路線圖（#7）
+
+`operations.py` 統一管理 `operations.db` 的版本化 migration、通知、成本與評分資料表；原有資料原地升級，不依附可重建的 `library.db`。每個資料集保存一個 `library_id` UUID，搬移完整資料根目錄時保留；新的空資料集會取得另一個 ID。請勿同時在備份副本啟動寄送 worker。
+
+CLI 的完整分析通過本機產物檢查後，以分析內容、來源 SHA-256 與模型版本產生 `analysis_revision`，並在同一 SQLite 交易寫入 `processed_revisions` 與完成事件。分類、索引時間、執行時間、快取命中數與絕對媒體路徑不會產生新版本；相同內容重跑保留首次資格時間。實際內容或模型版本改變才產生新版本。`dry-run`、`local-only`、不完整或缺漏產物不登記完成、不從完成 hook 寄送。
+
+```bash
+python pipeline.py --root /path/to/library --ops-reconcile
+```
+
+這是明確寫入本機帳本的補登命令，只掃描 `jobs/*/manifest.json`，不重跑分析、不呼叫供應商、不寄送。舊內容的首次完成時間未知時維持 `NULL`，標為 `backfill`，預設不進日／週 Digest；不以 manifest 的 `created_at` 或檔案時間假造完成時間。已有登記的相同版本保持不變。這個命令優先於其他功能命令（`--self-test` 除外），建議單獨執行。
+
+成本／預算／供應商／失敗清單與評分解釋／報告改用 SQLite `mode=ro`：缺少帳本回 `{"status":"unavailable"}`，舊版或不相容 schema 回 `{"status":"migration_required"}`，不在查詢時建立或升級 DB。資料可讀時維持既有輸出格式；首次有明確寫入操作時才套用 migration。Digest 依實際內容版本核對帳本資格；尚無帳本的舊資料只保留明確 `eligible_at` 相容入口，沒有資格時間就跳過。
+
+檔案、兩個 DB 與 RSS JSON 沒有共同交易；manifest 的身分欄位只是投影，補登與 Digest 仍以帳本及現有產物為準。備份／回復停寄、部署副本鎖、通知送出前 attempt 落盤及未知請求人工對帳仍是待完成的 release gates。完整交付順序、驗收對照與尚未實作項目見 [路線圖](docs/ROADMAP.md)。
+
 ## 成本守衛（#4）
 
 下列已啟用的傳輸入口經過同一道守衛：送出前先在 `operations.db` 原子預留金額，送出後入帳；結果不明時保留預留。CLI、背景排程與 MCP 綁定同一個成本帳本。部分 HTTP helper 的內建重試目前仍合併記在一次邏輯呼叫內，尚未逐次入帳；這些缺乏可驗證費用上限的操作在 strict 模式會拒絕送出。
@@ -746,7 +938,7 @@ OPEN_NOTEBOOK_PASSWORD=不要提交到版本控制
 | Groq | `audio.transcriptions` | 每個音訊片段送出前（命中本機快取時不預留、不產生新費用） |
 | MiniMax | `chat.completions`（整支影片畫面分析）、`summarize.*`、`query.keywords`、`query.answer`、`digest.report`、`library.classify` | 每次送出前，同一則 `finish_reason` 重試會各自入帳 |
 | MiniMax | `files.upload` | 每次 upload attempt 送出前；bytes 是請求單位，未知價格記為 unknown，strict 模式拒絕送出 |
-| OpenRouter | `embeddings` | 每個 batch 送出前（向量已存在時不送出、不預留） |
+| OpenRouter | `embeddings.document`、`embeddings.query`、`query.rerank` | 每個文件 batch／query／明確 rerank 送出前（文件快取命中時不送出、不預留） |
 | Meta Graph | `graph.query` | 每次分頁請求 |
 | Apify | `actor.run.start` | 只送出一次啟動 POST，不自動重試；金額以供應商端 `APIFY_MAX_TOTAL_CHARGE_USD` 封頂。timeout／5xx 保留未確認預留；後續 poll／dataset 讀取屬同一筆遠端工作，不重複計完整 Actor 費用 |
 | Bright Data | `datasets.trigger` | 寫入 `.submitted` 回執前；被拒絕時不會留下「送出狀態不明」的標記 |

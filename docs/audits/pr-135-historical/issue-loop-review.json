@@ -1,0 +1,26 @@
+{
+  "pr": 135,
+  "head": "f8b91f4157308d78792c409930c8ebeee77e4773",
+  "findings": [
+    {
+      "severity": "med",
+      "file": "pipeline.py",
+      "line": 6955,
+      "issue": "The new pre-save runs before local discovery-option validation in both add functions. Invalid or missing Bright Data max_items, invalid since, or incompatible Facebook modes leave an unusable subscription and cooldown on disk before any provider call. A corrected add is then rejected as already subscribed. Validate these persisted author options before saving, reusing the fetch validators."
+    },
+    {
+      "severity": "med",
+      "file": "pipeline.py",
+      "line": 7034,
+      "issue": "Both paid add paths pre-save enabled=True, while import_rss_opml applies vidbeeEnabled=false only after a successful return. Failed or interrupted discovery therefore retains a disabled OPML author as enabled, allowing later scheduled paid refreshes. Pass the imported enabled flag into the initial subscription save."
+    },
+    {
+      "severity": "med",
+      "file": "pipeline.py",
+      "line": 7018,
+      "issue": "The new retained Instagram subscription has an empty url until discovery succeeds. On a provider failure, export_rss_opml emits xmlUrl='', and import_rss_opml silently skips that outline, losing the retained subscription on export/import. Initialize its canonical author URL before dispatch."
+    }
+  ],
+  "fixed": true,
+  "summary": "Fixed three retained-subscription regressions: invalid author options persisted before validation, disabled OPML imports becoming enabled on provider failure, and retained Instagram subscriptions exporting with an empty URL. Red regressions reproduced all three on f8b91f4; direct Git Bash checks passed 932 Python tests (34 skipped), 109 widget scenarios, 30 Windows-sync checks, and self-test. scripts/check_offline.py produced two WinError 87 subprocess errors; the same complete suites passed when invoked directly."
+}

@@ -12,6 +12,7 @@ import os
 import re
 import shutil
 import socket
+import tempfile
 import threading
 import time
 import atexit
@@ -25,11 +26,11 @@ import drive_storage
 import analysis_report
 from job_queue import JobQueue, JobBusyError, report_progress, TERMINAL, validate_parent_writer_lease
 from media_lifecycle import StoragePolicy, MediaSigner
-from execution_control import DeadlineExceeded, ExecutionCancelled
+from execution_control import DeadlineExceeded, ExecutionCancelled, OperationBudget
 from mcp import types
 from mcp.server.fastmcp import FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 from starlette.requests import Request
 from starlette.responses import FileResponse, JSONResponse, PlainTextResponse
 
@@ -66,7 +67,7 @@ MCP_PUBLIC_BASE_URL = (
 MCP_MEDIA_BASE_URL = (
     os.getenv("MCP_MEDIA_BASE_URL", "") or MCP_PUBLIC_BASE_URL
 ).rstrip("/")
-WIDGET_VERSION = 17
+WIDGET_VERSION = 20
 
 
 def ui_uri(version: int) -> str:
@@ -234,16 +235,36 @@ class OpenAIFileReference(BaseModel):
     file_name: str = ""
 
 
+class VideoSegmentRange(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    start_seconds: float = Field(ge=0, allow_inf_nan=False, strict=True)
+    end_seconds: float = Field(gt=0, allow_inf_nan=False, strict=True)
+
+    @model_validator(mode="after")
+    def ordered(self) -> VideoSegmentRange:
+        if self.end_seconds <= self.start_seconds:
+            raise ValueError("end_seconds 必須大於 start_seconds。")
+        return self
+
+
 class VerifiedFileSummary(BaseModel):
     file_id: str
     mime_type: str | None = None
     file_name: str | None = None
+    start_seconds: float | None = None
+    end_seconds: float | None = None
 
 
 class FileHandoffResult(BaseModel):
     status: Literal["files_received"]
     files_received: int
     files: list[VerifiedFileSummary]
+    limitation: str = (
+        "僅確認收到 file_id 與 HTTPS download_url；模型是否可讀取影格或 MP4 尚未驗證。"
+        "時間範圍由呼叫端提供，未核對媒體。請先讀取實際檔案，再依可驗證畫面／影音分析；"
+        "若宿主不支援或讀取失敗，必須明確回報並停止，不得只依 metadata 產生影片摘要。"
+    )
 
 
 class AnalysisQuality(BaseModel):
@@ -296,7 +317,7 @@ class PreparedVideoSegment(BaseModel):
 
 
 class PreparedVideoResult(BaseModel):
-    status: Literal["ready", "error", "queued", "running", "failed", "cancelled", "expired", "interrupted"]
+    status: Literal["ready", "busy", "error", "queued", "running", "failed", "cancelled", "expired", "interrupted"]
     operation_id: str | None = None
     operation: str | None = None
     progress: dict[str, Any] | None = None
@@ -308,6 +329,11 @@ class PreparedVideoResult(BaseModel):
     segment_seconds: int | None = None
     segments: list[PreparedVideoSegment] | None = None
     error: str | None = None
+    error_code: str | None = None
+    retryable: bool | None = None
+    user_message: str | None = None
+    next_steps: list[str] | None = None
+    raw_error: str | None = None
 
 
 class DriveFileResult(BaseModel):
@@ -349,7 +375,10 @@ def normalize_file_references(files: list[dict]) -> list[dict]:
         if file_id in seen_ids:
             raise ValueError(f"files[{index}].file_id 重複。")
         download_url = str(item.get("download_url") or "").strip()
-        parsed = urlsplit(download_url)
+        try:
+            parsed = urlsplit(download_url)
+        except ValueError:
+            raise ValueError(f"files[{index}].download_url 必須是有效的 HTTPS 網址。") from None
         if parsed.scheme.lower() != "https" or not parsed.netloc:
             raise ValueError(f"files[{index}].download_url 必須是 HTTPS URL。")
         if parsed.username or parsed.password:
@@ -364,6 +393,70 @@ def normalize_file_references(files: list[dict]) -> list[dict]:
             }
         )
     return normalized
+
+
+def validate_upload_url(url: str) -> str:
+    try:
+        parsed = urlsplit(url)
+        port = parsed.port
+    except ValueError:
+        raise ValueError("上傳檔案下載網址格式無效；請使用 HTTPS／443。") from None
+    if parsed.scheme.lower() != "https" or not parsed.hostname:
+        raise ValueError("上傳檔案下載網址必須是 HTTPS URL。")
+    if parsed.username or parsed.password or port not in (None, 443):
+        raise ValueError("上傳檔案下載網址不可包含帳號、密碼或非 HTTPS 連接埠。")
+    allowed = {host.strip().lower() for host in
+               os.getenv("UPLOAD_ALLOWED_HOSTS", "files.oaiusercontent.com").split(",") if host.strip()}
+    if parsed.hostname.lower() not in allowed:
+        raise ValueError("上傳檔案下載主機不在 UPLOAD_ALLOWED_HOSTS 允許清單內。")
+    return url
+
+
+def download_uploaded_video(url: str, target: Path) -> str:
+    """Stream a signed file URL without ambient credentials or redirect cookies."""
+    budget = OperationBudget("上傳影片下載", 900, "VIDEO_API_TIMEOUT_SECONDS")
+    digest = hashlib.sha256()
+    size = 0
+    try:
+        with requests.Session() as session:
+            session.trust_env = False  # Disable .netrc credentials and environment proxies.
+            for _ in range(6):
+                url = validate_upload_url(url)
+                session.cookies.clear()
+                with session.get(url, stream=True, allow_redirects=False,
+                                 timeout=(budget.remaining(10), budget.remaining(30))) as response:
+                    if response.status_code in (301, 302, 303, 307, 308):
+                        location = response.headers.get("Location")
+                        if not location:
+                            raise ValueError("上傳檔案重新導向缺少目的網址。")
+                        url = validate_upload_url(urljoin(url, location))
+                        continue
+                    if response.status_code != 200:
+                        raise RuntimeError(f"上傳檔案下載失敗：HTTP {response.status_code}。")
+                    declared_size = response.headers.get("Content-Length")
+                    try:
+                        declared_size = int(declared_size) if declared_size is not None else None
+                    except ValueError:
+                        raise ValueError("上傳檔案回應的 Content-Length 無效。") from None
+                    if declared_size is not None and declared_size < 0:
+                        raise ValueError("上傳檔案回應的 Content-Length 無效。")
+                    if declared_size is not None and declared_size > MCP_MAX_SOURCE_BYTES:
+                        raise ValueError("上傳影片超過 MCP_MAX_SOURCE_MB 大小上限。")
+                    with target.open("xb") as output:
+                        for chunk in response.iter_content(chunk_size=64 * 1024):
+                            budget.check()
+                            size += len(chunk)
+                            if size > MCP_MAX_SOURCE_BYTES:
+                                raise ValueError("上傳影片超過 MCP_MAX_SOURCE_MB 大小上限。")
+                            output.write(chunk)
+                            digest.update(chunk)
+                    if not size:
+                        raise ValueError("上傳影片檔案是空的。")
+                    return digest.hexdigest()
+        raise ValueError("上傳檔案重新導向次數超過上限。")
+    except requests.RequestException:
+        # Request errors can contain the complete signed URL; never expose it.
+        raise RuntimeError("上傳檔案下載失敗或逾時；請重新上傳影片後再試。") from None
 
 
 def address_is_public(address: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
@@ -896,6 +989,33 @@ def _count_segment_list_rows(path: Path) -> int:
     return sum(1 for row in _read_segment_csv(path) if len(row) >= 3)
 
 
+def _remove_nonvisual_tail(segment_dir: Path, list_path: Path) -> None:
+    """Discard only trailing muxer outputs that contain no usable visual interval."""
+    rows = _read_segment_csv(list_path)
+    changed = False
+    while rows:
+        row = rows[-1]
+        if len(row) != 3 or not re.fullmatch(r"segment_\d{3,}\.mp4", row[0]):
+            break
+        path = segment_dir / row[0]
+        try:
+            probe = pipeline.probe_video(path, segment_dir / ".tail-probe.json")
+            invalid = not any(s.get("codec_type") == "video" for s in probe.get("streams", []))
+        except (DeadlineExceeded, ExecutionCancelled):
+            raise
+        except (RuntimeError, OSError, ValueError):
+            break  # Unreadable/corrupt video is still a validation error.
+        if not invalid:
+            # A broken CSV interval is not evidence that real frames can be
+            # discarded. Leave visual media for normal validation/rebuilding.
+            break
+        path.unlink(missing_ok=True)
+        rows.pop()
+        changed = True
+    if changed:
+        pipeline.write_text(list_path, "".join(",".join(row) + "\n" for row in rows))
+
+
 def _completed_segment_rows(
     segment_dir: Path, rows: list[list[str]], first_index: int = 0,
     min_start: float = 0.0, max_start: float = 1.0
@@ -1029,14 +1149,20 @@ def split_video(video_path: Path, segment_dir: Path, segment_seconds: int,
     preset = split_x264_preset()
     settings = {"max_long_side": long_side, "x264_preset": preset}
     segment_dir.mkdir(parents=True, exist_ok=True)
-    if duration is None:
-        # 呼叫端沒給長度時自行 probe；probe 失敗退回「無法判斷是否全部完成」的原行為。
-        try:
-            duration = pipeline.video_duration(pipeline.probe_video(video_path))
-        except (DeadlineExceeded, ExecutionCancelled):
-            raise
-        except Exception:
-            duration = None
+    try:
+        probe = pipeline.probe_video(video_path, segment_dir / ".source-probe.json" if duration is not None else None)
+        # Container duration can include an audio-only tail. Split coverage is
+        # about frames, so validate against the selected visual stream's end.
+        visual = next((s for s in probe.get("streams", []) if s.get("codec_type") == "video"), {})
+        visual_duration = float(visual.get("duration") or 0)
+        if math.isfinite(visual_duration) and visual_duration > 0:
+            duration = visual_duration
+        elif duration is None:
+            duration = pipeline.video_duration(probe)
+    except (DeadlineExceeded, ExecutionCancelled):
+        raise
+    except (RuntimeError, ValueError):
+        pass  # Preserve the caller's known duration if stream probing is unavailable.
     if mode == "transcode":
         return _split_with_encoder(video_path, segment_dir, segment_seconds, duration,
                                    split_encoder_args(), "transcode",
@@ -1070,6 +1196,16 @@ def _split_with_encoder(video_path: Path, segment_dir: Path, segment_seconds: in
         saved = json.loads(marker_path.read_text(encoding="utf-8"))
     except (OSError, ValueError):
         saved = None
+    if saved == params:
+        _remove_nonvisual_tail(segment_dir, list_path)
+        _remove_nonvisual_tail(segment_dir, resume_path)
+        if not resume and duration is not None and math.isfinite(duration) and duration > 0:
+            try:
+                # A complete copy can be reused; an incomplete copy still
+                # starts from zero because keyframe seeks cannot be resumed.
+                return _validated_segments(segment_dir, duration, SPLIT_TAIL_TOLERANCE_COPY)
+            except (RuntimeError, OSError, ValueError):
+                pass
     completed: list[tuple[str, float, float]] = []
     if resume and saved == params:
         # 參數一致：以 segments.csv 為準保留已完成分段，上次續切留下的暫存清單先救回，
@@ -1181,6 +1317,7 @@ def _split_with_encoder(video_path: Path, segment_dir: Path, segment_seconds: in
             _write_segment_csv(list_path, completed)
             resume_path.unlink(missing_ok=True)
     try:
+        _remove_nonvisual_tail(segment_dir, list_path)
         if mode == "copy":
             _clamp_copy_first_segment_start(segment_dir)
         result = _validated_segments(segment_dir, duration, tail_tolerance)
@@ -1271,6 +1408,76 @@ def prepare_video_sync(url: str, segment_seconds: int, max_segments: int | None)
             max_filesize=MCP_MAX_SOURCE_BYTES,
             max_duration=(segment_seconds * max_segments if max_segments is not None else None),
         )
+    return prepare_local_video(video_path, job_dir, job_id, source_url, segment_seconds, max_segments)
+
+
+def prepare_uploaded_video_sync(file: dict, segment_seconds: int, max_segments: int | None) -> dict:
+    reference = normalize_file_references([OpenAIFileReference.model_validate(file).model_dump()])[0]
+    validate_upload_url(reference["download_url"])
+    segment_bounds(1, segment_seconds, max_segments)
+    if MCP_MAX_SEGMENTS > 0 and max_segments is None:
+        max_segments = MCP_MAX_SEGMENTS
+    # Upload preparation holds the shared writer lock; only reap old crash leftovers.
+    root = MCP_JOBS_ROOT.resolve()
+    cutoff = time.time() - max(900, MCP_JOB_TIMEOUT)
+    for stale in MCP_JOBS_ROOT.glob(".upload-*"):
+        if (not stale.is_symlink() and stale.resolve() == root / stale.name
+                and stale.is_dir() and stale.stat().st_mtime < cutoff):
+            shutil.rmtree(stale)
+    require_disk_space(MCP_MAX_SOURCE_BYTES)
+    # Reserve against the total quota before the content-derived job ID is known.
+    check_job_capacity(pipeline.job_key("upload-staging"), MCP_MAX_SOURCE_BYTES)
+    with tempfile.TemporaryDirectory(prefix=".upload-", dir=MCP_JOBS_ROOT) as staging:
+        temporary = Path(staging) / "source.mp4"
+        report_progress("download", 10, "下載使用者上傳的影片")
+        sha256 = download_uploaded_video(reference["download_url"], temporary)
+        try:
+            probe = pipeline.probe_video(temporary, local_mp4_only=True)
+        except (DeadlineExceeded, ExecutionCancelled):
+            raise
+        except (RuntimeError, ValueError, OSError):
+            raise ValueError("上傳檔案不是可讀取的 MP4 影片。") from None
+        if (not isinstance(probe, dict) or not isinstance(probe.get("streams", []), list)
+                or any(not isinstance(stream, dict) for stream in probe.get("streams", []))):
+            raise ValueError("上傳檔案不是可讀取的 MP4 影片。")
+        if not any(stream.get("codec_type") == "video" for stream in probe.get("streams", [])):
+            raise ValueError("上傳檔案沒有視訊串流。")
+        segment_bounds(pipeline.video_duration(probe), segment_seconds, max_segments)
+        source_url = f"upload://{sha256}"
+        job_id = pipeline.job_key(source_url)
+        job_dir = MCP_JOBS_ROOT / job_id
+        video_path = job_dir / "source.mp4"
+        if video_path.exists():
+            if pipeline.file_sha256(video_path) != sha256:
+                raise RuntimeError("上傳影片工作識別碼與既有內容不符；未覆寫原檔。")
+        else:
+            check_job_capacity(job_id, temporary.stat().st_size)
+            new_job = not job_dir.exists()
+            job_dir.mkdir(parents=True, exist_ok=True)
+            try:
+                temporary.replace(video_path)
+            except OSError:
+                if new_job:
+                    job_dir.rmdir()
+                raise
+        storage_policy().mark_managed(job_id)
+        info_path = job_dir / "source.info.json"
+        if not info_path.exists():
+            pipeline.write_json(info_path, {
+                "title": reference["file_name"] or "上傳影片",
+                "source_type": "upload", "file_name": reference["file_name"],
+                "file_id": reference["file_id"], "sha256": sha256,
+            })
+        provenance = pipeline.reuse_artifact(info_path)
+        pipeline.write_json(job_dir / "source.probe.json", {
+            "fingerprint": pipeline.file_fingerprint(video_path), "probe": probe})
+        return prepare_local_video(video_path, job_dir, job_id, source_url, segment_seconds,
+                                   max_segments, provenance)
+
+
+def prepare_local_video(video_path: Path, job_dir: Path, job_id: str, source_url: str,
+                        segment_seconds: int, max_segments: int | None,
+                        provenance: dict | None = None) -> dict:
     if video_path.stat().st_size > MCP_MAX_SOURCE_BYTES:
         raise RuntimeError(f"影片超過 MCP_MAX_SOURCE_MB={MCP_MAX_SOURCE_BYTES // 1024 // 1024}。")
 
@@ -1322,6 +1529,7 @@ def prepare_video_sync(url: str, segment_seconds: int, max_segments: int | None)
         "status": "ready",
         "job_id": job_id,
         "source": {
+            **(provenance or {}),
             "url": pipeline.public_url(source_url),
             "title": pipeline.source_title(job_dir, video_path),
             "duration_seconds": round(duration, 3),
@@ -1443,20 +1651,20 @@ def tool_result(manifest: dict) -> types.CallToolResult:
     )
 
 
-def tool_error_result(error: Exception) -> types.CallToolResult:
+def tool_error_result(error: Exception, source_url: str = "") -> types.CallToolResult:
     if isinstance(error, JobBusyError):
         return job_busy_result(error)
     detail = str(error).strip() or error.__class__.__name__
+    classified = pipeline.classify_download_error(detail, source_url)
     return types.CallToolResult(
         isError=True,
-        structuredContent={"status": "error", "error": detail},
+        structuredContent={"status": "error", "error": detail, **classified},
         content=[
             types.TextContent(
                 type="text",
                 text=(
                     f"影片準備失敗：{detail}\n"
-                    "尚未產生影片分段；請確認來源可由無登入的公開 yt-dlp 下載，"
-                    "以及 MCP 服務目前仍在線。"
+                    + classified["user_message"] + "\n" + "\n".join(classified["next_steps"])
                 ),
             )
         ],
@@ -1584,6 +1792,8 @@ def visual_observations_incomplete(rows: list[dict[str, Any]] | None) -> bool:
     ``completion_status=incomplete`` / ``finish_reason=timestamp_coverage``.
     Absent markers (healthy observations) count as usable.
     """
+    if pipeline.visual_gaps_pending(rows):
+        return True
     for row in rows or []:
         if not isinstance(row, dict):
             return True
@@ -1737,10 +1947,19 @@ def analyze_prepared_sync(job_id: str) -> dict[str, Any]:
     errors: list[str] = []
     audio_status = "skipped" if not has_audio else "pending"
     visual_status = "pending"
+    progress_lock = threading.Lock()
+    stage_status = {"audio": "處理中" if has_audio else "無音訊", "visual": "準備中"}
+
+    def evidence_progress(part: str, value: str) -> None:
+        # Serialize updates from the concurrent audio and visual branches.
+        with progress_lock:
+            stage_status[part] = value
+            report_progress("evidence", 40,
+                            f"音訊：{stage_status['audio']}；視覺：{stage_status['visual']}")
 
     def visual_stage() -> list[dict[str, Any]]:
         pipeline.visual_mode()  # rejects the removed frame-sampling mode
-        report_progress("upload", 20, "上傳整支影片給 MiniMax 直接理解")
+        evidence_progress("visual", "準備 MP4 分析")
         # The same resolution the pipeline applies, so the recorded fps/detail
         # match the request that is really sent (detail=high is ~3.4x the cost
         # of default; a too-long video is analysed in segments instead of
@@ -1769,7 +1988,7 @@ def analyze_prepared_sync(job_id: str) -> dict[str, Any]:
         check_job_capacity(job_id, 2 * chunk_bytes)
         if plan.chunked:
             require_disk_space(2 * chunk_bytes)
-        report_progress("evidence", 40, "MiniMax 直接讀取 mp4")
+        evidence_progress("visual", "MiniMax 處理中")
         observations = pipeline.analyze_video_mp4(
             video_path,
             minimax_key,
@@ -1830,20 +2049,24 @@ def analyze_prepared_sync(job_id: str) -> dict[str, Any]:
         def safe_transcript() -> None:
             try:
                 transcript_box["value"] = transcript_stage()
+                evidence_progress("audio", "完成")
             except (DeadlineExceeded, ExecutionCancelled):
                 raise
             except Exception as error:
                 transcript_box["error"] = analysis_error(error)
+                evidence_progress("audio", "失敗")
 
         visual_box: dict[str, Any] = {}
 
         def safe_visual() -> None:
             try:
                 visual_box["value"] = visual_stage()
+                evidence_progress("visual", "完成")
             except (DeadlineExceeded, ExecutionCancelled):
                 raise
             except Exception as error:
                 visual_box["error"] = analysis_error(error)
+                evidence_progress("visual", "失敗")
 
         pipeline.run_parallel_stages(safe_transcript, safe_visual)
         if "value" in transcript_box:
@@ -2196,6 +2419,27 @@ for legacy_uri in LEGACY_UI_URIS:
 
 
 @mcp.tool(
+    name="probe_video_source",
+    title="Probe video source",
+    description=(
+        "Read-only metadata check; call before prepare_video_for_chatgpt when a source might be private or unsupported. "
+        "No media download or job files are created; yt-dlp cache and cookie writes are disabled. "
+        "External JavaScript runtimes may maintain their own caches. Uses the download network options with a bounded timeout. "
+        "Metadata success does not guarantee media bytes can be downloaded. "
+        "When error_code is present, relay user_message and next_steps; do not speculate about causes."
+    ),
+    annotations=types.ToolAnnotations(readOnlyHint=True, destructiveHint=False, openWorldHint=True),
+)
+async def probe_video_source(url: str) -> dict[str, Any]:
+    try:
+        source_url = await asyncio.to_thread(validate_source_url, url)
+        return await asyncio.to_thread(pipeline.probe_video_source, source_url)
+    except Exception as error:
+        detail = str(error).strip() or error.__class__.__name__
+        return {"status": "error", "error": detail, **pipeline.classify_download_error(detail, url)}
+
+
+@mcp.tool(
     name="prepare_video_for_chatgpt",
     title="Prepare video for ChatGPT",
     description=(
@@ -2203,7 +2447,10 @@ for legacy_uri in LEGACY_UI_URIS:
         "Download and split MP4 segments. Prefer background=true and poll get_video_job. After preparation "
         "completes, the widget automatically starts analyze_prepared_video and upload_prepared_video_to_drive "
         "in parallel without waiting for button presses. "
-        "Do not call analysis concurrently with the widget. Supports public URLs accepted by the pipeline."
+        "Do not call analysis concurrently with the widget. Supports public URLs accepted by the pipeline. "
+        "Call probe_video_source first when a source might be private or unsupported. "
+        "When error_code is present, relay user_message and next_steps; do not speculate about causes. "
+        "For private/login-required videos, ask the user to upload the MP4 and use prepare_uploaded_video."
     ),
     annotations=types.ToolAnnotations(
         readOnlyHint=False,
@@ -2230,7 +2477,47 @@ async def prepare_video_for_chatgpt(
                 "url": source_url, "segment_seconds": segment_seconds, "max_segments": effective_max}, job_id))
         manifest = await asyncio.to_thread(prepare_video_locked, url, segment_seconds, max_segments)
     except Exception as error:
-        return tool_error_result(error)
+        return tool_error_result(error, url)
+    return tool_result(manifest)
+
+
+@mcp.tool(
+    name="prepare_uploaded_video",
+    title="準備使用者上傳的影片",
+    description=(
+        "影片無法透過網址下載（例如私人 Facebook 影片或需要登入）且使用者已上傳 MP4 時使用。"
+        "file 必須是包含 file_id 與 download_url 的完整 OpenAI 檔案引用物件，"
+        "可附 file_name 與 mime_type。伺服器下載、驗證並分段後，呼叫 analyze_prepared_video"
+        "取得語音與畫面證據，再由 ChatGPT 整理；可選擇存到已設定的 Google Drive。"
+        "建議 background=true，使用 get_video_job 輪詢；widget 會自動啟動分析，請勿重複呼叫。"
+    ),
+    annotations=types.ToolAnnotations(readOnlyHint=False, destructiveHint=False,
+                                     idempotentHint=True, openWorldHint=True),
+    meta={**FILE_HANDOFF_META, **TOOL_META, "openai/fileParams": ["file"]},
+    structured_output=True,
+)
+async def prepare_uploaded_video(
+    file: OpenAIFileReference,
+    segment_seconds: int = 120,
+    max_segments: int | None = None,
+    background: bool = False,
+) -> Annotated[types.CallToolResult, PreparedVideoResult]:
+    try:
+        reference = normalize_file_references([OpenAIFileReference.model_validate(file).model_dump()])[0]
+        validate_upload_url(reference["download_url"])
+        segment_bounds(1, segment_seconds, max_segments)
+        if background:
+            return operation_tool_result(get_queue().submit("prepare", {
+                "file": reference, "segment_seconds": segment_seconds, "max_segments": max_segments}))
+        manifest = await asyncio.to_thread(run_job, prepare_uploaded_video_sync, reference,
+                                          segment_seconds, max_segments)
+    except Exception as error:
+        result = tool_error_result(error)
+        if result.isError:
+            result.content = [types.TextContent(type="text", text=(
+                f"影片準備失敗：{result.structuredContent['error']}\n"
+                "請確認檔案是含視訊串流的 MP4、下載主機在允許清單內；網址過期時請重新上傳。"))]
+        return result
     return tool_result(manifest)
 
 
@@ -2533,7 +2820,9 @@ def refreshed_operation(operation_id: str) -> dict:
           annotations=types.ToolAnnotations(readOnlyHint=True, destructiveHint=False, openWorldHint=False),
           meta=ANALYSIS_META)
 async def get_video_job(operation_id: str) -> dict[str, Any]:
-    """Poll a durable job; completed.result contains prepared/analysis/drive evidence. No work is started."""
+    """Poll a durable job; completed.result contains prepared/analysis/drive evidence. No work is started.
+    When error_code is present, relay user_message and next_steps; do not speculate about causes.
+    """
     return await asyncio.to_thread(refreshed_operation, operation_id)
 
 
@@ -2637,10 +2926,12 @@ async def collect_social_post(url: str, allow_paid: bool = False) -> dict[str, A
     name="ingest_video_segments",
     title="Receive video segments for analysis",
     description=(
-        "Legacy native-file handoff only; not used by the current server-analysis widget. "
-        "Call this only when ChatGPT has actually uploaded the MP4 segments. "
+        "Optional native-file handoff for the widget's explicit upload experiment; separate from server analysis. "
+        "Call this only when ChatGPT has file references for uploaded MP4 segments or preview images. "
         "Pass the files in the same order as the prepared segment list. "
         "Each item must be the complete OpenAI file object containing file_id and download_url. "
+        "Optionally pass segment_ranges in the same order as files, with start_seconds and end_seconds "
+        "copied from preparation in original-video seconds. These are caller-supplied, not verified media times. "
         "A public segment URL or MCP resource link alone is not proof that ChatGPT received the MP4 "
         "bytes and must be rejected. This tool only confirms file references; read the attached files "
         "before making any visual or audio claims, and fail closed when the references are missing."
@@ -2656,10 +2947,15 @@ async def collect_social_post(url: str, allow_paid: bool = False) -> dict[str, A
 )
 async def ingest_video_segments(
     files: list[OpenAIFileReference],
+    segment_ranges: list[VideoSegmentRange] | None = None,
 ) -> FileHandoffResult:
     references = normalize_file_references(
         [OpenAIFileReference.model_validate(item).model_dump() for item in files]
     )
+    ranges = ([VideoSegmentRange.model_validate(item) for item in segment_ranges]
+              if segment_ranges is not None else None)
+    if ranges is not None and len(ranges) != len(references):
+        raise ValueError("segment_ranges 必須與 files 一一對應。")
     return FileHandoffResult(
         status="files_received",
         files_received=len(references),
@@ -2668,8 +2964,9 @@ async def ingest_video_segments(
                 file_id=item["file_id"],
                 mime_type=item.get("mime_type"),
                 file_name=item.get("file_name"),
+                **(ranges[index].model_dump() if ranges is not None else {}),
             )
-            for item in references
+            for index, item in enumerate(references)
         ],
     )
 

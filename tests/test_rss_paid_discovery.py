@@ -68,19 +68,19 @@ def hours_ago(hours: float) -> str:
 
 class PaidDiscoveryAllowlistTests(unittest.TestCase):
     def test_without_the_setting_a_scheduled_refresh_pays_for_nothing(self) -> None:
-        self.assertEqual(refresh({"RSS_PAID_DISCOVERY": ""}, False), {"apify": False, "brightdata": False})
+        self.assertEqual(refresh({"RSS_PAID_DISCOVERY": ""}, False), {})
 
     def test_named_provider_is_allowed_and_the_other_stays_blocked(self) -> None:
-        self.assertEqual(refresh({"RSS_PAID_DISCOVERY": " Apify "}, False), {"apify": True, "brightdata": False})
+        self.assertEqual(refresh({"RSS_PAID_DISCOVERY": " Apify "}, False), {"apify": True})
 
     def test_allow_batch_cloud_still_allows_every_provider(self) -> None:
         self.assertEqual(refresh({"RSS_PAID_DISCOVERY": ""}, True), {"apify": True, "brightdata": True})
 
     def test_unknown_names_allow_nothing(self) -> None:
-        self.assertEqual(refresh({"RSS_PAID_DISCOVERY": "all,*,yes"}, False), {"apify": False, "brightdata": False})
+        self.assertEqual(refresh({"RSS_PAID_DISCOVERY": "all,*,yes"}, False), {})
 
     def test_each_name_only_allows_itself(self) -> None:
-        self.assertEqual(refresh({"RSS_PAID_DISCOVERY": "brightdata"}, False), {"apify": False, "brightdata": True})
+        self.assertEqual(refresh({"RSS_PAID_DISCOVERY": "brightdata"}, False), {"brightdata": True})
         self.assertEqual(refresh({"RSS_PAID_DISCOVERY": "apify,brightdata"}, False), {"apify": True, "brightdata": True})
 
     def test_free_meta_provider_is_not_affected(self) -> None:
@@ -99,7 +99,8 @@ class PaidDiscoveryIntervalTests(unittest.TestCase):
         seen = refresh(self.ENV, False, last={"fb-apify": six_hours_ago}, out=out)
         self.assertNotIn("apify", seen, "Apify must not be called again within 20 hours")
         self.assertEqual(out["totals"]["deferred"], 1)
-        self.assertEqual(out["totals"]["failed"], 1, "only the blocked Bright Data subscription fails")
+        self.assertEqual(out["totals"]["failed"], 0, "a provider excluded by policy is not a failed feed")
+        self.assertEqual(out["totals"]["skipped"], 1)
         self.assertEqual(out["subscriptions"]["fb-apify"]["paid_discovery_at"], six_hours_ago)
         self.assertNotIn("last_checked", out["subscriptions"]["fb-apify"])
 
@@ -143,7 +144,8 @@ class PaidDiscoveryIntervalTests(unittest.TestCase):
             self.assertEqual(run_refresh(root, self.ENV, True), {"apify": True, "brightdata": True})
             out: dict = {}
             self.assertEqual(run_refresh(root, self.ENV, False, out), {}, "both paid subscriptions wait after the manual run")
-            self.assertEqual(out["totals"]["deferred"], 2)
+            self.assertEqual(out["totals"]["deferred"], 1)
+            self.assertEqual(out["totals"]["skipped"], 1)
 
     def test_without_an_interval_nothing_extra_is_saved_before_the_call(self) -> None:
         out: dict = {}
@@ -252,17 +254,19 @@ class PaidDiscoveryAddStampTests(unittest.TestCase):
 
             def instagram(username, since, *, allow_paid=False, **kwargs):
                 paid_calls.append("instagram")
+                stamp_on_disk.append(bool(
+                    saved(root).get(self.IG_ID, {}).get("paid_discovery_at")))
                 return self.instagram_feed(username)
 
-            with mock.patch.dict(pipeline.os.environ, self.ENV), \
+            with mock.patch.dict(pipeline.os.environ, {**self.ENV, "RSS_PAID_DISCOVERY": "apify,brightdata"}), \
                  mock.patch.object(pipeline, "fetch_facebook_author", side_effect=facebook), \
                  mock.patch.object(pipeline, "fetch_instagram_author", side_effect=instagram):
                 pipeline.add_facebook_subscription(root, "somepage", since="365d",
                                                    provider="apify", allow_paid=True)
                 pipeline.add_instagram_subscription(root, "someone", since="365d",
                                                     max_items=5, allow_paid=True)
-                self.assertEqual(stamp_on_disk, [True],
-                                 "the stamp must be on disk before the billable call")
+                self.assertEqual(stamp_on_disk, [True, True],
+                                 "each stamp must be on disk before the billable call")
                 totals = pipeline.refresh_rss(root, allow_paid=False)
             self.assertEqual(paid_calls, ["facebook", "instagram"],
                              "the scheduled refresh must not pay again within the interval")
@@ -366,11 +370,90 @@ class PaidDiscoveryAddStampTests(unittest.TestCase):
             subscription = pipeline.load_rss_state(root)["subscriptions"][0]
             self.assertTrue(subscription["enabled"])
             self.assertTrue(subscription["paid_discovery_at"])
+            self.assertIn("尚未完成", subscription["last_error"])
             output = root / "subscriptions.opml"
             self.assertEqual(pipeline.export_rss_opml(root, output), 1)
             outline = pipeline.ET.fromstring(output.read_text(encoding="utf-8")).find(".//outline")
             self.assertEqual(outline.attrib["xmlUrl"], pipeline.instagram_author_url("someone"),
                              "OPML imports silently skip retained subscriptions with an empty xmlUrl")
+
+    def test_failed_initial_reservation_rolls_back_memory_and_never_dispatches(self) -> None:
+        cases = (
+            ("facebook", {"provider": "apify"}),
+            ("facebook", {"provider": "brightdata", "max_items": 5}),
+            ("instagram", {"max_items": 5}),
+        )
+        for platform, options in cases:
+            with self.subTest(platform=platform, options=options), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                existing = {"id": "existing", "kind": "rss"}
+                state = {"subscriptions": [existing], "items": []}
+                attempted: list[dict] = []
+
+                def failed_save(_root, current):
+                    attempted.append(current["subscriptions"][-1])
+                    raise OSError("synthetic disk failure")
+
+                with mock.patch.dict(pipeline.os.environ, self.ENV, clear=True), \
+                     mock.patch.object(pipeline, "load_rss_state", return_value=state), \
+                     mock.patch.object(pipeline, "save_rss_state", side_effect=failed_save), \
+                     mock.patch.object(pipeline, f"fetch_{platform}_author") as fetch:
+                    with self.assertRaisesRegex(OSError, "synthetic disk failure"):
+                        getattr(pipeline, f"add_{platform}_subscription")(root, "example", allow_paid=True, **options)
+                fetch.assert_not_called()
+                self.assertEqual(state["subscriptions"], [existing])
+                self.assertNotIn("paid_discovery_at", attempted[0])
+                self.assertEqual(attempted[0]["last_error"], "")
+
+    def test_successful_paid_add_sets_completion_time_and_clears_pending_error(self) -> None:
+        cases = (
+            ("facebook", {"provider": "apify"}),
+            ("facebook", {"provider": "brightdata", "max_items": 5}),
+            ("instagram", {"max_items": 5}),
+        )
+        initial, dispatched, completed = (
+            "2026-01-01T00:00:00Z", "2026-01-01T00:01:00Z", "2026-01-01T00:05:00Z"
+        )
+        for platform, options in cases:
+            with self.subTest(platform=platform, options=options), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                observed: list[dict] = []
+
+                def fetch(*_args, **_kwargs):
+                    observed.append(pipeline.load_rss_state(root)["subscriptions"][0])
+                    return (self.facebook_feed("example", options["provider"]) if platform == "facebook"
+                            else self.instagram_feed("example"))
+
+                with mock.patch.dict(pipeline.os.environ, self.ENV, clear=True), \
+                     mock.patch.object(pipeline, "rss_now", side_effect=[initial, dispatched, completed, completed]), \
+                     mock.patch.object(pipeline, f"fetch_{platform}_author", side_effect=fetch), \
+                     mock.patch.object(pipeline, f"write_{platform}_discovery", return_value=root / "snapshot.json"):
+                    subscription, _, _ = getattr(pipeline, f"add_{platform}_subscription")(
+                        root, "example", allow_paid=True, **options
+                    )
+                self.assertEqual(observed[0]["paid_discovery_at"], dispatched)
+                self.assertIn("尚未完成", observed[0]["last_error"])
+                self.assertEqual(subscription["paid_discovery_at"], completed)
+                self.assertEqual(subscription["last_checked"], completed)
+                self.assertEqual(subscription["last_error"], "")
+                self.assertEqual(pipeline.load_rss_state(root)["subscriptions"][0], subscription)
+
+    def test_reservation_failure_preserves_preexisting_subscription_fields(self) -> None:
+        for error in (OSError("synthetic disk failure"), KeyboardInterrupt()):
+            with self.subTest(error=type(error).__name__), tempfile.TemporaryDirectory() as directory:
+                subscription = {
+                    "kind": "instagram-author",
+                    "paid_discovery_at": "2026-01-01T00:00:00Z",
+                    "last_error": "earlier error",
+                }
+                before = dict(subscription)
+                state = {"subscriptions": [], "items": []}
+                with mock.patch.dict(pipeline.os.environ, self.ENV, clear=True), \
+                     mock.patch.object(pipeline, "save_rss_state", side_effect=error):
+                    with self.assertRaises(type(error)):
+                        pipeline.reserve_initial_paid_discovery(Path(directory), state, subscription, True)
+                self.assertEqual(state["subscriptions"], [])
+                self.assertEqual(subscription, before)
 
 
 if __name__ == "__main__":

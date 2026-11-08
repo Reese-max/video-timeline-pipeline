@@ -225,10 +225,17 @@ class AnalysisReportTests(unittest.TestCase):
             uploaded = server.drive_storage.upload_analysis_report(self.job, report, drive)
         self.assertEqual(calls, ['report-fixture']); self.assertTrue(uploaded['verified'])
 
-    def assert_raw_binding_workflow(self, peak, scope):
-        # Use the real coverage gate, clamp and placeholder stamping; only transport/gap filling are inert.
-        events = [{'timestamp':stamp, 'visual_summary':'owned video event', 'confidence':0.9}
-                  for stamp in (0, peak)]
+    def assert_raw_binding_workflow(self, peak, scope, finish_reason=None):
+        # Use the real schema, coverage and placeholder stamping; only transport/gap filling are inert.
+        stamps = (0, peak) if peak < 50 else (0, 25, 50, 75, *([95] if peak > 100 else []), peak)
+        events = [{
+            'timestamp': stamp,
+            'screen_type': 'owned fixture',
+            'visible_text': [],
+            'visual_summary': 'owned video event',
+            'important_details': [],
+            'confidence': 0.9,
+        } for stamp in stamps]
         source = self.job/'source.mp4'
         with patch.object(server.pipeline, 'minimax_reusable_upload', return_value=('inert-file', False)), \
              patch.object(server.pipeline, 'minimax_chat', return_value=json.dumps({'events':events})), \
@@ -245,8 +252,8 @@ class AnalysisReportTests(unittest.TestCase):
         else:
             self.assertNotEqual(cached['timeline'], result['timeline'])
             self.assertTrue(any(row['timestamp'] is None for row in cached['timeline'] if row['type'] == 'visual'))
-        if scope == 'speech_only':
-            self.assertEqual(visual[0]['finish_reason'], 'timestamp_coverage')
+        if finish_reason is not None:
+            self.assertEqual(visual[0]['finish_reason'], finish_reason)
         module = self.report_module()
         snapshot = server.report_snapshot(self.job_id, cached)
         self.assertEqual((snapshot['status'], snapshot['evidence_scope']), ('awaiting_segments', scope))
@@ -269,11 +276,11 @@ class AnalysisReportTests(unittest.TestCase):
         self.assertEqual(finalized['analysis_sha256'], snapshot['analysis_sha256'])
         self.assertEqual(raw_path.read_bytes(), raw)
 
-    def test_clamped_timestamp_report_queues_and_finalizes_with_raw_evidence(self):
-        self.assert_raw_binding_workflow(110, 'complete')
+    def test_out_of_bounds_timestamp_report_queues_speech_only_with_raw_evidence(self):
+        self.assert_raw_binding_workflow(110, 'speech_only', 'timestamp_bounds')
 
     def test_timestamp_coverage_report_queues_and_finalizes_with_raw_evidence(self):
-        self.assert_raw_binding_workflow(1, 'speech_only')
+        self.assert_raw_binding_workflow(1, 'speech_only', 'timestamp_coverage')
 
     def test_reliable_timestamp_report_queues_and_finalizes_with_raw_evidence(self):
         self.assert_raw_binding_workflow(90, 'complete')

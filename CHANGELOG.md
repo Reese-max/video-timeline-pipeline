@@ -5,6 +5,23 @@
 - 修正：付費新增訂閱預存前先驗證期間、模式與結果預算，避免無效參數留下壞訂閱；OPML 的停用狀態會一併預存，盤點失敗後不會意外啟用。失敗後保留的 Instagram 訂閱補上作者 URL，避免 OPML 匯入時遺失。
 
 - 修正：新增 Apify／Bright Data 付費訂閱（`--facebook-author`×`--facebook-provider apify`／`brightdata`、`--instagram-author`，含 OPML 匯入）完成付費盤點時不會寫入 `paid_discovery_at`，導致 `RSS_PAID_DISCOVERY_MIN_HOURS` 間隔內的排程刷新把同一位作者再付費盤點一次（該欄位原本只在 `--rss-refresh` 的送出前存檔寫入）。現在設定間隔時，`add_facebook_subscription` 與 `add_instagram_subscription` 在付費呼叫**送出前**就把 `paid_discovery_at` 寫入並存檔（涵蓋呼叫中斷），盤點完整完成後再重設為完成時間（與 refresh 一致）；付費盤點失敗時訂閱仍留在訂閱清單，間隔照樣起算、不重複扣款。未設定間隔、免費盤點（`provider="meta"`）或未加 `--allow-batch-cloud` 的行為不變（不多寫欄位、失敗不建訂閱）。新增回歸測試 `tests/test_rss_paid_discovery.py::PaidDiscoveryAddStampTests`（送出前 payload 已在磁碟、新增後立刻 `refresh_rss` deferred 且不再送供應商呼叫、未設間隔不寫欄位、被拒絕的付費新增不留訂閱）。README 同步說明。
+- 修正：`probe_video_source` 遇到 yt-dlp 回傳 `null` 或非物件 JSON 時，改用清理後的 stderr 回報錯誤（無 stderr 時提供備援訊息），讓 Facebook 私人影片正確分類為 `LOGIN_REQUIRED_OR_PRIVATE`；probe 子程序遇到 `None` 以非零結束碼退出。YouTube probe 使用代理時先以最多 3 秒的 TCP 連線檢查，連線失敗立即回報 `PROXY_UNREACHABLE`，不耗盡 45 秒預算；實際下載流程不變。
+- 新增：下載錯誤共用分類器，提供穩定 `error_code`、是否可重試、繁中說明／下一步與截短原始錯誤；同步準備及背景失敗輪詢保留既有欄位並附上分類。新增唯讀 `probe_video_source`，共用下載格式與網路選項，最多 45 秒檢查 metadata／選定格式與估計大小，不建立工作或媒體，停用 yt-dlp 快取與 cookie 回寫；外部 runtime／外掛／瀏覽器 cookie 擷取的檔案副作用仍是已知限制。一般下載及 probe 保留主機 yt-dlp 設定檔及外掛行為，Facebook／Instagram 延續既有專用選項並共用 cookie 重試邏輯；一般下載改為擷取 stderr，保留分類所需的實際錯誤。工具描述要求轉述分類結果、不推測原因；新增離線回歸與 README 錯誤碼表。
+- 修正：背景準備失敗輪詢可容忍損毀或非物件的 inputs 與非字串 URL；下載分類器縮窄登入／影片不可用的判斷，並共用 Facebook 網域判定，避免無證據推論。
+- 修正上傳 MP4 的異常網址／ffprobe JSON 錯誤訊息；下次上傳會於寫入鎖內清理過期的中斷暫存，容量或搬移失敗不再留下新建空工作。離線分析測試固定 MiniMax 模型，避免依賴主機環境。
+
+- 新增 `prepare_uploaded_video`：私人／需登入影片上傳 MP4 後，可經 OpenAI 檔案參數進入既有準備、背景佇列、ASR／MiniMax 分析與選用 Drive 流程。HTTPS 精確主機白名單（`UPLOAD_ALLOWED_HOSTS`）、逐跳重新導向驗證、串流大小上限與本機 ffprobe 驗證；內容 SHA-256 穩定識別工作，來源以 `upload://<sha256>` 保存上傳出處。新增離線安全、重用與分析／還原回歸測試。
+
+- 修正維運護欄：canary 協調程式固定使用 app venv，候選 interpreter 僅執行 yt-dlp；升級前中斷退出 `1`，回復成功才退出 `4`。Proxy 通知失敗階段與例外類型記入狀態檔及紀錄；解析度偏好限制為 1–4320，避免 Python 版本造成超長整數驗證差異。補上缺少狀態目錄與通知／canary 回歸測試。
+- 新增選用維運護欄：YouTube Proxy TCP／CONNECT 健康檢查、連續失敗與恢復通知，以及隔離環境的 yt-dlp canary 更新器（正式環境複驗失敗即離線回復）。附未安裝的 systemd timer 範本，更新預設 dry-run；新增 `YTDLP_MAX_HEIGHT` 格式偏好與驗證、PO Token provider 選用說明及離線回歸測試。未設定解析度時維持既有下載行為。
+- 修正 #56／#105：補漏事件先驗證原片時間碼，保留提示時段端點；每段與合併後的時間軸都維持最長 30 秒的覆蓋間隔，片尾無豁免。未補完的範圍持久標記為 partial，拒絕重用／寫入完整快取及完成 outbox。舊 receipt 失效。
+- 整合 PR #95 的 #23 原生檔案引用契約：嚴格有限起訖範圍、正式 output schema 與 busy 狀態；明確按鈕先等待相符 ingestion 回執再發送模型讀檔要求。widget 升為 v19，保留上傳範圍快照；真實宿主可讀性仍待驗收。
+
+- 整合 PR #94／#96／#97：F0 與選用 Dashboard 共用 migration registry、library identity、typed filters、RRF 與 grounding。Web 初始化原子套用第 5 版 schema；唯讀請求不遷移，過期 task 不重播已提交工作。Ask 缺模型／key 時在付費檢索前停下，保留原始來源核對身分後才遮蔽公開引用。新增跨功能與安全回歸；人工語意、真實 browser／provider／正式資料驗收另列。
+
+- 整合既有 PR #92／#90／#89 的小範圍修正：ASR 補轉缺少時間碼時不再捏造時間；A 取消／恢復／刷新不停止獨立 Drive 交接輪詢；檔案庫實驗按上傳當下的原片範圍換算驗證點。小工具升為 v18，保留 v16／v17 URI 相容；#55／#57／#59 的真實媒體與 host 驗收仍待完成。
+
+- 修正 #126–#131：首次 RSS Drive 上傳重讀完整資料夾 metadata；付費供應商排除項正常略過、新增訂閱在初次付費前保存間隔起算；Bright Data 已取消工作立即終止並保留既有費用預留；分段尾段按影像串流長度驗證並清理純音訊殘留；分段分析時間碼限制在原片範圍並更新合併快取版本。
 
 - 新增：YouTube 改走家用網路出口。A1 實測所有 YouTube 影片（連 `jNQXAC9IVRw`）都回「Sign in to confirm you're not a bot」，yt-dlp 2026.8.19 與 2026.10.21 相同，同一支影片從家用 IP 不帶 cookie 可抓。新增環境變數 `YTDLP_YOUTUBE_PROXY`：有設定時只有 YouTube 網址（`pipeline.is_youtube_url`：`youtube.com`、`www.`／`m.`／`music.`、`youtu.be`、`youtube-nocookie.com`）的下載與字幕抓取加上 `--proxy`，其他網站不變。新增 `scripts/youtube-egress/egress_proxy.py`（標準庫 HTTP CONNECT proxy：只回應允許的來源 IP、只接受 CONNECT 到 YouTube／Google 網域的 443 埠、拒絕 IP 字面值與解析到非公開位址的網域）與 Windows 安裝腳本 `install-windows.ps1`（開機排程工作＋只允許 A1 的防火牆規則，`-Uninstall` 移除）。新增 `tests/test_youtube_egress.py`；說明見 `docs/gitops.md`。
 
@@ -64,6 +81,7 @@
 - 改進 A／B 工作流（依 job e47517f85346 實測）：分析證據完整時，A 報告不必等 ChatGPT 摘要即自動上傳 Drive；B 交接內容改為一次貼上（先獨立輸出，再讀同資料夾 A 報告合併）；合併規則改為畫面文字採 B、A 不同讀法放附錄、語音採 A；逐字稿只有低信心片尾套語（如「ご視聴ありがとうございました」，avg_logprob < -0.3）、只有符號（♪）或沒有語音時，`quality` 標 `speech_reliable=false`、`recommend_route_b=true`。只有證據完整且 `quality.status=evidence_available` 才免摘要上傳；交接內容要求 B 先核對報告 job_id。widget 未改動（報告排程後需手動重新取得狀態）。
 
 - 修正 #58：v15 widget 在摘要已提交但 Drive 片段／worker 尚未完成（`awaiting_segments`）時，以唯讀快照追蹤至報告排程，再接續既有上傳工作輪詢。查詢核對 job、cache signature、分析與報告雜湊；最多 60 次，失敗或逾時停止並提示手動刷新，不重送摘要、分析或上傳。新增提交／通知／恢復、錯誤與綁定不符、等待上限及換影片／關閉的回歸測試；真實 Drive 與 ChatGPT 驗收仍待執行。
+- #7 F0.1／F0.2：統一 operations migration registry、持久 library UUID、內容版本與完成事件原子登記；新增零外部呼叫的 `--ops-reconcile`，歷史補登保留未知時間且不寄送。成本／評分讀取不再隱式建表，Digest 依內容版本與帳本資格選取，完成 hook 排除本機預覽與不完整產物。新增離線回歸及 [路線圖與驗收邊界](docs/ROADMAP.md)。
 
 - 新增 #59：v14 widget 提供可收合的 ChatGPT 檔案庫實驗，每個分段須明確點擊才 fetch／uploadFile；一般上傳亦須另行點擊。顯示上傳資訊、SHA-256 與完整遮蔽網址的錯誤；隔離連點、換 job 及實驗狀態保存失敗，模型讀取要求走既有訊息橋接與統一保存。新增獨立 Node 測試並納入離線檢查，固定既有 CSP／成功媒體 CORS 前提；檔案庫與模型可讀性仍需真實 ChatGPT 驗證。已知限制：上傳卡住時需重新載入介面。
 

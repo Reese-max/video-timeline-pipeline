@@ -148,10 +148,14 @@ class VisualTimeReliabilitySearchTests(unittest.TestCase):
         pipeline.build_index(self.root)
         with contextlib.closing(pipeline.index_connection(self.root)) as connection:
             for stamp, kind, text in self.rows():
-                if kind == "visual" and stamp is None:
-                    connection.execute("INSERT INTO vectors VALUES (?, ?, ?, ?)",
-                                       (pipeline.text_hash(text), "fake-model", 2, pipeline.pack_vector([1.0, 0.0])))
+                vector = [1.0, 0.0] if kind == "visual" and stamp is None else [0.0, 1.0]
+                connection.execute("INSERT INTO vectors VALUES (?, ?, ?, ?)",
+                                   (pipeline.text_hash(text), "fake-model", 2, pipeline.pack_vector(vector)))
             connection.commit()
+        contract = pipeline.EmbeddingContract("local", "fake-model")
+        pipeline.adopt_legacy_embeddings(self.root, contract)
+        with mock.patch.object(pipeline, "embed_texts", side_effect=AssertionError("legacy vectors must be reused")):
+            pipeline.build_embeddings(self.root, "", "fake-model", "local")
         with mock.patch.object(pipeline, "embed_texts", return_value=[[1.0, 0.0]]):
             hits = pipeline.semantic_search(self.root, "問題", "", "fake-model", 10, "local")
             self.assertEqual(len(hits), 2)
@@ -169,7 +173,7 @@ class VisualTimeReliabilitySearchTests(unittest.TestCase):
             self.assertEqual(len(result["citations"]), 2)
             self.assertTrue(all(hit["timestamp"] is None for hit in result["citations"]))
             output = self.cli("--ask", "問題")
-        prompt = chat.call_args.args[0][0]["content"]
+        prompt = chat.call_args.args[0][1]["content"]
         self.assertNotIn("00:00:05", prompt)
         self.assertNotIn("00:00:00", prompt)
         self.assertEqual(prompt.count("時間碼不可靠"), 2)
@@ -202,15 +206,20 @@ class VisualTimeReliabilitySearchTests(unittest.TestCase):
             self.assertEqual(pipeline.index_job(connection, self.job), 7)
             self.assertEqual(connection.total_changes, changes)
 
-    def test_pre_upgrade_library_drops_visual_rows_before_any_search(self):
+    def test_pre_upgrade_search_excludes_visual_without_writing_until_explicit_index(self):
         pipeline.build_index(self.root)
         with contextlib.closing(pipeline.index_connection(self.root)) as connection:
             connection.execute("INSERT INTO events VALUES (?, ?, ?, ?)",
                                (self.job.name, 95, "visual", "舊抽幀畫面殘留"))
             connection.execute("PRAGMA user_version = 2")
             connection.commit()
-        # No --index run: opening the library for search must already purge it.
+        before = (self.root / "library.db").read_bytes()
         self.assertEqual(pipeline.search_index(self.root, "舊抽幀畫面殘留", 10), [])
+        self.assertEqual(before, (self.root / "library.db").read_bytes())
+        with contextlib.closing(pipeline.library_connection(self.root)) as connection:
+            self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 2)
+            self.assertGreater(connection.execute("SELECT count(*) FROM events WHERE kind = 'visual'").fetchone()[0], 0)
+        # The explicit write connection performs the existing safety migration.
         with contextlib.closing(pipeline.index_connection(self.root)) as connection:
             self.assertEqual(connection.execute("SELECT count(*) FROM events WHERE kind = 'visual'").fetchone()[0], 0)
             self.assertEqual(connection.execute("SELECT count(*) FROM index_state").fetchone()[0], 0)
