@@ -41,6 +41,7 @@ Hermes / LINE（呆呆）用的影片連結「可帶走」cascade。部署時把
 - 工作只能以來源 metadata 的實際 URL／ID 比對，筆記本文與自行寫入的 request URL 不作為來源證據；缺少身分或來源衝突時會回報失敗。
 - Threads 的 markdown／HTML 若沒有相符的結構化來源 URL 或 HTML canonical link，會標記來源未驗證並停止使用；真實 Bright Data 回傳是否提供這些欄位仍需另行驗證。
 - 無法從短網址辨識貼文 ID 時，付費 fallback 不會啟動；可改用有明確貼文 ID 的原始社群網址。
+- 舊版 session 可能包含未驗證的草稿，追問時會保留原檔但不重用；重新貼上網址完成本版級聯後，同一 session 可恢復追問。無法取得內容時會明確回報失敗。
 - IG datacenter IP 可能擋 yt-dlp；依賴 L2/L3
 
 詳見 `docs/video-takeaway-cascade.md`。

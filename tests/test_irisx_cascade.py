@@ -334,7 +334,7 @@ class IrisxIdentityTests(unittest.TestCase):
     def test_hook_preserves_valid_session_and_replaces_previous_url_draft(self):
         root = self.jobs.parent
         fake = root / "fake_cascade.py"
-        fake.write_text('import json, sys; print(json.dumps({"ok": True, "draft": "Synthetic: " + sys.argv[1], "level": 2}))\n', encoding="utf-8")
+        fake.write_text('import json, sys; print(json.dumps({"ok": True, "url": sys.argv[1], "draft": "Synthetic: " + sys.argv[1], "level": 4, "note": "og-preview"}))\n', encoding="utf-8")
         source = (HOOKS / "video-url-prefetch.sh").read_text(encoding="utf-8")
         source = source.replace('/home/box/irisx-failover-restore/20260906/runtime/video-hook', str(root / 'runtime'))
         source = source.replace('/home/box/irisx-failover-restore/20260906/profile-irisx/hooks/video_takeaway_cascade.py', str(fake))
@@ -359,15 +359,24 @@ class IrisxIdentityTests(unittest.TestCase):
     def test_hook_followup_renders_only_successful_results(self):
         base = self.jobs.parent
         original = (HOOKS / "video-url-prefetch.sh").read_text(encoding="utf-8")
-        for mode in ("success", "nonzero", "exception", "bad_encoding", "failure_text", "stale_failure", "stale_failure_retry_fails"):
+        for mode in ("success", "nonzero", "exception", "bad_encoding", "failure_text", "stale_failure", "stale_failure_retry_fails", "wrong_source", "outside_root"):
             with self.subTest(mode=mode):
                 root = base / mode
                 sessions = root / "runtime" / "sessions"
                 sessions.mkdir(parents=True)
-                job = root / "job"
-                job.mkdir()
+                jobs = root / "jobs"
+                jobs.mkdir()
+                job = (root / "outside" if mode == "outside_root" else jobs) / "job"
+                job.mkdir(parents=True)
                 (job / "notes.md").write_text("synthetic", encoding="utf-8")
-                bundle = {"url": self.URL, "job": str(job), "draft": "(render failed: old)" if mode.startswith("stale_") else ""}
+                (job / "source.info.json").write_text(json.dumps({"webpage_url": self.OTHER if mode == "wrong_source" else self.URL}), encoding="utf-8")
+                cascade_script = root / "real_cascade.py"
+                cascade_code = (HOOKS / "video_takeaway_cascade.py").read_text(encoding="utf-8")
+                cascade_code = cascade_code.replace('JOBS = Path("/workspace/video-timeline-pipeline/jobs")', f'JOBS = Path({str(jobs)!r})')
+                cascade_script.write_text(cascade_code, encoding="utf-8")
+                (root / "irisx_identity.py").write_text((HOOKS / "irisx_identity.py").read_text(encoding="utf-8"), encoding="utf-8")
+                bundle = {"url": self.URL, "verified_url": self.URL, "session_schema": 2, "outcome": "success",
+                          "job": str(job), "draft": "(render failed: old)" if mode.startswith("stale_") else ""}
                 bundle_path = sessions / "followup.json"
                 bundle_path.write_text(json.dumps(bundle), encoding="utf-8")
                 renderer = root / "fake_renderer.py"
@@ -379,10 +388,13 @@ class IrisxIdentityTests(unittest.TestCase):
                     "failure_text": "print('(render failed: synthetic)')\n",
                     "stale_failure": "print('Synthetic rendered draft')\n",
                     "stale_failure_retry_fails": "import sys; sys.exit(1)\n",
+                    "wrong_source": "print('Synthetic wrong source')\n",
+                    "outside_root": "print('Synthetic outside root')\n",
                 }[mode]
                 renderer.write_text(body, encoding="utf-8")
                 source = original.replace('/home/box/irisx-failover-restore/20260906/runtime/video-hook', str(root / 'runtime'))
                 source = source.replace('/home/box/irisx-failover-restore/20260906/profile-irisx/hooks/render_takeaway.py', str(renderer))
+                source = source.replace('/home/box/irisx-failover-restore/20260906/profile-irisx/hooks/video_takeaway_cascade.py', str(cascade_script))
                 if mode == "exception":
                     needle = 'sys.executable, str(RENDER)'
                     self.assertIn(needle, source)
@@ -402,6 +414,90 @@ class IrisxIdentityTests(unittest.TestCase):
                     self.assertEqual(result.stdout, "", "renderer failure must not become answer context")
                     self.assertEqual(persisted, bundle, "failed rendering must leave the session retryable")
                     self.assertFalse((sessions / "followup.pending").exists())
+
+    @unittest.skipUnless(os.name == "posix" and shutil.which("bash"), "POSIX shell hook")
+    def test_legacy_session_is_not_reused_and_refresh_restores_followup(self):
+        root = self.jobs.parent
+        sessions = root / "runtime" / "sessions"
+        sessions.mkdir(parents=True)
+        bundle = sessions / "legacy.json"
+        original = json.dumps({"url": self.URL, "job": str(self.jobs / "wrong"), "draft": "Synthetic old unrelated draft"}).encode()
+        bundle.write_bytes(original)
+        fake = root / "fake_cascade.py"
+        fake.write_text('import json, sys; print(json.dumps({"ok": True, "url": sys.argv[1], "draft": "Synthetic refreshed", "level": 4, "note": "og-preview"}))\n', encoding="utf-8")
+        source = (HOOKS / "video-url-prefetch.sh").read_text(encoding="utf-8")
+        source = source.replace('/home/box/irisx-failover-restore/20260906/runtime/video-hook', str(root / 'runtime'))
+        source = source.replace('/home/box/irisx-failover-restore/20260906/profile-irisx/hooks/video_takeaway_cascade.py', str(fake))
+        script = root / "hook.sh"
+        script.write_text(source, encoding="utf-8")
+
+        def invoke(message):
+            result = subprocess.run(["bash", str(script)], input=json.dumps({"session_id": "legacy", "user_message": message}),
+                                    text=True, capture_output=True, cwd=root, env={"PATH": "/usr/bin:/bin", "HOME": str(root)}, timeout=10)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            return result.stdout
+
+        self.assertEqual(invoke("請再講一次可帶走內容"), "")
+        self.assertEqual(bundle.read_bytes(), original, "unknown legacy session must not be modified")
+        self.assertFalse((sessions / "legacy.pending").exists())
+        self.assertIn("Synthetic refreshed", json.loads(invoke(self.URL))["context"])
+        self.assertIn("Synthetic refreshed", json.loads(invoke("請再講一次可帶走內容"))["context"])
+
+    @unittest.skipUnless(os.name == "posix" and shutil.which("bash"), "POSIX shell hook")
+    def test_honest_cascade_failure_remains_a_failure_on_followup(self):
+        root = self.jobs.parent
+        fake = root / "fake_cascade.py"
+        fake.write_text('import json, sys; print(json.dumps({"ok": False, "url": sys.argv[1], "draft": "Synthetic no verified content", "level": 5, "note": "all_levels_failed"}))\n', encoding="utf-8")
+        source = (HOOKS / "video-url-prefetch.sh").read_text(encoding="utf-8")
+        source = source.replace('/home/box/irisx-failover-restore/20260906/runtime/video-hook', str(root / 'runtime'))
+        source = source.replace('/home/box/irisx-failover-restore/20260906/profile-irisx/hooks/video_takeaway_cascade.py', str(fake))
+        script = root / "hook.sh"
+        script.write_text(source, encoding="utf-8")
+        for message in (self.URL, "請再講一次可帶走內容"):
+            result = subprocess.run(["bash", str(script)], input=json.dumps({"session_id": "failure", "user_message": message}),
+                                    text=True, capture_output=True, cwd=root, env={"PATH": "/usr/bin:/bin", "HOME": str(root)}, timeout=10)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            context = json.loads(result.stdout)["context"]
+            self.assertIn("Synthetic no verified content", context)
+            self.assertIn("級聯失敗回報", context)
+            self.assertNotIn("可帶走草稿", context)
+
+    @unittest.skipUnless(os.name == "posix" and shutil.which("bash"), "POSIX shell hook")
+    def test_new_provider_result_is_checked_before_becoming_a_trusted_session(self):
+        base = self.jobs.parent
+        for matching in (True, False):
+            with self.subTest(matching=matching):
+                root = base / ("matching" if matching else "mismatch")
+                jobs = root / "jobs"
+                job = jobs / "brightdata-AbCdE123"
+                job.mkdir(parents=True)
+                (job / "notes.md").write_text("synthetic", encoding="utf-8")
+                source_url = self.URL if matching else self.OTHER
+                (job / "brightdata.item.json").write_text(json.dumps({"shortCode": source_url.split('/')[-2], "url": source_url}), encoding="utf-8")
+                (root / "irisx_identity.py").write_text((HOOKS / "irisx_identity.py").read_text(encoding="utf-8"), encoding="utf-8")
+                cascade_code = (HOOKS / "video_takeaway_cascade.py").read_text(encoding="utf-8")
+                cascade_code = cascade_code.replace('JOBS = Path("/workspace/video-timeline-pipeline/jobs")', f'JOBS = Path({str(jobs)!r})')
+                cascade_code = cascade_code.split('if __name__ == "__main__":', 1)[0]
+                cascade_code += '\nif __name__ == "__main__":\n    print(json.dumps({"ok": True, "url": sys.argv[1], "job": ' + repr(str(job)) + ', "draft": "Synthetic provider draft", "level": 2}))\n'
+                cascade_script = root / "fake_cascade.py"
+                cascade_script.write_text(cascade_code, encoding="utf-8")
+                source = (HOOKS / "video-url-prefetch.sh").read_text(encoding="utf-8")
+                source = source.replace('/home/box/irisx-failover-restore/20260906/runtime/video-hook', str(root / 'runtime'))
+                source = source.replace('/home/box/irisx-failover-restore/20260906/profile-irisx/hooks/video_takeaway_cascade.py', str(cascade_script))
+                script = root / "hook.sh"
+                script.write_text(source, encoding="utf-8")
+                result = subprocess.run(["bash", str(script)], input=json.dumps({"session_id": "new", "user_message": self.URL}),
+                                        text=True, capture_output=True, cwd=root, env={"PATH": "/usr/bin:/bin", "HOME": str(root)}, timeout=10)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                context = json.loads(result.stdout)["context"]
+                saved = json.loads((root / "runtime" / "sessions" / "new.json").read_text(encoding="utf-8"))
+                if matching:
+                    self.assertIn("Synthetic provider draft", context)
+                    self.assertEqual(saved["outcome"], "success")
+                else:
+                    self.assertNotIn("Synthetic provider draft", context)
+                    self.assertEqual(saved["outcome"], "failure")
+                    self.assertIn("級聯失敗回報", context)
 
     def test_render_failure_is_not_returned_as_a_successful_draft(self):
         job = self.job("render", self.URL, "brightdata.item.json")
