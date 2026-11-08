@@ -163,12 +163,21 @@ def render_event_email(event_type: str, item: dict[str, Any]) -> tuple[str, str]
 
     if event_type == "video.completed":
         subject = f"【影片完成】{title}"
+        summary = str(item.get("summary") or "")
+        drive_url = sanitize_link(item.get("drive_url"))
         text = f"影片已處理完成：\n標題：{title}\n連結：{raw_url or '無'}\n時間軸與摘要已存入本地知識庫。"
+        if summary:
+            text += f"\n摘要：{summary}"
+        if drive_url:
+            text += f"\nDrive 知識檔：{drive_url}"
+        extra = f"<p>{html.escape(summary)}</p>" if summary else ""
+        if drive_url:
+            extra += f'<p><a href="{html.escape(drive_url)}" style="color:#2563eb;">在 Drive 開啟知識檔</a></p>'
         html_msg = f"""
         <div style="font-family:sans-serif;padding:20px;max-width:600px;border:1px solid #e2e8f0;border-radius:8px;">
-          <h2 style="color:#0f172a;margin-top:0;">{subject}</h2>
+          <h2 style="color:#0f172a;margin-top:0;">{html.escape(subject)}</h2>
           <p>影片已順利分析並產出時間軸摘要：</p>
-          <p><a href="{safe_url}" style="color:#2563eb;font-weight:bold;">{safe_title}</a></p>
+          <p><a href="{safe_url}" style="color:#2563eb;font-weight:bold;">{safe_title}</a></p>{extra}
         </div>"""
     else:
         subject = f"【系統通知】{event_type} - {title}"

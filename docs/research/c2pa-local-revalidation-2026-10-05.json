@@ -1,0 +1,932 @@
+{
+  "schema_version": 1,
+  "repository": "Reese-max/video-timeline-pipeline",
+  "issue": 20,
+  "observed_utc": "2026-10-05T05:19:36.849534+00:00",
+  "decision": "NARROW_LOCAL_ORIGINAL_RESEARCH_ONLY",
+  "actual_source_commit": "cb060a7e53a30efe6dff0acaf2fb242532881f4c",
+  "historical_receipt_sha256": "6ce60ecd32c8fb3b0a1f4e10f3fbb23cb5bbf844f0279ff959d315bf4f83dd8d",
+  "historical_receipt_preserved": true,
+  "tool_binary_sha256": "3f76d680685a1387e2d3b7d13ba18f069d88dc1a05f096d0b7a4995b2633ee13",
+  "tool_version": "c2patool 0.28.1",
+  "settings_hashes_match_historical": true,
+  "public_downloads_only": true,
+  "validation_network": "Each of15 validator executions and actual pipeline helper readback use bwrap --unshare-net; no external route",
+  "validation_rows": [
+    {
+      "asset": "original",
+      "policy": "empty",
+      "started_utc": "2026-10-05T05:19:36.516317+00:00",
+      "finished_utc": "2026-10-05T05:19:36.529317+00:00",
+      "command": [
+        "bwrap",
+        "--unshare-net",
+        "--ro-bind",
+        "/",
+        "/",
+        "--dev",
+        "/dev",
+        "--proc",
+        "/proc",
+        "--bind",
+        "$STUDY",
+        "$STUDY",
+        "$STUDY/tool/c2patool/c2patool",
+        "--settings",
+        "$STUDY/offline-empty.json",
+        "--detailed",
+        "$STUDY/fixtures/video1.mp4"
+      ],
+      "exit_code": 0,
+      "asset_sha256": "b310ba339ca89950e3c921754566d5e44ef52c45dd1ddbbfe1383c8e7761cfd0",
+      "settings_sha256": "5938b4e471cfe62ced605b8ad8981efddebf61687cc2527a6b84653d8ed35a4f",
+      "report_sha256": "c58e37089ccfb7bb1bfe9f3aea35bc68d238aa8fc0cba347e432d91b6102229a",
+      "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "validation_state": "Valid",
+      "manifest_count": 2,
+      "active_codes": {
+        "success": [
+          "timeStamp.validated",
+          "timeStamp.trusted",
+          "claimSignature.insideValidity",
+          "claimSignature.validated",
+          "assertion.hashedURI.match",
+          "assertion.hashedURI.match",
+          "assertion.hashedURI.match",
+          "assertion.hashedURI.match",
+          "assertion.hashedURI.match",
+          "assertion.bmffHash.match"
+        ],
+        "informational": [
+          "signingCredential.ocsp.skipped",
+          "assertion.bmffHash.additionalExclusionsPresent"
+        ],
+        "failure": [
+          "signingCredential.untrusted"
+        ]
+      },
+      "input_unchanged": true,
+      "matches_historical_codes_and_asset": true,
+      "stderr": ""
+    },
+    {
+      "asset": "original",
+      "policy": "official",
+      "started_utc": "2026-10-05T05:19:36.531037+00:00",
+      "finished_utc": "2026-10-05T05:19:36.546422+00:00",
+      "command": [
+        "bwrap",
+        "--unshare-net",
+        "--ro-bind",
+        "/",
+        "/",
+        "--dev",
+        "/dev",
+        "--proc",
+        "/proc",
+        "--bind",
+        "$STUDY",
+        "$STUDY",
+        "$STUDY/tool/c2patool/c2patool",
+        "--settings",
+        "$STUDY/offline-official.json",
+        "--detailed",
+        "$STUDY/fixtures/video1.mp4"
+      ],
+      "exit_code": 0,
+      "asset_sha256": "b310ba339ca89950e3c921754566d5e44ef52c45dd1ddbbfe1383c8e7761cfd0",
+      "settings_sha256": "55dfbe26e542a45dd59294f045bb320b8678d11d142bac2c7976eaa232c0430b",
+      "report_sha256": "6f9e9b36b71c037a9a455cca569f8f4b55bc7e1b86240ed1c9b233ec47fd18c3",
+      "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "validation_state": "Valid",
+      "manifest_count": 2,
+      "active_codes": {
+        "success": [
+          "timeStamp.validated",
+          "timeStamp.trusted",
+          "claimSignature.insideValidity",
+          "claimSignature.validated",
+          "assertion.hashedURI.match",
+          "assertion.hashedURI.match",
+          "assertion.hashedURI.match",
+          "assertion.hashedURI.match",
+          "assertion.hashedURI.match",
+          "assertion.bmffHash.match"
+        ],
+        "informational": [
+          "signingCredential.ocsp.skipped",
+          "assertion.bmffHash.additionalExclusionsPresent"
+        ],
+        "failure": [
+          "signingCredential.untrusted"
+        ]
+      },
+      "input_unchanged": true,
+      "matches_historical_codes_and_asset": true,
+      "stderr": ""
+    },
+    {
+      "asset": "original",
+      "policy": "test",
+      "started_utc": "2026-10-05T05:19:36.548037+00:00",
+      "finished_utc": "2026-10-05T05:19:36.561172+00:00",
+      "command": [
+        "bwrap",
+        "--unshare-net",
+        "--ro-bind",
+        "/",
+        "/",
+        "--dev",
+        "/dev",
+        "--proc",
+        "/proc",
+        "--bind",
+        "$STUDY",
+        "$STUDY",
+        "$STUDY/tool/c2patool/c2patool",
+        "--settings",
+        "$STUDY/offline-test.json",
+        "--detailed",
+        "$STUDY/fixtures/video1.mp4"
+      ],
+      "exit_code": 0,
+      "asset_sha256": "b310ba339ca89950e3c921754566d5e44ef52c45dd1ddbbfe1383c8e7761cfd0",
+      "settings_sha256": "0837e59fec044fb404c5a0d799e410d290587e3b416f97935371d0521477fffa",
+      "report_sha256": "e5ad8d3d0c61c66b4930224580c1217a3704f632f3cb6f9de700128407c7f8c1",
+      "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "validation_state": "Valid",
+      "manifest_count": 2,
+      "active_codes": {
+        "success": [
+          "timeStamp.validated",
+          "timeStamp.trusted",
+          "signingCredential.trusted",
+          "claimSignature.insideValidity",
+          "claimSignature.validated",
+          "assertion.hashedURI.match",
+          "assertion.hashedURI.match",
+          "assertion.hashedURI.match",
+          "assertion.hashedURI.match",
+          "assertion.hashedURI.match",
+          "assertion.bmffHash.match"
+        ],
+        "informational": [
+          "signingCredential.ocsp.skipped",
+          "assertion.bmffHash.additionalExclusionsPresent"
+        ],
+        "failure": []
+      },
+      "input_unchanged": true,
+      "matches_historical_codes_and_asset": true,
+      "stderr": ""
+    },
+    {
+      "asset": "copy",
+      "policy": "empty",
+      "started_utc": "2026-10-05T05:19:36.562721+00:00",
+      "finished_utc": "2026-10-05T05:19:36.574669+00:00",
+      "command": [
+        "bwrap",
+        "--unshare-net",
+        "--ro-bind",
+        "/",
+        "/",
+        "--dev",
+        "/dev",
+        "--proc",
+        "/proc",
+        "--bind",
+        "$STUDY",
+        "$STUDY",
+        "$STUDY/tool/c2patool/c2patool",
+        "--settings",
+        "$STUDY/offline-empty.json",
+        "--detailed",
+        "$STUDY/fixtures/video1-copy.mp4"
+      ],
+      "exit_code": 0,
+      "asset_sha256": "b310ba339ca89950e3c921754566d5e44ef52c45dd1ddbbfe1383c8e7761cfd0",
+      "settings_sha256": "5938b4e471cfe62ced605b8ad8981efddebf61687cc2527a6b84653d8ed35a4f",
+      "report_sha256": "58acd4458968eb660fd520aff83ff2900220407c90c75e538f000c6f90565a93",
+      "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "validation_state": "Valid",
+      "manifest_count": 2,
+      "active_codes": {
+        "success": [
+          "timeStamp.validated",
+          "timeStamp.trusted",
+          "claimSignature.insideValidity",
+          "claimSignature.validated",
+          "assertion.hashedURI.match",
+          "assertion.hashedURI.match",
+          "assertion.hashedURI.match",
+          "assertion.hashedURI.match",
+          "assertion.hashedURI.match",
+          "assertion.bmffHash.match"
+        ],
+        "informational": [
+          "signingCredential.ocsp.skipped",
+          "assertion.bmffHash.additionalExclusionsPresent"
+        ],
+        "failure": [
+          "signingCredential.untrusted"
+        ]
+      },
+      "input_unchanged": true,
+      "matches_historical_codes_and_asset": true,
+      "stderr": ""
+    },
+    {
+      "asset": "copy",
+      "policy": "official",
+      "started_utc": "2026-10-05T05:19:36.576190+00:00",
+      "finished_utc": "2026-10-05T05:19:36.592014+00:00",
+      "command": [
+        "bwrap",
+        "--unshare-net",
+        "--ro-bind",
+        "/",
+        "/",
+        "--dev",
+        "/dev",
+        "--proc",
+        "/proc",
+        "--bind",
+        "$STUDY",
+        "$STUDY",
+        "$STUDY/tool/c2patool/c2patool",
+        "--settings",
+        "$STUDY/offline-official.json",
+        "--detailed",
+        "$STUDY/fixtures/video1-copy.mp4"
+      ],
+      "exit_code": 0,
+      "asset_sha256": "b310ba339ca89950e3c921754566d5e44ef52c45dd1ddbbfe1383c8e7761cfd0",
+      "settings_sha256": "55dfbe26e542a45dd59294f045bb320b8678d11d142bac2c7976eaa232c0430b",
+      "report_sha256": "88698f1fa2a1622caa425059cb4f9e11e61f0acea0ced5d3f6f0c63f627596dd",
+      "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "validation_state": "Valid",
+      "manifest_count": 2,
+      "active_codes": {
+        "success": [
+          "timeStamp.validated",
+          "timeStamp.trusted",
+          "claimSignature.insideValidity",
+          "claimSignature.validated",
+          "assertion.hashedURI.match",
+          "assertion.hashedURI.match",
+          "assertion.hashedURI.match",
+          "assertion.hashedURI.match",
+          "assertion.hashedURI.match",
+          "assertion.bmffHash.match"
+        ],
+        "informational": [
+          "signingCredential.ocsp.skipped",
+          "assertion.bmffHash.additionalExclusionsPresent"
+        ],
+        "failure": [
+          "signingCredential.untrusted"
+        ]
+      },
+      "input_unchanged": true,
+      "matches_historical_codes_and_asset": true,
+      "stderr": ""
+    },
+    {
+      "asset": "copy",
+      "policy": "test",
+      "started_utc": "2026-10-05T05:19:36.593643+00:00",
+      "finished_utc": "2026-10-05T05:19:36.609736+00:00",
+      "command": [
+        "bwrap",
+        "--unshare-net",
+        "--ro-bind",
+        "/",
+        "/",
+        "--dev",
+        "/dev",
+        "--proc",
+        "/proc",
+        "--bind",
+        "$STUDY",
+        "$STUDY",
+        "$STUDY/tool/c2patool/c2patool",
+        "--settings",
+        "$STUDY/offline-test.json",
+        "--detailed",
+        "$STUDY/fixtures/video1-copy.mp4"
+      ],
+      "exit_code": 0,
+      "asset_sha256": "b310ba339ca89950e3c921754566d5e44ef52c45dd1ddbbfe1383c8e7761cfd0",
+      "settings_sha256": "0837e59fec044fb404c5a0d799e410d290587e3b416f97935371d0521477fffa",
+      "report_sha256": "199c6aa2eb77524643d06b8488950fb24b493bbec8939d1a4403cb0d00a101ae",
+      "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "validation_state": "Valid",
+      "manifest_count": 2,
+      "active_codes": {
+        "success": [
+          "timeStamp.validated",
+          "timeStamp.trusted",
+          "signingCredential.trusted",
+          "claimSignature.insideValidity",
+          "claimSignature.validated",
+          "assertion.hashedURI.match",
+          "assertion.hashedURI.match",
+          "assertion.hashedURI.match",
+          "assertion.hashedURI.match",
+          "assertion.hashedURI.match",
+          "assertion.bmffHash.match"
+        ],
+        "informational": [
+          "signingCredential.ocsp.skipped",
+          "assertion.bmffHash.additionalExclusionsPresent"
+        ],
+        "failure": []
+      },
+      "input_unchanged": true,
+      "matches_historical_codes_and_asset": true,
+      "stderr": ""
+    },
+    {
+      "asset": "tampered",
+      "policy": "empty",
+      "started_utc": "2026-10-05T05:19:36.611252+00:00",
+      "finished_utc": "2026-10-05T05:19:36.622511+00:00",
+      "command": [
+        "bwrap",
+        "--unshare-net",
+        "--ro-bind",
+        "/",
+        "/",
+        "--dev",
+        "/dev",
+        "--proc",
+        "/proc",
+        "--bind",
+        "$STUDY",
+        "$STUDY",
+        "$STUDY/tool/c2patool/c2patool",
+        "--settings",
+        "$STUDY/offline-empty.json",
+        "--detailed",
+        "$STUDY/fixtures/video1-tampered.mp4"
+      ],
+      "exit_code": 0,
+      "asset_sha256": "86436ef0d680c4985314e78b60c2d48831619bf5749973638bb1b108c39395ba",
+      "settings_sha256": "5938b4e471cfe62ced605b8ad8981efddebf61687cc2527a6b84653d8ed35a4f",
+      "report_sha256": "da72368697da8defb76ecc37b38afce312d474296bfb9f1057f6a98ea6f9bb56",
+      "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "validation_state": "Invalid",
+      "manifest_count": 2,
+      "active_codes": {
+        "success": [
+          "timeStamp.validated",
+          "timeStamp.trusted",
+          "claimSignature.insideValidity",
+          "claimSignature.validated",
+          "assertion.hashedURI.match",
+          "assertion.hashedURI.match",
+          "assertion.hashedURI.match",
+          "assertion.hashedURI.match",
+          "assertion.hashedURI.match"
+        ],
+        "informational": [
+          "signingCredential.ocsp.skipped",
+          "assertion.bmffHash.additionalExclusionsPresent"
+        ],
+        "failure": [
+          "signingCredential.untrusted",
+          "assertion.bmffHash.mismatch"
+        ]
+      },
+      "input_unchanged": true,
+      "matches_historical_codes_and_asset": true,
+      "stderr": ""
+    },
+    {
+      "asset": "tampered",
+      "policy": "official",
+      "started_utc": "2026-10-05T05:19:36.624469+00:00",
+      "finished_utc": "2026-10-05T05:19:36.639041+00:00",
+      "command": [
+        "bwrap",
+        "--unshare-net",
+        "--ro-bind",
+        "/",
+        "/",
+        "--dev",
+        "/dev",
+        "--proc",
+        "/proc",
+        "--bind",
+        "$STUDY",
+        "$STUDY",
+        "$STUDY/tool/c2patool/c2patool",
+        "--settings",
+        "$STUDY/offline-official.json",
+        "--detailed",
+        "$STUDY/fixtures/video1-tampered.mp4"
+      ],
+      "exit_code": 0,
+      "asset_sha256": "86436ef0d680c4985314e78b60c2d48831619bf5749973638bb1b108c39395ba",
+      "settings_sha256": "55dfbe26e542a45dd59294f045bb320b8678d11d142bac2c7976eaa232c0430b",
+      "report_sha256": "13af6e1ed0c070a33e457ba43a2701a7091ed04bd0f0a4f3b906f0dba1cbba7c",
+      "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "validation_state": "Invalid",
+      "manifest_count": 2,
+      "active_codes": {
+        "success": [
+          "timeStamp.validated",
+          "timeStamp.trusted",
+          "claimSignature.insideValidity",
+          "claimSignature.validated",
+          "assertion.hashedURI.match",
+          "assertion.hashedURI.match",
+          "assertion.hashedURI.match",
+          "assertion.hashedURI.match",
+          "assertion.hashedURI.match"
+        ],
+        "informational": [
+          "signingCredential.ocsp.skipped",
+          "assertion.bmffHash.additionalExclusionsPresent"
+        ],
+        "failure": [
+          "signingCredential.untrusted",
+          "assertion.bmffHash.mismatch"
+        ]
+      },
+      "input_unchanged": true,
+      "matches_historical_codes_and_asset": true,
+      "stderr": ""
+    },
+    {
+      "asset": "tampered",
+      "policy": "test",
+      "started_utc": "2026-10-05T05:19:36.640608+00:00",
+      "finished_utc": "2026-10-05T05:19:36.656214+00:00",
+      "command": [
+        "bwrap",
+        "--unshare-net",
+        "--ro-bind",
+        "/",
+        "/",
+        "--dev",
+        "/dev",
+        "--proc",
+        "/proc",
+        "--bind",
+        "$STUDY",
+        "$STUDY",
+        "$STUDY/tool/c2patool/c2patool",
+        "--settings",
+        "$STUDY/offline-test.json",
+        "--detailed",
+        "$STUDY/fixtures/video1-tampered.mp4"
+      ],
+      "exit_code": 0,
+      "asset_sha256": "86436ef0d680c4985314e78b60c2d48831619bf5749973638bb1b108c39395ba",
+      "settings_sha256": "0837e59fec044fb404c5a0d799e410d290587e3b416f97935371d0521477fffa",
+      "report_sha256": "7eb11a7691c20c4c4c758e0c6036b014a1e84cfbf151e2a58dc3bdcfe0fdf7ed",
+      "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "validation_state": "Invalid",
+      "manifest_count": 2,
+      "active_codes": {
+        "success": [
+          "timeStamp.validated",
+          "timeStamp.trusted",
+          "signingCredential.trusted",
+          "claimSignature.insideValidity",
+          "claimSignature.validated",
+          "assertion.hashedURI.match",
+          "assertion.hashedURI.match",
+          "assertion.hashedURI.match",
+          "assertion.hashedURI.match",
+          "assertion.hashedURI.match"
+        ],
+        "informational": [
+          "signingCredential.ocsp.skipped",
+          "assertion.bmffHash.additionalExclusionsPresent"
+        ],
+        "failure": [
+          "assertion.bmffHash.mismatch"
+        ]
+      },
+      "input_unchanged": true,
+      "matches_historical_codes_and_asset": true,
+      "stderr": ""
+    },
+    {
+      "asset": "absent",
+      "policy": "empty",
+      "started_utc": "2026-10-05T05:19:36.657798+00:00",
+      "finished_utc": "2026-10-05T05:19:36.664603+00:00",
+      "command": [
+        "bwrap",
+        "--unshare-net",
+        "--ro-bind",
+        "/",
+        "/",
+        "--dev",
+        "/dev",
+        "--proc",
+        "/proc",
+        "--bind",
+        "$STUDY",
+        "$STUDY",
+        "$STUDY/tool/c2patool/c2patool",
+        "--settings",
+        "$STUDY/offline-empty.json",
+        "--detailed",
+        "$STUDY/fixtures/video1_no_manifest.mp4"
+      ],
+      "exit_code": 1,
+      "asset_sha256": "e5acfbfbb0db93b1551520f2f692630dabd507555adc9386aa9595acf261d8c9",
+      "settings_sha256": "5938b4e471cfe62ced605b8ad8981efddebf61687cc2527a6b84653d8ed35a4f",
+      "report_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "stderr_sha256": "11fb6f23374bb493f962990f8c30e684dc2c856077b27a53de11a94b83adb226",
+      "validation_state": null,
+      "manifest_count": 0,
+      "active_codes": {
+        "success": [],
+        "informational": [],
+        "failure": []
+      },
+      "input_unchanged": true,
+      "matches_historical_codes_and_asset": true,
+      "stderr": "Error: No claim found\n"
+    },
+    {
+      "asset": "absent",
+      "policy": "official",
+      "started_utc": "2026-10-05T05:19:36.665958+00:00",
+      "finished_utc": "2026-10-05T05:19:36.672623+00:00",
+      "command": [
+        "bwrap",
+        "--unshare-net",
+        "--ro-bind",
+        "/",
+        "/",
+        "--dev",
+        "/dev",
+        "--proc",
+        "/proc",
+        "--bind",
+        "$STUDY",
+        "$STUDY",
+        "$STUDY/tool/c2patool/c2patool",
+        "--settings",
+        "$STUDY/offline-official.json",
+        "--detailed",
+        "$STUDY/fixtures/video1_no_manifest.mp4"
+      ],
+      "exit_code": 1,
+      "asset_sha256": "e5acfbfbb0db93b1551520f2f692630dabd507555adc9386aa9595acf261d8c9",
+      "settings_sha256": "55dfbe26e542a45dd59294f045bb320b8678d11d142bac2c7976eaa232c0430b",
+      "report_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "stderr_sha256": "11fb6f23374bb493f962990f8c30e684dc2c856077b27a53de11a94b83adb226",
+      "validation_state": null,
+      "manifest_count": 0,
+      "active_codes": {
+        "success": [],
+        "informational": [],
+        "failure": []
+      },
+      "input_unchanged": true,
+      "matches_historical_codes_and_asset": true,
+      "stderr": "Error: No claim found\n"
+    },
+    {
+      "asset": "absent",
+      "policy": "test",
+      "started_utc": "2026-10-05T05:19:36.673923+00:00",
+      "finished_utc": "2026-10-05T05:19:36.679543+00:00",
+      "command": [
+        "bwrap",
+        "--unshare-net",
+        "--ro-bind",
+        "/",
+        "/",
+        "--dev",
+        "/dev",
+        "--proc",
+        "/proc",
+        "--bind",
+        "$STUDY",
+        "$STUDY",
+        "$STUDY/tool/c2patool/c2patool",
+        "--settings",
+        "$STUDY/offline-test.json",
+        "--detailed",
+        "$STUDY/fixtures/video1_no_manifest.mp4"
+      ],
+      "exit_code": 1,
+      "asset_sha256": "e5acfbfbb0db93b1551520f2f692630dabd507555adc9386aa9595acf261d8c9",
+      "settings_sha256": "0837e59fec044fb404c5a0d799e410d290587e3b416f97935371d0521477fffa",
+      "report_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "stderr_sha256": "11fb6f23374bb493f962990f8c30e684dc2c856077b27a53de11a94b83adb226",
+      "validation_state": null,
+      "manifest_count": 0,
+      "active_codes": {
+        "success": [],
+        "informational": [],
+        "failure": []
+      },
+      "input_unchanged": true,
+      "matches_historical_codes_and_asset": true,
+      "stderr": "Error: No claim found\n"
+    },
+    {
+      "asset": "remux",
+      "policy": "empty",
+      "started_utc": "2026-10-05T05:19:36.680783+00:00",
+      "finished_utc": "2026-10-05T05:19:36.686058+00:00",
+      "command": [
+        "bwrap",
+        "--unshare-net",
+        "--ro-bind",
+        "/",
+        "/",
+        "--dev",
+        "/dev",
+        "--proc",
+        "/proc",
+        "--bind",
+        "$STUDY",
+        "$STUDY",
+        "$STUDY/tool/c2patool/c2patool",
+        "--settings",
+        "$STUDY/offline-empty.json",
+        "--detailed",
+        "$STUDY/fixtures/video1-remux.mp4"
+      ],
+      "exit_code": 1,
+      "asset_sha256": "e26425e85cb4229b4999868d14c8ae37c37b8f1c183f66bbbfe26c8ae6ecd9b2",
+      "settings_sha256": "5938b4e471cfe62ced605b8ad8981efddebf61687cc2527a6b84653d8ed35a4f",
+      "report_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "stderr_sha256": "11fb6f23374bb493f962990f8c30e684dc2c856077b27a53de11a94b83adb226",
+      "validation_state": null,
+      "manifest_count": 0,
+      "active_codes": {
+        "success": [],
+        "informational": [],
+        "failure": []
+      },
+      "input_unchanged": true,
+      "matches_historical_codes_and_asset": true,
+      "stderr": "Error: No claim found\n"
+    },
+    {
+      "asset": "remux",
+      "policy": "official",
+      "started_utc": "2026-10-05T05:19:36.687394+00:00",
+      "finished_utc": "2026-10-05T05:19:36.692514+00:00",
+      "command": [
+        "bwrap",
+        "--unshare-net",
+        "--ro-bind",
+        "/",
+        "/",
+        "--dev",
+        "/dev",
+        "--proc",
+        "/proc",
+        "--bind",
+        "$STUDY",
+        "$STUDY",
+        "$STUDY/tool/c2patool/c2patool",
+        "--settings",
+        "$STUDY/offline-official.json",
+        "--detailed",
+        "$STUDY/fixtures/video1-remux.mp4"
+      ],
+      "exit_code": 1,
+      "asset_sha256": "e26425e85cb4229b4999868d14c8ae37c37b8f1c183f66bbbfe26c8ae6ecd9b2",
+      "settings_sha256": "55dfbe26e542a45dd59294f045bb320b8678d11d142bac2c7976eaa232c0430b",
+      "report_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "stderr_sha256": "11fb6f23374bb493f962990f8c30e684dc2c856077b27a53de11a94b83adb226",
+      "validation_state": null,
+      "manifest_count": 0,
+      "active_codes": {
+        "success": [],
+        "informational": [],
+        "failure": []
+      },
+      "input_unchanged": true,
+      "matches_historical_codes_and_asset": true,
+      "stderr": "Error: No claim found\n"
+    },
+    {
+      "asset": "remux",
+      "policy": "test",
+      "started_utc": "2026-10-05T05:19:36.693786+00:00",
+      "finished_utc": "2026-10-05T05:19:36.700206+00:00",
+      "command": [
+        "bwrap",
+        "--unshare-net",
+        "--ro-bind",
+        "/",
+        "/",
+        "--dev",
+        "/dev",
+        "--proc",
+        "/proc",
+        "--bind",
+        "$STUDY",
+        "$STUDY",
+        "$STUDY/tool/c2patool/c2patool",
+        "--settings",
+        "$STUDY/offline-test.json",
+        "--detailed",
+        "$STUDY/fixtures/video1-remux.mp4"
+      ],
+      "exit_code": 1,
+      "asset_sha256": "e26425e85cb4229b4999868d14c8ae37c37b8f1c183f66bbbfe26c8ae6ecd9b2",
+      "settings_sha256": "0837e59fec044fb404c5a0d799e410d290587e3b416f97935371d0521477fffa",
+      "report_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "stderr_sha256": "11fb6f23374bb493f962990f8c30e684dc2c856077b27a53de11a94b83adb226",
+      "validation_state": null,
+      "manifest_count": 0,
+      "active_codes": {
+        "success": [],
+        "informational": [],
+        "failure": []
+      },
+      "input_unchanged": true,
+      "matches_historical_codes_and_asset": true,
+      "stderr": "Error: No claim found\n"
+    }
+  ],
+  "pipeline_readback": {
+    "source_commit": "cb060a7e53a30efe6dff0acaf2fb242532881f4c",
+    "pipeline_blob": "9fdc3884576d71f1ab3a7575ae099084669e2253",
+    "command": [
+      "bwrap",
+      "--unshare-net",
+      "--ro-bind",
+      "/",
+      "/",
+      "--dev",
+      "/dev",
+      "--proc",
+      "/proc",
+      "--bind",
+      "$STUDY",
+      "$STUDY",
+      "--setenv",
+      "TMPDIR",
+      "$STUDY/tmp",
+      "/opt/codex/runtimes/codex-primary-runtime/dependencies/python/bin/python",
+      "$STUDY/readback.py"
+    ],
+    "exit_code": 0,
+    "rows": [
+      {
+        "asset": "video1.mp4",
+        "sha256": "b310ba339ca89950e3c921754566d5e44ef52c45dd1ddbbfe1383c8e7761cfd0",
+        "file_fingerprint": "828571:1791177232504558664",
+        "file_fingerprint_is_cryptographic": false,
+        "duration_seconds": 2.0,
+        "format_name": "mov,mp4,m4a,3gp,3g2,mj2",
+        "streams": [
+          {
+            "codec_type": "video",
+            "codec_name": "h264",
+            "width": 720,
+            "height": 1280
+          },
+          {
+            "codec_type": "audio",
+            "codec_name": "aac",
+            "width": null,
+            "height": null
+          }
+        ],
+        "probe_cache_readback_equal": true,
+        "input_unchanged": true,
+        "cache_sha256": "99d32b38927c047b2ffd777f2c5b22fd95ed77ee44582a500ba77141fee37ade"
+      },
+      {
+        "asset": "video1-copy.mp4",
+        "sha256": "b310ba339ca89950e3c921754566d5e44ef52c45dd1ddbbfe1383c8e7761cfd0",
+        "file_fingerprint": "828571:1791177323692923548",
+        "file_fingerprint_is_cryptographic": false,
+        "duration_seconds": 2.0,
+        "format_name": "mov,mp4,m4a,3gp,3g2,mj2",
+        "streams": [
+          {
+            "codec_type": "video",
+            "codec_name": "h264",
+            "width": 720,
+            "height": 1280
+          },
+          {
+            "codec_type": "audio",
+            "codec_name": "aac",
+            "width": null,
+            "height": null
+          }
+        ],
+        "probe_cache_readback_equal": true,
+        "input_unchanged": true,
+        "cache_sha256": "b059181958218e6eb395a8a4479080c5df68801092b04caaba9d6f521da08b03"
+      },
+      {
+        "asset": "video1-tampered.mp4",
+        "sha256": "86436ef0d680c4985314e78b60c2d48831619bf5749973638bb1b108c39395ba",
+        "file_fingerprint": "828571:1791177323693929285",
+        "file_fingerprint_is_cryptographic": false,
+        "duration_seconds": 2.0,
+        "format_name": "mov,mp4,m4a,3gp,3g2,mj2",
+        "streams": [
+          {
+            "codec_type": "video",
+            "codec_name": "h264",
+            "width": 720,
+            "height": 1280
+          },
+          {
+            "codec_type": "audio",
+            "codec_name": "aac",
+            "width": null,
+            "height": null
+          }
+        ],
+        "probe_cache_readback_equal": true,
+        "input_unchanged": true,
+        "cache_sha256": "059776618fb84556aa6c2e77c8e9880bb931d61bad6bd2d09215cbed9756e585"
+      },
+      {
+        "asset": "video1_no_manifest.mp4",
+        "sha256": "e5acfbfbb0db93b1551520f2f692630dabd507555adc9386aa9595acf261d8c9",
+        "file_fingerprint": "797909:1791177232709283048",
+        "file_fingerprint_is_cryptographic": false,
+        "duration_seconds": 2.0,
+        "format_name": "mov,mp4,m4a,3gp,3g2,mj2",
+        "streams": [
+          {
+            "codec_type": "video",
+            "codec_name": "h264",
+            "width": 720,
+            "height": 1280
+          },
+          {
+            "codec_type": "audio",
+            "codec_name": "aac",
+            "width": null,
+            "height": null
+          }
+        ],
+        "probe_cache_readback_equal": true,
+        "input_unchanged": true,
+        "cache_sha256": "680a6368fe992dec305bfbf34781f56e6130b89c9f938778e062938248c63648"
+      },
+      {
+        "asset": "video1-remux.mp4",
+        "sha256": "e26425e85cb4229b4999868d14c8ae37c37b8f1c183f66bbbfe26c8ae6ecd9b2",
+        "file_fingerprint": "739239:1791177323781130044",
+        "file_fingerprint_is_cryptographic": false,
+        "duration_seconds": 2.0,
+        "format_name": "mov,mp4,m4a,3gp,3g2,mj2",
+        "streams": [
+          {
+            "codec_type": "video",
+            "codec_name": "h264",
+            "width": 720,
+            "height": 1280
+          },
+          {
+            "codec_type": "audio",
+            "codec_name": "aac",
+            "width": null,
+            "height": null
+          }
+        ],
+        "probe_cache_readback_equal": true,
+        "input_unchanged": true,
+        "cache_sha256": "eb8bca128ad5b925c1e90caedbdad856b2d556587506a6f70b8df80361e23cd8"
+      }
+    ],
+    "scope": "Only existing file_fingerprint/probe_video/video_duration; no full pipeline, downloader, social URL, model or product C2PA gate"
+  },
+  "assertions": {
+    "actual_validator_cases": 15,
+    "all_codes_and_assets_match_historical": true,
+    "current_pipeline_readback_assets": 5,
+    "inputs_unchanged": true,
+    "provider_requests": 0,
+    "signing_requests": 0,
+    "production_gate_activated": false
+  },
+  "remaining_bounds": [
+    "Exit code 0 also occurs for Invalid tampered assets; exit code and aggregate Valid are not admission evidence.",
+    "Original official-policy report is Valid with signingCredential.untrusted. Trust is a separate axis and must require explicit success under the intended frozen policy.",
+    "Timestamp success says legacy timestamp cert trusted. Inclusion of frozen official TSA roots is not independent proof of strict official-list-only TSA matching.",
+    "signingCredential.ocsp.skipped means current revocation status is unknown; no network revocation check was performed.",
+    "assertion.bmffHash.additionalExclusionsPresent is reported; only this covered mdat-byte tamper and the declared BMFF assertion were studied, not exhaustive coverage of all file bytes.",
+    "Frozen trust-list HTTPS/GitHub retrieval and SHA256 are recorded; LoTE signature authenticity was not independently verified.",
+    "Original sample claim metadata and certificate test identities are signed assertions, not independently established identity, content truth, or licensing claims.",
+    "Remux is one owned local ffmpeg stream-copy transformation, not evidence for any social platform or arbitrary CDN behavior.",
+    "Canonical pipeline helpers only prove normal local MP4 probe/cache readback. file_fingerprint is size:mtime_ns, not a cryptographic identity or product C2PA verification.",
+    "No authoritative production/conforming-signer licensed MP4, supported public-platform same-source derivative receipt, or user time-saving evaluation was obtained."
+  ]
+}

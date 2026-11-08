@@ -1,0 +1,42 @@
+{
+  "specHash": "47c4d03885b0bc3d729348bb56bb6e65485a399fc9a697b15194697610825c0b",
+  "cutSpecVersion": 1,
+  "source": {
+    "videoPath": "tests/fixtures/cutspec/cfr_30.mp4",
+    "contentHash": "e6284cc94ec4aae135b02662f7ee851d7a41d373e2fc111b2210cc87ba0d4602",
+    "fps": 30.0,
+    "timebase": "30/1",
+    "vfr": false,
+    "durationSec": 4.0
+  },
+  "clipCount": 1,
+  "intendedDurationSec": 98.5,
+  "clips": [
+    {
+      "segmentId": "seg-0",
+      "sourceStartSec": 0.5,
+      "sourceEndSec": 99.0,
+      "timelineStartSec": 0.0,
+      "timelineEndSec": 98.5,
+      "evidenceRef": "transcript:cfr_30.mp4:span-0",
+      "selection": "manual",
+      "status": "rejected",
+      "flags": [
+        "OUT_OF_RANGE"
+      ]
+    }
+  ],
+  "gaps": [],
+  "status": "rejected",
+  "rejectCodes": [
+    "OUT_OF_RANGE"
+  ],
+  "issues": [
+    {
+      "code": "OUT_OF_RANGE",
+      "severity": "reject",
+      "segmentId": "seg-0",
+      "detail": "range 0.5-99.0 exceeds source duration 4.0"
+    }
+  ]
+}

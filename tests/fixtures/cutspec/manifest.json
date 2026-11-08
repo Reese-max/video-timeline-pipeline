@@ -1,0 +1,78 @@
+{
+  "schema": "cutspec-fixture-manifest/1",
+  "ffmpeg": "ffmpeg version 7.1.5-0+deb13u1 Copyright (c) 2000-2026 the FFmpeg developers",
+  "fixtures": [
+    {
+      "file": "cfr_23976.mp4",
+      "sha256": "5c8c27aaf3a2f0859b96f6691be80d3e2ecdec7076b7173ab351b84c75e9db8e",
+      "bytes": 15909,
+      "probe": {
+        "r_frame_rate": "24000/1001",
+        "avg_frame_rate": "24000/1001",
+        "time_base": "1/24000",
+        "duration": "4.004000",
+        "nb_frames": "96"
+      }
+    },
+    {
+      "file": "cfr_24.mp4",
+      "sha256": "676f6681df64fe588b1dee5160e8086c680bfd93ac324708e4c3440c2d98876c",
+      "bytes": 15954,
+      "probe": {
+        "r_frame_rate": "24/1",
+        "avg_frame_rate": "24/1",
+        "time_base": "1/12288",
+        "duration": "4.000000",
+        "nb_frames": "96"
+      }
+    },
+    {
+      "file": "cfr_25.mp4",
+      "sha256": "570a40aa7a8dbdfeb1b7505028f0438a0eb57862136f9c17e02ee592f74c98e7",
+      "bytes": 16191,
+      "probe": {
+        "r_frame_rate": "25/1",
+        "avg_frame_rate": "25/1",
+        "time_base": "1/12800",
+        "duration": "4.000000",
+        "nb_frames": "100"
+      }
+    },
+    {
+      "file": "cfr_2997.mp4",
+      "sha256": "50e064602f0fdb1cd795252f2030fe75e5c0faee18d6c0e07d7a532e15fc968b",
+      "bytes": 17539,
+      "probe": {
+        "r_frame_rate": "30000/1001",
+        "avg_frame_rate": "30000/1001",
+        "time_base": "1/30000",
+        "duration": "4.004000",
+        "nb_frames": "120"
+      }
+    },
+    {
+      "file": "cfr_30.mp4",
+      "sha256": "e6284cc94ec4aae135b02662f7ee851d7a41d373e2fc111b2210cc87ba0d4602",
+      "bytes": 17568,
+      "probe": {
+        "r_frame_rate": "30/1",
+        "avg_frame_rate": "30/1",
+        "time_base": "1/15360",
+        "duration": "4.000000",
+        "nb_frames": "120"
+      }
+    },
+    {
+      "file": "vfr_30.mp4",
+      "sha256": "a1ef0a42f32f00d5ccf132838625e2bf6a7b428b6edba71ab271230f2c5e02f5",
+      "bytes": 16609,
+      "probe": {
+        "r_frame_rate": "30/1",
+        "avg_frame_rate": "2880/119",
+        "time_base": "1/15360",
+        "duration": "3.966667",
+        "nb_frames": "96"
+      }
+    }
+  ]
+}

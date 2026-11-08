@@ -4,7 +4,7 @@ set -euo pipefail
 payload=$(cat)
 export IRISX_HOOK_PAYLOAD="$payload"
 python3 - <<'PY'
-import json, os, re, subprocess, sys
+import hashlib, json, os, re, subprocess, sys
 from pathlib import Path
 
 raw = os.environ.get("IRISX_HOOK_PAYLOAD") or ""
@@ -17,6 +17,8 @@ umsg = extra.get("user_message") or o.get("user_message") or extra.get("message"
 if not isinstance(umsg, str):
     umsg = str(umsg or "")
 sid = str(o.get("session_id") or extra.get("session_id") or "") or "nosid"
+if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", sid):
+    sid = "sid~" + hashlib.sha256(sid.encode("utf-8", errors="surrogatepass")).hexdigest()
 
 URL_RE = re.compile(r"https?://[^\s<>\"\']+", re.I)
 VIDEO_HINT = re.compile(

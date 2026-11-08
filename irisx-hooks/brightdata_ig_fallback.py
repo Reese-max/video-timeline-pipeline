@@ -10,8 +10,9 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from html.parser import HTMLParser
 from pathlib import Path
-from urllib.parse import urlparse
+from irisx_identity import content_id as social_content_id, platform_for_url, provider_item_matches, video_identity
 
 JOBS = Path("/workspace/video-timeline-pipeline/jobs")
 DATASET_ID = "gd_lyclm20il4r5helnj"
@@ -57,38 +58,12 @@ def token() -> str:
 
 
 def detect_platform(url: str) -> str:
-    host = (urlparse(url or "").hostname or "").lower()
-    if host.startswith("www."):
-        host = host[4:]
-    if host in ("instagram.com", "www.instagram.com") or host.endswith(".instagram.com"):
-        return "instagram"
-    if host in ("x.com", "twitter.com", "mobile.twitter.com", "mobile.x.com", "t.co"):
-        return "x"
-    if host in ("threads.net", "www.threads.net") or host.endswith(".threads.net"):
-        return "threads"
-    # path-based fallbacks
-    low = (url or "").lower()
-    if "instagram.com" in low:
-        return "instagram"
-    if "twitter.com" in low or "x.com/" in low or low.startswith("https://x.com"):
-        return "x"
-    if "threads.net" in low:
-        return "threads"
-    return ""
+    platform = platform_for_url(url)
+    return platform if platform in {"instagram", "x", "threads"} else ""
 
 
 def content_id(url: str, platform: str) -> str:
-    u = url or ""
-    if platform == "instagram":
-        m = re.search(r"/(?:reel|reels|p)/([^/?#]+)", u, re.I)
-        return m.group(1) if m else ""
-    if platform == "x":
-        m = re.search(r"/status/(\d+)", u, re.I)
-        return m.group(1) if m else ""
-    if platform == "threads":
-        m = re.search(r"/post/([\w-]+)", u, re.I)
-        return m.group(1) if m else ""
-    return ""
+    return social_content_id(url, platform)
 
 
 def normalize_url(url: str, platform: str, cid: str) -> str:
@@ -339,36 +314,14 @@ def scrape_reel_datasets(tok: str, reel_url: str) -> list:
 
 
 def pick_hit(items: list, cid: str, platform: str):
-    cleaned = []
     for it in items or []:
         if not isinstance(it, dict):
             continue
         if it.get("error") or it.get("error_code"):
             continue
-        cleaned.append(it)
-    for it in cleaned:
-        sc = str(
-            it.get("shortcode")
-            or it.get("shortCode")
-            or it.get("tweet_id")
-            or it.get("id")
-            or it.get("post_id")
-            or ""
-        )
-        u = str(it.get("url") or it.get("webpage_url") or "")
-        if cid and (cid == sc or cid in u or cid in sc):
+        if provider_item_matches(it, cid, platform):
             return it
-    for it in cleaned:
-        if (
-            it.get("description")
-            or it.get("caption")
-            or it.get("video_url")
-            or it.get("text")
-            or it.get("full_text")
-            or it.get("body")
-        ):
-            return it
-    return cleaned[0] if cleaned else None
+    return None
 
 
 def parse_threads_markdown(md: str, url: str, cid: str) -> dict:
@@ -646,9 +599,41 @@ def fetch_x(tok: str, url: str, cid: str):
     return hit, via, "", items
 
 
+class _CanonicalLinkParser(HTMLParser):
+    def __init__(self):
+        super().__init__()
+        self.urls = []
+
+    def handle_starttag(self, tag, attrs):
+        attrs = dict(attrs)
+        if tag.lower() == "link" and "canonical" in str(attrs.get("rel") or "").lower().split():
+            if attrs.get("href"):
+                self.urls.append(attrs["href"])
+
+
+def _threads_source(result, cid: str, raw_html: str = "") -> str:
+    urls = []
+    if isinstance(result, dict):
+        for metadata in (result, result.get("structuredContent")):
+            if isinstance(metadata, dict):
+                urls.extend(metadata.get(key) for key in ("url", "source_url", "canonical_url", "webpage_url"))
+        for item in result.get("content") or []:
+            if isinstance(item, dict) and item.get("type") == "resource" and isinstance(item.get("resource"), dict):
+                urls.append(item["resource"].get("uri"))
+    if raw_html:
+        parser = _CanonicalLinkParser()
+        parser.feed(raw_html)
+        urls.extend(parser.urls)
+    urls = [value for value in urls if isinstance(value, str) and value]
+    if not urls or any(video_identity(value) != ("threads", cid) for value in urls):
+        return ""
+    return urls[0]
+
+
 def fetch_threads(tok: str, url: str, cid: str):
     via = "mcp-http"
     md = ""
+    raw_html = ""
     try:
         result = mcp_tool_call(
             tok,
@@ -671,6 +656,7 @@ def fetch_threads(tok: str, url: str, cid: str):
             )
             texts2 = mcp_content_texts(result2)
             raw_html = "\n".join(texts2)
+            result = result2
             # crude strip tags
             md = re.sub(r"<script[\s\S]*?</script>", " ", raw_html, flags=re.I)
             md = re.sub(r"<style[\s\S]*?</style>", " ", md, flags=re.I)
@@ -683,22 +669,29 @@ def fetch_threads(tok: str, url: str, cid: str):
     if not md or len(md.strip()) < 20:
         return None, via, "brightdata_threads_thin_or_empty", []
 
+    source = _threads_source(result, cid, raw_html)
+    if not source:
+        return None, via, "brightdata_threads_source_unverified", []
     hit = parse_threads_markdown(md, url, cid)
+    hit["_verified_source_url"] = source
     if hit.get("_threads_thin") and len((hit.get("description") or "")) < 40:
         return hit, via, "brightdata_threads_login_wall_or_thin", [hit]
     return hit, via, "", [hit]
 
 
 def main(url: str) -> int:
-    tok = token()
-    if not tok:
-        print(json.dumps({"ok": False, "note": "no_brightdata_token"}))
-        return 0
     platform = detect_platform(url)
     if not platform:
         print(json.dumps({"ok": False, "note": "unsupported_platform"}))
         return 0
     cid = content_id(url, platform)
+    if not cid:
+        print(json.dumps({"ok": False, "note": "unidentified_post", "platform": platform}))
+        return 0
+    tok = token()
+    if not tok:
+        print(json.dumps({"ok": False, "note": "no_brightdata_token"}))
+        return 0
     hit = None
     via = None
     note = ""
@@ -748,6 +741,11 @@ def main(url: str) -> int:
         )
         return 0
 
+    if not provider_item_matches(hit, cid, platform) or (
+        platform == "threads" and video_identity(hit.get("_verified_source_url")) != video_identity(url)
+    ):
+        print(json.dumps({"ok": False, "note": "brightdata_source_unverified", "id": cid, "platform": platform}))
+        return 0
     job = write_job(url, cid, hit, via or "unknown", platform)
     out = {
         "ok": True,

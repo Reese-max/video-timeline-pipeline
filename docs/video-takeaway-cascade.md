@@ -27,6 +27,8 @@ Use when the user pastes a social video/link (Facebook / Instagram / YouTube / T
 - Reply skeleton: type → one-liner → short meta → claims/flow → takeaways (fit/not-fit). Ban unsolicited 行動表.
 - Prefer Bright Data over Apify to conserve Apify free credits.
 - Threads path is best-effort (login wall / thin markdown possible); report honestly if unusable.
+- Validate the actual social host and post ID before invoking a provider; source metadata must agree, while mentions in notes or a locally written request marker do not establish identity.
+- Threads markdown or HTML without a matching structured source URL or canonical link is rejected as unverified. Whether the real Bright Data response supplies this evidence remains unverified; unidentified short links must be resolved to an explicit post URL before a paid fallback.
 
 ## Entry points
 

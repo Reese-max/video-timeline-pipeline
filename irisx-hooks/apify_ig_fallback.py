@@ -3,6 +3,7 @@
 from __future__ import annotations
 import json, os, re, sys, time, urllib.request
 from pathlib import Path
+from irisx_identity import content_id, platform_for_url, provider_item_matches
 
 JOBS = Path("/workspace/video-timeline-pipeline/jobs")
 
@@ -33,8 +34,7 @@ def api(tok: str, method: str, path: str, body=None, timeout=180):
 
 
 def shortcode(url: str) -> str:
-    m = re.search(r"/(?:reel|p)/([^/?#]+)", url)
-    return m.group(1) if m else ""
+    return content_id(url, "instagram")
 
 
 def wait_run(tok: str, rid: str, loops: int = 72):
@@ -59,14 +59,11 @@ def dataset_items(tok: str, run: dict) -> list:
 
 def pick_hit(items: list, code: str):
     for it in items:
+        if not isinstance(it, dict):
+            continue
         if it.get("error") or it.get("success") is False:
             continue
-        sc = str(it.get("shortCode") or it.get("postCode") or it.get("code") or "")
-        u = str(it.get("url") or "")
-        if code and (code in sc or code in u or sc == code):
-            return it
-    for it in items:
-        if not it.get("error") and it.get("success") is not False and (it.get("caption") or it.get("transcript")):
+        if provider_item_matches(it, code, "instagram"):
             return it
     return None
 
@@ -115,12 +112,14 @@ def write_job(url: str, code: str, hit: dict) -> Path:
 
 
 def main(url: str) -> int:
+    code = shortcode(url)
+    if platform_for_url(url) != "instagram" or not code:
+        print(json.dumps({"ok": False, "note": "unsupported_or_unidentified_post"}))
+        return 0
     tok = token()
     if not tok:
         print(json.dumps({"ok": False, "note": "no_apify_token"}))
         return 0
-    code = shortcode(url)
-
     # A) cheap metadata first
     try:
         run = api(tok, "POST", "/acts/data-slayer~instagram-post-details/runs?waitForFinish=0", {

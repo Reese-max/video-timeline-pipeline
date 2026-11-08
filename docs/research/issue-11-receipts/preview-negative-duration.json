@@ -1,0 +1,42 @@
+{
+  "specHash": "10582e3395c20764a41e9ac6381199b9027df6b418afed344e9dd1fc23c30cc0",
+  "cutSpecVersion": 1,
+  "source": {
+    "videoPath": "tests/fixtures/cutspec/cfr_30.mp4",
+    "contentHash": "e6284cc94ec4aae135b02662f7ee851d7a41d373e2fc111b2210cc87ba0d4602",
+    "fps": 30.0,
+    "timebase": "30/1",
+    "vfr": false,
+    "durationSec": 4.0
+  },
+  "clipCount": 1,
+  "intendedDurationSec": -1.0,
+  "clips": [
+    {
+      "segmentId": "seg-0",
+      "sourceStartSec": 1.5,
+      "sourceEndSec": 0.5,
+      "timelineStartSec": 0.0,
+      "timelineEndSec": -1.0,
+      "evidenceRef": "transcript:cfr_30.mp4:span-0",
+      "selection": "manual",
+      "status": "rejected",
+      "flags": [
+        "NEGATIVE_DURATION"
+      ]
+    }
+  ],
+  "gaps": [],
+  "status": "rejected",
+  "rejectCodes": [
+    "NEGATIVE_DURATION"
+  ],
+  "issues": [
+    {
+      "code": "NEGATIVE_DURATION",
+      "severity": "reject",
+      "segmentId": "seg-0",
+      "detail": "end 0.5 <= start 1.5"
+    }
+  ]
+}

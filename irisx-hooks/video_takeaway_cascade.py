@@ -15,7 +15,7 @@ Also used by pre_llm_call hook.
 from __future__ import annotations
 import json, os, re, subprocess, sys, time
 from pathlib import Path
-from urllib.parse import unquote, urlparse, parse_qs
+from irisx_identity import content_id, platform_for_url, provider_item_matches, video_identity
 
 ROOT = Path("/home/box/irisx-failover-restore/20260906/profile-irisx/hooks")
 JOBS = Path("/workspace/video-timeline-pipeline/jobs")
@@ -26,73 +26,73 @@ BRIGHTDATA = ROOT / "brightdata_ig_fallback.py"
 OG = ROOT / "ig_og_fallback.py"
 LINK = Path("/workspace/bin/link-summarize.sh")
 
-GENERIC = {
-    "facebook", "instagram", "youtube", "youtu", "tiktok", "share", "watch",
-    "mibextid", "wwxifr", "https", "http", "www", "com", "reels", "reel",
-    "videos", "video", "posts", "story", "stories", "channel", "user",
-    "twitter", "threads", "status", "mobile",
-}
-
-
 def video_keys(url: str) -> set[str]:
-    keys = set()
-    u = unquote(url or "")
-    for pat in (
-        r"/share/v/([^/?#\s]+)",
-        r"/share/r/([^/?#\s]+)",
-        r"/reel(?:s)?/([^/?#\s]+)",
-        r"/videos/(\d+)",
-        r"[?&]v=(\d{6,})",
-        r"youtu\.be/([\w-]{6,})",
-        r"youtube\.com/watch\?[^\s]*v=([\w-]{6,})",
-        r"tiktok\.com/@[^/]+/video/(\d+)",
-        r"vm\.tiktok\.com/([\w]+)",
-        r"fb\.watch/([\w-]+)",
-        r"/p/([^/?#\s]+)",
-        r"/status/(\d+)",
-        r"threads\.net/@[^/]+/post/([\w-]+)",
-        r"/post/([\w-]{6,})",
-    ):
-        for m in re.finditer(pat, u, re.I):
-            k = m.group(1).strip()
-            if not k or k.lower() in GENERIC:
-                continue
-            # X status ids are numeric (may be short on legacy posts); others need len>=5
-            if k.isdigit() and len(k) >= 2:
-                keys.add(k)
-            elif len(k) >= 5:
-                keys.add(k)
-    try:
-        qs = parse_qs(urlparse(u).query)
-        for v in qs.get("v", []):
-            if v.isdigit() and len(v) >= 6:
-                keys.add(v)
-        seg = (urlparse(u).path or "").rstrip("/").split("/")[-1]
-        if seg and seg.lower() not in GENERIC and re.match(r"^[\w-]{8,}$", seg):
-            keys.add(seg)
-    except Exception:
-        pass
-    return keys
-
-
-def job_blob(job: Path) -> str:
-    parts = []
-    for name in ("source.json", "source.info.json", "knowledge.md", "notes.md", "request_url.txt", "apify.item.json", "brightdata.item.json"):
-        p = job / name
-        if p.exists():
-            try:
-                parts.append(p.read_text(errors="ignore")[:80000])
-            except Exception:
-                pass
-    return "\n".join(parts)
+    identity = video_identity(url)
+    return {identity[1]} if identity else set()
 
 
 def job_matches(job: Path, url: str) -> bool:
-    keys = video_keys(url)
-    blob = job_blob(job)
-    if not keys:
-        return url.split("?")[0] in blob or url in blob
-    return any(k in blob for k in keys)
+    wanted = video_identity(url)
+    if not wanted:
+        return False
+    observed = []
+    for name in ("manifest.json", "source.json", "source.info.json"):
+        path = job / name
+        if not path.is_file():
+            continue
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return False
+        if not isinstance(data, dict):
+            return False
+        urls = []
+        if name == "source.info.json":
+            urls = [data.get("webpage_url"), data.get("original_url")]
+        else:
+            source = data.get("source")
+            if isinstance(source, dict):
+                urls.append(source.get("url"))
+            if name == "source.json":
+                urls.append(data.get("url"))
+        present = [value for value in urls if isinstance(value, str) and value]
+        for value in present:
+            identity = video_identity(value)
+            if not identity:
+                return False
+            observed.append(identity)
+        if name == "source.info.json" and not present and data.get("id"):
+            extractor = str(data.get("extractor_key") or data.get("extractor") or "").lower()
+            platforms = {"instagram": "instagram", "youtube": "youtube", "facebook": "facebook",
+                         "tiktok": "tiktok", "twitter": "x", "threads": "threads", "vimeo": "vimeo"}
+            platform = next((value for prefix, value in platforms.items() if extractor.startswith(prefix)), "")
+            if platform:
+                observed.append((platform, str(data["id"])))
+    return bool(observed) and all(identity == wanted for identity in observed)
+
+
+def provider_job_matches(job: Path, url: str, provider: str) -> bool:
+    platform = platform_for_url(url)
+    cid = content_id(url, platform)
+    if not cid or provider not in {"brightdata", "apify"}:
+        return False
+    if provider == "apify" and platform != "instagram":
+        return False
+    if provider == "brightdata" and platform not in {"instagram", "x", "threads"}:
+        return False
+    try:
+        resolved = job.resolve(strict=True)
+        resolved.relative_to(JOBS.resolve(strict=True))
+        if resolved.name != f"{provider}-{cid}" or not (resolved / "notes.md").is_file():
+            return False
+        item = json.loads((resolved / f"{provider}.item.json").read_text(encoding="utf-8"))
+        if not provider_item_matches(item, cid, platform):
+            return False
+        if platform == "threads":
+            return video_identity(item.get("_verified_source_url")) == video_identity(url)
+        return True
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        return False
 
 
 def find_job(url: str) -> Path | None:
@@ -109,7 +109,8 @@ def find_job(url: str) -> Path | None:
                     continue
             except Exception:
                 pass
-        if job_matches(d, url):
+        provider = next((p for p in ("brightdata", "apify") if d.name.startswith(p + "-")), None)
+        if (provider_job_matches(d, url, provider) if provider else job_matches(d, url)):
             matched.append(((d / "notes.md").stat().st_mtime, d))
     if not matched:
         return None
@@ -120,13 +121,17 @@ def find_job(url: str) -> Path | None:
 def render(job: Path) -> str:
     try:
         p = subprocess.run([sys.executable, str(RENDER), str(job)], capture_output=True, text=True, timeout=30)
-        return (p.stdout or "").strip()
-    except Exception as e:
-        return f"(render failed: {e})"
+        return (p.stdout or "").strip() if p.returncode == 0 else ""
+    except (OSError, subprocess.SubprocessError):
+        return ""
+
+
+def usable_draft(draft: str) -> bool:
+    return bool(draft and not re.match(r"^\s*\(?render failed\b", draft, re.I))
 
 
 def level1_pipeline(url: str) -> Path | None:
-    if not LINK.exists():
+    if not video_identity(url) or not LINK.exists():
         return None
     try:
         subprocess.run([str(LINK), url], capture_output=True, text=True, timeout=540, cwd="/workspace/video-timeline-pipeline")
@@ -138,18 +143,8 @@ def level1_pipeline(url: str) -> Path | None:
 
 
 def _brightdata_url(url: str) -> bool:
-    u = (url or "").lower()
-    return any(
-        h in u
-        for h in (
-            "instagram.com",
-            "x.com/",
-            "://x.com",
-            "twitter.com",
-            "mobile.twitter.com",
-            "threads.net",
-        )
-    )
+    platform = platform_for_url(url)
+    return platform in {"instagram", "x", "threads"} and bool(content_id(url, platform))
 
 
 def level2_brightdata(url: str) -> Path | None:
@@ -165,22 +160,15 @@ def level2_brightdata(url: str) -> Path | None:
     except Exception as e:
         (LOG / "last-brightdata.json").write_text(f'{{"ok":false,"note":"{e}"}}')
         return None
-    if meta.get("ok") and meta.get("job"):
+    if p.returncode == 0 and isinstance(meta, dict) and meta.get("ok") and isinstance(meta.get("job"), str):
         job = Path(meta["job"])
-        try:
-            (job / "request_url.txt").write_text(url + "\n")
-        except Exception:
-            pass
-        if job_matches(job, url) or not video_keys(url):
-            return job if (job / "notes.md").exists() else None
-        keys = video_keys(url)
-        if any(k in job.name for k in keys):
-            return job if (job / "notes.md").exists() else None
+        if provider_job_matches(job, url, "brightdata"):
+            return job
     return None
 
 
 def level2_apify(url: str) -> Path | None:
-    if "instagram.com" not in url:
+    if platform_for_url(url) != "instagram" or not content_id(url, "instagram"):
         return None
     if not APIFY.exists():
         return None
@@ -192,30 +180,23 @@ def level2_apify(url: str) -> Path | None:
     except Exception as e:
         (LOG / "last-apify.json").write_text(f'{{"ok":false,"note":"{e}"}}')
         return None
-    if meta.get("ok") and meta.get("job"):
+    if p.returncode == 0 and isinstance(meta, dict) and meta.get("ok") and isinstance(meta.get("job"), str):
         job = Path(meta["job"])
-        try:
-            (job / "request_url.txt").write_text(url + "\n")
-        except Exception:
-            pass
-        # If direct URL miss, apify script may still return a job — verify keys
-        if job_matches(job, url) or not video_keys(url):
-            return job if (job / "notes.md").exists() else None
-        # accept if shortcode folder name matches
-        keys = video_keys(url)
-        if any(k in job.name for k in keys):
-            return job if (job / "notes.md").exists() else None
+        if provider_job_matches(job, url, "apify"):
+            return job
     return None
 
 
 def level3_og(url: str) -> str:
     """Return a draft string from OG, or empty."""
-    if "instagram.com" not in url and "facebook.com" not in url:
+    if platform_for_url(url) not in {"instagram", "facebook"}:
         return ""
     if not OG.exists():
         return ""
     try:
         p = subprocess.run([sys.executable, str(OG), url], capture_output=True, text=True, timeout=40)
+        if p.returncode != 0:
+            return ""
         meta = json.loads(p.stdout.strip() or "{}")
     except Exception:
         return ""
@@ -244,7 +225,7 @@ def cascade(url: str) -> dict:
     job = level1_pipeline(url)
     if job and (job / "notes.md").exists():
         draft = render(job)
-        if draft and "render failed" not in draft:
+        if usable_draft(draft):
             out.update(ok=True, level=1, job=str(job), draft=draft, note="video-pipeline")
             return out
 
@@ -252,7 +233,7 @@ def cascade(url: str) -> dict:
     job = level2_brightdata(url)
     if job and (job / "notes.md").exists():
         draft = render(job)
-        if draft:
+        if usable_draft(draft):
             # Infer platform note from job provider if present
             note = "brightdata-social"
             try:
@@ -261,12 +242,12 @@ def cascade(url: str) -> dict:
                 if note in ("instagram", "x", "threads"):
                     note = f"brightdata-{note if note != 'instagram' else 'ig'}"
             except Exception:
-                low = (url or "").lower()
-                if "instagram.com" in low:
+                platform = platform_for_url(url)
+                if platform == "instagram":
                     note = "brightdata-ig"
-                elif "threads.net" in low:
+                elif platform == "threads":
                     note = "brightdata-threads"
-                elif "twitter.com" in low or "x.com" in low:
+                elif platform == "x":
                     note = "brightdata-x"
             out.update(ok=True, level=2, job=str(job), draft=draft, note=note)
             return out
@@ -275,7 +256,7 @@ def cascade(url: str) -> dict:
     job = level2_apify(url)
     if job and (job / "notes.md").exists():
         draft = render(job)
-        if draft:
+        if usable_draft(draft):
             out.update(ok=True, level=3, job=str(job), draft=draft, note="apify-instagram")
             return out
 

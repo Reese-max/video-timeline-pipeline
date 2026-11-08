@@ -2,13 +2,32 @@
 """Best-effort Instagram metadata when yt-dlp fails (embed/oembed/UA)."""
 from __future__ import annotations
 import json, re, sys, urllib.request, html, codecs
+from urllib.parse import urlsplit
+from irisx_identity import platform_for_url
 
 UA = "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15"
 
 
+class SocialRedirectHandler(urllib.request.HTTPRedirectHandler):
+    def __init__(self, platform: str):
+        super().__init__()
+        self.platform = platform
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        if platform_for_url(newurl) != self.platform:
+            return None
+        if req.type == "https" and urlsplit(newurl).scheme.lower() != "https":
+            return None
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
 def fetch(url: str) -> bytes:
+    platform = platform_for_url(url)
+    if platform not in {"instagram", "facebook"}:
+        raise ValueError("unsupported social URL")
     req = urllib.request.Request(url, headers={"User-Agent": UA, "Accept-Language": "zh-TW,zh;q=0.9,en;q=0.8"})
-    with urllib.request.urlopen(req, timeout=25) as r:
+    opener = urllib.request.build_opener(SocialRedirectHandler(platform))
+    with opener.open(req, timeout=25) as r:
         return r.read()
 
 
@@ -50,11 +69,16 @@ def looks_garbage(s: str) -> bool:
 
 def main(url: str) -> dict:
     out = {"url": url, "ok": False, "title": "", "author": "", "caption": "", "note": ""}
+    platform = platform_for_url(url)
+    if platform not in {"instagram", "facebook"}:
+        out["note"] = "unsupported_platform"
+        print(json.dumps(out, ensure_ascii=False))
+        return out
     m = re.search(r"/reel/([^/?#]+)", url) or re.search(r"/p/([^/?#]+)", url)
     code = m.group(1) if m else ""
     out["shortcode"] = code
     candidates = []
-    if code:
+    if code and platform == "instagram":
         candidates += [
             f"https://www.instagram.com/reel/{code}/embed/captioned/",
             f"https://www.instagram.com/p/{code}/embed/",

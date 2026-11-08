@@ -1,0 +1,51 @@
+{
+  "specHash": "c0600de6d3f779ffffd7a1530d986f9648be96f5611d3aacba0d0f59fca8e24b",
+  "cutSpecVersion": 1,
+  "source": {
+    "videoPath": "tests/fixtures/cutspec/cfr_30.mp4",
+    "contentHash": "e6284cc94ec4aae135b02662f7ee851d7a41d373e2fc111b2210cc87ba0d4602",
+    "fps": 30.0,
+    "timebase": "30/1",
+    "vfr": false,
+    "durationSec": 4.0
+  },
+  "clipCount": 2,
+  "intendedDurationSec": 3.5,
+  "clips": [
+    {
+      "segmentId": "seg-0",
+      "sourceStartSec": 0.5,
+      "sourceEndSec": 2.0,
+      "timelineStartSec": 0.0,
+      "timelineEndSec": 1.5,
+      "evidenceRef": "transcript:cfr_30.mp4:span-0",
+      "selection": "manual",
+      "status": "ok",
+      "flags": []
+    },
+    {
+      "segmentId": "seg-1",
+      "sourceStartSec": 1.0,
+      "sourceEndSec": 3.0,
+      "timelineStartSec": 1.5,
+      "timelineEndSec": 3.5,
+      "evidenceRef": "transcript:cfr_30.mp4:span-1",
+      "selection": "manual",
+      "status": "degraded",
+      "flags": [
+        "OVERLAP"
+      ]
+    }
+  ],
+  "gaps": [],
+  "status": "degraded",
+  "rejectCodes": [],
+  "issues": [
+    {
+      "code": "OVERLAP",
+      "severity": "degraded",
+      "segmentId": "seg-1",
+      "detail": "source range overlaps seg-0"
+    }
+  ]
+}

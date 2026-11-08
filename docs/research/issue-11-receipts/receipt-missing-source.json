@@ -1,0 +1,18 @@
+{
+  "schema": "cut-receipt/1",
+  "specHash": "3899c388860bf9008d9d74ccfa955794041c0e2dda47a6a45bbcd668a6545b74",
+  "exportFormat": "otio",
+  "expectedContentHash": "e6284cc94ec4aae135b02662f7ee851d7a41d373e2fc111b2210cc87ba0d4602",
+  "observedContentHash": "",
+  "toleranceSec": 0.05,
+  "nleImport": "NLE_IMPORT_UNVERIFIED",
+  "externalApiCalls": 0,
+  "localSubprocessCalls": 0,
+  "segments": [],
+  "mismatches": 0,
+  "stillNeedsHumanFix": true,
+  "status": "MISSING_SOURCE",
+  "parser": "",
+  "specIssues": [],
+  "receiptId": "b612ad1bfd32308f"
+}
