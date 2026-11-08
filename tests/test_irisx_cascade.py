@@ -11,6 +11,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+import urllib.parse
 import urllib.request
 from pathlib import Path
 from unittest import mock
@@ -186,6 +187,28 @@ class IrisxIdentityTests(unittest.TestCase):
                 with mock.patch.object(cascade.subprocess, "run", return_value=self.response(job)):
                     self.assertEqual(method(self.URL), job)
 
+    def test_mocked_x_and_verified_threads_create_usable_brightdata_jobs(self):
+        cases = [
+            ("x", "https://x.com/person/status/123456789", "123456789"),
+            ("threads", "https://www.threads.com/@person/post/PostABC123", "PostABC123"),
+        ]
+        for platform, url, identifier in cases:
+            with self.subTest(platform=platform), mock.patch.object(brightdata, "JOBS", self.jobs), \
+                 mock.patch.object(brightdata, "token", return_value="test-only"), contextlib.redirect_stdout(io.StringIO()) as output:
+                if platform == "x":
+                    item = {"tweet_id": identifier, "url": url, "text": "synthetic post"}
+                    with mock.patch.object(brightdata, "fetch_x", return_value=(item, "mock", "", [item])):
+                        self.assertEqual(brightdata.main(url), 0)
+                else:
+                    result = {"structuredContent": {"url": url}, "content": [{"type": "text", "text": "Synthetic post body. " * 10}]}
+                    with mock.patch.object(brightdata, "mcp_tool_call", return_value=result):
+                        self.assertEqual(brightdata.main(url), 0)
+                meta = json.loads(output.getvalue().splitlines()[-1])
+                self.assertTrue(meta["ok"])
+                job = Path(meta["job"])
+                with mock.patch.object(cascade.subprocess, "run", return_value=self.response(job)):
+                    self.assertEqual(cascade.level2_brightdata(url), job)
+
     def test_threads_requires_provider_source_metadata_not_self_filled_fields(self):
         url = "https://www.threads.net/@person/post/PostABC123"
         other = "https://www.threads.net/@person/post/OtherABC999"
@@ -196,6 +219,12 @@ class IrisxIdentityTests(unittest.TestCase):
                 hit, _via, note, _items = brightdata.fetch_threads("test-only", url, "PostABC123")
                 self.assertIsNone(hit)
                 self.assertIn("source", note)
+        contradiction = {"content": [{"type": "text", "text": "Source URL: " + other + "\n" + text}],
+                         "structuredContent": {"url": url}}
+        with mock.patch.object(brightdata, "mcp_tool_call", return_value=contradiction):
+            hit, _via, note, _items = brightdata.fetch_threads("test-only", url, "PostABC123")
+            self.assertIsNone(hit, "an explicit conflicting source claim must not be ignored")
+            self.assertIn("source", note)
         with mock.patch.object(brightdata, "mcp_tool_call", return_value={"content": content, "structuredContent": {"url": url}}):
             hit, _via, _note, _items = brightdata.fetch_threads("test-only", url, "PostABC123")
         self.assertIsNotNone(hit)
@@ -206,6 +235,22 @@ class IrisxIdentityTests(unittest.TestCase):
         (job / "notes.md").write_text("synthetic", encoding="utf-8")
         (job / "brightdata.item.json").write_text(json.dumps({"id": "PostABC123", "url": url, "_source_markdown": "content of " + other}), encoding="utf-8")
         self.assertFalse(cascade.provider_job_matches(job, url, "brightdata"))
+
+    def test_brightdata_errors_never_return_even_a_prefix_of_the_synthetic_token(self):
+        token = "S3cR+Synthetic/Token123456"
+        self.assertNotIn(token[:4], brightdata.redact(token, "error " + token))
+        encoded = urllib.parse.quote(token, safe="")
+        self.assertNotIn(token[:4], brightdata.redact(token, "error " + encoded))
+
+    def test_apify_errors_never_return_the_synthetic_token(self):
+        token = "S3cR+Synthetic/Token123456"
+        output = io.StringIO()
+        with mock.patch.object(apify, "token", return_value=token), \
+             mock.patch.object(apify, "api", side_effect=RuntimeError("failed " + token + " " + urllib.parse.quote(token, safe=""))), \
+             contextlib.redirect_stdout(output):
+            apify.main(self.URL)
+        self.assertNotIn(token, output.getvalue())
+        self.assertNotIn(token[:4], output.getvalue())
 
     def test_non_social_url_never_reaches_paid_or_og_subprocesses(self):
         bad_urls = ["https://evil.invalid/?next=https://instagram.com/reel/AbCdE123/",
@@ -228,6 +273,14 @@ class IrisxIdentityTests(unittest.TestCase):
             result = og.main("https://evil.invalid/?next=https://instagram.com/reel/AbCdE123/")
         self.assertFalse(result["ok"])
         fetch.assert_not_called()
+
+    def test_direct_og_entry_keeps_valid_instagram_preview(self):
+        html = b'<meta property="og:description" content="Synthetic preview text">' + b' ' * 1100
+        with mock.patch.object(og, "fetch", return_value=html) as fetch, contextlib.redirect_stdout(io.StringIO()):
+            result = og.main(self.URL)
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["caption"], "Synthetic preview text")
+        self.assertTrue(fetch.call_args.args[0].startswith("https://www.instagram.com/"))
 
     def test_provider_direct_entry_rejects_bad_hosts_before_reading_credentials(self):
         url = "https://evil.invalid/?next=https://instagram.com/reel/AbCdE123/"

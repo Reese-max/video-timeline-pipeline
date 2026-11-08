@@ -2,7 +2,15 @@
 from __future__ import annotations
 
 import re
-from urllib.parse import parse_qs, unquote, urlsplit
+from urllib.parse import parse_qs, quote, quote_plus, unquote, urlsplit
+
+
+def redact_secret(text: str, secret: str) -> str:
+    if not secret:
+        return text
+    for value in sorted({secret, quote(secret, safe=""), quote_plus(secret, safe="")}, key=len, reverse=True):
+        text = text.replace(value, "[REDACTED]")
+    return text
 
 
 def platform_for_url(url: str) -> str:

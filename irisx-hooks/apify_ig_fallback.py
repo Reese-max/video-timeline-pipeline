@@ -3,7 +3,7 @@
 from __future__ import annotations
 import json, os, re, sys, time, urllib.request
 from pathlib import Path
-from irisx_identity import content_id, platform_for_url, provider_item_matches
+from irisx_identity import content_id, platform_for_url, provider_item_matches, redact_secret
 
 JOBS = Path("/workspace/video-timeline-pipeline/jobs")
 
@@ -159,7 +159,8 @@ def main(url: str) -> int:
                 print(json.dumps({"ok": True, "job": str(job), "shortcode": code, "via": "instagram-reel-scraper", "run_id": run.get("id")}))
                 return 0
     except Exception as e:
-        print(json.dumps({"ok": False, "note": f"official_err:{e}"}))
+        message = redact_secret(str(e), tok)
+        print(json.dumps({"ok": False, "note": f"official_err:{message}"}))
         return 0
 
     # C) use backup metadata-only if any

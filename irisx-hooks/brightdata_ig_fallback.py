@@ -12,7 +12,7 @@ import urllib.parse
 import urllib.request
 from html.parser import HTMLParser
 from pathlib import Path
-from irisx_identity import content_id as social_content_id, platform_for_url, provider_item_matches, video_identity
+from irisx_identity import content_id as social_content_id, platform_for_url, provider_item_matches, redact_secret, video_identity
 
 JOBS = Path("/workspace/video-timeline-pipeline/jobs")
 DATASET_ID = "gd_lyclm20il4r5helnj"
@@ -26,9 +26,7 @@ SNAPSHOT_RE = re.compile(r"^s[a-z]*_[A-Za-z0-9_-]+$")
 
 
 def redact(tok: str, text: str) -> str:
-    if not tok:
-        return text
-    return text.replace(tok, tok[:4] + "…")
+    return redact_secret(text, tok)
 
 
 def token() -> str:
@@ -611,7 +609,7 @@ class _CanonicalLinkParser(HTMLParser):
                 self.urls.append(attrs["href"])
 
 
-def _threads_source(result, cid: str, raw_html: str = "") -> str:
+def _threads_source(result, cid: str, raw_html: str = "", markdown: str = "") -> str:
     urls = []
     if isinstance(result, dict):
         for metadata in (result, result.get("structuredContent")):
@@ -625,7 +623,10 @@ def _threads_source(result, cid: str, raw_html: str = "") -> str:
         parser.feed(raw_html)
         urls.extend(parser.urls)
     urls = [value for value in urls if isinstance(value, str) and value]
-    if not urls or any(video_identity(value) != ("threads", cid) for value in urls):
+    # A source label in the returned text may contradict metadata, but a
+    # free-form body alone is not independent evidence of the source.
+    claims = re.findall(r"(?im)^\s*(?:source[_ ]url|canonical(?:[_ ]url)?|url)\s*:\s*(https?://[^\s<>]+)", markdown)
+    if not urls or any(video_identity(value) != ("threads", cid) for value in urls + claims):
         return ""
     return urls[0]
 
@@ -669,7 +670,7 @@ def fetch_threads(tok: str, url: str, cid: str):
     if not md or len(md.strip()) < 20:
         return None, via, "brightdata_threads_thin_or_empty", []
 
-    source = _threads_source(result, cid, raw_html)
+    source = _threads_source(result, cid, raw_html, md)
     if not source:
         return None, via, "brightdata_threads_source_unverified", []
     hit = parse_threads_markdown(md, url, cid)
