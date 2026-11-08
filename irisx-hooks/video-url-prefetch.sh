@@ -64,12 +64,17 @@ def save_bundle(b):
     (logdir / f"{sid}.url").write_text(b.get("url") or "")
 
 
+def usable_draft(draft):
+    return isinstance(draft, str) and bool(draft.strip()) and not re.match(r"^\s*\(?render failed\b", draft, re.I)
+
+
 def render_draft(job: Path) -> str:
     try:
         p = subprocess.run([sys.executable, str(RENDER), str(job)], capture_output=True, text=True, timeout=30)
-        return (p.stdout or "").strip()
-    except Exception as e:
-        return f"(render failed: {e})"
+        draft = (p.stdout or "").strip() if p.returncode == 0 else ""
+        return draft if usable_draft(draft) else ""
+    except Exception:
+        return ""
 
 
 def build_context(url, draft, *, level=0, follow=False, note=""):
@@ -133,7 +138,7 @@ if urls:
 # Path B: follow-up
 if FOLLOW_RE.search(umsg):
     b = load_bundle()
-    if b.get("draft") and b.get("url"):
+    if usable_draft(b.get("draft")) and b.get("url"):
         (sess_dir / f"{sid}.pending").write_text("1")
         print(json.dumps({
             "context": build_context(b.get("url") or "", b.get("draft") or "", level=b.get("level") or 0, follow=True, note="session-cache")
@@ -143,6 +148,8 @@ if FOLLOW_RE.search(umsg):
         jp = Path(b["job"])
         if jp.exists() and (jp / "notes.md").exists():
             draft = render_draft(jp)
+            if not draft:
+                sys.exit(0)
             b["draft"] = draft
             save_bundle(b)
             (sess_dir / f"{sid}.pending").write_text("1")

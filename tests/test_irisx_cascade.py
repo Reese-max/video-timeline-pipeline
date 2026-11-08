@@ -355,9 +355,59 @@ class IrisxIdentityTests(unittest.TestCase):
         self.assertIn("Synthetic: " + self.OTHER, updated)
         self.assertNotIn("Synthetic: " + self.URL + "\n", updated)
 
+    @unittest.skipUnless(os.name == "posix" and shutil.which("bash"), "POSIX shell hook")
+    def test_hook_followup_renders_only_successful_results(self):
+        base = self.jobs.parent
+        original = (HOOKS / "video-url-prefetch.sh").read_text(encoding="utf-8")
+        for mode in ("success", "nonzero", "exception", "bad_encoding", "failure_text", "stale_failure", "stale_failure_retry_fails"):
+            with self.subTest(mode=mode):
+                root = base / mode
+                sessions = root / "runtime" / "sessions"
+                sessions.mkdir(parents=True)
+                job = root / "job"
+                job.mkdir()
+                (job / "notes.md").write_text("synthetic", encoding="utf-8")
+                bundle = {"url": self.URL, "job": str(job), "draft": "(render failed: old)" if mode.startswith("stale_") else ""}
+                bundle_path = sessions / "followup.json"
+                bundle_path.write_text(json.dumps(bundle), encoding="utf-8")
+                renderer = root / "fake_renderer.py"
+                body = {
+                    "success": "print('Synthetic rendered draft')\n",
+                    "nonzero": "import sys; print('stale draft'); sys.exit(1)\n",
+                    "exception": "print('unreachable')\n",
+                    "bad_encoding": "import sys; sys.stdout.buffer.write(b'\\xff')\n",
+                    "failure_text": "print('(render failed: synthetic)')\n",
+                    "stale_failure": "print('Synthetic rendered draft')\n",
+                    "stale_failure_retry_fails": "import sys; sys.exit(1)\n",
+                }[mode]
+                renderer.write_text(body, encoding="utf-8")
+                source = original.replace('/home/box/irisx-failover-restore/20260906/runtime/video-hook', str(root / 'runtime'))
+                source = source.replace('/home/box/irisx-failover-restore/20260906/profile-irisx/hooks/render_takeaway.py', str(renderer))
+                if mode == "exception":
+                    needle = 'sys.executable, str(RENDER)'
+                    self.assertIn(needle, source)
+                    source = source.replace(needle, repr(str(root / 'missing-python')) + ', str(RENDER)')
+                script = root / "hook.sh"
+                script.write_text(source, encoding="utf-8")
+                payload = json.dumps({"session_id": "followup", "user_message": "請再講一次可帶走內容"})
+                result = subprocess.run(["bash", str(script)], input=payload, text=True, capture_output=True,
+                                        cwd=root, env={"PATH": "/usr/bin:/bin", "HOME": str(root)}, timeout=10)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                persisted = json.loads(bundle_path.read_text(encoding="utf-8"))
+                if mode in {"success", "stale_failure"}:
+                    self.assertIn("Synthetic rendered draft", json.loads(result.stdout)["context"])
+                    self.assertEqual(persisted["draft"], "Synthetic rendered draft")
+                    self.assertTrue((sessions / "followup.pending").is_file())
+                else:
+                    self.assertEqual(result.stdout, "", "renderer failure must not become answer context")
+                    self.assertEqual(persisted, bundle, "failed rendering must leave the session retryable")
+                    self.assertFalse((sessions / "followup.pending").exists())
+
     def test_render_failure_is_not_returned_as_a_successful_draft(self):
         job = self.job("render", self.URL, "brightdata.item.json")
         with mock.patch.object(cascade.subprocess, "run", side_effect=subprocess.TimeoutExpired("render", 30)):
+            self.assertFalse(cascade.render(job))
+        with mock.patch.object(cascade.subprocess, "run", side_effect=UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid")):
             self.assertFalse(cascade.render(job))
         with mock.patch.object(cascade.subprocess, "run", return_value=subprocess.CompletedProcess([], 1, stdout="stale draft", stderr="failed")):
             self.assertFalse(cascade.render(job))

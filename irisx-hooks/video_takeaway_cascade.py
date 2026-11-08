@@ -122,7 +122,7 @@ def render(job: Path) -> str:
     try:
         p = subprocess.run([sys.executable, str(RENDER), str(job)], capture_output=True, text=True, timeout=30)
         return (p.stdout or "").strip() if p.returncode == 0 else ""
-    except (OSError, subprocess.SubprocessError):
+    except Exception:
         return ""
 
 
