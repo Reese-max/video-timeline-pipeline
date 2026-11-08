@@ -5967,7 +5967,10 @@ def pack_vector(vector: list[float]) -> bytes:
 
 def unpack_vector(blob: bytes) -> array.array:
     vector = array.array("f")
-    vector.frombytes(blob)
+    try:
+        vector.frombytes(blob)
+    except TypeError as exc:
+        raise ValueError("embedding vector 必須是 bytes") from exc
     return vector
 
 
@@ -6210,7 +6213,19 @@ def semantic_search(
             f"SELECT videos.title, videos.source, events.job, events.timestamp, events.kind, "
             f"events.text, substr(events.text,1,120), {projection}, c.dim, c.vector {joins} WHERE {clause}",
             [namespace, *params])
-        first = rows.fetchone()
+
+        def valid_rows():
+            for row in rows:
+                try:
+                    vector = validate_vectors([unpack_vector(row[9])], 1, dimension)[0]
+                    if row[8] != dimension:
+                        continue
+                except (ValueError, RuntimeError):
+                    continue  # Quarantined from retrieval; --audit reports the stored corruption.
+                yield row, vector
+
+        valid = valid_rows()
+        first = next(valid, None)
         if first is None:
             # A real category miss is empty; an indexed category whose chunks
             # lack this generation's vectors needs embedding or an explicit fallback.
@@ -6225,13 +6240,7 @@ def semantic_search(
 
         def scored_rows():
             import itertools
-            for row in itertools.chain([first], rows):
-                try:
-                    vector = validate_vectors([unpack_vector(row[9])], 1, dimension)[0]
-                    if row[8] != dimension:
-                        continue
-                except (ValueError, RuntimeError):
-                    continue  # Quarantined from retrieval; --audit reports the stored corruption.
+            for row, vector in itertools.chain([first], valid):
                 hit = _search_hit(row[:8], query, "semantic")
                 hit["score"] = cosine(query_vector, vector)
                 yield hit
@@ -6824,8 +6833,7 @@ def list_videos(root: Path, category: str = "") -> int:
         raise RuntimeError(f"索引不存在：{db_path}；先執行 `--index`。")
     connection = library_connection(root)
     try:
-        # The synthetic unclassified group also includes empty or invalid metadata.
-        where, params = library_filter_sql({"category": "" if category == "未分類" else category})
+        where, params = library_filter_sql({"category": category})
         rows = connection.execute(
             "SELECT title, source, duration, categories FROM videos LEFT JOIN video_catalog c ON c.job=videos.job WHERE " + where + " ORDER BY duration DESC", params
         ).fetchall()

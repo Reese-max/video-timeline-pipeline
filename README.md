@@ -777,7 +777,7 @@ python pipeline.py --search '密碼' --author '作者名稱' --platform Youtube 
 python pipeline.py --ask '有哪些相關片段？' --job JOB_ID --date-field first_completed_at --until 2026-09-30 --json
 ```
 
-`--category` 依完整分類標籤精確比對，可搭配 `--list`、`--search` 或 `--ask`，也適用於 `--semantic`。分類比對只接受 JSON 陣列中的字串元素，不把純字串或物件的鍵／值當成分類標籤；`--list` 仍保留「未分類」顯示群組。已有有效向量契約而分類沒有命中時，語意檢索回傳零筆且不發送 query embedding；若符合分類的片段沒有該契約的向量，或該契約尚未建立，預設明示 `semantic_unavailable` 並回退 FTS，`--search-strict` 則失敗。可先用 `--embed-plan` 檢查，再執行 `--embed`。
+`--category` 依完整分類標籤精確比對，可搭配 `--list`、`--search` 或 `--ask`，也適用於 `--semantic`。分類比對只接受 JSON 陣列中的字串元素，不把純字串或物件的鍵／值當成分類標籤；未篩選的 `--list` 仍保留「未分類」顯示群組，但以「未分類」篩選時只匹配實際標籤。已有有效向量契約而分類沒有命中時，語意檢索回傳零筆且不發送 query embedding；若符合篩選的片段存在，卻沒有任何該契約的有效向量，或該契約尚未建立，預設明示 `semantic_unavailable` 並回退 FTS，`--search-strict` 則失敗。可先用 `--embed-plan` 檢查，再執行 `--embed`。
 
 ## 問答與總覽
 
@@ -829,7 +829,7 @@ OpenRouter 已有 [embeddings 官方契約](https://openrouter.ai/docs/api_refer
 
 舊 `vectors` 表保留原樣，因缺少 provider／revision，不能只憑 model 名稱自動認定相容。確認契約後可先執行 `--adopt-legacy-embeddings --embed-backend local --embed-model MODEL` 本機驗證映射，再看 `--embed-plan`；`requires_embedding=0` 時 `--embed` 只驗證並啟用，不送出請求。
 
-Hybrid 為明確 opt-in：metadata eligible-set → FTS／vector 各取最多 1000 候選 → occurrence 去重 → RRF（k=60，ID 作 tie-break）→ 可選 rerank。保留 `--semantic` 單一路徑；向量掃描使用游標與有界 Top-K。缺能力時可見地降為 FTS；`--search-strict` 改為失敗，預算拒絕一律向上回報。`--explain-ranking` 只呈現本次排名，不另發起 rerank；semantic／hybrid 本身仍會做一次 query embedding。
+Hybrid 為明確 opt-in：metadata eligible-set → FTS／vector 各取最多 1000 候選 → occurrence 去重 → RRF（k=60，ID 作 tie-break）→ 可選 rerank。保留 `--semantic` 單一路徑；向量掃描使用游標與有界 Top-K。缺能力時可見地降為 FTS；`--search-strict` 改為失敗，預算拒絕一律向上回報。`--explain-ranking` 只呈現本次排名，不另發起 rerank；semantic／hybrid 僅在有可用向量且允許時做 query embedding。
 
 ```powershell
 python pipeline.py --search '厚皮動物' --hybrid --explain-ranking --json

@@ -118,11 +118,29 @@ class CategoryFilterTests(unittest.TestCase):
             pipeline.list_videos(self.root)
         self.assertIn("未分類", output.getvalue())
         with contextlib.redirect_stdout(io.StringIO()):
-            self.assertGreater(pipeline.list_videos(self.root, "未分類"), 0)
+            self.assertEqual(pipeline.list_videos(self.root, "未分類"), 0)
 
     def test_list_filter_uses_exact_category(self) -> None:
         with contextlib.redirect_stdout(io.StringIO()):
             self.assertEqual(pipeline.list_videos(self.root, "AI"), 1)
+
+    def test_unclassified_filter_requires_an_explicit_category(self) -> None:
+        for explicit in (False, True):
+            if explicit:
+                _write_job(self.root, "literal", "明確標籤", "src-literal", ["未分類"])
+                pipeline.build_index(self.root)
+            expected = {"literal"} if explicit else set()
+            with self.subTest(explicit=explicit):
+                self.assertEqual({hit["job"] for hit in pipeline.search_index(
+                    self.root, "測試關鍵字", 30, "未分類")}, expected)
+                page = pipeline.query_videos(self.root, filters={"category": "未分類"}, readonly=True)
+                self.assertEqual({row["job"] for row in page["items"]}, expected)
+                with contextlib.redirect_stdout(io.StringIO()) as output:
+                    self.assertEqual(pipeline.list_videos(self.root, "未分類"), len(expected))
+                self.assertNotIn("無分類片", output.getvalue())
+            with contextlib.redirect_stdout(io.StringIO()) as output:
+                pipeline.list_videos(self.root)
+            self.assertIn("無分類片", output.getvalue())
 
     def test_semantic_search_category_filter(self) -> None:
         self._seed_vectors()
@@ -189,6 +207,44 @@ class CategoryFilterTests(unittest.TestCase):
             embed.assert_not_called()
         self.assertEqual(result["retrieval"]["degraded_reason"], "semantic_unavailable")
         self.assertEqual({h["job"] for h in result["evidence"]}, {"job-ai-exact"})
+
+    def test_semantic_category_with_only_invalid_vectors_degrades_without_embedding(self) -> None:
+        self._seed_vectors()
+        with contextlib.closing(sqlite3.connect(self.root / "library.db")) as connection, connection:
+            texts = [row[0] for row in connection.execute("SELECT text FROM events WHERE job=?", ("job-ai-exact",))]
+            connection.executemany("UPDATE embedding_cache SET vector=? WHERE content_hash=?",
+                                   [(b"\x00" if index % 2 == 0 else "invalid blob", pipeline.content_hash(text))
+                                    for index, text in enumerate(texts)])
+        with contextlib.redirect_stdout(io.StringIO()):
+            issues = pipeline.audit_library(self.root)
+        self.assertTrue(any(f"invalid={len(texts)}" in issue for issue in issues), issues)
+        plan = pipeline.embedding_plan(self.root, pipeline.EmbeddingContract("local", "test-model"))
+        self.assertGreaterEqual(plan["requires_embedding"], len(texts))
+        filters = pipeline.SearchFilter(category="AI")
+        for mode in ("direct", "fallback", "strict"):
+            with self.subTest(mode=mode), mock.patch.object(
+                pipeline, "embed_texts", return_value=[[1.0, 0.0]]
+            ) as embed:
+                if mode == "direct":
+                    with self.assertRaisesRegex(RuntimeError, "先執行 `--embed`"):
+                        self._semantic("AI")
+                elif mode == "strict":
+                    with self.assertRaisesRegex(RuntimeError, "semantic_unavailable"):
+                        pipeline.retrieve_evidence(self.root, "測試關鍵字", 30, filters=filters,
+                                                   mode="semantic", embed_backend="local",
+                                                   embed_model="test-model", strict=True)
+                else:
+                    result = pipeline.retrieve_evidence(self.root, "測試關鍵字", 30, filters=filters,
+                                                        mode="semantic", embed_backend="local", embed_model="test-model")
+                    self.assertEqual(result["retrieval"]["degraded_reason"], "semantic_unavailable")
+                    self.assertEqual({hit["job"] for hit in result["evidence"]}, {"job-ai-exact"})
+                embed.assert_not_called()
+        with contextlib.closing(sqlite3.connect(self.root / "library.db")) as connection, connection:
+            connection.execute("UPDATE embedding_cache SET vector=? WHERE content_hash=?",
+                               (pipeline.pack_vector([1.0, 0.0]), pipeline.content_hash(texts[-1])))
+        with mock.patch.object(pipeline, "embed_texts", return_value=[[1.0, 0.0]]) as embed:
+            self.assertEqual({hit["job"] for hit in self._semantic("AI")}, {"job-ai-exact"})
+            embed.assert_called_once()
 
     def test_semantic_cli_category_miss_succeeds(self) -> None:
         self._seed_vectors()
