@@ -61,13 +61,29 @@ def job_matches(job: Path, url: str) -> bool:
             if not identity:
                 return False
             observed.append(identity)
-        if name == "source.info.json" and not present and data.get("id"):
+        if name == "source.info.json":
             extractor = str(data.get("extractor_key") or data.get("extractor") or "").lower()
             platforms = {"instagram": "instagram", "youtube": "youtube", "facebook": "facebook",
-                         "tiktok": "tiktok", "twitter": "x", "threads": "threads", "vimeo": "vimeo"}
+                         "tiktok": "tiktok", "twitter": "x", "threads": "threads", "vimeo": "vimeo",
+                         "douyin": "douyin", "bilibili": "bilibili"}
             platform = next((value for prefix, value in platforms.items() if extractor.startswith(prefix)), "")
-            if platform:
-                observed.append((platform, str(data["id"])))
+            if extractor in {"x", "x.com"}:
+                platform = "x"
+            if platform and platform != wanted[0]:
+                return False
+            identifier = data.get("id")
+            if identifier not in (None, "") and (isinstance(identifier, bool) or not isinstance(identifier, (str, int))):
+                return False
+            if platform == "instagram":
+                # Instagram's numeric media id is not necessarily its shortcode.
+                for field in ("shortcode", "shortCode"):
+                    if data.get(field) not in (None, ""):
+                        observed.append((platform, str(data[field])))
+            elif platform and identifier not in (None, ""):
+                # Do not infer equivalence between a short-link token and a resolved id.
+                if wanted[1].startswith("short:"):
+                    return False
+                observed.append((platform, str(identifier)))
     return bool(observed) and all(identity == wanted for identity in observed)
 
 

@@ -137,10 +137,46 @@ class IrisxIdentityTests(unittest.TestCase):
         url = "https://youtu.be/Video12345"
         info.write_text(json.dumps({"id": "Video12345", "extractor_key": "Youtube"}), encoding="utf-8")
         self.assertEqual(cascade.find_job(url), job)
+        info.write_text(json.dumps({"id": "Video12345", "extractor_key": "Youtube", "webpage_url": url}), encoding="utf-8")
+        self.assertEqual(cascade.find_job(url), job)
+        info.write_text(json.dumps({"id": "Other99999", "extractor_key": "Youtube", "webpage_url": url}), encoding="utf-8")
+        self.assertIsNone(cascade.find_job(url), "canonical URL cannot hide a contradictory YouTube ID")
+        info.write_text(json.dumps({"id": "Video12345", "extractor_key": "Instagram", "webpage_url": url}), encoding="utf-8")
+        self.assertIsNone(cascade.find_job(url), "a conflicting extractor cannot establish this source")
         info.write_text(json.dumps({"id": "Video12345", "extractor_key": "Instagram"}), encoding="utf-8")
         self.assertIsNone(cascade.find_job(url))
         info.write_text("{", encoding="utf-8")
         self.assertIsNone(cascade.find_job(url))
+
+    def test_instagram_numeric_media_id_can_differ_from_shortcode(self):
+        job = self.jobs / "instagram-job"
+        job.mkdir()
+        (job / "notes.md").write_text("synthetic", encoding="utf-8")
+        info = job / "source.info.json"
+        info.write_text(json.dumps({"extractor_key": "Instagram", "id": "123456789", "webpage_url": self.URL}), encoding="utf-8")
+        self.assertEqual(cascade.find_job(self.URL), job)
+        info.write_text(json.dumps({"extractor_key": "Instagram", "id": "123456789", "shortcode": "Other999", "webpage_url": self.URL}), encoding="utf-8")
+        self.assertIsNone(cascade.find_job(self.URL))
+
+    def test_comparable_extractor_ids_match_their_platform_urls(self):
+        cases = (
+            ("https://x.com/a/status/12345678", "Twitter", "12345678", "12345679"),
+            ("https://threads.net/@a/post/PostABC123", "Threads", "PostABC123", "OtherABC9"),
+            ("https://www.tiktok.com/@a/video/12345678", "TikTok", "12345678", "12345679"),
+            ("https://www.douyin.com/video/12345678", "Douyin", "12345678", "12345679"),
+            ("https://vimeo.com/12345678", "Vimeo", "12345678", "12345679"),
+            ("https://www.facebook.com/a/videos/12345678/", "Facebook", "12345678", "12345679"),
+            ("https://www.bilibili.com/video/BV12345678", "Bilibili", "BV12345678", "av12345678"),
+        )
+        for index, (url, extractor, wanted, other) in enumerate(cases):
+            with self.subTest(extractor=extractor):
+                job = self.jobs / f"platform-{index}"
+                job.mkdir()
+                info = job / "source.info.json"
+                info.write_text(json.dumps({"extractor_key": extractor, "id": wanted, "webpage_url": url}), encoding="utf-8")
+                self.assertTrue(cascade.job_matches(job, url))
+                info.write_text(json.dumps({"extractor_key": extractor, "id": other, "webpage_url": url}), encoding="utf-8")
+                self.assertFalse(cascade.job_matches(job, url))
 
     def test_cascade_never_starts_l1_for_a_spoofed_social_url(self):
         fake_link = self.jobs.parent / "fake-link"
