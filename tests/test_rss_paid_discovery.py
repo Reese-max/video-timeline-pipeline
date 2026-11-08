@@ -418,14 +418,23 @@ class PaidDiscoveryAddStampTests(unittest.TestCase):
             with self.subTest(platform=platform, options=options), tempfile.TemporaryDirectory() as directory:
                 root = Path(directory)
                 observed: list[dict] = []
+                # Keep only OS fields needed for the real Windows private ACL and
+                # subprocess lookup; provider credentials must never be inherited.
+                runtime_env = {key: pipeline.os.environ[key] for key in
+                               ("USERNAME", "SYSTEMROOT", "SYSTEMDRIVE", "PROGRAMDATA", "WINDIR", "PATH",
+                                "PATHEXT", "COMSPEC", "TEMP", "TMP")
+                               if key in pipeline.os.environ}
+                first_times = iter((initial, dispatched))
 
                 def fetch(*_args, **_kwargs):
+                    if pipeline.os.name == "nt":
+                        self.assertTrue((root / "rss" / ".acl-complete").is_file())
                     observed.append(pipeline.load_rss_state(root)["subscriptions"][0])
                     return (self.facebook_feed("example", options["provider"]) if platform == "facebook"
                             else self.instagram_feed("example"))
 
-                with mock.patch.dict(pipeline.os.environ, self.ENV, clear=True), \
-                     mock.patch.object(pipeline, "rss_now", side_effect=[initial, dispatched, completed, completed]), \
+                with mock.patch.dict(pipeline.os.environ, {**runtime_env, **self.ENV}, clear=True), \
+                     mock.patch.object(pipeline, "rss_now", side_effect=lambda: next(first_times, completed)), \
                      mock.patch.object(pipeline, f"fetch_{platform}_author", side_effect=fetch), \
                      mock.patch.object(pipeline, f"write_{platform}_discovery", return_value=root / "snapshot.json"):
                     subscription, _, _ = getattr(pipeline, f"add_{platform}_subscription")(
