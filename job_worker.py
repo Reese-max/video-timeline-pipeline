@@ -46,7 +46,8 @@ def main():
             return server.run_job(operation, _parent_writer=delegation) if delegation is not None else server.run_job(operation)
         report_progress("starting", 1, "開始處理")
         if operation == "prepare":
-            result = run(lambda: server.tool_payload(server.prepare_video_sync(**args)))
+            prepare = server.prepare_uploaded_video_sync if "file" in args else server.prepare_video_sync
+            result = run(lambda: server.tool_payload(prepare(**args)))
         elif operation == "analyze":
             result = run(lambda: server.analyze_prepared_sync(**args))
         elif operation == "drive":

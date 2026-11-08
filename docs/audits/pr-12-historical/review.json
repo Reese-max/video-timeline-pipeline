@@ -1,0 +1,14 @@
+{
+  "pr": 12,
+  "head": "4f8ff3443a60bf963e826720be67b84b1a6ee8b8",
+  "findings": [
+    {
+      "severity": "med",
+      "file": "pipeline.py",
+      "line": 4284,
+      "issue": "Category membership does not require a JSON array. index_job preserves scalar and object manifest categories, so json_each treats categories=\"AI\" or {\"topic\":\"AI\"} as an AI membership in FTS, short-query, semantic and both Ask paths. list_videos instead treats the key of {\"AI\":\"elsewhere\"} as a category. Require array metadata in both readers so only actual category string elements can match."
+    }
+  ],
+  "fixed": true,
+  "summary": "Fixed one medium-severity defect: non-array category metadata could become false memberships, with inconsistent results across Search, Ask and --list. A regression through build_index failed in all six affected paths before the three-line reader fix; full offline checks now pass (637 Python tests and 109 Node controls, with 24 Python skips)."
+}

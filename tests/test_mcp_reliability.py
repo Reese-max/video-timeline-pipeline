@@ -2,6 +2,7 @@ import asyncio
 import copy
 import csv
 import json
+import os
 import shutil
 import tempfile
 import unittest
@@ -276,7 +277,9 @@ class ReliabilityTests(unittest.TestCase):
                 server.pipeline.require_tool("ffmpeg"), "-v", "error", "-f", "lavfi", "-i",
                 "testsrc2=size=64x64:rate=7/2:duration=31", "-f", "lavfi", "-i",
                 "sine=frequency=880:duration=31", "-c:v", "libx264", "-c:a", "aac", str(source)])
-            parts = server.split_video(source, root / "segments", 15)
+            # 邊界取自 muxer 的實際關鍵畫面，需要重新編碼模式（copy 不強制關鍵畫面）。
+            with patch.dict(os.environ, {"MCP_SEGMENT_MODE": "transcode"}):
+                parts = server.split_video(source, root / "segments", 15)
             rows = list(csv.reader((root / "segments" / "segments.csv").read_text().splitlines()))
             self.assertEqual(len(parts), 3)
             self.assertNotEqual(float(rows[1][1]), 15.0)
@@ -334,8 +337,8 @@ class ReliabilityTests(unittest.TestCase):
                 notifications.get_operations_db(Path("unused"))
         connection.close.assert_called_once()
         connection.reset_mock()
-        with (patch.object(cost_tracker, "get_operations_db", return_value=connection),
-              patch.object(cost_tracker, "_init_cost_schema", side_effect=RuntimeError("schema"))):
+        with (patch.object(cost_tracker, "open_readonly", return_value=connection),
+              patch.object(connection, "cursor", side_effect=RuntimeError("schema"))):
             with self.assertRaisesRegex(RuntimeError, "schema"):
                 cost_tracker.get_cost_report(Path("unused"))
         connection.close.assert_called_once()
@@ -366,7 +369,7 @@ class ReliabilityTests(unittest.TestCase):
                 def upload(_token, path, name, parent, *, file_id):
                     nonlocal fail
                     uploaded.append(file_id)
-                    should_fail = name == "segment_001.mp4" and fail
+                    should_fail = name.endswith("segment_001.mp4") and fail
                     if not should_fail or committed:
                         remote[file_id] = {"id": file_id, "mimeType": "video/mp4", "parents": [parent],
                             "size": str(path.stat().st_size), "sha256Checksum": drive._sha256(path),
@@ -381,6 +384,7 @@ class ReliabilityTests(unittest.TestCase):
                       patch.object(drive, "_env", return_value=""),
                       patch.object(drive, "_new_id", side_effect=reserve),
                       patch.object(drive, "_create_folder", side_effect=folder),
+                      patch.object(drive, "_list_children", return_value=[]),
                       patch.object(drive, "_upload_file", side_effect=upload),
                       patch.object(drive, "_get_file", side_effect=lambda _, fid: remote.get(fid))):
                     args = (root, "0123456789ab", "demo", "source", rows)

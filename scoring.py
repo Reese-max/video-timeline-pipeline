@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Any
 
 from notifications import get_operations_db
+from operations import foundation_status, open_readonly
 
 
 @dataclass
@@ -34,52 +35,10 @@ class ScoreResult:
 
 
 def _init_scoring_schema(conn: sqlite3.Connection) -> None:
-    """Idempotently initialize tables for video scoring and decisions."""
-    with conn:
-        conn.executescript(
-            """
-            CREATE TABLE IF NOT EXISTS video_scores (
-                score_id TEXT PRIMARY KEY,
-                library_id TEXT,
-                job TEXT NOT NULL,
-                analysis_revision TEXT NOT NULL,
-                current_input_hash TEXT NOT NULL,
-                schema_version TEXT DEFAULT '1',
-                prompt_version TEXT DEFAULT '1',
-                model_version TEXT NOT NULL,
-                provider TEXT NOT NULL,
-                profile_hash TEXT NOT NULL,
-                evidence_hash TEXT NOT NULL,
-                knowledge_cutoff TEXT,
-                retrieval_version TEXT DEFAULT '1',
-                status TEXT NOT NULL,
-                importance REAL,
-                relevance REAL,
-                novelty REAL,
-                novelty_status TEXT NOT NULL,
-                evidence_confidence REAL,
-                priority_score REAL,
-                reasons_json TEXT,
-                claims_json TEXT,
-                raw_output TEXT,
-                cache_key TEXT UNIQUE,
-                scored_at TEXT NOT NULL
-            );
+    """Compatibility entry point; the shared registry owns all migrations."""
+    from operations import ensure_foundation_schema
 
-            CREATE TABLE IF NOT EXISTS score_decisions (
-                decision_id TEXT PRIMARY KEY,
-                score_id TEXT NOT NULL,
-                policy_hash TEXT NOT NULL,
-                priority REAL,
-                decision TEXT NOT NULL,
-                reasons TEXT,
-                decided_at TEXT NOT NULL,
-                FOREIGN KEY(score_id) REFERENCES video_scores(score_id)
-            );
-
-            CREATE INDEX IF NOT EXISTS ix_scores_job ON video_scores(job, analysis_revision);
-            """
-        )
+    ensure_foundation_schema(conn)
 
 
 def calculate_priority_score(
@@ -138,32 +97,17 @@ def retrieve_history_evidence(
 
     if db_path.is_file():
         try:
-            with closing(sqlite3.connect(db_path)) as conn:
-                conn.row_factory = sqlite3.Row
-                # Search for keyword matches across events
-                for kw in keywords[:4]:
-                    if len(evidence) >= max_evidence:
-                        break
-                    cur = conn.cursor()
-                    cur.execute(
-                        """
-                        SELECT job, kind, timestamp, snippet
-                        FROM events
-                        WHERE job != ? AND snippet LIKE ?
-                        LIMIT 3
-                        """,
-                        (current_job, f"%{kw}%"),
-                    )
-                    for row in cur.fetchall():
-                        evidence.append(
-                            {
-                                "job": row["job"],
-                                "kind": row["kind"],
-                                "timestamp": row["timestamp"],
-                                "text": row["snippet"][:250],
-                            }
-                        )
-        except Exception:
+            from pipeline import SearchFilter, search_index
+
+            filters = SearchFilter(exclude_job=current_job, until=cutoff_time or "",
+                                   date_field="first_completed_at")
+            seen: set[str] = set()
+            for keyword in keywords[:4]:
+                for hit in search_index(root, keyword, max_evidence, filters=filters):
+                    if hit["occurrence_id"] not in seen and len(evidence) < max_evidence:
+                        seen.add(hit["occurrence_id"])
+                        evidence.append(hit)
+        except (RuntimeError, ValueError, sqlite3.Error):
             pass
 
     serialized = json.dumps(evidence, sort_keys=True, ensure_ascii=False)
@@ -381,10 +325,12 @@ def score_video(
         }
 
 
-def explain_score(root: Path, job: str) -> dict[str, Any]:
+def explain_score(root: Path, job: str, *, readonly: bool = False) -> dict[str, Any]:
     """Read-only score explanation without any API cost."""
-    with closing(get_operations_db(root)) as conn:
-        _init_scoring_schema(conn)
+    conn = open_readonly(root)
+    if conn is None:
+        return foundation_status(root)
+    with closing(conn):
 
         cur = conn.cursor()
         cur.execute(
@@ -421,8 +367,10 @@ def explain_score(root: Path, job: str) -> dict[str, Any]:
 
 def generate_score_report(root: Path) -> dict[str, Any]:
     """Aggregate daily/overall scoring summary from operations.db."""
-    with closing(get_operations_db(root)) as conn:
-        _init_scoring_schema(conn)
+    conn = open_readonly(root)
+    if conn is None:
+        return foundation_status(root)
+    with closing(conn):
 
         cur = conn.cursor()
         cur.execute(

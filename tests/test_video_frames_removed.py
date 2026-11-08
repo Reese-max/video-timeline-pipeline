@@ -68,6 +68,8 @@ class VideoFramesRemovedTests(unittest.TestCase):
             "important_details": [], "confidence": 0.9, "completion_status": "complete",
             "visual_schema_version": pipeline.VISUAL_OBSERVATION_SCHEMA_VERSION,
             "timestamp_original": 90.0, "timestamp_reliable": True,
+            "video_gap_check_version": pipeline.VIDEO_EVENT_GAP_CHECK_VERSION,
+            "unanswered_gap_windows": [],
         }
         self.assertTrue(pipeline.reusable_video_artifact([{**event, "analysis_method": "minimax_video"}]))
         for method in ("minimax_video_fallback_frames", "minimax", "frames"):

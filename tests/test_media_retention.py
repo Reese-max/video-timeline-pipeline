@@ -73,6 +73,57 @@ class RetentionTests(unittest.TestCase):
                 os.utime(result, (self.now - 8 * 86400,) * 2)
                 self.assertEqual(retention.cleanup(root, now=self.now)["selected_files"], expected)
 
+    def test_chunk_segments_left_by_a_failed_run_are_cleaned(self):
+        # A chunked analysis that failed before its merge leaves the segment
+        # files behind; the retention rules have to be able to remove them.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve() / "mcp_jobs"
+            job = self.make_job(root)
+            run = "analysis/runs/" + ("a" * 64)
+            chunk_dir = job / run / "vision-video-work/minimax-chunks"
+            chunk_dir.mkdir(parents=True, exist_ok=True)
+            (chunk_dir / "chunk-0000.mp4").write_bytes(b"segment")
+            (chunk_dir / "chunk-0001.mp4").write_bytes(b"segment")
+            (chunk_dir / "chunks.csv").write_text("keep", encoding="utf-8")
+            work_dir = chunk_dir / "chunk-0000-work"
+            work_dir.mkdir(parents=True, exist_ok=True)
+            (work_dir / "minimax-compressed.mp4").write_bytes(b"compressed")
+            (work_dir / "minimax-upload-abc.json").write_text("keep", encoding="utf-8")
+            for path in job.rglob("*"):
+                if path.is_file():
+                    os.utime(path, (self.now - 8 * 86400,) * 2)
+            relative = (run + "/vision-video-work/minimax-chunks/chunk-0000.mp4")
+            self.assertTrue(retention.MEDIA.fullmatch(relative))
+            self.assertTrue(retention.DERIVED.fullmatch(relative))
+            report = retention.cleanup(root, now=self.now)
+            # The six media files of the job plus the three segment files.
+            self.assertEqual(report["selected_files"], 9)
+            report = retention.cleanup(root, apply=True, now=self.now)
+            self.assertEqual(report["deleted_files"], 9)
+            self.assertEqual(report["errors"], [])
+            self.assertFalse((chunk_dir / "chunk-0000.mp4").exists())
+            self.assertFalse((chunk_dir / "chunk-0001.mp4").exists())
+            self.assertFalse((work_dir / "minimax-compressed.mp4").exists())
+            # Records stay: the segment list and the upload receipt.
+            self.assertTrue((chunk_dir / "chunks.csv").exists())
+            self.assertTrue((work_dir / "minimax-upload-abc.json").exists())
+
+    def test_chunk_pattern_does_not_take_other_files(self):
+        run = "analysis/runs/" + ("a" * 64)
+        kept = [
+            run + "/vision-video-work/minimax-chunks/chunks.csv",
+            run + "/vision-video-work/minimax-chunks/chunk-0000-work/minimax-upload-abc.json",
+            run + "/vision-video-work/minimax-chunks/notes.mp4",
+            run + "/vision-video-work/minimax-chunks/chunk-abc.mp4",
+            "analysis/runs/not-a-hash/vision-video-work/minimax-chunks/chunk-0000.mp4",
+            "minimax-chunks/chunk-0000.mp4",
+            run + "/vision-video-work/minimax-chunks/chunk-0000-work/other.mp4",
+        ]
+        for relative in kept:
+            with self.subTest(relative=relative):
+                self.assertIsNone(retention.MEDIA.fullmatch(relative))
+                self.assertIsNone(retention.DERIVED.fullmatch(relative))
+
     def test_ineligible_jobs_are_untouched(self):
         for reason in ["exactly_7_days", "recent_write", "partial", "needs_review", "drive", "manual_hold", "invalid", "source_changed", "unfinished", "frame_era"]:
             with self.subTest(reason=reason), tempfile.TemporaryDirectory() as directory:
@@ -158,8 +209,8 @@ class RetentionTests(unittest.TestCase):
                 state_dir.mkdir()
                 db_path = state_dir / "jobs.sqlite3"
                 with closing(sqlite3.connect(db_path)) as db, db:
-                    db.execute("CREATE TABLE jobs (job_id TEXT,status TEXT)")
-                    db.execute("INSERT INTO jobs VALUES (?,?)", (job.name, state if state not in {"live_share", "changed_bytes"} else "completed"))
+                    db.execute("CREATE TABLE jobs (job_id TEXT,status TEXT,input_hash TEXT,created REAL)")
+                    db.execute("INSERT INTO jobs VALUES (?,?,'h',1)", (job.name, state if state not in {"live_share", "changed_bytes"} else "completed"))
                 if state == "live_share":
                     marker = job / ".media-lifecycle.json"
                     pipeline.write_json(marker, {"version": 1, "job_id": job.name,
@@ -176,6 +227,28 @@ class RetentionTests(unittest.TestCase):
                 self.assertTrue((job / "analysis/result.json").exists())
                 with closing(sqlite3.connect(db_path)) as db:
                     self.assertEqual(db.execute("SELECT count(*) FROM jobs").fetchone()[0], 1)
+
+    def test_failure_is_released_only_by_a_later_completed_run_of_the_same_request(self):
+        cases = {"superseded": ([("cancelled", "h", 1), ("completed", "h", 2)], 6),
+                 "failed_then_two_retries": ([("failed", "h", 1), ("interrupted", "h", 2), ("completed", "h", 3)], 6),
+                 "other_request": ([("cancelled", "h", 1), ("completed", "x", 2)], 0),
+                 "earlier_success": ([("completed", "h", 1), ("failed", "h", 2)], 0),
+                 "other_job": ([("cancelled", "h", 1), ("completed", "h", 2, "ba9876543210")], 0),
+                 "active_never_superseded": ([("queued", "h", 1), ("completed", "h", 2)], 0)}
+        for name, (rows, deleted) in cases.items():
+            with self.subTest(case=name), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory).resolve() / "mcp_jobs"
+                job = self.make_job(root)
+                state_dir = root.parent / ".video-state"
+                state_dir.mkdir()
+                with closing(sqlite3.connect(state_dir / "jobs.sqlite3")) as db, db:
+                    db.execute("CREATE TABLE jobs (job_id TEXT,status TEXT,input_hash TEXT,created REAL)")
+                    for status, key, created, *other in rows:
+                        db.execute("INSERT INTO jobs VALUES (?,?,?,?)", (other[0] if other else job.name, status, key, created))
+                report = retention.cleanup(root, apply=True, now=self.now)
+                self.assertEqual(report["deleted_files"], deleted)
+                self.assertEqual(report["skipped"]["queue_failure_or_review"], int(deleted == 0 and name != "active_never_superseded"))
+                self.assertEqual(report["skipped"]["queue_active_or_unresolved"], int(name == "active_never_superseded"))
 
     def test_real_worker_dispatch_respects_cleanup_lock_for_every_operation(self):
         import job_worker
@@ -198,3 +271,52 @@ class RetentionTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ThreadsMediaRetentionTests(unittest.TestCase):
+    def setUp(self):
+        self.now = time.time()
+
+    def test_drive_backed_threads_media_fragments_are_cleaned(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve() / "mcp_jobs"
+            job = root / "0123456789ac"
+            stamp = self.now - 8 * 86400
+            for name in ["source.mp4", "threads_media_000.mp4", "threads_media_001.mp4"]:
+                path = job / name
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(b"media")
+                os.utime(path, (stamp, stamp))
+            fingerprint = pipeline.file_fingerprint(job / "source.mp4")
+            manifest = {"status": "ready", "job_id": job.name, "source": {"fingerprint": fingerprint}, "segments": []}
+            pipeline.write_json(job / "manifest.json", manifest)
+            pipeline.write_json(job / "analysis/result.json", {"status": "complete", "job_id": job.name,
+                "source_fingerprint": fingerprint, "source_sha256": pipeline.file_sha256(job / "source.mp4"),
+                "quality": {"status": "evidence_available"}, "transcript": "keep"})
+            state = {
+                "job_id": job.name,
+                "fingerprint": fingerprint,
+                "source_file": {"file_name": "source.mp4", "sha256": pipeline.file_sha256(job / "source.mp4")},
+                "segments": [],
+                "files": [
+                    {"relative_path": "source.mp4", "sha256": pipeline.file_sha256(job / "source.mp4")},
+                ],
+            }
+            pipeline.write_json(job / "drive-manifest.json", state)
+            pipeline.write_json(job / ".media-lifecycle.json", {
+                "version": 1,
+                "job_id": job.name,
+                "managed_at": self.now - 10 * 86400,
+                "last_used_at": self.now - 10 * 86400,
+                "protected_until": self.now - 1000,
+                "link_until": self.now - 1000,
+            })
+            with patch("drive_storage.backup_complete", return_value=True), \
+                 patch("drive_storage.local_matches_backup", return_value=True), \
+                 patch("drive_storage.backup_relative_paths", return_value={"source.mp4"}), \
+                 patch("drive_storage.verify_remote_backup", return_value=True):
+                report = retention.cleanup(root, apply=True, now=self.now)
+                self.assertGreater(report["deleted_files"], 0)
+                self.assertNotIn("unbacked_media", report["skipped"])
+                self.assertFalse((job / "threads_media_000.mp4").exists())
+                self.assertFalse((job / "threads_media_001.mp4").exists())

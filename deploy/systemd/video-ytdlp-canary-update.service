@@ -1,0 +1,15 @@
+[Unit]
+Description=Video Timeline yt-dlp canary update preview
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=ubuntu
+WorkingDirectory=/home/ubuntu/video-timeline-pipeline
+Environment=HOME=/home/ubuntu
+Environment=PYTHONDONTWRITEBYTECODE=1
+ExecStart=/bin/bash scripts/ytdlp_canary_update.sh --dry-run
+UMask=0077
+TimeoutStartSec=30min
+TimeoutStopSec=2min

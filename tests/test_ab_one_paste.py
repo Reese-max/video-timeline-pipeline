@@ -7,7 +7,11 @@ import unittest
 
 import analysis_report
 import mcp_server as server
-from test_parallel_ab import _drive, _prepared
+
+try:  # 測試可以當作 tests.test_ab_one_paste 或直接 discover 執行
+    from test_parallel_ab import _drive, _prepared
+except ImportError:  # pragma: no cover - `python -m unittest tests.…` 的匯入路徑
+    from tests.test_parallel_ab import _drive, _prepared
 
 
 def _result(texts, audio_status="complete", logprobs=None):

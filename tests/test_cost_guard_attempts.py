@@ -49,6 +49,7 @@ class CostAttemptTests(unittest.TestCase):
             "BUDGET_HARD_STOP": "false", "DAILY_BUDGET_USD": "100",
             "MINIMAX_BASE_URL": "https://api.minimax.io/v1",
             "APIFY_API_TOKEN": "offline-placeholder", "APIFY_MAX_TOTAL_CHARGE_USD": "0.75",
+            "BRIGHTDATA_CREDIT_LEDGER": str(self.root / "brightdata-credits.sqlite3"),
         }, clear=True)
         self.environment.start()
         self.scope = cost_tracker.cost_root_scope(self.root)
@@ -245,6 +246,11 @@ class CostAttemptTests(unittest.TestCase):
         before = rows(self.root, "usage_costs")
         with closing(sqlite3.connect(self.root / "operations.db")) as connection, connection:
             connection.execute("ALTER TABLE usage_costs DROP COLUMN reservation_id")
+            # This fixture represents a pre-link store, before registry migration 3.
+            connection.execute("DELETE FROM schema_migrations WHERE version >= 3")
+        self.assertEqual(cost_tracker.get_cost_report(self.root)["status"], "migration_required")
+        # Reports no longer migrate; an explicit writer initializes the shared schema.
+        cost_tracker.get_operations_db(self.root).close()
         report = cost_tracker.get_cost_report(self.root)
         after = rows(self.root, "usage_costs")
         self.assertEqual(before, after)

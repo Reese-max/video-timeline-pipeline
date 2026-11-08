@@ -158,6 +158,17 @@ class AnalysisCacheRegressionTests(unittest.TestCase):
         self.assertEqual(analyze_mock.call_count, 2)
         self.assertNotEqual(second["status"], "complete")
 
+    def test_unanswered_visual_window_stays_partial_and_reaches_model_on_retry(self):
+        observation = {**GOOD_OBSERVATION,
+                       "video_gap_check_version": pipeline.VIDEO_EVENT_GAP_CHECK_VERSION,
+                       "unanswered_gap_windows": [[30.0, DURATION]]}
+        first, stored, second, analyze_mock, _ = self._run_twice([observation], CLEAN_TRANSCRIPT)
+        for result in (first, stored, second):
+            self.assertEqual(result["status"], "partial")
+            self.assertNotEqual(result["visual_status"], "complete")
+        self.assertEqual(analyze_mock.call_count, 2)
+        self.assertEqual(first["quality"]["status"], "needs_review")
+
     def test_transcript_gap_with_backfill_error_is_not_cached_as_complete(self):
         first, stored, second, _, transcribe_mock = self._run_twice(
             [GOOD_OBSERVATION], GAPPED_TRANSCRIPT)

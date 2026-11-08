@@ -281,6 +281,13 @@ class FacebookAuthorTests(unittest.TestCase):
 
 
 class InstagramAuthorTests(unittest.TestCase):
+    def setUp(self):
+        directory = self.enterContext(tempfile.TemporaryDirectory())
+        self.enterContext(mock.patch.dict(pipeline.os.environ, {
+            "BRIGHTDATA_CREDIT_LEDGER": str(Path(directory) / "credits.sqlite3"),
+            "BRIGHTDATA_MONTHLY_CREDIT_LIMIT": "4500", "BRIGHTDATA_POST_DAILY_LIMIT": "20",
+        }))
+
     def test_brightdata_discovery_is_opt_in_and_filters_known_dates(self) -> None:
         with self.assertRaisesRegex(RuntimeError, "--allow-batch-cloud"):
             pipeline.fetch_instagram_author("example")

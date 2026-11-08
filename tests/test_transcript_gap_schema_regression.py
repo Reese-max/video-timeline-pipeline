@@ -18,7 +18,7 @@ class TranscriptGapSchemaRegressionTests(unittest.TestCase):
             with self.subTest(bad=bad):
                 self.assertEqual(pipeline.find_transcript_gaps(genuine + [bad]), expected)
 
-    def run_backfill(self, bad, *, twice=False, failure=None):
+    def run_backfill(self, bad, *, twice=False, failure=None, response=None):
         with tempfile.TemporaryDirectory(prefix="video65-schema-") as temporary:
             root = Path(temporary)
             chunks = []
@@ -37,6 +37,8 @@ class TranscriptGapSchemaRegressionTests(unittest.TestCase):
                 if Path(audio).name.startswith("gap-"):
                     if failure is not None:
                         raise failure
+                    if response is not None:
+                        return response
                     return {"language": "zh", "segments": bad + [
                         {"start": 15.0, "end": 44.6, "text": "valid gap speech"}]}
                 if Path(audio).name.endswith("0000.mp3"):
@@ -73,6 +75,37 @@ class TranscriptGapSchemaRegressionTests(unittest.TestCase):
             {"start": float("nan"), "end": float("nan"), "text": "invalid cached nan"}], twice=True)
         self.assert_only_valid_speech(transcript)
         self.assertEqual(len(calls), 3)
+
+    def test_untimed_backfill_cannot_hide_issue55_gap(self):
+        text = "context without timing"
+        for response in ({"text": text}, {"segments": [], "text": text},
+                         {"segments": [{"text": text}]},
+                         {"segments": [{"start": 0.0, "text": text}]},
+                         {"segments": [{"end": 44.6, "text": text}]}):
+            with self.subTest(response=response):
+                transcript, calls = self.run_backfill([], response=response, twice=True)
+                self.assertEqual(transcript["gap_check"]["remaining"],
+                                 [{"start": 120.0, "end": 149.6}])
+                self.assertEqual([x["text"] for x in transcript["segments"]], ["left", "right"])
+                self.assertEqual(transcript["backfill_errors"], [])
+                self.assertEqual(len(calls), 3)
+
+    def test_untimed_rows_do_not_discard_valid_backfill(self):
+        transcript, calls = self.run_backfill([
+            {"text": "missing both timestamps"},
+            {"start": 15.0, "text": "missing end"},
+            {"end": 44.6, "text": "missing start"}], twice=True)
+        self.assert_only_valid_speech(transcript)
+        self.assertEqual(len(calls), 3)
+
+    def test_boolean_backfill_times_cannot_cover_missing_speech(self):
+        for start, end in ((True, 44.6), (False, 44.6), (0, True)):
+            with self.subTest(start=start, end=end):
+                transcript, calls = self.run_backfill([], response={"segments": [
+                    {"start": start, "end": end, "text": "boolean timestamp fixture"}]}, twice=True)
+                self.assertEqual(transcript["gap_check"]["remaining"], [{"start": 120.0, "end": 149.6}])
+                self.assertEqual([row["text"] for row in transcript["segments"]], ["left", "right"])
+                self.assertEqual(len(calls), 3)
 
     def test_cancel_and_deadline_propagate_exact_original_exception(self):
         for cls in (pipeline.ExecutionCancelled, pipeline.DeadlineExceeded):

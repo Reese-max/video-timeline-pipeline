@@ -22,19 +22,28 @@ import pipeline
 from media_lifecycle import StoragePolicy
 
 
+# Segments left behind by a chunked MiniMax analysis that failed before its
+# merge; a successful run deletes them together with the whole directory.
+CHUNK_MEDIA = (
+    r"analysis/runs/[a-f0-9]{64}/vision-video-work/minimax-chunks/"
+    r"(?:chunk-\d+\.mp4|chunk-\d+-work/minimax-compressed\.mp4)"
+)
 MEDIA = re.compile(
     r"(?:source\.(?:mp4|mkv|webm|mov|avi|m4v)|threads_media_\d+\.mp4|"
     r"segments/segment_\d+\.mp4|previews/preview_\d+\.jpg|"
     r"analysis/(?:runs/[a-f0-9]{64}/)?(?:frames|budgeted-frames)/frame_\d+\.jpg|"
     r"analysis/(?:runs/[a-f0-9]{64}/)?audio/audio_\d+\.mp3|"
-    r"analysis/runs/[a-f0-9]{64}/vision-video-work/minimax-compressed\.mp4)", re.I)
+    r"analysis/runs/[a-f0-9]{64}/vision-video-work/minimax-compressed\.mp4|"
+    + CHUNK_MEDIA + r")", re.I)
 AUDIT = "media-retention.json"
 # Media rebuilt from the source (previews, analysis frames/audio, compression output).
 DERIVED = re.compile(
     r"(?:previews/preview_\d+\.jpg|"
     r"analysis/(?:runs/[a-f0-9]{64}/)?(?:frames|budgeted-frames)/frame_\d+\.jpg|"
     r"analysis/(?:runs/[a-f0-9]{64}/)?audio/audio_\d+\.mp3|"
-    r"analysis/runs/[a-f0-9]{64}/vision-video-work/minimax-compressed\.mp4)", re.I)
+    r"analysis/runs/[a-f0-9]{64}/vision-video-work/minimax-compressed\.mp4|"
+    + CHUNK_MEDIA + r"|"
+    r"threads_media_\d+\.mp4)", re.I)
 
 
 def drive_backup_still_verified(job: Path) -> bool:
@@ -169,7 +178,11 @@ def cleanup(jobs_root: Path, *, apply: bool = False, now: float | None = None) -
             try:
                 # Serialize enqueue/status changes with the complete cleanup, without changing rows.
                 db.execute("BEGIN IMMEDIATE")
-                for job_id, status in db.execute("SELECT job_id,status FROM jobs WHERE status!='completed'"):
+                # A failed or cancelled row stops protecting media once a later run of the same request completes.
+                for job_id, status in db.execute(
+                        "SELECT job_id,status FROM jobs AS old WHERE status!='completed' AND (status IN ('queued','running') "
+                        "OR job_id IS NULL OR NOT EXISTS (SELECT 1 FROM jobs AS new WHERE new.status='completed' "
+                        "AND new.job_id=old.job_id AND new.input_hash=old.input_hash AND new.created>old.created))"):
                     if status in {"queued", "running"} or job_id is None:
                         report["skipped"]["queue_active_or_unresolved"] += 1
                         return report

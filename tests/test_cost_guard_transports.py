@@ -63,7 +63,7 @@ class TransportBlockedTestCase(unittest.TestCase):
     def setUp(self) -> None:
         self.tmp_dir = tempfile.TemporaryDirectory()
         self.root = Path(self.tmp_dir.name)
-        self.env = patch.dict(os.environ, BLOCKED_ENV)
+        self.env = patch.dict(os.environ, {**BLOCKED_ENV, "BRIGHTDATA_CREDIT_LEDGER": str(self.root / "brightdata-credits.sqlite3")})
         self.env.start()
         self.scope = cost_tracker.cost_root_scope(self.root)
         self.scope.__enter__()
@@ -195,7 +195,7 @@ class GuardAccountingTests(unittest.TestCase):
     def setUp(self) -> None:
         self.tmp_dir = tempfile.TemporaryDirectory()
         self.root = Path(self.tmp_dir.name)
-        self.env = patch.dict(os.environ, OPEN_ENV)
+        self.env = patch.dict(os.environ, {**OPEN_ENV, "BRIGHTDATA_CREDIT_LEDGER": str(self.root / "brightdata-credits.sqlite3")})
         self.env.start()
         self.scope = cost_tracker.cost_root_scope(self.root)
         self.scope.__enter__()
@@ -288,7 +288,7 @@ class UncertainSubmissionTests(unittest.TestCase):
     def setUp(self) -> None:
         self.tmp_dir = tempfile.TemporaryDirectory()
         self.root = Path(self.tmp_dir.name)
-        self.env = patch.dict(os.environ, OPEN_ENV)
+        self.env = patch.dict(os.environ, {**OPEN_ENV, "BRIGHTDATA_CREDIT_LEDGER": str(self.root / "brightdata-credits.sqlite3")})
         self.env.start()
         self.scope = cost_tracker.cost_root_scope(self.root)
         self.scope.__enter__()
@@ -325,7 +325,7 @@ class UnidentifiedSubmissionTests(unittest.TestCase):
     def setUp(self) -> None:
         self.tmp_dir = tempfile.TemporaryDirectory()
         self.root = Path(self.tmp_dir.name)
-        self.env = patch.dict(os.environ, OPEN_ENV)
+        self.env = patch.dict(os.environ, {**OPEN_ENV, "BRIGHTDATA_CREDIT_LEDGER": str(self.root / "brightdata-credits.sqlite3")})
         self.env.start()
         self.scope = cost_tracker.cost_root_scope(self.root)
         self.scope.__enter__()
@@ -385,7 +385,7 @@ class NotificationEntryPointTests(unittest.TestCase):
         import notifications
 
         payload = FakeResponse({"id": "msg-1"})
-        with patch.dict(os.environ, OPEN_ENV), patch.object(
+        with patch.dict(os.environ, {**OPEN_ENV, "BRIGHTDATA_CREDIT_LEDGER": str(self.root / "brightdata-credits.sqlite3")}), patch.object(
             urllib.request, "urlopen", return_value=payload
         ), cost_tracker.cost_root_scope(self.root), patch.object(
             notifications, "get_configured_provider", return_value=email_providers.ResendProvider(api_key="resend-key")
@@ -405,8 +405,11 @@ class GuardModeTests(unittest.TestCase):
     def setUp(self) -> None:
         self.tmp_dir = tempfile.TemporaryDirectory()
         self.root = Path(self.tmp_dir.name)
+        self.env = patch.dict(os.environ, {"BRIGHTDATA_CREDIT_LEDGER": str(self.root / "brightdata-credits.sqlite3")})
+        self.env.start()
 
     def tearDown(self) -> None:
+        self.env.stop()
         self.tmp_dir.cleanup()
 
     def test_strict_mode_rejects_estimates_without_provider_enforced_bound(self) -> None:
@@ -507,6 +510,9 @@ class GuardModeTests(unittest.TestCase):
                 patch.object(urllib.request, "urlopen", side_effect=responses) as transport:
             result = pipeline.fetch_facebook_author_apify("https://www.facebook.com/somepage", "365d")
         self.assertEqual(result["items"], [])
+        # 10-21 A1 run: the discovery snapshot is saved as JSON; a Decimal here crashed after the paid run.
+        snapshot = pipeline.write_facebook_discovery(self.root, result)
+        self.assertEqual(json.loads(snapshot.read_text(encoding="utf-8"))["facebook"]["max_total_charge_usd"], "1")
         self.assertEqual([call.args[0].get_method() for call in transport.call_args_list], ["POST", "GET"])
         usage = rows(self.root, "usage_costs")
         self.assertEqual(len(usage), 1)
@@ -563,6 +569,25 @@ class GuardModeTests(unittest.TestCase):
         self.assertTrue(cost_id)
         row = rows(self.root, "usage_costs")[0]
         self.assertEqual(row["cost_status"], "unknown")
+
+
+class BrightDataLedgerIsolationTests(unittest.TestCase):
+    def test_every_transport_test_class_uses_its_own_temporary_ledger(self):
+        with tempfile.TemporaryDirectory() as home, patch.dict(
+            os.environ, {"HOME": home, "USERPROFILE": home}, clear=True
+        ):
+            for case_type in (TransportBlockedTestCase, GuardAccountingTests,
+                              UncertainSubmissionTests, UnidentifiedSubmissionTests,
+                              GuardModeTests):
+                with self.subTest(case=case_type.__name__):
+                    case = case_type()
+                    case.setUp()
+                    try:
+                        self.assertEqual(pipeline.brightdata_credits.ledger_path(),
+                                         case.root / "brightdata-credits.sqlite3")
+                    finally:
+                        case.tearDown()
+            self.assertFalse((Path(home) / ".local/state/video-timeline-pipeline").exists())
 
 
 if __name__ == "__main__":
