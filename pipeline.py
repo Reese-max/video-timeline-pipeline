@@ -8379,6 +8379,8 @@ def add_facebook_subscription(
     }
     def select_posts_mode() -> None:
         subscription["facebook_brightdata_mode"] = "posts"
+        if reserved:
+            save_rss_state(root, state)
 
     if allow_paid and provider in {"apify", "brightdata"} and paid_discovery_min_hours():
         validate_facebook_discovery_options(provider, brightdata_mode)

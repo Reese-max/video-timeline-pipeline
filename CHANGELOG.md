@@ -2,9 +2,9 @@
 
 ## Unreleased
 
-- 修正：付費新增訂閱預存前先驗證期間、模式與結果預算，避免無效參數留下壞訂閱；OPML 的停用狀態會一併預存，盤點失敗後不會意外啟用。失敗後保留的 Instagram 訂閱補上作者 URL，避免 OPML 匯入時遺失。
+- 修正：付費新增訂閱預存前先驗證期間、模式與結果預算，避免無效參數留下壞訂閱；OPML 的停用狀態會一併預存，盤點失敗後不會意外啟用。失敗後保留的 Instagram 訂閱補上作者 URL，避免 OPML 匯入時遺失；保留的 Facebook 訂閱在送出 posts 前保存模式，失敗後刷新可沿用已有的 posts 回執。
 
-- 修正：新增 Apify／Bright Data 付費訂閱（`--facebook-author`×`--facebook-provider apify`／`brightdata`、`--instagram-author`，含 OPML 匯入）完成付費盤點時不會寫入 `paid_discovery_at`，導致 `RSS_PAID_DISCOVERY_MIN_HOURS` 間隔內的排程刷新把同一位作者再付費盤點一次（該欄位原本只在 `--rss-refresh` 的送出前存檔寫入）。現在設定間隔時，`add_facebook_subscription` 與 `add_instagram_subscription` 在付費呼叫**送出前**就把 `paid_discovery_at` 寫入並存檔（涵蓋呼叫中斷），盤點完整完成後再重設為完成時間（與 refresh 一致）；付費盤點失敗時訂閱仍留在訂閱清單，間隔照樣起算、不重複扣款。未設定間隔、免費盤點（`provider="meta"`）或未加 `--allow-batch-cloud` 的行為不變（不多寫欄位、失敗不建訂閱）。新增回歸測試 `tests/test_rss_paid_discovery.py::PaidDiscoveryAddStampTests`（送出前 payload 已在磁碟、新增後立刻 `refresh_rss` deferred 且不再送供應商呼叫、未設間隔不寫欄位、被拒絕的付費新增不留訂閱）。README 同步說明。
+- 改善：設定付費間隔時，新增 Facebook／Instagram 訂閱的初次盤點成功後，將 `paid_discovery_at` 從既有的送出前預留時間更新為完成時間。新增回歸測試，涵蓋送出前存檔、立即刷新時延後、未設定間隔及未授權付費的情況。
 - 修正：`probe_video_source` 遇到 yt-dlp 回傳 `null` 或非物件 JSON 時，改用清理後的 stderr 回報錯誤（無 stderr 時提供備援訊息），讓 Facebook 私人影片正確分類為 `LOGIN_REQUIRED_OR_PRIVATE`；probe 子程序遇到 `None` 以非零結束碼退出。YouTube probe 使用代理時先以最多 3 秒的 TCP 連線檢查，連線失敗立即回報 `PROXY_UNREACHABLE`，不耗盡 45 秒預算；實際下載流程不變。
 - 新增：下載錯誤共用分類器，提供穩定 `error_code`、是否可重試、繁中說明／下一步與截短原始錯誤；同步準備及背景失敗輪詢保留既有欄位並附上分類。新增唯讀 `probe_video_source`，共用下載格式與網路選項，最多 45 秒檢查 metadata／選定格式與估計大小，不建立工作或媒體，停用 yt-dlp 快取與 cookie 回寫；外部 runtime／外掛／瀏覽器 cookie 擷取的檔案副作用仍是已知限制。一般下載及 probe 保留主機 yt-dlp 設定檔及外掛行為，Facebook／Instagram 延續既有專用選項並共用 cookie 重試邏輯；一般下載改為擷取 stderr，保留分類所需的實際錯誤。工具描述要求轉述分類結果、不推測原因；新增離線回歸與 README 錯誤碼表。
 - 修正：背景準備失敗輪詢可容忍損毀或非物件的 inputs 與非字串 URL；下載分類器縮窄登入／影片不可用的判斷，並共用 Facebook 網域判定，避免無證據推論。

@@ -149,7 +149,7 @@ class PaidDiscoveryIntervalTests(unittest.TestCase):
 
     def test_without_an_interval_nothing_extra_is_saved_before_the_call(self) -> None:
         out: dict = {}
-        refresh({"RSS_PAID_DISCOVERY": "apify"}, False, out=out)
+        refresh({"RSS_PAID_DISCOVERY": "apify", "RSS_PAID_DISCOVERY_MIN_HOURS": ""}, False, out=out)
         self.assertNotIn("paid_discovery_at", out["subscriptions"]["fb-apify"])
 
     def test_a_stamp_that_cannot_be_saved_blocks_the_paid_call(self) -> None:
@@ -279,7 +279,7 @@ class PaidDiscoveryAddStampTests(unittest.TestCase):
     def test_without_an_interval_a_paid_add_writes_no_stamp(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            with mock.patch.dict(pipeline.os.environ, {"RSS_PAID_DISCOVERY": "apify"}), \
+            with mock.patch.dict(pipeline.os.environ, {"RSS_PAID_DISCOVERY": "apify", "RSS_PAID_DISCOVERY_MIN_HOURS": ""}), \
                  mock.patch.object(pipeline, "fetch_facebook_author",
                                    side_effect=lambda *a, **k: self.facebook_feed("somepage", "apify")), \
                  mock.patch.object(pipeline, "fetch_instagram_author",
