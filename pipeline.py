@@ -5221,7 +5221,7 @@ LIBRARY_SCHEMA_VERSION = 3
 
 
 def index_connection(root: Path) -> sqlite3.Connection:
-    connection = sqlite3.connect(root / "library.db")
+    connection = sqlite3.connect(root / "library.db", timeout=30)
     # tokenize='trigram'：unicode61 會把整句中文吃成單一 token，中文查詢一律落空。
     connection.executescript(
         """
@@ -5273,6 +5273,7 @@ def index_connection(root: Path) -> sqlite3.Connection:
     from operations import foundation_status
     foundation = foundation_status(root)
     canonical_id = foundation.get("library_id") if foundation.get("status") == "ready" else None
+    connection.execute("BEGIN IMMEDIATE")
     known = connection.execute("SELECT value FROM library_metadata WHERE key='library_id'").fetchone()
     if known is not None and canonical_id and known[0] != canonical_id:
         connection.close()
@@ -5316,6 +5317,7 @@ def index_connection(root: Path) -> sqlite3.Connection:
     connection.execute("""CREATE TABLE IF NOT EXISTS video_catalog (
         job TEXT PRIMARY KEY, platform TEXT, author TEXT, published_at TEXT, first_completed_at TEXT
     )""")
+    connection.commit()  # Initialization must not leave an idle reader holding a writer transaction.
     return connection
 
 
@@ -7040,6 +7042,15 @@ def secure_rss_directory(root: Path) -> Path:
 
 class WriterBusyError(RuntimeError):
     pass
+
+
+def job_writer_path(root: Path, key: str) -> Path:
+    if not isinstance(key, str) or not re.fullmatch(r"(?:[a-f0-9]{12}|[a-f0-9]{32})", key):
+        raise ValueError("Invalid job lock identity")
+    directory = Path(root).resolve() / ".job-locks"
+    if directory.is_symlink() or directory.resolve() != directory.absolute():
+        raise ValueError("Job lock directory must not be linked")
+    return directory / (key + ".lock")
 
 
 @contextlib.contextmanager

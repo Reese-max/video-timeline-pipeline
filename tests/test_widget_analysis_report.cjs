@@ -46,7 +46,7 @@ function harness({ output = job('first'), saved = {}, snapshot, respond, bridge 
     Promise.resolve().then(async () => {
       try {
         if (!bridge) throw Object.assign(new Error('Unsupported bridge'), { code: -32601 });
-        if (message.method === 'ui/initialize') { assert.equal(message.params.appInfo?.name, 'video-timeline-pipeline'); assert.equal(message.params.appInfo?.version, '20'); assert.equal(message.params.protocolVersion, '2026-01-26'); assert.equal(typeof message.params.appCapabilities, 'object'); }
+        if (message.method === 'ui/initialize') { assert.equal(message.params.appInfo?.name, 'video-timeline-pipeline'); assert.equal(message.params.appInfo?.version, '21'); assert.equal(message.params.protocolVersion, '2026-01-26'); assert.equal(typeof message.params.appCapabilities, 'object'); }
         if (message.method === 'ui/message') { assert.equal(message.params.role, 'user'); assert(Array.isArray(message.params.content)); }
         const result = message.method === 'tools/call' ? await callTool(message.params.name, message.params.arguments) : message.method === 'ui/message' ? await send(message.params.content[0].text) : {};
         notify({ id: message.id, result });
@@ -290,13 +290,21 @@ async function test(name, run) { try { await run(); count++; console.log('ok ' +
       assert(h.calls.every(x=>x.name==='get_prepared_video'));
     }
   });
-  await test('waiting snapshot polling is bounded and explicit refresh can start a new read-only wait', async () => {
-    const snapshot={prepared:job('first'),analysis:a(),report:awaitingReport()};
-    const waiting=setup(awaitingReport(),()=>snapshot);await waiting.flush();
-    for(let i=0;i<100&&[...waiting.timers.values()].some(x=>x.ms<=10000);i++) await waiting.poll();
-    assert(![...waiting.timers.values()].some(x=>x.ms<=10000));
+  await test('T7 waiting prerequisites continue beyond 60 polls and remain bounded by job timeout', async () => {
+    const snapshot={prepared:job('first'),analysis:a(),report:{...awaitingReport(),job_timeout_seconds:3600},
+      pending_operations:[pending('drive-1','drive','queued')]};
+    const waiting=setup(snapshot.report,name=>name==='get_video_job'?pending('drive-1','drive','queued'):snapshot);await waiting.flush();
+    for(let i=0;i<140;i++) await waiting.poll();
+    assert([...waiting.timers.values()].some(x=>x.ms<=10000));
+    assert(!waiting.elements.get('status').textContent.includes('逾時'));
+    assert(waiting.calls.filter(x=>x.name==='get_prepared_video').length>=66);
+    assert(waiting.calls.every(x=>['get_prepared_video','get_video_job'].includes(x.name)));
+    // Advance the real widget clock, not its poll count: the deadline must still stop waiting.
+    vm.runInContext('Date.now = () => '+(Date.now()+3601000), waiting.context);
+    const reportTimer=vm.runInContext('reportPollTimer',waiting.context), timer=waiting.timers.get(reportTimer);
+    waiting.timers.delete(reportTimer);timer.callback();await waiting.flush();
+    assert(!waiting.timers.has(vm.runInContext('reportPollTimer',waiting.context)));
     assert.match(waiting.elements.get('status').textContent,/重新取得狀態/);
-    assert(waiting.calls.length<=61);assert(waiting.calls.every(x=>x.name==='get_prepared_video'));
     await waiting.click('refresh');assert([...waiting.timers.values()].some(x=>x.ms<=10000));
     waiting.teardown();
   });

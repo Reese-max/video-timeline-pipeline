@@ -46,7 +46,7 @@ class PairedQueueExecutionTests(unittest.TestCase):
         self.root = Path(self.temp.name).resolve()
         self.worker = self.root / "inert_worker.py"
         self.worker.write_text(WORKER, encoding="utf-8")
-        self.environment = patch.dict(os.environ, {"MCP_ROOT": str(self.root / "mcp"), "PYTHONPATH": str(Path(__file__).resolve().parents[1])})
+        self.environment = patch.dict(os.environ, {"MCP_ROOT": str(self.root / "mcp"), "PYTHONPATH": str(Path(__file__).resolve().parents[1]), "MCP_MAX_PARALLEL_JOBS": "1"})
         self.environment.start()
         self.queues = []
         self.releases = []
@@ -70,7 +70,7 @@ class PairedQueueExecutionTests(unittest.TestCase):
         if paired and "paired_same_job" in inspect.signature(JobQueue).parameters:
             writer = self.root / "mcp/mcp_jobs/.writer.lock"
             kwargs.update(paired_same_job=True, writer_path=writer,
-                          writer_context=lambda: pipeline.file_writer_lock(writer))
+                          writer_context=pipeline.file_writer_lock)
         queue = JobQueue(self.root / ("paired" if paired else "serial"), **kwargs)
         self.queues.append(queue)
         return queue
@@ -114,7 +114,7 @@ class PairedQueueExecutionTests(unittest.TestCase):
         self.assertEqual(queue.get(analysis["operation_id"])["status"], "running")
         self.assertFalse(arelease.exists())
         with self.assertRaises(pipeline.WriterBusyError):
-            with pipeline.file_writer_lock(self.root / "mcp/mcp_jobs/.writer.lock"):
+            with pipeline.file_writer_lock(pipeline.job_writer_path(self.root / "mcp/mcp_jobs", JOB)):
                 pass
         arelease.touch()
         analysis_result = self.await_state(queue, analysis["operation_id"])
@@ -131,6 +131,22 @@ class PairedQueueExecutionTests(unittest.TestCase):
         self.assertEqual(queue.get(drive["operation_id"])["status"], "running")
         self.assertEqual(queue.get(analysis["operation_id"])["status"], "running")
         self.assertFalse(drelease.exists()); self.assertFalse(arelease.exists())
+
+    def test_two_video_pairs_hold_independent_leases_with_two_units(self):
+        with patch.dict(os.environ, {"MCP_MAX_PARALLEL_JOBS": "2"}):
+            queue = self.queue()
+        entries = [self.submit(queue, kind, job + kind, hold=True, job=job)
+                   for job in (JOB, "abcdef012345") for kind in ("analyze", "drive")]
+        queue.start()
+        for value, marker, release in entries:
+            self.await_marker(marker)
+            self.assertEqual(queue.get(value["operation_id"])["status"], "running")
+            self.assertFalse(release.exists())
+            lease = json.loads((queue.root / value["operation_id"] / "writer-lease.json").read_text())
+            self.assertEqual(lease["job_id"], value["job_id"])
+            self.assertEqual(Path(lease["writer_path"]), pipeline.job_writer_path(self.root / "mcp/mcp_jobs", value["job_id"]))
+        self.assertEqual(queue.stats()["running_count"], 2)
+        self.assertEqual(queue.stats()["counts"]["running"], 4)
 
     def test_cancelling_either_owned_role_does_not_cancel_its_companion(self):
         for cancelled_kind in ("analyze", "drive"):

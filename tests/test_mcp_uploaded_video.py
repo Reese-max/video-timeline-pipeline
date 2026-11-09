@@ -8,6 +8,9 @@ from pathlib import Path
 import sys
 import tempfile
 import unittest
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
 from unittest.mock import MagicMock, patch
 
 import job_worker
@@ -133,6 +136,27 @@ class UploadedVideoTests(unittest.TestCase):
         restored = asyncio.run(server.get_prepared_video(payload.job_id))
         self.assertEqual(restored["prepared"]["job_id"], payload.job_id)
         self.assertEqual(restored["analysis"]["source_sha256"], sha256)
+
+    def test_parallel_identical_uploads_serialize_content_job_writes(self):
+        barrier = threading.Barrier(2)
+        spans = []
+        def download(url, target):
+            target.write_bytes(self.data)
+            barrier.wait(timeout=5)
+            return hashlib.sha256(self.data).hexdigest()
+        def prepare(source, job_dir, job_id, *unused):
+            start = time.monotonic()
+            time.sleep(.15)
+            spans.append((start, time.monotonic()))
+            return {"job_id": job_id}
+        self.jobs.mkdir()
+        with (patch.object(server, "download_uploaded_video", side_effect=download),
+              patch.object(server, "prepare_local_video", side_effect=prepare),
+              ThreadPoolExecutor(max_workers=2) as workers):
+            results = list(workers.map(lambda _: server.prepare_uploaded_video_sync(self.reference, 120, None), range(2)))
+        self.assertEqual(results[0], results[1])
+        self.assertEqual(len(spans), 2)
+        self.assertLessEqual(spans[0][1], spans[1][0])
 
     def test_same_bytes_new_reference_reuses_completed_preparation(self):
         first = self.prepare().structuredContent

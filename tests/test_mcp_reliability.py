@@ -10,6 +10,7 @@ import urllib.error
 from pathlib import Path
 from unittest.mock import patch
 
+from job_queue import JobQueue
 import drive_storage as drive
 import mcp_server as server
 
@@ -210,12 +211,20 @@ class ReliabilityTests(unittest.TestCase):
         self.assertEqual(result["quality"]["status"], "needs_review")
 
     def test_analysis_busy_does_not_start_provider_work(self):
-        with patch.object(server, "analyze_prepared_sync") as analyze, server.JOB_LOCK:
-            result = asyncio.run(server.mcp._tool_manager.call_tool(
-                "analyze_prepared_video", {"job_id": "0123456789ab"}, convert_result=True))
-        analyze.assert_not_called()
-        self.assertFalse(result.isError)
-        self.assertEqual(server.PreparedVideoAnalysisResult.model_validate(result.structuredContent).status, "busy")
+        with tempfile.TemporaryDirectory() as raw:
+            queue = JobQueue(Path(raw), autostart=False)
+            with (patch.object(server, "analyze_prepared_sync") as analyze, server.JOB_LOCK,
+                  patch.object(server, "get_queue", return_value=queue),
+                  patch.object(server, "prepared_job_dir", return_value=Path(raw)),
+                  patch.object(server, "storage_policy"), patch.object(server.drive_storage, "configured", return_value=False)):
+                result = asyncio.run(server.mcp._tool_manager.call_tool(
+                    "analyze_prepared_video", {"job_id": "0123456789ab"}, convert_result=True))
+            analyze.assert_not_called()
+            self.assertFalse(result.isError)
+            payload = server.PreparedVideoAnalysisResult.model_validate(result.structuredContent)
+            self.assertEqual(payload.status, "queued")
+            self.assertEqual(queue.get(payload.operation_id)["status"], "queued")
+            queue.close()
 
     def test_server_limit_applies_when_argument_is_omitted(self):
         with patch.object(server, "MCP_MAX_SEGMENTS", 1):
@@ -309,18 +318,22 @@ class ReliabilityTests(unittest.TestCase):
                     server.require_disk_space(10)
 
     def test_drive_busy_returns_retryable_state_without_starting_upload(self):
-        with patch.object(server, "upload_prepared_drive_sync") as upload:
-            with server.JOB_LOCK:
+        with tempfile.TemporaryDirectory() as raw:
+            queue = JobQueue(Path(raw), autostart=False)
+            with (patch.object(server, "upload_prepared_drive_sync") as upload, server.JOB_LOCK,
+                  patch.object(server, "get_queue", return_value=queue),
+                  patch.object(server, "prepared_job_dir", return_value=Path(raw)), patch.object(server, "storage_policy")):
                 result = asyncio.run(server.mcp._tool_manager.call_tool(
                     "upload_prepared_video_to_drive", {"job_id": "0123456789ab"}, convert_result=True))
             upload.assert_not_called()
-        self.assertFalse(result.isError)
-        state = server.DriveUploadResult.model_validate(result.structuredContent)
-        self.assertEqual(state.status, "busy")
-        self.assertEqual(state.error_code, "MCP_BUSY")
-        self.assertEqual(state.retry_after_seconds, 5)
-        self.assertEqual(state.files, [])
-        self.assertIn("尚未分析或上傳", result.content[0].text)
+            self.assertFalse(result.isError)
+            state = server.DriveUploadResult.model_validate(result.structuredContent)
+            self.assertEqual(state.status, "queued")
+            self.assertIsNone(state.error_code)
+            self.assertEqual(state.retry_after_seconds, 2)
+            self.assertEqual(state.files, [])
+            self.assertEqual(queue.get(state.operation_id)["status"], "queued")
+            queue.close()
         denied = server.drive_tool_error_result(RuntimeError("HTTP 403"))
         self.assertTrue(denied.isError)
         self.assertEqual(denied.structuredContent["status"], "error")

@@ -46,7 +46,7 @@ function harness({ output = job('first'), saved = {}, snapshot, respond, bridge 
     Promise.resolve().then(async () => {
       try {
         if (!bridge) throw Object.assign(new Error('Unsupported bridge'), { code: -32601 });
-        if (message.method === 'ui/initialize') { assert.equal(message.params.appInfo?.name, 'video-timeline-pipeline'); assert.equal(message.params.appInfo?.version, '20'); assert.equal(message.params.protocolVersion, '2026-01-26'); assert.equal(typeof message.params.appCapabilities, 'object'); }
+        if (message.method === 'ui/initialize') { assert.equal(message.params.appInfo?.name, 'video-timeline-pipeline'); assert.equal(message.params.appInfo?.version, '21'); assert.equal(message.params.protocolVersion, '2026-01-26'); assert.equal(typeof message.params.appCapabilities, 'object'); }
         if (message.method === 'ui/message') { assert.equal(message.params.role, 'user'); assert(Array.isArray(message.params.content)); }
         const result = message.method === 'tools/call' ? await callTool(message.params.name, message.params.arguments) : message.method === 'ui/message' ? await send(message.params.content[0].text) : {};
         notify({ id: message.id, result });
@@ -67,6 +67,10 @@ function harness({ output = job('first'), saved = {}, snapshot, respond, bridge 
 let count = 0;
 async function test(name, run) { await run(); count++; console.log('ok ' + count + ' - ' + name); }
 (async () => {
+  await test('queued operation displays the number of queued units ahead', async () => {
+    const h=harness({snapshot:{prepared:job('first'),analysis:null,active_operation:{...pending(),queue_position:3}}});await h.flush();
+    assert.match(h.elements.get('progress-label').textContent,/排隊中，前面還有 3 個/);
+  });
   await test('evidence stage uses indeterminate progress and reports elapsed state', async () => {
     const running = { ...pending('operation-1', 'analyze', 'running'), progress: { stage: 'evidence', current: 40, total: 100, message: '音訊：完成；視覺：MiniMax 處理中', updated_at: Math.floor(Date.now() / 1000) - 65 } };
     const h = harness({ snapshot: { prepared: job('first'), analysis: null, active_operation: running } });

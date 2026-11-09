@@ -663,7 +663,7 @@ else:
             kwargs={'idle_callback':idle} if 'idle_callback' in inspect.signature(JobQueue).parameters else {}
             writer=root/'writer.lock'
             queue=JobQueue(root/'q',worker=worker,autostart=False,timeout_seconds=60,
-                paired_same_job=True,writer_path=writer,writer_context=lambda:server.pipeline.file_writer_lock(writer),**kwargs)
+                paired_same_job=True,writer_path=writer,writer_context=server.pipeline.file_writer_lock,**kwargs)
             try:
                 a=queue.submit('analyze',{'job_id':'0123456789ab','completion_protocol':protocol,'delay':.1 if fast=='analyze' else .3},'0123456789ab');b=queue.submit('drive',{'job_id':'0123456789ab','completion_protocol':protocol,'delay':.1 if fast=='drive' else .3},'0123456789ab');queue.start()
                 deadline=time.time()+5

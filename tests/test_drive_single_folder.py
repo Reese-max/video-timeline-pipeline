@@ -5,6 +5,9 @@ import hashlib
 import json
 import tempfile
 import unittest
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack
 from pathlib import Path
 from unittest.mock import patch
@@ -102,6 +105,37 @@ def upload(drive: FakeDrive, job: Path, manifest: dict, source: Path, title: str
 
 
 class SharedVideoFolderTests(unittest.TestCase):
+    def test_parallel_uploads_reserve_one_shared_folder_and_overlap_transfers(self):
+        with tempfile.TemporaryDirectory() as raw, ExitStack() as stack:
+            root = Path(raw).resolve() / "mcp_jobs"
+            jobs = [build_job(root, job_id, job_id) for job_id in (JOB_A, JOB_B)]
+            drive = FakeDrive(["folder_1", "file_a", "file_b", "src_a", "src_b"])
+            for patcher in drive.patches(): stack.enter_context(patcher)
+            barrier = threading.Barrier(2)
+            transfer = drive.upload()
+            spans = []
+            def upload_file(*args, **kwargs):
+                start = time.perf_counter_ns()
+                barrier.wait(timeout=5)  # Both different videos must reach transport together.
+                result = transfer(*args, **kwargs)
+                spans.append((start, time.perf_counter_ns()))
+                return result
+            def create_folder(*args, **kwargs):
+                time.sleep(.1)  # Expose the old read/reserve/write race.
+                return drive.create_folder(*args, **kwargs)
+            stack.enter_context(patch.object(drive_storage, "_upload_file", side_effect=upload_file))
+            stack.enter_context(patch.object(drive_storage, "_create_folder", side_effect=create_folder))
+            def run(item):
+                job, manifest, source = item
+                return drive_storage.upload_prepared_segments(job, job.name, job.name,
+                    manifest["source"]["fingerprint"], manifest["segments"], source)
+            with ThreadPoolExecutor(max_workers=2) as workers:
+                results = list(workers.map(run, jobs))
+            self.assertEqual(len(drive.folders), 1)
+            self.assertEqual({result["folder_id"] for result in results}, {"folder_1"})
+            self.assertEqual(len(spans), 4)
+            self.assertLess(max(spans[0][0], spans[1][0]), min(spans[0][1], spans[1][1]))
+
     def test_two_videos_share_one_folder_with_prefixed_names(self):
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw) / "mcp_jobs"

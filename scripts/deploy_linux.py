@@ -370,7 +370,19 @@ def stop_verified(shared: Path, code: Path) -> None:
 
 
 def switch_idle(shared: Path, home: Path, target: Path | None, code: Path, *, allow_unhealthy=False) -> None:
+    shared = shared.resolve()
     with locked(shared / "mcp-supervisor.lock"), locked(shared / "mcp_jobs" / ".writer.lock"):
+        # Admissions take job locks only under the global gate we now hold, so probing each
+        # lock once proves no worker is active; holding them all would exhaust fds (one per job).
+        directory = shared / "mcp_jobs" / ".job-locks"
+        if directory.is_symlink() or directory.resolve() != directory.absolute():
+            raise RuntimeError("Job lock inventory is linked")
+        if directory.exists():
+            for path in sorted(directory.iterdir()):
+                if not re.fullmatch(r"(?:[a-f0-9]{12}|[a-f0-9]{32})\.lock", path.name) or not path.is_file():
+                    raise RuntimeError("Unknown job lock inventory entry")
+                with locked(path):
+                    pass
         database = shared / ".video-state" / "jobs.sqlite3"
         db = sqlite3.connect(database.as_uri() + "?mode=rw", uri=True, timeout=0)
         try:

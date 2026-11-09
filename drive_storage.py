@@ -15,7 +15,6 @@ import mimetypes
 import os
 import re
 import sys
-import threading
 import time
 import urllib.error
 import urllib.parse
@@ -25,7 +24,7 @@ from pathlib import Path
 from typing import Any, Iterable
 
 import analysis_report
-from pipeline import write_json
+from pipeline import file_writer_lock, write_json
 
 
 DRIVE_FILES_URL = "https://www.googleapis.com/drive/v3/files"
@@ -33,8 +32,6 @@ DRIVE_UPLOAD_URL = "https://www.googleapis.com/upload/drive/v3/files"
 OAUTH_TOKEN_URL = "https://oauth2.googleapis.com/token"
 FOLDER_MIME = "application/vnd.google-apps.folder"
 UPLOAD_CHUNK_BYTES = 1024 * 1024
-# ponytail: one MCP process; use a shared lease before adding multiple workers.
-UPLOAD_LOCK = threading.Lock()
 _DRIVE_ID = re.compile(r"[A-Za-z0-9_-]+")
 _SHA256 = re.compile(r"[0-9a-f]{64}")
 _SEGMENT_NAME = re.compile(r"segment_\d{3,}\.mp4")
@@ -414,6 +411,13 @@ def _find_shared_video_folder(token: str, parent_id: str,
 
 def _video_folder(token: str, state_path: Path,
                   preferred_ids: Iterable[str] = ()) -> dict[str, Any]:
+    # Only shared-folder discovery/reservation is serialized, never video uploads.
+    with file_writer_lock(state_path.with_suffix(".lock"), timeout=3600):
+        return _video_folder_locked(token, state_path, preferred_ids)
+
+
+def _video_folder_locked(token: str, state_path: Path,
+                  preferred_ids: Iterable[str] = ()) -> dict[str, Any]:
     """One shared folder holds every video; its ID is durable before the folder is created.
 
     A folder that is gone, trashed, no longer a folder, or no longer under the configured
@@ -485,12 +489,8 @@ def upload_prepared_segments(
     segment_rows: list[dict[str, Any]],
     source_path: Path | None = None,
 ) -> dict[str, Any]:
-    if not UPLOAD_LOCK.acquire(blocking=False):
-        raise RuntimeError("Google Drive 正在處理另一個上傳，請稍後重試。")
-    try:
+    with file_writer_lock(job_dir / ".drive-upload.lock"):
         return _upload_prepared_segments(job_dir, job_id, title, source_fingerprint, segment_rows, source_path)
-    finally:
-        UPLOAD_LOCK.release()
 
 
 def _upload_prepared_segments(
@@ -797,9 +797,7 @@ def _matches_report(remote: dict | None, file_id: str, report: dict, folder_id: 
 
 def upload_analysis_report(job_dir: Path, report: dict, segments: dict) -> dict:
     """A distinct FIFO task: verify the original segment folder; never replace user files."""
-    if not UPLOAD_LOCK.acquire(blocking=False):
-        raise RuntimeError("Google Drive 正在處理另一個上傳，請稍後重試。")
-    try:
+    with file_writer_lock(job_dir / ".drive-upload.lock"):
         if not configured():
             raise DriveNotConfigured("Google Drive fallback 尚未設定；報告未上傳。")
         if not analysis_report.uploadable(report) or segments.get("status") != "drive_ready":
@@ -877,8 +875,6 @@ def upload_analysis_report(job_dir: Path, report: dict, segments: dict) -> dict:
         state.update(status="report_ready", verified=True, url=str(remote["webViewLink"]))
         write_json(state_path, state)
         return state
-    finally:
-        UPLOAD_LOCK.release()
 
 
 RSS_FOLDER_NAME = "RSS 自動摘要"
