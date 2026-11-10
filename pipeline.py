@@ -4521,7 +4521,8 @@ def _analyze_video_mp4_chunked(
             index: int, chunk: VideoMp4Chunk
         ) -> tuple[list[dict[str, Any]], dict[str, Any] | None] | None:
             if stop.is_set():
-                # An earlier segment failed: this one is never uploaded or paid for.
+                # Another segment failed or the run was interrupted: this one is
+                # never uploaded or paid for.
                 return None
             try:
                 # A cancelled or expired job must not pay for another segment.
@@ -4567,8 +4568,8 @@ def _analyze_video_mp4_chunked(
                 observation["chunk_source"] = chunk.path.name
             return observations, parsed
 
-        # Leaving the pool waits for the segments already sent, so nothing is
-        # cleaned up under a running upload; each finished one is cached.
+        # Leaving the pool waits for every segment already started, so nothing
+        # is cleaned up under a running upload.
         with concurrent.futures.ThreadPoolExecutor(
             max_workers=max(1, min(workers, len(chunks)))
         ) as pool:
@@ -4577,12 +4578,18 @@ def _analyze_video_mp4_chunked(
                 pool.submit(copy_context().run, analyze_chunk, index, chunk)
                 for index, chunk in enumerate(chunks, start=1)
             ]
+            try:
+                concurrent.futures.wait(futures)
+            except BaseException:
+                # Interrupted while waiting (Ctrl-C): start no further segment.
+                stop.set()
+                raise
+        # A skipped segment (None) may come before the one that failed, so the
+        # failure is raised here before any result is unpacked.
+        results = [future.result() for future in futures]
         merged: list[dict[str, Any]] = []
         summaries: list[str] = []
-        for index, (chunk, future) in enumerate(zip(chunks, futures), start=1):
-            # Segments start in order, so the failure that set `stop` comes
-            # before every skipped (None) segment and is raised here first.
-            observations, parsed = future.result()
+        for index, (chunk, (observations, parsed)) in enumerate(zip(chunks, results), start=1):
             merged.extend(observations)
             summary = (parsed or {}).get("overall_summary")
             if isinstance(summary, str) and summary.strip():
