@@ -170,6 +170,17 @@ cache still match, and regenerates previews. Without a complete backup the old
 path applies (download the source URL again). `get_prepared_video` reports
 `MEDIA_EXPIRED` with `drive_backup: true` while media is archived on Drive.
 
+`MCP_DRIVE_VIDEO_RETENTION_DAYS` (unset or `0` keeps videos for good) makes the same
+hourly run move a job's Drive videos — source and segments, never the A report — to
+the Drive trash once its newest upload is older than that many days. Only files the
+folder listing still shows with the uploaded SHA-256 are touched; queued or running
+jobs are skipped, and a failed listing trashes nothing. The manifest becomes
+`drive_trashed` with `drive_trashed_at` (`drive_trashing` marks an interrupted run
+that the next one finishes), so the job counts as having no backup: local media that
+was already cleaned can then only come back by preparing the source URL again, and a
+later Drive job uploads fresh copies. Google empties the trash after 30 days; until
+then the files still use quota, and restoring one by hand does not change the manifest.
+
 Health reports `runtime_sha256`, `writer_busy` and the retention policy for rollout
 verification; healthy status alone is not proof of successful cleanup.
 

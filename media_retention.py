@@ -15,6 +15,7 @@ import re
 import sqlite3
 import stat
 import time
+from datetime import datetime
 from pathlib import Path
 
 import drive_storage
@@ -59,6 +60,90 @@ def drive_backed_grace_seconds() -> int:
     """Quiet period after the last preparation/analysis before Drive-backed media goes."""
     raw = os.getenv("MCP_DRIVE_BACKED_GRACE_SECONDS", "").strip()
     return max(0, int(raw)) if raw else 3600
+
+
+def drive_video_retention_days() -> int:
+    """Days a video stays on Drive before it goes to the trash; unset or 0 keeps it for good."""
+    raw = os.getenv("MCP_DRIVE_VIDEO_RETENTION_DAYS", "").strip()
+    return max(0, int(raw)) if raw else 0
+
+
+def _drive_videos(state: dict) -> dict[str, str]:
+    """Drive file id -> SHA-256 of every video a job uploaded; the A report is not in the manifest."""
+    videos = {str(saved["file_id"]): str(row["sha256"])
+              for row, saved in zip(state["local_segments"], state["files"])}
+    source = state.get("source_file")
+    if isinstance(source, dict):  # Manifests written before source backups existed have none.
+        videos[str(source["file_id"])] = str(source["sha256"])
+    return videos
+
+
+def _uploaded_at(item: dict, now: float) -> float:
+    """Drive creation time of a file; an unreadable time counts as uploaded just now."""
+    try:
+        return datetime.fromisoformat(str(item["createdTime"]).replace("Z", "+00:00")).timestamp()
+    except (KeyError, ValueError):
+        return now
+
+
+def trash_expired_drive_videos(root: Path, active: set[str], now: float, apply: bool, report: dict) -> None:
+    """Move the videos of jobs uploaded longer ago than the retention period to the Drive trash.
+
+    Only files the folder listing still shows with the uploaded bytes are trashed, so
+    the A report and anything the user replaced stay. A job counts from its newest
+    upload. An interrupted run leaves ``drive_trashing`` and the next run finishes it.
+    """
+    days = drive_video_retention_days()
+    report["drive_retention_days"] = days
+    if not days or not drive_storage.configured():
+        return
+    token = ""
+    listings: dict[str, dict[str, dict]] = {}
+    for job in sorted(root.iterdir()):
+        path = job / "drive-manifest.json"
+        if (not re.fullmatch(r"[a-f0-9]{12}", job.name) or job.name in active
+                or job.is_symlink() or path.is_symlink() or not path.is_file()):
+            continue
+        try:
+            with pipeline.file_writer_lock(job / ".drive-upload.lock"):
+                try:
+                    state = json.loads(path.read_text(encoding="utf-8"))
+                    if state["job_id"] != job.name or state["status"] not in {"drive_ready", "drive_trashing"}:
+                        continue
+                    folder_id = str(state["folder_id"])
+                    videos = _drive_videos(state)
+                    if not drive_storage._DRIVE_ID.fullmatch(folder_id):
+                        raise ValueError("invalid Drive folder id")
+                except (OSError, ValueError, KeyError, TypeError):
+                    report["skipped"]["missing_or_invalid_evidence"] += 1
+                    continue
+                if folder_id not in listings:
+                    try:
+                        token = token or drive_storage._access_token()
+                        listings[folder_id] = {str(item.get("id")): item
+                                               for item in drive_storage._list_children(token, folder_id)}
+                    except (OSError, RuntimeError):
+                        # Unknown Drive state never authorizes a deletion.
+                        report["skipped"]["drive_listing_failed"] += 1
+                        return
+                listed = listings[folder_id]
+                ours = [listed[file_id] for file_id, digest in videos.items()
+                        if listed.get(file_id, {}).get("sha256Checksum") == digest]
+                if state["status"] == "drive_ready" and (
+                        not ours or max(_uploaded_at(item, now) for item in ours) > now - days * 86400):
+                    continue
+                report["drive_expired_jobs"] += 1
+                if not apply:
+                    continue
+                pipeline.write_json(path, {**state, "status": "drive_trashing"})
+                for item in ours:
+                    drive_storage._trash_file(token, str(item["id"]))
+                    report["drive_trashed_files"] += 1
+                pipeline.write_json(path, {**state, "status": "drive_trashed", "drive_trashed_at": now})
+        except pipeline.WriterBusyError:
+            report["skipped"]["job_lock_busy"] += 1
+        except (OSError, RuntimeError) as exc:
+            report["errors"].append({"job_id": job.name, "error": str(exc)})
 
 
 def _selected_media(job: Path, files: list[Path], source: Path) -> tuple[list[Path], str]:
@@ -164,7 +249,8 @@ def cleanup(jobs_root: Path, *, apply: bool = False, now: float | None = None) -
     timestamp = time.time() if now is None else now
     report = {"mode": "apply" if apply else "dry_run", "retention_days": 7,
               "eligible_jobs": 0, "drive_backed_jobs": 0, "selected_files": 0, "selected_bytes": 0,
-              "deleted_files": 0, "deleted_bytes": 0, "skipped": collections.Counter(), "errors": []}
+              "deleted_files": 0, "deleted_bytes": 0, "skipped": collections.Counter(), "errors": [],
+              "drive_retention_days": 0, "drive_expired_jobs": 0, "drive_trashed_files": 0}
     with (pipeline.file_writer_lock(root / ".media-lifecycle.lock"),
           contextlib.ExitStack() as stack):
         protected = set()
@@ -238,6 +324,7 @@ def cleanup(jobs_root: Path, *, apply: bool = False, now: float | None = None) -
                 report["skipped"]["job_lock_busy"] += 1
             except (OSError, RuntimeError) as exc:
                 report["errors"].append({"job_id": job.name, "error": str(exc)})
+        trash_expired_drive_videos(root, active, timestamp, apply, report)
     return report
 
 
