@@ -179,8 +179,8 @@ busy jobs are skipped, and a failed listing trashes nothing. The manifest become
 `drive_trashed` with `drive_trashed_at` (`drive_trashing` marks an interrupted run
 that the next one finishes), so the job counts as having no backup: local media that
 was already cleaned can then only come back by preparing the source URL again, local
-media that is still there returns to the 7-day rule, and a later Drive job uploads
-fresh copies. Google empties the trash after 30 days; until then the files still use
+media that is still there returns to the 7-day rule, and a later Drive job checks
+each file again and uploads a new copy of any that is trashed or changed. Google empties the trash after 30 days; until then the files still use
 quota, and restoring one by hand does not change the manifest. A value that is not a
 whole number turns this off for the run (`skipped.invalid_drive_retention_days`).
 
