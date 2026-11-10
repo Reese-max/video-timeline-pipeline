@@ -184,6 +184,17 @@ each file again and uploads a new copy of any that is trashed or changed. Google
 quota, and restoring one by hand does not change the manifest. A value that is not a
 whole number turns this off for the run (`skipped.invalid_drive_retention_days`).
 
+`MCP_PREPARED_RETENTION_DAYS` (unset or `0` keeps them, as before) covers jobs that
+were prepared but have no analysis result, which no other rule cleans: once the newest
+write and the last use are both older than that many days and no playback link is live,
+the same run deletes source, segments and previews and keeps the records
+(`prepared_only_jobs` in the report, `policy: prepared_only` in the audit file). This
+applies with or without a Drive backup. Queued, running and failed-and-unresolved jobs
+are skipped as usual. Afterwards `get_prepared_video` reports `MEDIA_EXPIRED`; the
+video comes back from Drive when a complete backup exists, otherwise by preparing the
+source URL again (an uploaded file has to be uploaded again). A value that is not a
+whole number turns this off for the run (`skipped.invalid_prepared_retention_days`).
+
 Health reports `runtime_sha256`, `writer_busy` and the retention policy for rollout
 verification; healthy status alone is not proof of successful cleanup.
 

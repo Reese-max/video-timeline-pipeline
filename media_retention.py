@@ -68,6 +68,12 @@ def drive_video_retention_days() -> int:
     return max(0, int(raw)) if raw else 0
 
 
+def prepared_retention_days() -> int:
+    """Idle days before a prepared job with no analysis loses its local media; unset or 0 keeps it."""
+    raw = os.getenv("MCP_PREPARED_RETENTION_DAYS", "").strip()
+    return max(0, int(raw)) if raw else 0
+
+
 def _drive_videos(state: dict) -> dict[str, str]:
     """Drive file id -> SHA-256 of every video a job uploaded; the A report is not in the manifest."""
     videos = {str(saved["file_id"]): str(row["sha256"])
@@ -229,7 +235,31 @@ def _drive_videos_trashed(job: Path) -> bool:
         return False
 
 
-def eligible_media(job: Path, cutoff: float, now: float | None = None) -> tuple[list[Path], str]:
+def prepared_only_media(job: Path, files: list[Path], now: float, days: int) -> tuple[list[Path], str]:
+    """Media of a ready job that has no analysis result, idle for ``days`` (MCP_PREPARED_RETENTION_DAYS).
+
+    Nothing else ever cleans these: every other rule needs a finished analysis.
+    """
+    try:
+        cutoff = now - days * 86400
+        marker = StoragePolicy._marker(job)
+        if marker and (max(marker["managed_at"], marker["last_used_at"]) >= cutoff
+                       or marker["protected_until"] > now):
+            return [], "retained_or_live_share"
+        manifest = json.loads((job / "manifest.json").read_text(encoding="utf-8"))
+        if manifest["status"] != "ready" or manifest["job_id"] != job.name:
+            return [], "not_complete_or_needs_review"
+        source = pipeline.locate_source_video(job)
+        if max(p.stat().st_mtime for p in files if p.name not in {AUDIT, ".drive-upload.lock"}) >= cutoff:
+            return [], "younger_than_retention"
+    except (OSError, ValueError, KeyError, TypeError, RuntimeError):
+        return [], "missing_or_invalid_evidence"
+    paths, reason = _selected_media(job, files, source)
+    return paths, "eligible_prepared_only" if paths else reason
+
+
+def eligible_media(job: Path, cutoff: float, now: float | None = None,
+                   prepared_days: int = 0) -> tuple[list[Path], str]:
     if job.is_symlink() or getattr(job, "is_junction", lambda: False)():
         return [], "linked_path"
     paths = list(job.rglob("*"))
@@ -238,6 +268,8 @@ def eligible_media(job: Path, cutoff: float, now: float | None = None) -> tuple[
     files = [p for p in paths if p.is_file()]
     if any(p.name == ".keep-media" or p.suffix in {".tmp", ".part", ".ytdl"} for p in files):
         return [], "review_or_incomplete"
+    if prepared_days and not (job / "analysis/result.json").exists():
+        return prepared_only_media(job, files, time.time() if now is None else now, prepared_days)
     if (job / "drive-manifest.json").exists() and not _drive_videos_trashed(job):
         return drive_backed_media(job, files, time.time() if now is None else now)
     try:
@@ -280,7 +312,13 @@ def cleanup(jobs_root: Path, *, apply: bool = False, now: float | None = None) -
     report = {"mode": "apply" if apply else "dry_run", "retention_days": 7,
               "eligible_jobs": 0, "drive_backed_jobs": 0, "selected_files": 0, "selected_bytes": 0,
               "deleted_files": 0, "deleted_bytes": 0, "skipped": collections.Counter(), "errors": [],
-              "drive_retention_days": 0, "drive_expired_jobs": 0, "drive_trashed_files": 0}
+              "drive_retention_days": 0, "drive_expired_jobs": 0, "drive_trashed_files": 0,
+              "prepared_retention_days": 0, "prepared_only_jobs": 0}
+    try:
+        prepared_days = report["prepared_retention_days"] = prepared_retention_days()
+    except ValueError:  # A typo in .env must not stop the regular cleanup.
+        report["skipped"]["invalid_prepared_retention_days"] += 1
+        prepared_days = 0
     with (pipeline.file_writer_lock(root / ".media-lifecycle.lock"),
           contextlib.ExitStack() as stack):
         protected = set()
@@ -316,20 +354,23 @@ def cleanup(jobs_root: Path, *, apply: bool = False, now: float | None = None) -
                 continue
             try:
                 with pipeline.file_writer_lock(pipeline.job_writer_path(root, job.name)):
-                    paths, reason = eligible_media(job, timestamp - 7 * 86400, timestamp)
+                    paths, reason = eligible_media(job, timestamp - 7 * 86400, timestamp, prepared_days)
                     if not paths:
                         report["skipped"][reason] += 1
                         continue
                     if reason == "eligible_drive_backed":
                         report["drive_backed_jobs"] += 1
+                    policy = {"eligible_drive_backed": "drive_backed",
+                              "eligible_prepared_only": "prepared_only"}.get(reason, "retention_days")
+                    report["prepared_only_jobs"] += policy == "prepared_only"
                     snapshots = {p: p.lstat() for p in paths}
                     report["eligible_jobs"] += 1
                     report["selected_files"] += len(paths)
                     report["selected_bytes"] += sum(s.st_size for s in snapshots.values())
                     if not apply:
                         continue
-                    audit = {"status": "deleting", "started_at": timestamp, "retention_days": 7,
-                             "policy": "drive_backed" if reason == "eligible_drive_backed" else "retention_days",
+                    audit = {"status": "deleting", "started_at": timestamp,
+                             "retention_days": prepared_days if policy == "prepared_only" else 7, "policy": policy,
                              "planned_files": [str(p.relative_to(job)) for p in paths], "deleted_files": []}
                     pipeline.write_json(job / AUDIT, audit)
                     for path in paths:
