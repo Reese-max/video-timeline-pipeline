@@ -305,6 +305,17 @@ class DriveBackedCleanupTests(unittest.TestCase):
             self.assertEqual(sorted(Path(name).as_posix() for name in audit["deleted_files"]),
                              ["previews/preview_000.jpg", "segments/segment_000.mp4"])
 
+    def test_job_with_nothing_left_to_delete_does_not_ask_drive(self):
+        # Drive round trips run while the queue database is write-locked.
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw).resolve() / "mcp_jobs"
+            build_job(root, now=self.now)
+            self.assertEqual(self.run_cleanup(root, apply=True)["deleted_files"], 3)
+            with patch.object(drive_storage, "verify_remote_backup") as verify:
+                report = retention.cleanup(root, apply=True, now=self.now)
+            verify.assert_not_called()
+            self.assertEqual((report["skipped"].get("eligible"), report["errors"]), (1, []))
+
 
 class DriveVideoRetentionTests(unittest.TestCase):
     """MCP_DRIVE_VIDEO_RETENTION_DAYS: old videos go to the Drive trash, the A report stays."""

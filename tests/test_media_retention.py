@@ -169,6 +169,13 @@ class RetentionTests(unittest.TestCase):
             self.assertEqual((report["deleted_files"], report["errors"]), (6, []))
             self.assertFalse((job / "source.mp4").exists())
 
+    def test_lock_file_from_a_drive_check_does_not_restart_the_7_day_clock(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve() / "mcp_jobs"
+            job = self.make_job(root)
+            (job / ".drive-upload.lock").write_bytes(b"0")  # created just now by the Drive pass
+            self.assertEqual(retention.cleanup(root, apply=True, now=self.now)["deleted_files"], 6)
+
     def test_cross_process_lock_blocks_cleanup_and_mcp_then_releases(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory).resolve() / "mcp_jobs"
