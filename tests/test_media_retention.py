@@ -169,6 +169,54 @@ class RetentionTests(unittest.TestCase):
             self.assertEqual((report["deleted_files"], report["errors"]), (6, []))
             self.assertFalse((job / "source.mp4").exists())
 
+    def test_prepared_only_job_is_cleaned_only_when_the_setting_allows_it(self):
+        def run(days, age=8, change=lambda job: None):
+            with tempfile.TemporaryDirectory() as directory, patch.dict(os.environ):
+                root = Path(directory).resolve() / "mcp_jobs"
+                job = self.make_job(root, age)
+                (job / "analysis/result.json").unlink()
+                change(job)
+                os.environ.pop("MCP_PREPARED_RETENTION_DAYS", None)
+                if days is not None:
+                    os.environ["MCP_PREPARED_RETENTION_DAYS"] = days
+                report = retention.cleanup(root, apply=True, now=self.now)
+                audit = job / retention.AUDIT
+                return (report, (job / "source.mp4").exists(), (job / "manifest.json").exists(),
+                        json.loads(audit.read_text()) if audit.exists() else None)
+
+        def old_file(job, name, text):
+            (job / name).write_text(text, encoding="utf-8")
+            os.utime(job / name, (self.now - 8 * 86400,) * 2)
+
+        def live_link(job):
+            old_file(job, ".media-lifecycle.json", json.dumps({
+                "version": 1, "job_id": job.name, "managed_at": 0, "last_used_at": 0,
+                "protected_until": self.now + 60}))
+
+        for days in (None, "0", "x", "9"):  # off, off, typo, not idle long enough
+            with self.subTest(days=days):
+                report, source, _, audit = run(days)
+                self.assertEqual((report["deleted_files"], source, audit), (0, True, None))
+        self.assertEqual(run("x")[0]["skipped"]["invalid_prepared_retention_days"], 1)
+        self.assertEqual(run("9")[0]["skipped"]["younger_than_retention"], 1)
+        for change in (live_link, lambda job: (job / ".keep-media").touch(),
+                       lambda job: old_file(job, "manifest.json", '{"status": "preparing", "job_id": "0123456789ab"}')):
+            self.assertEqual(run("7", change=change)[0]["deleted_files"], 0)
+        # With or without a Drive copy: a job that was never analyzed is not covered by the Drive rule.
+        for change in (lambda job: None, lambda job: old_file(job, "drive-manifest.json", "{}")):
+            report, source, manifest, audit = run("7", change=change)
+            self.assertEqual((report["deleted_files"], report["prepared_only_jobs"], report["errors"]), (6, 1, []))
+            self.assertEqual((source, manifest), (False, True))
+            self.assertEqual((audit["status"], audit["policy"], audit["retention_days"]), ("cleaned", "prepared_only", 7))
+
+    def test_prepared_setting_leaves_analyzed_jobs_on_the_7_day_rule(self):
+        with tempfile.TemporaryDirectory() as directory, patch.dict(os.environ, {"MCP_PREPARED_RETENTION_DAYS": "30"}):
+            root = Path(directory).resolve() / "mcp_jobs"
+            job = self.make_job(root)
+            report = retention.cleanup(root, apply=True, now=self.now)
+            self.assertEqual((report["deleted_files"], report["prepared_only_jobs"]), (6, 0))
+            self.assertEqual(json.loads((job / retention.AUDIT).read_text())["policy"], "retention_days")
+
     def test_lock_file_from_a_drive_check_does_not_restart_the_7_day_clock(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory).resolve() / "mcp_jobs"
