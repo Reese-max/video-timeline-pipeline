@@ -93,44 +93,62 @@ def trash_expired_drive_videos(root: Path, active: set[str], now: float, apply: 
     the A report and anything the user replaced stay. A job counts from its newest
     upload. An interrupted run leaves ``drive_trashing`` and the next run finishes it.
     """
-    days = drive_video_retention_days()
+    try:
+        days = drive_video_retention_days()
+    except ValueError:  # A typo in .env must not stop the local cleanup.
+        report["skipped"]["invalid_drive_retention_days"] += 1
+        return
     report["drive_retention_days"] = days
     if not days or not drive_storage.configured():
         return
     token = ""
     listings: dict[str, dict[str, dict]] = {}
+
+    def due(state: dict, fresh: bool) -> list[dict] | None:
+        """The job's videos still on Drive, or None while the job is not due."""
+        nonlocal token
+        folder_id = str(state["folder_id"])
+        if fresh or folder_id not in listings:
+            token = token or drive_storage._access_token()
+            listings[folder_id] = {str(item.get("id")): item
+                                   for item in drive_storage._list_children(token, folder_id)}
+        listed = listings[folder_id]
+        ours = [listed[file_id] for file_id, digest in _drive_videos(state).items()
+                if listed.get(file_id, {}).get("sha256Checksum") == digest]
+        if state["status"] == "drive_ready" and (
+                not ours or max(_uploaded_at(item, now) for item in ours) > now - days * 86400):
+            return None
+        return ours
+
     for job in sorted(root.iterdir()):
         path = job / "drive-manifest.json"
         if (not re.fullmatch(r"[a-f0-9]{12}", job.name) or job.name in active
                 or job.is_symlink() or path.is_symlink() or not path.is_file()):
             continue
         try:
-            with pipeline.file_writer_lock(job / ".drive-upload.lock"):
+            # A direct analysis or restore holds only the job writer lock; uploads hold the other.
+            with (pipeline.file_writer_lock(pipeline.job_writer_path(root, job.name)),
+                  pipeline.file_writer_lock(job / ".drive-upload.lock")):
                 try:
                     state = json.loads(path.read_text(encoding="utf-8"))
                     if state["job_id"] != job.name or state["status"] not in {"drive_ready", "drive_trashing"}:
                         continue
-                    folder_id = str(state["folder_id"])
-                    videos = _drive_videos(state)
-                    if not drive_storage._DRIVE_ID.fullmatch(folder_id):
+                    _drive_videos(state)
+                    if not drive_storage._DRIVE_ID.fullmatch(str(state["folder_id"])):
                         raise ValueError("invalid Drive folder id")
                 except (OSError, ValueError, KeyError, TypeError):
                     report["skipped"]["missing_or_invalid_evidence"] += 1
                     continue
-                if folder_id not in listings:
-                    try:
-                        token = token or drive_storage._access_token()
-                        listings[folder_id] = {str(item.get("id")): item
-                                               for item in drive_storage._list_children(token, folder_id)}
-                    except (OSError, RuntimeError):
-                        # Unknown Drive state never authorizes a deletion.
-                        report["skipped"]["drive_listing_failed"] += 1
-                        return
-                listed = listings[folder_id]
-                ours = [listed[file_id] for file_id, digest in videos.items()
-                        if listed.get(file_id, {}).get("sha256Checksum") == digest]
-                if state["status"] == "drive_ready" and (
-                        not ours or max(_uploaded_at(item, now) for item in ours) > now - days * 86400):
+                try:
+                    ours = due(state, fresh=False)
+                    if ours is not None and apply:
+                        # The shared listing may predate this job's locks; trash only what a new one shows.
+                        ours = due(state, fresh=True)
+                except (OSError, RuntimeError):
+                    # Unknown Drive state never authorizes a deletion.
+                    report["skipped"]["drive_listing_failed"] += 1
+                    return
+                if ours is None:
                     continue
                 report["drive_expired_jobs"] += 1
                 if not apply:
@@ -200,6 +218,14 @@ def drive_backed_media(job: Path, files: list[Path], now: float) -> tuple[list[P
     return paths, ("eligible_drive_backed" if paths else reason)
 
 
+def _drive_videos_trashed(job: Path) -> bool:
+    """Drive no longer backs this job, so its local media is back on the 7-day rule."""
+    try:
+        return json.loads((job / "drive-manifest.json").read_text(encoding="utf-8"))["status"] == "drive_trashed"
+    except (OSError, ValueError, KeyError, TypeError):
+        return False
+
+
 def eligible_media(job: Path, cutoff: float, now: float | None = None) -> tuple[list[Path], str]:
     if job.is_symlink() or getattr(job, "is_junction", lambda: False)():
         return [], "linked_path"
@@ -209,7 +235,7 @@ def eligible_media(job: Path, cutoff: float, now: float | None = None) -> tuple[
     files = [p for p in paths if p.is_file()]
     if any(p.name == ".keep-media" or p.suffix in {".tmp", ".part", ".ytdl"} for p in files):
         return [], "review_or_incomplete"
-    if (job / "drive-manifest.json").exists():
+    if (job / "drive-manifest.json").exists() and not _drive_videos_trashed(job):
         return drive_backed_media(job, files, time.time() if now is None else now)
     try:
         marker = StoragePolicy._marker(job)

@@ -332,7 +332,8 @@ class DriveVideoRetentionTests(unittest.TestCase):
             trashed.append(file_id)
             return {}
 
-        listed = listing if isinstance(listing, Exception) else None
+        # A tuple gives one listing per Drive call; an exception makes the call fail.
+        listed = listing if isinstance(listing, (Exception, tuple)) else None
         with (patch.dict(os.environ, {"MCP_DRIVE_VIDEO_RETENTION_DAYS": days,
                                       "GOOGLE_DRIVE_ACCESS_TOKEN": "token"}),
               patch.object(drive_storage, "verify_remote_backup", return_value=False),
@@ -441,6 +442,33 @@ class DriveVideoRetentionTests(unittest.TestCase):
             pipeline.write_json(job / "drive-manifest.json", {**state, "files": [{"verified": True}]})
             report, trashed, _ = self.run_cleanup(root, self.listing(state))
             self.assertEqual((trashed, self.status(job), report["errors"]), ([], "drive_ready", []))
+
+    def test_job_busy_with_a_direct_analysis_keeps_its_drive_videos(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw).resolve() / "mcp_jobs"
+            job, _, state = build_job(root, now=self.now)
+            # A direct (not queued) analysis or restore holds only the job writer lock.
+            with pipeline.file_writer_lock(pipeline.job_writer_path(root, JOB)):
+                report, trashed, _ = self.run_cleanup(root, self.listing(state))
+            self.assertEqual((trashed, self.status(job), report["errors"]), ([], "drive_ready", []))
+
+    def test_upload_finished_after_the_shared_listing_is_seen_before_trashing(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw).resolve() / "mcp_jobs"
+            job, _, state = build_job(root, now=self.now)
+            stale, fresh = self.listing(state), self.listing(state, source_age_days=1.0)
+            report, trashed, list_children = self.run_cleanup(root, (stale, fresh))
+            self.assertEqual((trashed, self.status(job), report["drive_expired_jobs"]), ([], "drive_ready", 0))
+            self.assertEqual(list_children.call_count, 2)
+
+    def test_unreadable_setting_turns_drive_retention_off_without_failing_the_run(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw).resolve() / "mcp_jobs"
+            job, _, state = build_job(root, now=self.now)
+            report, trashed, list_children = self.run_cleanup(root, self.listing(state), days="fourteen")
+            list_children.assert_not_called()
+            self.assertEqual((trashed, self.status(job), report["errors"]), ([], "drive_ready", []))
+            self.assertEqual(report["skipped"].get("invalid_drive_retention_days"), 1)
 
 
 if __name__ == "__main__":
