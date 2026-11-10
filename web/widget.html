@@ -287,7 +287,7 @@ function request(method, params) {
 function ensureBridge() {
   if (!bridgePromise) bridgePromise = request("ui/initialize", {
     protocolVersion: "2026-01-26", appCapabilities: {},
-    appInfo: { name: "video-timeline-pipeline", version: "20" },
+    appInfo: { name: "video-timeline-pipeline", version: "21" },
   }).then(result => {
     window.parent.postMessage({ jsonrpc: "2.0", method: "ui/notifications/initialized", params: {} }, "*");
     return result;
@@ -472,7 +472,7 @@ function showOperation() {
   $("operation").hidden = !activeOperation;
   if (!activeOperation) return;
   const progress = activeOperation.progress || {}, names = { prepare: "準備影片", analyze: "分析影片", drive: "上傳 Drive" };
-  const statuses = { queued: "排隊中", running: "執行中", completed: "已完成", failed: "失敗", cancelled: "已取消", expired: "已過期", interrupted: "執行中斷" };
+  const statuses = { queued: `排隊中，前面還有 ${activeOperation.queue_position ?? "未知"} 個`, running: "執行中", completed: "已完成", failed: "失敗", cancelled: "已取消", expired: "已過期", interrupted: "執行中斷" };
   const indeterminate = activeOperation.operation === "analyze" && activeOperation.status === "running" && progress.stage === "evidence";
   const updated = Number(progress.updated_at);
   const elapsed = indeterminate && Number.isFinite(updated) && updated > 0 ? `目前狀態已維持 ${Math.max(0, Math.floor(Date.now() / 1000 - updated))} 秒` : null;
@@ -628,7 +628,7 @@ function adoptDriveOperation(value, version) {
   driveOperation = value;
   saveState(); showOperation();
   if (isPending(value)) {
-    status("Drive 上傳排隊／執行中；分析不受影響，完成後會顯示交接內容。");
+    status((value.status === "queued" ? `Drive 排隊中，前面還有 ${value.queue_position ?? "未知"} 個` : "Drive 上傳執行中") + "；分析不受影響，完成後會顯示交接內容。");
     scheduleDrivePoll(version, value.retry_after_seconds);
     updateButtons();
     return;
@@ -990,13 +990,13 @@ async function refreshReport(version) {
     return false;
   }
 }
-function scheduleReportPoll(version, seconds, remaining = 60) {
+function scheduleReportPoll(version, seconds, deadline) {
   const epoch = reportPollEpoch, delay = Math.min(10, Math.max(1, Number(seconds) || 2));
   reportPollTimer = setTimeout(() => {
-    if (current(version) && epoch === reportPollEpoch) pollReportOperation(version, epoch, delay, remaining);
+    if (current(version) && epoch === reportPollEpoch) pollReportOperation(version, epoch, delay, deadline);
   }, delay * 1000);
 }
-async function pollReportOperation(version, epoch, delay, remaining) {
+async function pollReportOperation(version, epoch, delay, deadline) {
   const report = reportResult, id = report?.operation?.operation_id;
   if (!report) return;
   try {
@@ -1004,14 +1004,14 @@ async function pollReportOperation(version, epoch, delay, remaining) {
       const snapshot = await callTool("get_prepared_video", { job_id: report.job_id }, version);
       if (!current(version) || epoch !== reportPollEpoch) return;
       if (snapshot.prepared?.job_id !== report.job_id || !snapshot.report || ["job_id", "cache_signature", "analysis_sha256", "report_sha256"].some(key => snapshot.report[key] !== report[key])) throw new Error("報告快照綁定不符；請重新取得狀態。");
-      applyReport(snapshot.report, delay * 2, remaining - 1);
+      applyReport(snapshot.report, delay * 2, deadline);
       return;
     }
     const value = await callTool("get_video_job", { operation_id: id }, version);
     if (!current(version) || epoch !== reportPollEpoch) return;
     if (value.operation_id !== id || value.operation !== "report" || value.job_id !== data?.job_id) throw new Error("報告背景工作識別碼或工作不符。");
     if (isPending(value)) {
-      applyReport({ ...report, status: value.status, operation: value }, delay * 2);
+      applyReport({ ...report, status: value.status, operation: value }, delay * 2, deadline);
     } else if (value.status === "completed") {
       if (value.result_kind !== "report" || !value.result || ["job_id", "cache_signature", "analysis_sha256", "report_sha256"].some(key => value.result[key] !== report[key])) throw new Error("報告回傳綁定不符；請重新取得狀態。");
       applyReport({ ...report, ...value.result, operation: value });
@@ -1026,7 +1026,7 @@ async function pollReportOperation(version, epoch, delay, remaining) {
   }
 }
 function clearReport() { reportRefreshEpoch++; reportRefreshing = false; stopReportPolling(); reportSubmitting = false; reportWritePending = false; reportResult = null; $("analysis-report").hidden = true; $("report-link").hidden = true; $("copy-merge").disabled = true; }
-function applyReport(result, seconds = result?.operation?.retry_after_seconds, remaining = 60) {
+function applyReport(result, seconds = result?.operation?.retry_after_seconds, deadline = Date.now() + (result?.job_timeout_seconds || 3600) * 1000) {
   if (!analysisResult || result?.job_id !== data?.job_id || result.cache_signature !== analysisResult.cache_signature) return false;
   reportRefreshing = false;
   stopReportPolling(); reportResult = result;
@@ -1046,14 +1046,14 @@ function applyReport(result, seconds = result?.operation?.retry_after_seconds, r
     : result.status === "summary_pending" ? "A 分析已完成，證據不完整：等待 ChatGPT 整理摘要後才會上傳 A_server_analysis.md。"
     : "A 報告尚未確認上傳至 Drive，請核對下方狀態。";
   const error = result.error || result.operation?.error;
-  $("report-state").textContent = message + `A 證據=${result.evidence_status || "未知"}；摘要=${result.summary_status || "未知"}（caller_submitted，未獨立驗證作者）；報告=${result.status}。` + (error ? " " + errorText(error) : "");
+  const queueMessage = result.status === "queued" ? `排隊中，前面還有 ${result.operation?.queue_position ?? "未知"} 個。` : "";
+  $("report-state").textContent = queueMessage + message + `A 證據=${result.evidence_status || "未知"}；摘要=${result.summary_status || "未知"}（caller_submitted，未獨立驗證作者）；報告=${result.status}。` + (error ? " " + errorText(error) : "");
   const download = safeURL(result.download_url);
   $("report-link").hidden = !download; if (download) $("report-link").href = download;
   $("copy-merge").disabled = !ready;
   $("finalize-report").disabled = reportSubmitting || !result.analysis_sha256;
-  // ponytail: cap prerequisite snapshots at 60 reads; explicit refresh starts another wait.
-  if (waiting && remaining <= 0) status("等待 A 報告排程逾時；請按「重新取得狀態」。未重新提交摘要或上傳。");
-  else if (waiting || (isPending(result) && result.operation?.operation_id)) scheduleReportPoll(generation, seconds, remaining);
+  if ((waiting || isPending(result)) && Date.now() >= deadline) status("等待 A 報告排程逾時；請按「重新取得狀態」。未重新提交摘要或上傳。");
+  else if (waiting || (isPending(result) && result.operation?.operation_id)) scheduleReportPoll(generation, seconds, deadline);
   return true;
 }
 async function submitReportSummary() {

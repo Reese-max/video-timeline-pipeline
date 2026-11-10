@@ -32,6 +32,51 @@ def archive(files):
 
 
 class LinuxDeployTests(unittest.TestCase):
+    def test_active_job_lock_defers_before_switch_or_process_signal(self):
+        import pipeline
+        with tempfile.TemporaryDirectory() as name:
+            shared = Path(name).resolve() / "shared"
+            path = pipeline.job_writer_path(shared / "mcp_jobs", "a" * 12)
+            @contextlib.contextmanager
+            def portable_lock(path):
+                try:
+                    with pipeline.file_writer_lock(path): yield
+                except pipeline.WriterBusyError:
+                    raise deploy.Deferred("LOCK_BUSY: " + path.name) from None
+            with (pipeline.file_writer_lock(path), patch.object(deploy, "locked", portable_lock),
+                  patch.object(deploy, "stop_verified") as stop, patch.object(deploy, "atomic_current") as switch):
+                with self.assertRaisesRegex(deploy.Deferred, "LOCK_BUSY: a{12}"):
+                    deploy.switch_idle(shared, Path(name) / "deploy", Path(name) / "new", shared)
+            stop.assert_not_called()
+            switch.assert_not_called()
+
+    def test_job_lock_probe_holds_one_job_lock_at_a_time(self):
+        # One lock file accumulates per job; holding all of them at once would exhaust fds.
+        import pipeline
+        with tempfile.TemporaryDirectory() as name:
+            shared = Path(name).resolve() / "shared"
+            for index in range(300):
+                path = pipeline.job_writer_path(shared / "mcp_jobs", f"{index:012x}")
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(b"0")
+            held, probed, peak = set(), [], [0]
+            @contextlib.contextmanager
+            def counting_lock(path):
+                held.add(path)
+                if path.parent.name == ".job-locks":
+                    probed.append(path.name)
+                    peak[0] = max(peak[0], sum(p.parent.name == ".job-locks" for p in held))
+                try: yield
+                finally: held.discard(path)
+            with (patch.object(deploy, "locked", counting_lock),
+                  patch.object(deploy, "stop_verified") as stop, patch.object(deploy, "atomic_current") as switch):
+                with self.assertRaises(Exception):  # No queue database: stops right after probing.
+                    deploy.switch_idle(shared, Path(name) / "deploy", Path(name) / "new", shared)
+            self.assertEqual(len(probed), 300)
+            self.assertEqual(peak[0], 1)
+            stop.assert_not_called()
+            switch.assert_not_called()
+
     def test_runtime_inventory_matches_server(self):
         import mcp_server
         self.assertEqual(set(deploy.RUNTIME_FILES), set(mcp_server.RUNTIME_SHA256))

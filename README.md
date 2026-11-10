@@ -125,7 +125,7 @@ Facebook 私人影片或登入牆導致網址無法下載時，先把 MP4 上傳
 
 下載只接受 HTTPS／443，主機名稱必須**完整相符**於 `UPLOAD_ALLOWED_HOSTS`（逗號分隔、不支援萬用字元或自動包含子網域）；既有引用正規化沒有主機清單，因此保守預設僅 `files.oaiusercontent.com`。若宿主使用其他下載主機，管理者須明確將該可信主機加入，例如 `UPLOAD_ALLOWED_HOSTS=files.oaiusercontent.com,另一個可信主機`；每次重新導向都重新核對，最多 5 次。不傳送 Cookie、帳密或環境中的代理／`.netrc` 憑證。連線逾時 10 秒、單次讀取逾時 30 秒，整體下載沿用 `VIDEO_API_TIMEOUT_SECONDS`（預設 900 秒）與背景工作期限。
 
-影片串流寫入 `mcp_jobs/.upload-*` 暫存目錄，沿用 `MCP_MAX_SOURCE_MB`（預設 **512 MiB**）硬上限及儲存空間檢查，失敗會清掉當次暫存檔。行程中斷遺留的暫存目錄會在下次上傳的容量檢查前，於既有寫入鎖內清理；僅處理超過 `max(900, MCP_JOB_TIMEOUT_SECONDS)` 秒且未連結至其他路徑的 `.upload-*` 目錄。容量不足或原片搬移失敗不會留下新建的空工作目錄。格式異常的下載網址與 ffprobe JSON 會回傳繁體中文錯誤。伺服器以 ffprobe 限定本機 MP4/MOV 容器並確認有視訊串流，音軌可省略；不依副檔名或 MIME 宣稱判定成功。內容 SHA-256 經 `pipeline.job_key("upload://<sha256>")` 產生既有格式的 12 碼 job ID：相同 bytes 即使檔名／file ID 不同也共用工作，同樣分段設定重用完成產物；修改分段設定會在同一工作重建分段。每次新引用仍須下載 bytes 才能核對內容。
+影片串流寫入 `mcp_jobs/.upload-*` 暫存目錄，沿用 `MCP_MAX_SOURCE_MB`（預設 **512 MiB**）硬上限及儲存空間檢查，失敗會清掉當次暫存檔。行程中斷遺留的暫存目錄會在下次上傳的容量檢查前，取得該暫存工作的個別鎖後清理；僅處理超過 `max(900, MCP_JOB_TIMEOUT_SECONDS)` 秒且未連結至其他路徑的 `.upload-*` 目錄。容量不足或原片搬移失敗不會留下新建的空工作目錄。格式異常的下載網址與 ffprobe JSON 會回傳繁體中文錯誤。伺服器以 ffprobe 限定本機 MP4/MOV 容器並確認有視訊串流，音軌可省略；不依副檔名或 MIME 宣稱判定成功。內容 SHA-256 經 `pipeline.job_key("upload://<sha256>")` 產生既有格式的 12 碼 job ID：相同 bytes 即使檔名／file ID 不同也共用工作，同樣分段設定重用完成產物；修改分段設定會在同一工作重建分段。每次新引用仍須下載 bytes 才能核對內容。
 
 `source.mp4`、`source.info.json`、`source.probe.json`、分段、預覽與 manifest 與網址工作相容；來源記為 `upload://<sha256>`，不是公開可瀏覽網址。`source.info.json` 與 manifest 的 `source` 保存首次準備的 `source_type="upload"`、原始 `file_name`、`file_id`、`sha256`，不保存暫時下載網址。背景佇列的私人 `.video-state/` 會保存下載引用以便執行／續跑；網址過期時須重新上傳並重新準備。正式 ChatGPT 檔案交接與線上供應商分析仍需部署後驗收。
 
@@ -230,7 +230,7 @@ v11 的 `quality` 是保守證據檢查，不是準確率評分：分析階段�
 
 v9 修正 developer MCP 與官方 Drive 的交接邊界：不在原對話送出 Drive 讀取／摘要 follow-up；先開啟未啟用 developer MCP 的一般 ChatGPT 對話，選擇官方 Google Drive，再貼上 widget 的交接內容（job ID、全部檔案 ID／網址／大小與原片分段時間）。新對話須實際取得 bytes、記錄大小／SHA-256 並解碼，不能把 `drive_ready` 當成讀取成功。一般對話連結不會自動改變帳號的 developer mode 或連線設定，使用者需確認對話類型。登入、OAuth、Drive 檔案權限均未變更。UI URI 含媒體網址 SHA-256 前 12 碼，避免換網址後仍使用舊 CSP 快取。
 
-分析與 Drive 未取得單程序工作鎖時回傳 `status=busy`、`error_code=MCP_BUSY`、`retry_after_seconds=5`，不是成功，也不加入背景佇列。widget 僅對此忙碌狀態（或舊 host 包裝後的同一忙碌訊息）等待 5、10、20 秒，各重試一次；最多四次呼叫。仍忙碌就停止並保留手動重試入口。Drive 或 ChatGPT follow-up 失敗時沿用同一 widget 的分析結果，不重跑付費分析。其他錯誤不在 widget 自動重試；Drive 儲存層原有的續傳重試仍保留。切換 job 後不再重試舊工作，也不讓資料型通知覆寫目前分段。這不是持久化佇列，也沒有解除 ChatGPT 原生 `Unsupported file type` 限制。依 [官方 UI 快取規則](https://developers.openai.com/plugins/build/chatgpt-ui#embed-the-component-in-the-server-response)，UI URI 升為 `ui://video-timeline-pipeline/v11-<媒體網址 SHA-256 前 12 碼>.html`；部署後必須重新整理外掛動作並產生新 widget，歷史 widget 不會自動更新。`node tests/test_widget_handoff.cjs` 驗證流程與競態；不代表真實模型品質或網頁端驗收通過。
+準備、分析與 Drive 的同步呼叫在無法立即執行時會自動進入持久化背景佇列，回傳 `status=queued`、`operation_id` 與 `retry_after_seconds`；請以 `get_video_job` 輪詢，不要重新提交。只有 deployment-draining 等拒絕新工作的狀態仍回傳 `status=busy`、`error_code=MCP_BUSY`。widget 顯示排隊順位，並持續等待報告前置工作；報告輪詢最久等待伺服器設定的工作時限，間隔最多 10 秒，不會自動重送摘要或上傳。Drive 或 ChatGPT follow-up 失敗時沿用既有分析結果，不重跑付費分析。切換 job 後不採用舊工作的延遲回應。部署後需重新整理外掛動作並建立新 widget；歷史 widget 不會自動更新。`node tests/test_widget_handoff.cjs` 驗證流程與競態，不代表真實模型品質或網頁端驗收。
 
 監督啟動器預設讓媒體網址沿用固定的 `MCP_PUBLIC_BASE_URL`，避免 Cloudflare Quick Tunnel 換名後，長時間運作的 MCP 仍回傳已失效的影片網址。既有 `MCP_MEDIA_BASE_URL` 明確設定仍優先；需要 Quick Tunnel 時可明確設 `MCP_USE_QUICK_TUNNEL=1`，此模式仍需要在網址變更後受控重載 MCP 並建立新 widget。歷史 widget 的舊網址不會自動更新。
 
@@ -246,7 +246,9 @@ v8 保留 v7 的工作隔離，下載期限改為涵蓋 HTTP 回應與完整 `bl
 
 Drive 上傳以 1 MiB 分塊；遇到斷線、HTTP 429／5xx，最多退避重試三次，先查詢同一 resumable session 的已接收範圍，再續傳，避免盲目重建檔案。回歸檢查：`node tests/test_widget_handoff.cjs` 與 `python -m unittest discover -s tests -p test_mcp_server.py -v`。
 
-跨呼叫重試也保留進度：採 [Google Drive 預先配置 ID](https://developers.google.com/workspace/drive/api/guides/manage-uploads#use_a_pre-generated_id_to_upload_files)，先原子保存 ID 再建立資料夾／影片。每次重用都重新讀取 Drive，確認未進垃圾桶、大小、SHA-256 與父資料夾；403／網路錯誤會停止，不把它當成不存在。已刪除或被修改的檔案會建立新 ID，不覆寫原檔。只有全部驗證成功才標示 `drive_ready`。舊版未記錄的孤立上傳不會自動刪除。此實作使用單程序鎖與 JSON checkpoint；多程序部署需先換成共享鎖，大量分段若 checkpoint 寫入成為瓶頸，再改成增量日誌。
+跨呼叫重試也保留進度：採 [Google Drive 預先配置 ID](https://developers.google.com/workspace/drive/api/guides/manage-uploads#use_a_pre-generated_id_to_upload_files)，先原子保存 ID 再建立資料夾／影片。每次重用都重新讀取 Drive，確認未進垃圾桶、大小、SHA-256 與父資料夾；403／網路錯誤會停止，不把它當成不存在。已刪除或被修改的檔案會建立新 ID，不覆寫原檔。只有全部驗證成功才標示 `drive_ready`。舊版未記錄的孤立上傳不會自動刪除。每個影片使用跨進程 job 鎖與 JSON checkpoint；共用 Drive 資料夾的尋找／ID 保留另有短範圍跨進程鎖，檔案上傳仍可並行。
+
+`MCP_MAX_PARALLEL_JOBS` 控制同時處理的不同影片數，預設 **2**，最小 **1**；非法值會記錄警告並退回 2。設為 **1** 恢復舊版一次一支影片的行為（同影片 analyze＋Drive 仍可配對並行）。提高上限會增加 CPU、記憶體與磁碟負載；2 核主機建議先維持 2，記憶體不足或使用本機語音辨識時可設 1。同步呼叫無法立即執行時會自動排隊；收到 `status=queued` 後用 `get_video_job` 輪詢，不必重新提交。排隊結果包含 `queue_position`、`running_count`、`parallel_limit`。
 
 可用環境變數：`MCP_MAX_SOURCE_MB`（預設 512）、`MCP_MAX_SEGMENT_SECONDS`（預設 600）、`MCP_MAX_SEGMENTS`（預設 0，不限段數；設為正整數後，省略 `max_segments` 也不會繞過伺服器上限）、`MCP_MIN_FREE_MB`（預設保留 1024 MiB）、`MCP_ROOT`（預設 repo 根目錄）、`MCP_SEGMENT_MODE`（預設 `copy`，見下）、`MCP_SEGMENT_MAX_LONG_SIDE`（預設 1280）、`MCP_SEGMENT_X264_PRESET`（預設 `veryfast`）、`TRANSCRIBE_BACKEND`（`groq` 或 `local`）、`GROQ_ASR_MODEL`、`MINIMAX_MODEL`。工具的 `max_segments` 預設仍不設上限。
 
@@ -284,7 +286,7 @@ python scripts/migrate_drive_single_folder.py --jobs-root mcp_jobs --apply --tra
 
 **注意**：copy 的分段維持原編碼（例如 VP9），部分瀏覽器與 iOS 無法播放；分段時間以 `segments.csv` 的實際值為準（copy 不能強制關鍵畫面，切點落在下一個關鍵畫面）。copy 與 transcode 都用 `-avoid_negative_ts disabled`，分段沿用來源時間軸、切點與播放時間軸一致，同樣以 `segments.csv` 的實際值為準。**需要到處都能播放的 H.264 分段：設 `MCP_SEGMENT_MODE=transcode`**。相同來源與設定的完整 copy 分段可直接重用；copy 模式不續切中斷片段（`-ss` 會對齊到關鍵畫面，偏移合併不可靠），未完成時清空重切。transcode 模式保留中斷續切。尾段覆蓋以影像串流長度驗證，較長的純音訊尾段不會使準備失敗；續切殘留的純音訊輸出會移除，含影像但時間清單損壞的檔案仍交由正常驗證。模式或設定改變時，舊分段會全部重切（參數記在 `segments/.split-params.json`）。
 
-容量保護是事前檢查：下載前預留來源上限，切割／分析前至少再預留一份來源大小與最低剩餘空間；轉碼大小不固定，這不是磁碟配額保證。準備、分析、Drive 上傳共用單程序工作鎖；忙碌時立即回傳可重試錯誤，不讓背景執行緒無限排隊。仍採同步處理；持久化長片佇列、Drive 配額管理、定期刪除未實作。沒有保留天數授權時不刪除任何既有影片。
+容量保護是事前檢查：下載前預留來源上限，切割／分析前至少再預留一份來源大小與最低剩餘空間；轉碼大小不固定，這不是磁碟配額保證。準備、分析、Drive 上傳使用每個 job 的跨進程鎖；不同影片依 MCP_MAX_PARALLEL_JOBS 並行，無法立即執行的同步呼叫自動排隊。佇列保留既有 64 筆活動 operation 上限，滿額時明確拒絕；Drive 配額管理未實作。沒有保留天數授權時不刪除任何既有影片。
 
 Drive fallback 另需 `GOOGLE_DRIVE_FOLDER_ID`（可留白表示根目錄）及 `GOOGLE_DRIVE_REFRESH_TOKEN`、`GOOGLE_DRIVE_CLIENT_ID`、`GOOGLE_DRIVE_CLIENT_SECRET`；`GOOGLE_DRIVE_ACCESS_TOKEN` 僅適合短期測試。這些憑證只放在 MCP 主機環境，不提交到 Git；OAuth 使用者必須能讀取該資料夾，否則 ChatGPT 的 Google Drive connector 無法取回影片。Drive OAuth 僅處理儲存端授權，**不代表 MCP 公開入口已驗證呼叫者**；本版沒有更動入口驗證設定。
 

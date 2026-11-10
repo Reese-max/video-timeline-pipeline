@@ -63,12 +63,15 @@ class ProtocolSmokeTests(unittest.TestCase):
                                           'arguments': {'files': bad_files}}, number)
                             self.assertTrue(denied['isError'])
                             self.assertNotIn('structuredContent', denied)
-                    with patch.object(server, 'prepare_video_locked', side_effect=server.JobBusyError('busy')):
+                    queue = server.get_queue()
+                    with (patch.object(server, 'prepare_video_locked', side_effect=server.JobBusyError('busy')),
+                          patch.object(server, 'validate_source_url', side_effect=lambda url: url), server.JOB_LOCK):
                         busy = call('tools/call', {'name': 'prepare_video_for_chatgpt',
                                     'arguments': {'url': 'https://video.example/test.mp4'}}, 13)
+                        queue.cancel(busy['structuredContent']['operation_id'])
                     self.assertFalse(busy.get('isError', False))
-                    self.assertEqual(busy['structuredContent']['status'], 'busy')
-                    self.assertEqual(busy['structuredContent']['error_code'], 'MCP_BUSY')
+                    self.assertEqual(busy['structuredContent']['status'], 'queued')
+                    self.assertIn('operation_id', busy['structuredContent'])
                     resource = resources[0]
                     contents = call('resources/read', {'uri': resource['uri']}, 4)['contents']
                     self.assertIn('<html', contents[0]['text'])
@@ -76,7 +79,7 @@ class ProtocolSmokeTests(unittest.TestCase):
                     self.assertEqual([item['uri'] for item in resources], [server.UI_URI, *server.LEGACY_UI_URIS])
                     for number, legacy in enumerate(server.LEGACY_UI_URIS, 5):
                         self.assertEqual(call('resources/read', {'uri': legacy}, number)['contents'][0]['text'], contents[0]['text'])
-                    self.assertEqual([uri.split('/')[-1].split('-')[0] for uri in server.LEGACY_UI_URIS], ['v18', 'v19'])
+                    self.assertEqual([uri.split('/')[-1].split('-')[0] for uri in server.LEGACY_UI_URIS], ['v19', 'v20'])
                     self.assertEqual(tools['prepare_video_for_chatgpt']['_meta']['openai/outputTemplate'], server.UI_URI)
                     health = client.get('/health').json()
                     deadline = time.monotonic() + 3
@@ -84,12 +87,14 @@ class ProtocolSmokeTests(unittest.TestCase):
                         time.sleep(0.02)  # The empty scheduler briefly holds its ownership lock while polling.
                         health = client.get('/health').json()
                     self.assertTrue(health['jobs']['scheduler_alive'])
+                    self.assertEqual(health['jobs']['worker_limit'], server.JOB_SLOTS.limit)
+                    self.assertEqual(health['jobs']['running_count'], 0)
                     self.assertFalse(health['writer_busy'])
                     self.assertFalse(health['deployment_draining'])
                     self.assertEqual(health['runtime_sha256'], server.RUNTIME_SHA256)
-                    self.assertEqual(health['version'], 20)
-                    self.assertIn('/v20-', str(resource['uri']))
-                    self.assertIn('version: "20"', contents[0]['text'])
+                    self.assertEqual(health['version'], 21)
+                    self.assertIn('/v21-', str(resource['uri']))
+                    self.assertIn('version: "21"', contents[0]['text'])
                 finally:
                     if server._QUEUE is not None:
                         server._QUEUE.close()

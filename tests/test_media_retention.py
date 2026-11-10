@@ -16,8 +16,8 @@ import pipeline
 
 
 class RetentionTests(unittest.TestCase):
-    def make_job(self, root, age=8):
-        job = root / "0123456789ab"
+    def make_job(self, root, age=8, job_id="0123456789ab"):
+        job = root / job_id
         stamp = self.now - age * 86400
         for name in ["source.mp4", "threads_media_000.mp4", "segments/segment_000.mp4",
                      "previews/preview_000.jpg", "analysis/frames/frame_000001.jpg", "analysis/audio/audio_0000.mp3"]:
@@ -162,14 +162,45 @@ class RetentionTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory).resolve() / "mcp_jobs"
             self.make_job(root)
-            with pipeline.file_writer_lock(root / ".writer.lock"):
+            with pipeline.file_writer_lock(pipeline.job_writer_path(root, "0123456789ab")):
                 completed = subprocess.run([sys.executable, str(Path(retention.__file__)), "--jobs-root", str(root), "--apply"], capture_output=True, text=True)
                 self.assertEqual(completed.returncode, 0, completed.stderr)
-                self.assertEqual(json.loads(completed.stdout)["status"], "busy")
+                self.assertEqual(json.loads(completed.stdout)["skipped"]["job_lock_busy"], 1)
+                self.assertEqual(json.loads(completed.stdout)["deleted_files"], 0)
                 with patch.object(server, "MCP_JOBS_ROOT", root), self.assertRaises(server.JobBusyError):
-                    server.run_job(lambda: self.fail("must not run"))
+                    server.run_job(lambda: self.fail("must not run"), _job_id="0123456789ab")
             with patch.object(server, "MCP_JOBS_ROOT", root):
-                self.assertEqual(server.run_job(lambda: "ok"), "ok")
+                self.assertEqual(server.run_job(lambda: "ok", _job_id="0123456789ab"), "ok")
+
+    def test_T5_locked_job_is_skipped_while_other_job_is_cleaned(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve() / "mcp_jobs"
+            locked = self.make_job(root)
+            free = self.make_job(root, job_id="abcdef012345")
+            with pipeline.file_writer_lock(pipeline.job_writer_path(root, locked.name)):
+                result = retention.cleanup(root, apply=True, now=self.now)
+            self.assertEqual(result["skipped"]["job_lock_busy"], 1)
+            self.assertEqual(result["deleted_files"], 6)
+            self.assertTrue((locked / "source.mp4").exists())
+            self.assertFalse((free / "source.mp4").exists())
+            self.assertEqual(result["errors"], [])
+
+    def test_queued_job_protects_only_its_own_media(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve() / "mcp_jobs"
+            queued = self.make_job(root)
+            free = self.make_job(root, job_id="abcdef012345")
+            from job_queue import JobQueue
+            queue = JobQueue(root.parent / ".video-state", autostart=False)
+            try:
+                queue.submit("analyze", {"job_id": queued.name}, queued.name)
+                result = retention.cleanup(root, apply=True, now=self.now)
+            finally:
+                queue.close()
+            self.assertEqual(result["skipped"]["queue_active_or_unresolved"], 1)
+            self.assertEqual(result["deleted_files"], 6)
+            self.assertTrue((queued / "source.mp4").exists())
+            self.assertFalse((free / "source.mp4").exists())
 
     @unittest.skipIf(os.name == "nt", "symlink creation needs Windows privileges")
     def test_symlink_and_hardlink_do_not_escape_scope(self):
@@ -257,13 +288,13 @@ class RetentionTests(unittest.TestCase):
                 work = Path(directory).resolve()
                 jobs = work / "mcp_jobs"
                 jobs.mkdir()
-                pipeline.write_json(work / "input.json", {"operation": operation, "inputs": {}})
+                pipeline.write_json(work / "input.json", {"operation": operation, "inputs": {"job_id": "0123456789ab"}})
                 with (patch.object(job_worker.sys, "argv", ["job_worker.py", str(work)]),
                       patch.object(job_worker.threading.Thread, "start"),
                       patch.object(job_worker, "report_progress"),
                       patch.object(server, "MCP_JOBS_ROOT", jobs),
                       patch.object(server, function) as provider,
-                      pipeline.file_writer_lock(jobs / ".writer.lock")):
+                      pipeline.file_writer_lock(pipeline.job_writer_path(jobs, "0123456789ab"))):
                     job_worker.main()
                     provider.assert_not_called()
                 self.assertFalse(json.loads((work / "output.json").read_text())["ok"])

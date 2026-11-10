@@ -43,7 +43,11 @@ def main():
         operation, args = task["operation"], task["inputs"]
         delegation = (work, task["parent_writer_lease"]) if "parent_writer_lease" in task else None
         def run(operation):
-            return server.run_job(operation, _parent_writer=delegation) if delegation is not None else server.run_job(operation)
+            if delegation is not None:
+                return server.run_job(operation, _parent_writer=delegation)
+            if args.get("job_id"):
+                return server.run_job(operation, _job_id=args["job_id"])
+            return server.run_job(operation)
         report_progress("starting", 1, "開始處理")
         if operation == "prepare":
             prepare = server.prepare_uploaded_video_sync if "file" in args else server.prepare_video_sync

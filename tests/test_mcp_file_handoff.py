@@ -1,6 +1,9 @@
 """Offline file-reference receipts never substitute for a model reading the bytes."""
 import asyncio
 import unittest
+import tempfile
+from pathlib import Path
+from job_queue import JobQueue
 from unittest.mock import patch
 
 import mcp_server as server
@@ -27,7 +30,7 @@ class FileHandoffContractTests(unittest.TestCase):
         self.assertEqual(tool.inputSchema["required"], ["files"])
         self.assertIn("start_seconds", tool.outputSchema["$defs"]["VerifiedFileSummary"]["properties"])
         self.assertIn("end_seconds", tool.outputSchema["$defs"]["VerifiedFileSummary"]["properties"])
-        self.assertIn("/v20-", server.UI_URI)
+        self.assertIn("/v21-", server.UI_URI)
 
     def test_ingestion_retains_identity_mime_names_and_fractional_times(self):
         files = self.files()
@@ -69,13 +72,19 @@ class FileHandoffContractTests(unittest.TestCase):
                 asyncio.run(server.ingest_video_segments(self.files(), segment_ranges=ranges))
 
     def test_prepare_busy_is_a_schema_valid_state(self):
-        with patch.object(server, "prepare_video_locked", side_effect=server.JobBusyError("busy")):
-            result = asyncio.run(server.prepare_video_for_chatgpt("https://video.example/test.mp4"))
-        self.assertFalse(result.isError)
-        payload = server.PreparedVideoResult.model_validate(result.structuredContent)
-        self.assertEqual(payload.status, "busy")
-        self.assertEqual(payload.error_code, "MCP_BUSY")
-        self.assertEqual(payload.retry_after_seconds, 5)
+        with tempfile.TemporaryDirectory() as raw:
+            queue = JobQueue(Path(raw), autostart=False)
+            with (patch.object(server, "prepare_video_locked", side_effect=server.JobBusyError("busy")),
+                  patch.object(server, "validate_source_url", side_effect=lambda url: url),
+                  patch.object(server, "get_queue", return_value=queue)):
+                result = asyncio.run(server.prepare_video_for_chatgpt("https://video.example/test.mp4"))
+            self.assertFalse(result.isError)
+            payload = server.PreparedVideoResult.model_validate(result.structuredContent)
+            self.assertEqual(payload.status, "queued")
+            self.assertIsNone(payload.error_code)
+            self.assertEqual(payload.retry_after_seconds, 2)
+            self.assertEqual(queue.get(payload.operation_id)["status"], "queued")
+            queue.close()
 
 
 if __name__ == "__main__":

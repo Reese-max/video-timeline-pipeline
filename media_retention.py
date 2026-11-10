@@ -165,10 +165,10 @@ def cleanup(jobs_root: Path, *, apply: bool = False, now: float | None = None) -
     report = {"mode": "apply" if apply else "dry_run", "retention_days": 7,
               "eligible_jobs": 0, "drive_backed_jobs": 0, "selected_files": 0, "selected_bytes": 0,
               "deleted_files": 0, "deleted_bytes": 0, "skipped": collections.Counter(), "errors": []}
-    with (pipeline.file_writer_lock(root / ".writer.lock"),
-          pipeline.file_writer_lock(root / ".media-lifecycle.lock"),
+    with (pipeline.file_writer_lock(root / ".media-lifecycle.lock"),
           contextlib.ExitStack() as stack):
         protected = set()
+        active = set()
         database = root.parent / ".video-state" / "jobs.sqlite3"
         if database.exists():
             if database.resolve() != database or not database.is_file():
@@ -183,53 +183,59 @@ def cleanup(jobs_root: Path, *, apply: bool = False, now: float | None = None) -
                         "SELECT job_id,status FROM jobs AS old WHERE status!='completed' AND (status IN ('queued','running') "
                         "OR job_id IS NULL OR NOT EXISTS (SELECT 1 FROM jobs AS new WHERE new.status='completed' "
                         "AND new.job_id=old.job_id AND new.input_hash=old.input_hash AND new.created>old.created))"):
-                    if status in {"queued", "running"} or job_id is None:
+                    if job_id is None:
                         report["skipped"]["queue_active_or_unresolved"] += 1
-                        return report
-                    protected.add(job_id)
+                        return report  # Unknown content identity: fail closed.
+                    (active if status in {"queued", "running"} else protected).add(job_id)
             except sqlite3.OperationalError as exc:
                 raise pipeline.WriterBusyError("Queue state unavailable; no media removed") from exc
         for job in sorted(root.iterdir()):
             if not re.fullmatch(r"[a-f0-9]{12}", job.name) or not job.is_dir():
                 continue
+            if job.name in active:
+                report["skipped"]["queue_active_or_unresolved"] += 1
+                continue
             if job.name in protected:
                 report["skipped"]["queue_failure_or_review"] += 1
                 continue
             try:
-                paths, reason = eligible_media(job, timestamp - 7 * 86400, timestamp)
-                if not paths:
-                    report["skipped"][reason] += 1
-                    continue
-                if reason == "eligible_drive_backed":
-                    report["drive_backed_jobs"] += 1
-                snapshots = {p: p.lstat() for p in paths}
-                report["eligible_jobs"] += 1
-                report["selected_files"] += len(paths)
-                report["selected_bytes"] += sum(s.st_size for s in snapshots.values())
-                if not apply:
-                    continue
-                audit = {"status": "deleting", "started_at": timestamp, "retention_days": 7,
-                         "policy": "drive_backed" if reason == "eligible_drive_backed" else "retention_days",
-                         "planned_files": [str(p.relative_to(job)) for p in paths], "deleted_files": []}
-                pipeline.write_json(job / AUDIT, audit)
-                for path in paths:
-                    if (reason == "eligible_drive_backed" and path.parent == job and path.name.startswith("source.")
-                            and not drive_backup_still_verified(job)):
-                        audit.update(status="stopped_drive_changed", completed_at=time.time())
-                        pipeline.write_json(job / AUDIT, audit)
-                        raise RuntimeError("Google Drive 備份在清理途中變動；保留原片。")
-                    old, current = snapshots[path], path.lstat()
-                    if (path.is_symlink() or not path.resolve().is_relative_to(root)
-                            or (old.st_dev, old.st_ino, old.st_size, old.st_mtime_ns)
-                            != (current.st_dev, current.st_ino, current.st_size, current.st_mtime_ns)):
-                        raise RuntimeError("清理期間檔案改變；停止此工作。")
-                    path.unlink()
-                    report["deleted_files"] += 1
-                    report["deleted_bytes"] += old.st_size
-                    audit["deleted_files"].append(str(path.relative_to(job)))
-                audit["status"] = "cleaned"
-                audit["completed_at"] = time.time()
-                pipeline.write_json(job / AUDIT, audit)
+                with pipeline.file_writer_lock(pipeline.job_writer_path(root, job.name)):
+                    paths, reason = eligible_media(job, timestamp - 7 * 86400, timestamp)
+                    if not paths:
+                        report["skipped"][reason] += 1
+                        continue
+                    if reason == "eligible_drive_backed":
+                        report["drive_backed_jobs"] += 1
+                    snapshots = {p: p.lstat() for p in paths}
+                    report["eligible_jobs"] += 1
+                    report["selected_files"] += len(paths)
+                    report["selected_bytes"] += sum(s.st_size for s in snapshots.values())
+                    if not apply:
+                        continue
+                    audit = {"status": "deleting", "started_at": timestamp, "retention_days": 7,
+                             "policy": "drive_backed" if reason == "eligible_drive_backed" else "retention_days",
+                             "planned_files": [str(p.relative_to(job)) for p in paths], "deleted_files": []}
+                    pipeline.write_json(job / AUDIT, audit)
+                    for path in paths:
+                        if (reason == "eligible_drive_backed" and path.parent == job and path.name.startswith("source.")
+                                and not drive_backup_still_verified(job)):
+                            audit.update(status="stopped_drive_changed", completed_at=time.time())
+                            pipeline.write_json(job / AUDIT, audit)
+                            raise RuntimeError("Google Drive 備份在清理途中變動；保留原片。")
+                        old, current = snapshots[path], path.lstat()
+                        if (path.is_symlink() or not path.resolve().is_relative_to(root)
+                                or (old.st_dev, old.st_ino, old.st_size, old.st_mtime_ns)
+                                != (current.st_dev, current.st_ino, current.st_size, current.st_mtime_ns)):
+                            raise RuntimeError("清理期間檔案改變；停止此工作。")
+                        path.unlink()
+                        report["deleted_files"] += 1
+                        report["deleted_bytes"] += old.st_size
+                        audit["deleted_files"].append(str(path.relative_to(job)))
+                    audit["status"] = "cleaned"
+                    audit["completed_at"] = time.time()
+                    pipeline.write_json(job / AUDIT, audit)
+            except pipeline.WriterBusyError:
+                report["skipped"]["job_lock_busy"] += 1
             except (OSError, RuntimeError) as exc:
                 report["errors"].append({"job_id": job.name, "error": str(exc)})
     return report
