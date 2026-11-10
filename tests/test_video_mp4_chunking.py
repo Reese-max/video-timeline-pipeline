@@ -586,29 +586,18 @@ class VideoChunkingTests(unittest.TestCase):
         self.assertEqual([line.split("：")[-1] for line in summary],
                          ["chunk-0000.mp4", "chunk-0001.mp4", "chunk-0002.mp4"])
 
-    def _watch_stop_flag(self, hold_first_check: bool = False):
+    def _watch_stop_flag(self):
         """Swap the segment stop flag for one a test can wait on.
 
         `stopped` is set once the flag really is set, so no test has to guess
-        with a sleep. hold_first_check keeps the first segment that looks at the
-        flag waiting until another segment has failed.
+        with a sleep.
         """
         stopped = threading.Event()
-        lock = threading.Lock()
-        seen: list[int] = []
 
         class Flag(threading.Event):
             def set(self) -> None:
                 super().set()
                 stopped.set()
-
-            def is_set(self) -> bool:
-                with lock:
-                    first = not seen
-                    seen.append(1)
-                if hold_first_check and first:
-                    stopped.wait(timeout=20)
-                return super().is_set()
 
         class Threading:
             Event = Flag
@@ -620,32 +609,25 @@ class VideoChunkingTests(unittest.TestCase):
 
     def test_worker_limit_caps_the_segments_in_flight(self) -> None:
         video = self._make_video()
-        lock = threading.Lock()
         pair = threading.Barrier(2)
-        state = {"now": 0, "peak": 0, "calls": 0}
 
         def hook(name: str) -> None:
-            with lock:
-                state["now"] += 1
-                state["calls"] += 1
-                state["peak"] = max(state["peak"], state["now"])
-                paired = state["calls"] <= 2
-            if paired:
-                # Two segments really overlap; the pause only gives a third one
-                # room to show up if the limit were ignored.
+            # The first two segments must overlap; the third runs afterwards.
+            if name != "chunk-0002.mp4":
                 pair.wait(timeout=20)
-                time.sleep(0.2)
-            with lock:
-                state["now"] -= 1
 
         upload, chat = self._by_segment(hook)
         with upload, chat, \
+             mock.patch.object(
+                 pipeline.concurrent.futures, "ThreadPoolExecutor",
+                 wraps=pipeline.concurrent.futures.ThreadPoolExecutor) as pool, \
              mock.patch.object(pipeline, "MINIMAX_VIDEO_CONTEXT_TOKEN_BUDGET", 2000), \
              self._env(MINIMAX_VIDEO_CHUNK_SECONDS="4", MINIMAX_VIDEO_CHUNK_WORKERS="2"):
             rows = pipeline.analyze_video_mp4(
                 video, "key", "MiniMax-M3", duration=self.duration,
                 cache_dir=self.cache, work_dir=self.work)
-        self.assertEqual(state["peak"], 2)
+        # The pool size is the limit, so no timing can let a third segment in.
+        self.assertEqual([call.kwargs["max_workers"] for call in pool.call_args_list], [2])
         self.assertEqual(len(rows), 6)
 
     def test_failed_segment_starts_no_further_segment_when_parallel(self) -> None:
@@ -698,12 +680,28 @@ class VideoChunkingTests(unittest.TestCase):
 
     def test_the_real_failure_is_raised_when_an_earlier_segment_was_skipped(self) -> None:
         video = self._make_video()
-        # The first segment to look at the stop flag is held until another
-        # segment has failed, so it is skipped although it comes first.
-        flag, _stopped = self._watch_stop_flag(hold_first_check=True)
+        flag, stopped = self._watch_stop_flag()
+        real_copy = pipeline.copy_context
+        uploaded: list[str] = []
+
+        def upload(path: Path, api_key: str) -> str:
+            uploaded.append(Path(path).name)
+            raise RuntimeError("boom: 上傳失敗")
+
+        def first_segment_held():
+            context = real_copy()
+
+            def run(work, index, chunk):
+                if index == 1:
+                    # Reaches the stop check only after a later segment failed.
+                    stopped.wait(timeout=20)
+                return context.run(work, index, chunk)
+
+            return mock.Mock(run=run)
+
         with flag, \
-             mock.patch.object(pipeline, "minimax_upload_video_understanding",
-                               side_effect=RuntimeError("boom: 上傳失敗")) as upload_mock, \
+             mock.patch.object(pipeline, "copy_context", first_segment_held), \
+             mock.patch.object(pipeline, "minimax_upload_video_understanding", side_effect=upload), \
              mock.patch.object(pipeline, "minimax_chat") as chat_mock, \
              mock.patch.object(pipeline, "MINIMAX_VIDEO_CONTEXT_TOKEN_BUDGET", 2000), \
              self._env(MINIMAX_VIDEO_CHUNK_SECONDS="4", MINIMAX_VIDEO_CHUNK_WORKERS="2"):
@@ -712,33 +710,49 @@ class VideoChunkingTests(unittest.TestCase):
                     video, "key", "MiniMax-M3", duration=self.duration,
                     cache_dir=self.cache, work_dir=self.work)
         self.assertIn("boom", str(caught.exception))
-        self.assertEqual(upload_mock.call_count, 1)
+        # Only the second segment got as far as uploading: the first was skipped.
+        self.assertEqual(uploaded, ["chunk-0001.mp4"])
         chat_mock.assert_not_called()
 
     def test_interrupt_while_waiting_starts_no_further_segment(self) -> None:
         video = self._make_video()
         in_flight = threading.Event()
+        finished = threading.Event()
+        cleaned: list[bool] = []
         flag, stopped = self._watch_stop_flag()
+        real_cleanup = tempfile.TemporaryDirectory.cleanup
 
         def hook(name: str) -> None:
             in_flight.set()
             stopped.wait(timeout=20)
+            # Still busy while the interrupt travels upwards.
+            time.sleep(0.2)
+            finished.set()
 
         def interrupt(futures, *args, **kwargs):
             # Ctrl-C arrives while the first segment is in flight.
             in_flight.wait(timeout=20)
             raise KeyboardInterrupt
 
+        def cleanup(directory) -> None:
+            if in_flight.is_set():
+                cleaned.append(finished.is_set())
+            real_cleanup(directory)
+
         upload, chat = self._by_segment(hook)
         with flag, upload as upload_mock, chat as chat_mock, \
+             mock.patch.object(tempfile.TemporaryDirectory, "cleanup", cleanup), \
              mock.patch.object(pipeline.concurrent.futures, "wait", side_effect=interrupt), \
              mock.patch.object(pipeline, "MINIMAX_VIDEO_CONTEXT_TOKEN_BUDGET", 2000), \
              self._env(MINIMAX_VIDEO_CHUNK_SECONDS="4", MINIMAX_VIDEO_CHUNK_WORKERS="1"):
             with self.assertRaises(KeyboardInterrupt):
                 pipeline.analyze_video_mp4(
                     video, "key", "MiniMax-M3", duration=self.duration,
-                    cache_dir=self.cache, work_dir=self.work)
-        # The segment in flight was waited for; the other two never started.
+                    cache_dir=self.cache, work_dir=None)
+        # The scratch directory went only after the segment in flight had
+        # finished; the other two never started.
+        self.assertTrue(cleaned)
+        self.assertTrue(all(cleaned))
         self.assertEqual(upload_mock.call_count, 1)
         self.assertEqual(chat_mock.call_count, 1)
 
