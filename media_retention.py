@@ -206,6 +206,10 @@ def drive_backed_media(job: Path, files: list[Path], now: float) -> tuple[list[P
             relative = path.relative_to(job).as_posix()
             if MEDIA.fullmatch(relative) and relative not in backed_up and not DERIVED.fullmatch(relative):
                 return [], "unbacked_media"  # e.g. a newer source the backup never saw
+        paths, reason = _selected_media(job, files, source)
+        if not paths:
+            # Nothing to delete: skip the Drive round trips, they run under the queue database lock.
+            return [], reason
         try:
             verified = drive_storage.verify_remote_backup(state)
         except Exception:  # Unknown Drive state never authorizes a deletion.
@@ -214,8 +218,7 @@ def drive_backed_media(job: Path, files: list[Path], now: float) -> tuple[list[P
             return [], "drive_unverified"
     except (OSError, ValueError, KeyError, TypeError, RuntimeError):
         return [], "missing_or_invalid_evidence"
-    paths, reason = _selected_media(job, files, source)
-    return paths, ("eligible_drive_backed" if paths else reason)
+    return paths, "eligible_drive_backed"
 
 
 def _drive_videos_trashed(job: Path) -> bool:
@@ -261,7 +264,8 @@ def eligible_media(job: Path, cutoff: float, now: float | None = None) -> tuple[
         if result["source_sha256"] != pipeline.file_sha256(source):
             return [], "source_changed"
         # result.json is written only on completed analysis. Later writes extend retention.
-        if max(p.stat().st_mtime for p in files if p.name != AUDIT) >= cutoff:
+        # The lock file is created by read-only Drive checks, not by work on the job.
+        if max(p.stat().st_mtime for p in files if p.name not in {AUDIT, ".drive-upload.lock"}) >= cutoff:
             return [], "younger_than_retention"
     except (OSError, ValueError, KeyError, TypeError, RuntimeError):
         return [], "missing_or_invalid_evidence"
