@@ -18,6 +18,7 @@ import os
 import shutil
 import subprocess
 import tempfile
+import threading
 import time
 import unittest
 from pathlib import Path
@@ -206,6 +207,9 @@ class VideoChunkingTests(unittest.TestCase):
             "ANALYZE_VIDEO_DETAIL": "default",
             "MINIMAX_VIDEO_CHUNKING": "on",
             "MINIMAX_VIDEO_CHUNK_SECONDS": "",
+            # One by one: these mocks answer in call order. The parallel
+            # tests below ask for more workers themselves.
+            "MINIMAX_VIDEO_CHUNK_WORKERS": "1",
             "VIDEO_JOB_DEADLINE": "",
         }
         base.update(values)
@@ -544,6 +548,137 @@ class VideoChunkingTests(unittest.TestCase):
         self.assertEqual(chat.call_count, 1)
         self.assertEqual(upload.call_count, 1)
 
+    def _by_segment(self, chat_hook=None):
+        """Mocks that answer by segment, whatever order the calls arrive in."""
+        def upload(path: Path, api_key: str) -> str:
+            return Path(path).name
+
+        def chat(messages, *args, **kwargs):
+            name = messages[0]["content"][1]["video_url"]["url"].removeprefix("mm_file://")
+            if chat_hook is not None:
+                chat_hook(name)
+            return _answer(name, 0.0, 2.0)
+
+        return (
+            mock.patch.object(pipeline, "minimax_upload_video_understanding", side_effect=upload),
+            mock.patch.object(pipeline, "minimax_chat", side_effect=chat),
+        )
+
+    def test_segments_run_side_by_side_and_merge_in_timeline_order(self) -> None:
+        video = self._make_video()
+        # All three calls must be in flight together or the barrier breaks.
+        barrier = threading.Barrier(3)
+        upload, chat = self._by_segment(lambda name: barrier.wait(timeout=20))
+        with upload, chat as chat_mock, \
+             mock.patch.object(pipeline, "MINIMAX_VIDEO_CONTEXT_TOKEN_BUDGET", 2000), \
+             self._env(MINIMAX_VIDEO_CHUNK_SECONDS="4", MINIMAX_VIDEO_CHUNK_WORKERS="3"):
+            rows = pipeline.analyze_video_mp4(
+                video, "key", "MiniMax-M3", duration=self.duration,
+                cache_dir=self.cache, work_dir=self.work)
+        self.assertEqual(chat_mock.call_count, 3)
+        self.assertEqual([row["chunk_index"] for row in rows], [1, 1, 2, 2, 3, 3])
+        stamps = [row["timestamp"] for row in rows]
+        self.assertEqual(stamps, sorted(stamps))
+        self.assertEqual(
+            [row["chunk_source"] for row in rows[::2]],
+            ["chunk-0000.mp4", "chunk-0001.mp4", "chunk-0002.mp4"])
+        summary = self._merged_cache()["overall_summary"].splitlines()
+        self.assertEqual([line.split("：")[-1] for line in summary],
+                         ["chunk-0000.mp4", "chunk-0001.mp4", "chunk-0002.mp4"])
+
+    def test_worker_limit_caps_the_segments_in_flight(self) -> None:
+        video = self._make_video()
+        lock = threading.Lock()
+        state = {"now": 0, "peak": 0}
+
+        def hook(name: str) -> None:
+            with lock:
+                state["now"] += 1
+                state["peak"] = max(state["peak"], state["now"])
+            time.sleep(0.2)
+            with lock:
+                state["now"] -= 1
+
+        upload, chat = self._by_segment(hook)
+        with upload, chat, \
+             mock.patch.object(pipeline, "MINIMAX_VIDEO_CONTEXT_TOKEN_BUDGET", 2000), \
+             self._env(MINIMAX_VIDEO_CHUNK_SECONDS="4", MINIMAX_VIDEO_CHUNK_WORKERS="2"):
+            rows = pipeline.analyze_video_mp4(
+                video, "key", "MiniMax-M3", duration=self.duration,
+                cache_dir=self.cache, work_dir=self.work)
+        self.assertEqual(state["peak"], 2)
+        self.assertEqual(len(rows), 6)
+
+    def test_failed_segment_starts_no_further_segment_when_parallel(self) -> None:
+        video = self._make_video()
+        second_sent = threading.Event()
+        first_failed = threading.Event()
+        uploaded: list[str] = []
+
+        def upload(path: Path, api_key: str) -> str:
+            name = Path(path).name
+            uploaded.append(name)
+            if name == "chunk-0000.mp4":
+                # Fail only once the second segment is already on its way.
+                second_sent.wait(timeout=20)
+                first_failed.set()
+                raise RuntimeError("boom: 第一段上傳失敗")
+            second_sent.set()
+            return name
+
+        def chat(messages, *args, **kwargs):
+            # Still in flight while the first segment fails.
+            first_failed.wait(timeout=20)
+            time.sleep(0.3)
+            return _answer("第二段", 0.0, 2.0)
+
+        chat_mock = mock.MagicMock(side_effect=chat)
+        with mock.patch.object(pipeline, "minimax_upload_video_understanding", side_effect=upload), \
+             mock.patch.object(pipeline, "minimax_chat", chat_mock), \
+             mock.patch.object(pipeline, "MINIMAX_VIDEO_CONTEXT_TOKEN_BUDGET", 2000), \
+             self._env(MINIMAX_VIDEO_CHUNK_SECONDS="4", MINIMAX_VIDEO_CHUNK_WORKERS="2"):
+            with self.assertRaises(RuntimeError) as caught:
+                pipeline.analyze_video_mp4(
+                    video, "key", "MiniMax-M3", duration=self.duration,
+                    cache_dir=self.cache, work_dir=self.work)
+        self.assertIn("boom", str(caught.exception))
+        # The third segment was never sent; the second one finished and is cached.
+        self.assertEqual(sorted(uploaded), ["chunk-0000.mp4", "chunk-0001.mp4"])
+        self.assertEqual(chat_mock.call_count, 1)
+        upload_again, chat_again = self._by_segment()
+        with upload_again as upload_mock, chat_again as rerun, \
+             mock.patch.object(pipeline, "MINIMAX_VIDEO_CONTEXT_TOKEN_BUDGET", 2000), \
+             self._env(MINIMAX_VIDEO_CHUNK_SECONDS="4", MINIMAX_VIDEO_CHUNK_WORKERS="2"):
+            rows = pipeline.analyze_video_mp4(
+                video, "key", "MiniMax-M3", duration=self.duration,
+                cache_dir=self.cache, work_dir=self.work)
+        self.assertEqual(
+            sorted(Path(call.args[0]).name for call in upload_mock.call_args_list),
+            ["chunk-0000.mp4", "chunk-0002.mp4"])
+        self.assertEqual(rerun.call_count, 2)
+        self.assertEqual(len(rows), 6)
+
+    def test_cancelled_job_starts_no_further_segment_when_parallel(self) -> None:
+        self.addCleanup(execution_control.reset_execution_cancellation)
+        video = self._make_video()
+        both = threading.Barrier(2)
+
+        def hook(name: str) -> None:
+            both.wait(timeout=20)
+            execution_control.cancel_execution()
+
+        upload, chat = self._by_segment(hook)
+        with upload as upload_mock, chat as chat_mock, \
+             mock.patch.object(pipeline, "MINIMAX_VIDEO_CONTEXT_TOKEN_BUDGET", 2000), \
+             self._env(MINIMAX_VIDEO_CHUNK_SECONDS="4", MINIMAX_VIDEO_CHUNK_WORKERS="2"):
+            with self.assertRaises(execution_control.ExecutionCancelled):
+                pipeline.analyze_video_mp4(
+                    video, "key", "MiniMax-M3", duration=self.duration,
+                    cache_dir=self.cache, work_dir=self.work)
+        # Only the two segments already in flight were paid for.
+        self.assertEqual(upload_mock.call_count, 2)
+        self.assertEqual(chat_mock.call_count, 2)
+
     def test_chunking_off_keeps_the_previous_downgrade(self) -> None:
         video = self._make_video()
         chat = mock.MagicMock(side_effect=[_answer("摘要", 0.0, 2.0)])
@@ -571,6 +706,9 @@ class VideoChunkingTests(unittest.TestCase):
             {"MINIMAX_VIDEO_CHUNK_SECONDS": "-5"},
             {"MINIMAX_VIDEO_CHUNK_SECONDS": "1"},
             {"MINIMAX_VIDEO_CHUNK_SECONDS": "999999"},
+            {"MINIMAX_VIDEO_CHUNK_WORKERS": "0"},
+            {"MINIMAX_VIDEO_CHUNK_WORKERS": "5"},
+            {"MINIMAX_VIDEO_CHUNK_WORKERS": "many"},
         ]
         for values in cases:
             with self.subTest(values=values):

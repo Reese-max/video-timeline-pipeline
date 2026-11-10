@@ -267,7 +267,8 @@ class VideoGapFillCallTests(unittest.TestCase):
         plan = pipeline.VideoMp4ChunkPlan(True, 60, 2, 1, "default", "default", False, None)
         with mock.patch.object(pipeline, "split_video_mp4_into_chunks", return_value=chunks), \
                 mock.patch.object(pipeline, "minimax_upload_video_understanding", return_value="fid"), \
-                mock.patch.object(pipeline, "minimax_chat", side_effect=[answer(0, 30), answer(30, 60)]):
+                mock.patch.object(pipeline, "minimax_chat", side_effect=[answer(0, 30), answer(30, 60)]), \
+                mock.patch.dict("os.environ", {"MINIMAX_VIDEO_CHUNK_WORKERS": "1"}):  # answers come in call order
             rows = pipeline._analyze_video_mp4_chunked(self.video, "key", "MiniMax-M3",
                 duration=120, cache_dir=cache, fps_value=1, detail_value="default", timeout=60,
                 work_dir=self.root / "work", plan=plan, max_completion_tokens=1000)

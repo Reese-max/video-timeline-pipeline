@@ -66,6 +66,12 @@ which is never lowered for a segment. Segment length is
 `MINIMAX_VIDEO_CHUNK_SECONDS` (positive seconds, at least 60 and at most the
 budget-derived limit). An illegal `MINIMAX_VIDEO_CHUNK_SECONDS` is rejected before any
 call, even for a video short enough to be analysed in one piece.
+Up to `MINIMAX_VIDEO_CHUNK_WORKERS` segments (default 3, an integer from 1 to 4;
+`1` analyses them one by one, an illegal value is rejected the same way) are sent
+at the same time, so one host makes at most `MCP_MAX_PARALLEL_JOBS` times that
+many MiniMax requests at once. Once a segment fails or the job is cancelled or
+expires no further segment is sent; the ones already sent finish, are cached and
+are still billed.
 A single un-chunked call is bounded by the same budget: at 1 fps `high` covers
 about 584 s (9.7 min) and `default` about 2011 s (33 min); anything longer is
 split into segments of the length above.

@@ -4,7 +4,7 @@ import argparse
 import array
 import concurrent.futures
 import contextlib
-from contextvars import ContextVar
+from contextvars import ContextVar, copy_context
 import csv
 import ctypes
 import datetime
@@ -2949,6 +2949,7 @@ MINIMAX_VIDEO_CHUNK_BUDGET_RATIO = 0.9
 # A chunk shorter than a minute only buys extra uploads.
 VIDEO_MP4_MIN_CHUNK_SECONDS = 60
 VIDEO_MP4_CHUNK_DIRNAME = "minimax-chunks"
+MINIMAX_VIDEO_CHUNK_WORKERS_ENV = "MINIMAX_VIDEO_CHUNK_WORKERS"
 
 
 def video_mp4_chunking_mode() -> str:
@@ -2999,6 +3000,18 @@ def video_mp4_chunk_seconds(fps: float, detail: str) -> int:
     return value
 
 
+def video_mp4_chunk_workers() -> int:
+    """Segments of one long video analysed at the same time (1 = one by one)."""
+    raw = os.getenv(MINIMAX_VIDEO_CHUNK_WORKERS_ENV, "").strip()
+    try:
+        value = int(raw) if raw else 3
+    except ValueError:
+        value = 0
+    if not 1 <= value <= 4:
+        raise RuntimeError(f"{MINIMAX_VIDEO_CHUNK_WORKERS_ENV} 必須是 1 到 4 的整數。")
+    return value
+
+
 def video_mp4_total_tokens(fps: float, duration: float, detail: str) -> float:
     """Prompt tokens the whole video would cost at the requested fps and detail."""
     return fps * duration * minimax_video_tokens_per_frame(detail)
@@ -3036,6 +3049,7 @@ def plan_video_mp4_analysis(
     if video_mp4_chunking_mode() == MINIMAX_VIDEO_CHUNKING_ON:
         # Reading the override here also rejects an illegal value before any call.
         chunk_seconds = video_mp4_chunk_seconds(fps, requested)
+        video_mp4_chunk_workers()
         if (
             duration is not None
             and duration > 0
@@ -4440,10 +4454,12 @@ def _analyze_video_mp4_chunked(
     """Analyse a long video segment by segment and merge the answers.
 
     Each segment is sent with the requested fps and detail (never lowered) and
-    analysed on its own, so one segment stays inside the token budget. The
-    segments run in order; cancellation, deadlines and budget blocks keep
-    travelling upwards.
+    analysed on its own, so one segment stays inside the token budget. Up to
+    MINIMAX_VIDEO_CHUNK_WORKERS segments run at the same time; cancellation,
+    deadlines and budget blocks keep travelling upwards, and once one segment
+    fails no further segment is started.
     """
+    workers = video_mp4_chunk_workers()
     prompt = _video_mp4_prompt(duration)
     source_sha256 = file_sha256(video_path)
     cache_path: Path | None = None
@@ -4489,8 +4505,8 @@ def _analyze_video_mp4_chunked(
             video_path, chunk_dir, plan.chunk_seconds, duration=duration
         )
         per_frame = minimax_video_tokens_per_frame(detail_value)
-        merged: list[dict[str, Any]] = []
-        summaries: list[str] = []
+        # Every segment is sized before any is sent: side by side, a late
+        # oversized segment could no longer stop the earlier ones.
         for index, chunk in enumerate(chunks, start=1):
             tokens = fps_value * chunk.duration * per_frame
             if tokens > MINIMAX_VIDEO_CONTEXT_TOKEN_BUDGET:
@@ -4499,35 +4515,47 @@ def _analyze_video_mp4_chunked(
                     f"MiniMax 單次請求預算 {MINIMAX_VIDEO_CONTEXT_TOKEN_BUDGET}：關鍵畫面間隔太久，"
                     f"請把 {MINIMAX_VIDEO_CHUNK_SECONDS_ENV} 設得更小。"
                 )
-            # A cancelled or expired job must not pay for another segment.
-            check_video_mp4_chunk_budget(f"MiniMax 分段 {index}/{len(chunks)}")
-            print(
-                f"· MiniMax 分段分析 {index}/{len(chunks)}"
-                f"（{format_media_clock(chunk.start)}–{format_media_clock(chunk.end)}）"
-            )
-            chunk_work = chunk_dir / f"chunk-{index:04d}-work"
-            chunk_work.mkdir(parents=True, exist_ok=True)
-            observations, parsed, _file_id = _analyze_video_mp4_single(
-                chunk.path,
-                api_key,
-                model,
-                duration=chunk.duration,
-                cache_dir=cache_dir,
-                fps_value=fps_value,
-                detail_value=detail_value,
-                timeout=timeout,
-                work_dir=chunk_work,
-                max_completion_tokens=max_completion_tokens,
-                # The segment is identified by the source it came from and by
-                # where it starts and ends, not by the bytes of the cut file:
-                # a rerun then hits the cache even when a different ffmpeg
-                # writes the very same segment with different bytes.
-                cache_identity={
-                    "video_sha256": source_sha256,
-                    "chunk_start": round(chunk.start, 3),
-                    "chunk_end": round(chunk.end, 3),
-                },
-            )
+        stop = threading.Event()
+
+        def analyze_chunk(
+            index: int, chunk: VideoMp4Chunk
+        ) -> tuple[list[dict[str, Any]], dict[str, Any] | None] | None:
+            if stop.is_set():
+                # An earlier segment failed: this one is never uploaded or paid for.
+                return None
+            try:
+                # A cancelled or expired job must not pay for another segment.
+                check_video_mp4_chunk_budget(f"MiniMax 分段 {index}/{len(chunks)}")
+                print(
+                    f"· MiniMax 分段分析 {index}/{len(chunks)}"
+                    f"（{format_media_clock(chunk.start)}–{format_media_clock(chunk.end)}）"
+                )
+                chunk_work = chunk_dir / f"chunk-{index:04d}-work"
+                chunk_work.mkdir(parents=True, exist_ok=True)
+                observations, parsed, _file_id = _analyze_video_mp4_single(
+                    chunk.path,
+                    api_key,
+                    model,
+                    duration=chunk.duration,
+                    cache_dir=cache_dir,
+                    fps_value=fps_value,
+                    detail_value=detail_value,
+                    timeout=timeout,
+                    work_dir=chunk_work,
+                    max_completion_tokens=max_completion_tokens,
+                    # The segment is identified by the source it came from and by
+                    # where it starts and ends, not by the bytes of the cut file:
+                    # a rerun then hits the cache even when a different ffmpeg
+                    # writes the very same segment with different bytes.
+                    cache_identity={
+                        "video_sha256": source_sha256,
+                        "chunk_start": round(chunk.start, 3),
+                        "chunk_end": round(chunk.end, 3),
+                    },
+                )
+            except BaseException:
+                stop.set()
+                raise
             offset_chunk_timestamps(observations, chunk.start, duration)
             for observation in observations:
                 observation["chunk_index"] = index
@@ -4537,6 +4565,24 @@ def _analyze_video_mp4_chunked(
                 # for tracing.
                 observation["source_video"] = str(video_path)
                 observation["chunk_source"] = chunk.path.name
+            return observations, parsed
+
+        # Leaving the pool waits for the segments already sent, so nothing is
+        # cleaned up under a running upload; each finished one is cached.
+        with concurrent.futures.ThreadPoolExecutor(
+            max_workers=max(1, min(workers, len(chunks)))
+        ) as pool:
+            futures = [
+                # copy_context: the durable-transport fence must follow each segment.
+                pool.submit(copy_context().run, analyze_chunk, index, chunk)
+                for index, chunk in enumerate(chunks, start=1)
+            ]
+        merged: list[dict[str, Any]] = []
+        summaries: list[str] = []
+        for index, (chunk, future) in enumerate(zip(chunks, futures), start=1):
+            # Segments start in order, so the failure that set `stop` comes
+            # before every skipped (None) segment and is raised here first.
+            observations, parsed = future.result()
             merged.extend(observations)
             summary = (parsed or {}).get("overall_summary")
             if isinstance(summary, str) and summary.strip():
