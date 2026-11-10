@@ -6,6 +6,7 @@ import json
 import os
 import tempfile
 import unittest
+from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import patch
 
@@ -303,6 +304,171 @@ class DriveBackedCleanupTests(unittest.TestCase):
             self.assertEqual(audit["status"], "stopped_drive_changed")
             self.assertEqual(sorted(Path(name).as_posix() for name in audit["deleted_files"]),
                              ["previews/preview_000.jpg", "segments/segment_000.mp4"])
+
+
+class DriveVideoRetentionTests(unittest.TestCase):
+    """MCP_DRIVE_VIDEO_RETENTION_DAYS: old videos go to the Drive trash, the A report stays."""
+
+    def setUp(self):
+        self.now = 1_800_000_000.0
+
+    def listing(self, state, *, age_days=20.0, source_age_days=None, source_sha=None):
+        def created(days):
+            return datetime.fromtimestamp(self.now - days * 86400, timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+        rows = [{"id": "seg_1", "sha256Checksum": state["local_segments"][0]["sha256"],
+                 "createdTime": created(age_days)},
+                {"id": "report_1", "sha256Checksum": "f" * 64, "createdTime": created(age_days)}]
+        if "source_file" in state:
+            rows.append({"id": "src_1", "sha256Checksum": source_sha or state["source_file"]["sha256"],
+                         "createdTime": created(age_days if source_age_days is None else source_age_days)})
+        return rows
+
+    def run_cleanup(self, root, listing, *, days="14", apply=True, trash_error_on=None):
+        trashed = []
+
+        def trash(_token, file_id):
+            if file_id == trash_error_on:
+                raise drive_storage.DriveAPIError(500)
+            trashed.append(file_id)
+            return {}
+
+        # A tuple gives one listing per Drive call; an exception makes the call fail.
+        listed = listing if isinstance(listing, (Exception, tuple)) else None
+        with (patch.dict(os.environ, {"MCP_DRIVE_VIDEO_RETENTION_DAYS": days,
+                                      "GOOGLE_DRIVE_ACCESS_TOKEN": "token"}),
+              patch.object(drive_storage, "verify_remote_backup", return_value=False),
+              patch.object(drive_storage, "_list_children", side_effect=listed,
+                           return_value=listing) as list_children,
+              patch.object(drive_storage, "_trash_file", side_effect=trash)):
+            report = retention.cleanup(root, apply=apply, now=self.now)
+        return report, trashed, list_children
+
+    def status(self, job):
+        return json.loads((job / "drive-manifest.json").read_text(encoding="utf-8"))["status"]
+
+    def test_off_by_default_never_asks_drive(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw).resolve() / "mcp_jobs"
+            job, _, state = build_job(root, now=self.now)
+            report, trashed, list_children = self.run_cleanup(root, self.listing(state), days="")
+            list_children.assert_not_called()
+            self.assertEqual((report["drive_retention_days"], trashed, self.status(job)), (0, [], "drive_ready"))
+
+    def test_dry_run_counts_and_touches_nothing(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw).resolve() / "mcp_jobs"
+            job, _, state = build_job(root, now=self.now)
+            report, trashed, _ = self.run_cleanup(root, self.listing(state), apply=False)
+            self.assertEqual((report["drive_expired_jobs"], report["drive_trashed_files"]), (1, 0))
+            self.assertEqual((trashed, self.status(job)), ([], "drive_ready"))
+
+    def test_expired_videos_are_trashed_and_the_report_stays(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw).resolve() / "mcp_jobs"
+            job, manifest, state = build_job(root, now=self.now)
+            report, trashed, _ = self.run_cleanup(root, self.listing(state))
+            self.assertEqual(trashed, ["seg_1", "src_1"])  # report_1 is not in the manifest
+            self.assertEqual((report["drive_expired_jobs"], report["drive_trashed_files"], report["errors"]),
+                             (1, 2, []))
+            saved = json.loads((job / "drive-manifest.json").read_text(encoding="utf-8"))
+            self.assertEqual((saved["status"], saved["drive_trashed_at"]), ("drive_trashed", self.now))
+            self.assertFalse(drive_storage.backup_complete(saved, manifest["segments"],
+                                                           manifest["source"]["fingerprint"]))
+            # Trashing the Drive copy never removes a local one.
+            self.assertTrue((job / "source.mp4").exists())
+
+    def test_videos_stay_until_the_newest_upload_is_old_enough(self):
+        cases = {"young": {"age_days": 13.9}, "source_uploaded_later": {"source_age_days": 1.0}}
+        for case, ages in cases.items():
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as raw:
+                root = Path(raw).resolve() / "mcp_jobs"
+                job, _, state = build_job(root, now=self.now)
+                report, trashed, _ = self.run_cleanup(root, self.listing(state, **ages))
+                self.assertEqual((report["drive_expired_jobs"], trashed, self.status(job)), (0, [], "drive_ready"))
+
+    def test_a_file_the_user_replaced_is_left_alone(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw).resolve() / "mcp_jobs"
+            job, _, state = build_job(root, now=self.now)
+            _, trashed, _ = self.run_cleanup(root, self.listing(state, source_sha="0" * 64))
+            self.assertEqual((trashed, self.status(job)), (["seg_1"], "drive_trashed"))
+
+    def test_manifest_from_before_source_backups_trashes_its_segments(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw).resolve() / "mcp_jobs"
+            job, _, state = build_job(root, now=self.now)
+            state = {key: value for key, value in state.items() if key != "source_file"}
+            pipeline.write_json(job / "drive-manifest.json", state)
+            _, trashed, _ = self.run_cleanup(root, self.listing(state))
+            self.assertEqual((trashed, self.status(job)), (["seg_1"], "drive_trashed"))
+
+    def test_queued_job_keeps_its_drive_videos(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw).resolve() / "mcp_jobs"
+            job, _, state = build_job(root, now=self.now)
+            from job_queue import JobQueue
+            queue = JobQueue(root.parent / ".video-state", autostart=False)
+            try:
+                queue.submit("analyze", {"job_id": JOB}, JOB)
+                report, trashed, _ = self.run_cleanup(root, self.listing(state))
+            finally:
+                queue.close()
+            self.assertEqual((report["drive_expired_jobs"], trashed, self.status(job)), (0, [], "drive_ready"))
+
+    def test_interrupted_run_is_finished_by_the_next_one(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw).resolve() / "mcp_jobs"
+            job, _, state = build_job(root, now=self.now)
+            report, trashed, _ = self.run_cleanup(root, self.listing(state), trash_error_on="src_1")
+            self.assertEqual((trashed, self.status(job)), (["seg_1"], "drive_trashing"))
+            self.assertEqual([error["job_id"] for error in report["errors"]], [JOB])
+            # Drive no longer lists the trashed segment; a fresh timestamp must not stop the resume.
+            left = [row for row in self.listing(state, age_days=0.0) if row["id"] != "seg_1"]
+            report, trashed, _ = self.run_cleanup(root, left)
+            self.assertEqual((trashed, self.status(job), report["errors"]), (["src_1"], "drive_trashed", []))
+
+    def test_unknown_drive_state_trashes_nothing_and_is_not_an_error(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw).resolve() / "mcp_jobs"
+            job, _, _ = build_job(root, now=self.now)
+            report, trashed, _ = self.run_cleanup(root, drive_storage.DriveAPIError(503))
+            self.assertEqual((trashed, self.status(job), report["errors"]), ([], "drive_ready", []))
+            self.assertEqual(report["skipped"].get("drive_listing_failed"), 1)
+
+    def test_broken_manifest_is_skipped_without_failing_the_run(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw).resolve() / "mcp_jobs"
+            job, _, state = build_job(root, now=self.now)
+            pipeline.write_json(job / "drive-manifest.json", {**state, "files": [{"verified": True}]})
+            report, trashed, _ = self.run_cleanup(root, self.listing(state))
+            self.assertEqual((trashed, self.status(job), report["errors"]), ([], "drive_ready", []))
+
+    def test_job_busy_with_a_direct_analysis_keeps_its_drive_videos(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw).resolve() / "mcp_jobs"
+            job, _, state = build_job(root, now=self.now)
+            # A direct (not queued) analysis or restore holds only the job writer lock.
+            with pipeline.file_writer_lock(pipeline.job_writer_path(root, JOB)):
+                report, trashed, _ = self.run_cleanup(root, self.listing(state))
+            self.assertEqual((trashed, self.status(job), report["errors"]), ([], "drive_ready", []))
+
+    def test_upload_finished_after_the_shared_listing_is_seen_before_trashing(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw).resolve() / "mcp_jobs"
+            job, _, state = build_job(root, now=self.now)
+            stale, fresh = self.listing(state), self.listing(state, source_age_days=1.0)
+            report, trashed, list_children = self.run_cleanup(root, (stale, fresh))
+            self.assertEqual((trashed, self.status(job), report["drive_expired_jobs"]), ([], "drive_ready", 0))
+            self.assertEqual(list_children.call_count, 2)
+
+    def test_unreadable_setting_turns_drive_retention_off_without_failing_the_run(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw).resolve() / "mcp_jobs"
+            job, _, state = build_job(root, now=self.now)
+            report, trashed, list_children = self.run_cleanup(root, self.listing(state), days="fourteen")
+            list_children.assert_not_called()
+            self.assertEqual((trashed, self.status(job), report["errors"]), ([], "drive_ready", []))
+            self.assertEqual(report["skipped"].get("invalid_drive_retention_days"), 1)
 
 
 if __name__ == "__main__":

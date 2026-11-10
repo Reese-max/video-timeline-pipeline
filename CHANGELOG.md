@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- 新增：`MCP_DRIVE_VIDEO_RETENTION_DAYS`（未設或 `0` 為關閉）讓每小時的 `media_retention.py` 把上傳超過該天數的 Drive 影片（原片與分段，不含 A 報告）移到垃圾桶。只動資料夾清單中 SHA-256 仍與上傳時相同的檔案；排隊或執行中的工作不動，讀不到清單時不動，中斷後下次接續完成。
 - 新增：長片分段分析改為同時送出多段（`MINIMAX_VIDEO_CHUNK_WORKERS`，預設 3，1 到 4；設 `1` 回到逐段依序），合併結果仍依原片時間排序。所有分段先檢查預算再送出；某段失敗後不再開始新的分段，已開始的分段跑完、成功的寫入分段快取；工作被取消或逾期時進行中的請求照舊中斷，也不再開始新的分段。非法值在任何呼叫前報錯。
 - 修正：`probe_video_source` 遇到 yt-dlp 回傳 `null` 或非物件 JSON 時，改用清理後的 stderr 回報錯誤（無 stderr 時提供備援訊息），讓 Facebook 私人影片正確分類為 `LOGIN_REQUIRED_OR_PRIVATE`；probe 子程序遇到 `None` 以非零結束碼退出。YouTube probe 使用代理時先以最多 3 秒的 TCP 連線檢查，連線失敗立即回報 `PROXY_UNREACHABLE`，不耗盡 45 秒預算；實際下載流程不變。
 - 新增：下載錯誤共用分類器，提供穩定 `error_code`、是否可重試、繁中說明／下一步與截短原始錯誤；同步準備及背景失敗輪詢保留既有欄位並附上分類。新增唯讀 `probe_video_source`，共用下載格式與網路選項，最多 45 秒檢查 metadata／選定格式與估計大小，不建立工作或媒體，停用 yt-dlp 快取與 cookie 回寫；外部 runtime／外掛／瀏覽器 cookie 擷取的檔案副作用仍是已知限制。一般下載及 probe 保留主機 yt-dlp 設定檔及外掛行為，Facebook／Instagram 延續既有專用選項並共用 cookie 重試邏輯；一般下載改為擷取 stderr，保留分類所需的實際錯誤。工具描述要求轉述分類結果、不推測原因；新增離線回歸與 README 錯誤碼表。

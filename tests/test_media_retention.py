@@ -158,6 +158,17 @@ class RetentionTests(unittest.TestCase):
                 self.assertEqual(retention.cleanup(root, apply=True, now=self.now)["deleted_files"], 0)
                 self.assertTrue((job / "source.mp4").exists())
 
+    def test_job_whose_drive_videos_were_trashed_returns_to_the_7_day_rule(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve() / "mcp_jobs"
+            job = self.make_job(root)
+            state = job / "drive-manifest.json"
+            state.write_text('{"status": "drive_trashed"}', encoding="utf-8")
+            os.utime(state, (self.now - 8 * 86400,) * 2)
+            report = retention.cleanup(root, apply=True, now=self.now)
+            self.assertEqual((report["deleted_files"], report["errors"]), (6, []))
+            self.assertFalse((job / "source.mp4").exists())
+
     def test_cross_process_lock_blocks_cleanup_and_mcp_then_releases(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory).resolve() / "mcp_jobs"
