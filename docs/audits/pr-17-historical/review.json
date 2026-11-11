@@ -1,0 +1,14 @@
+{
+  "pr": 17,
+  "head": "6f4d4112d43a7a6d5aa5fe0bf7f07444f97aaac1",
+  "findings": [
+    {
+      "severity": "med",
+      "file": "docs/roadmap-v0.6.md",
+      "line": 19,
+      "issue": "The claimed r2 roadmap snapshot jumps directly to the optional v0.6 backlog, omitting issue #7's F0 prerequisites, delivery dependencies, and v0.3a-v0.5 release gates. Readers cannot determine the Email MVP's prerequisites or acceptance conditions from the repository plan. Restore these existing decisions as unverified planning, without implementing or enabling services."
+    }
+  ],
+  "fixed": true,
+  "summary": "Restored issue #7 r2's F0 prerequisites, delivery dependencies, and v0.3a-v0.5 release gates while preserving their historical, unverified planning status. Both documentation regression tests now pass after failing before the correction. The full suite remains at 31 passed and 8 pre-existing Windows SQLite cleanup failures, reproduced unchanged on parent dc421fe."
+}
