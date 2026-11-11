@@ -5718,6 +5718,15 @@ def library_read_connection(root: Path) -> sqlite3.Connection:
         raise
 
 
+_CATEGORY_MEMBERSHIP_SQL = (
+    "EXISTS (SELECT 1 FROM json_each("
+    "CASE WHEN json_valid(videos.categories) THEN "
+    "CASE WHEN json_type(videos.categories) = 'array' THEN videos.categories ELSE '[]' END "
+    "ELSE '[]' END) AS category_item "
+    "WHERE category_item.type = 'text' AND category_item.value = ?)"
+)
+
+
 def library_filter_sql(filters: dict[str, str] | None = None, *, events: bool = False) -> tuple[str, list[Any]]:
     """The CLI and Dashboard share exact categories and parameterized filters."""
     if filters is not None and not isinstance(filters, dict):
@@ -5737,7 +5746,7 @@ def library_filter_sql(filters: dict[str, str] | None = None, *, events: bool = 
             clauses.append(column + "=?")
         values.append(filters[field])
     if "category" in filters:
-        clauses.append("EXISTS (SELECT 1 FROM json_each(CASE WHEN json_valid(videos.categories) THEN videos.categories ELSE '[]' END) WHERE value=?)")
+        clauses.append(_CATEGORY_MEMBERSHIP_SQL)
         values.append(filters["category"])
     date_field = filters.get("date_field", "first_completed_at")
     if date_field not in {"first_completed_at", "published_at"}:
@@ -5839,8 +5848,7 @@ def _search_parts(connection: sqlite3.Connection, filters: SearchFilter, *, date
         clauses.append("events.job != ?")
         params.append(filters.exclude_job)
     if filters.category:
-        clauses.append("EXISTS (SELECT 1 FROM json_each(CASE WHEN json_valid(videos.categories) "
-                       "THEN videos.categories ELSE '[]' END) WHERE value = ?)")
+        clauses.append(_CATEGORY_MEMBERSHIP_SQL)
         params.append(filters.category)
     date_column = "videos.indexed_at" if filters.date_field == "indexed_at" else "m." + filters.date_field
     date_clauses = []
@@ -6014,7 +6022,10 @@ def pack_vector(vector: list[float]) -> bytes:
 
 def unpack_vector(blob: bytes) -> array.array:
     vector = array.array("f")
-    vector.frombytes(blob)
+    try:
+        vector.frombytes(blob)
+    except TypeError as exc:
+        raise ValueError("embedding vector 必須是 bytes") from exc
     return vector
 
 
@@ -6248,15 +6259,35 @@ def semantic_search(
             raise RuntimeError(f"索引裡沒有 {model} 的有效契約向量；先執行 `--embed`（舊向量可明確本機沿用）。")
         namespace, dimension = generation
         connection.create_function("content_hash", 1, content_hash, deterministic=True)
-        joins, projection, clause, params = _search_parts(connection, filters or SearchFilter())
+        active_filters = filters or SearchFilter()
+        joins, projection, clause, params = _search_parts(connection, active_filters)
+        indexed_joins = joins
         joins += ("JOIN embedding_cache c ON c.content_hash=content_hash(events.text) "
                   "AND c.text=events.text AND c.namespace=? ")
         rows = connection.execute(
             f"SELECT videos.title, videos.source, events.job, events.timestamp, events.kind, "
             f"events.text, substr(events.text,1,120), {projection}, c.dim, c.vector {joins} WHERE {clause}",
             [namespace, *params])
-        first = rows.fetchone()
+
+        def valid_rows():
+            for row in rows:
+                try:
+                    vector = validate_vectors([unpack_vector(row[9])], 1, dimension)[0]
+                    if row[8] != dimension:
+                        continue
+                except (ValueError, RuntimeError):
+                    continue  # Quarantined from retrieval; --audit reports the stored corruption.
+                yield row, vector
+
+        valid = valid_rows()
+        first = next(valid, None)
         if first is None:
+            # A real category miss is empty; an indexed category whose chunks
+            # lack this generation's vectors needs embedding or an explicit fallback.
+            if active_filters.category and connection.execute(
+                f"SELECT 1 {indexed_joins} WHERE {clause} LIMIT 1", params
+            ).fetchone():
+                raise RuntimeError(f"分類中的片段沒有 {model} 的有效契約向量；先執行 `--embed`。")
             return []
         with cost_root_scope(root):
             query_vector = validate_vectors(embed_texts([query], api_key, model, backend,
@@ -6264,13 +6295,7 @@ def semantic_search(
 
         def scored_rows():
             import itertools
-            for row in itertools.chain([first], rows):
-                try:
-                    vector = validate_vectors([unpack_vector(row[9])], 1, dimension)[0]
-                    if row[8] != dimension:
-                        continue
-                except (ValueError, RuntimeError):
-                    continue  # Quarantined from retrieval; --audit reports the stored corruption.
+            for row, vector in itertools.chain([first], valid):
                 hit = _search_hit(row[:8], query, "semantic")
                 hit["score"] = cosine(query_vector, vector)
                 yield hit
@@ -6873,9 +6898,11 @@ def list_videos(root: Path, category: str = "") -> int:
     grouped: dict[str, list[tuple[Any, ...]]] = {}
     for title, source, duration, raw in rows:
         try:
-            cats = json.loads(raw or "[]") or ["未分類"]
-        except json.JSONDecodeError:
-            cats = ["未分類"]
+            cats = json.loads(raw or "[]")
+        except (TypeError, json.JSONDecodeError):
+            cats = []
+        cats = [name for name in cats if isinstance(name, str)] if isinstance(cats, list) else []
+        cats = cats or ["未分類"]
         for name in cats:
             if category and category != name:
                 continue
@@ -10475,7 +10502,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--list", action="store_true", help="列出所有影片（可搭配 --category 篩選）")
     parser.add_argument("--show", help="依標題關鍵字顯示某支影片的摘要與章節")
-    parser.add_argument("--category", default="", help="限定分類；可搭配 --list 或 --search")
+    parser.add_argument("--category", default="", help="依完整分類標籤篩選；可搭配 --list、--search 或 --ask")
     parser.add_argument("--categorize", action="store_true", help="產生固定分類並歸類所有影片（讓 --digest 用程式碼分群）")
     parser.add_argument("--audit", action="store_true", help="健檢知識庫：找出壞掉的摘要、落後的索引與向量")
     parser.add_argument("--ops-reconcile", action="store_true", help="本機補登已完成的分析版本與事件；歷史內容不寄送")
