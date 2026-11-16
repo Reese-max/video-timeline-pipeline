@@ -40,7 +40,7 @@ from pathlib import Path
 from dataclasses import asdict, dataclass
 from typing import Any, Callable, NamedTuple
 
-from execution_control import DeadlineExceeded, ExecutionCancelled, OperationBudget, read_response
+from execution_control import DeadlineExceeded, ExecutionCancelled, OperationBudget, iter_response_chunks, read_response
 import brightdata_credits
 
 
@@ -1749,6 +1749,10 @@ class ApiRequestError(RuntimeError):
         self.retry_after = retry_after
 
 
+class ApiResponseFormatError(ApiRequestError):
+    """Malformed provider output has unknown cost and must not trigger a replay."""
+
+
 _DURABLE_TRANSPORT: ContextVar[Callable[[], bool] | None] = ContextVar("durable_transport", default=None)
 
 
@@ -1762,6 +1766,92 @@ def durable_transport_scope(before_request: Callable[[], bool]):
         _DURABLE_TRANSPORT.reset(token)
 
 
+def _api_header_secrets(headers: dict[str, str]) -> set[str]:
+    secrets = {value for key, value in headers.items() if key.lower() in {"authorization", "x-api-key", "api-key"}}
+    secrets.update(value.split(" ", 1)[-1] for value in list(secrets))
+    return secrets
+
+
+def _api_response_error(url: str, headers: dict[str, str], detail: str, *,
+                        status_code: int | None, durable_post: bool,
+                        retry_after: float | None = None) -> ApiRequestError:
+    detail = redact_values(detail, _api_header_secrets(headers))
+    label = f"HTTP {status_code}" if status_code is not None else "串流錯誤"
+    return ApiRequestError(
+        f"API {label}（{public_url(url)}）：{detail[:1200]}",
+        status_code=status_code, response_body=detail, retry_after=retry_after,
+        provider_outcome_unknown=durable_post and (status_code == 408 or
+                                                  (status_code is not None and status_code >= 500)),
+    )
+
+
+def _read_chat_sse(response: Any, budget: OperationBudget, *, timeout: int,
+                   url: str, headers: dict[str, str], durable_post: bool) -> dict[str, Any]:
+    """Fold completed SSE events into the usual chat response; reasoning stays separate."""
+    result: dict[str, Any] = {"choices": [{"finish_reason": None, "message": {"content": ""}}]}
+    content: list[str] = []
+    pending = b""
+    data: list[bytes] = []
+    event_type = b""
+    for chunk in iter_response_chunks(response, budget, read_timeout=timeout):
+        pending += chunk
+        while b"\n" in pending:
+            budget.check()
+            line, pending = pending.split(b"\n", 1)
+            line = line.removesuffix(b"\r")
+            if line:
+                field, separator, value = line.partition(b":")
+                if value.startswith(b" "):
+                    value = value[1:]
+                if field == b"data" and separator:
+                    data.append(value)
+                elif field == b"event":
+                    event_type = value
+                continue
+            if not data:
+                event_type = b""
+                continue
+            payload = b"\n".join(data)
+            data.clear()
+            if payload.strip() == b"[DONE]":
+                result["choices"][0]["message"]["content"] = "".join(content)
+                return result
+            try:
+                event = json.loads(payload.decode("utf-8"))
+                if not isinstance(event, dict):
+                    raise ValueError("SSE event must be an object")
+                base = event.get("base_resp") or {}
+                if ("error" in event or event_type == b"error" or event.get("type") == "error"
+                        or (isinstance(base, dict) and base.get("status_code") not in (None, 0, "0"))):
+                    error = event.get("error")
+                    error = error if isinstance(error, dict) else event
+                    status = next((value for obj in (error, event)
+                                   for key in ("status_code", "status", "code")
+                                   if isinstance(value := obj.get(key), int) and 400 <= value <= 599), None)
+                    raise _api_response_error(url, headers, json.dumps(event, ensure_ascii=False),
+                                              status_code=status, durable_post=durable_post)
+                choices = event.get("choices") or []
+                if choices:
+                    choice = choices[0]
+                    delta = choice.get("delta") or {}
+                    piece = delta.get("content")
+                    if piece is not None:
+                        if not isinstance(piece, str):
+                            raise ValueError("SSE content must be text")
+                        content.append(piece)
+                    if choice.get("finish_reason") is not None:
+                        result["choices"][0]["finish_reason"] = choice["finish_reason"]
+                if isinstance(event.get("usage"), dict):
+                    result["usage"] = event["usage"]
+            except (ValueError, UnicodeError, AttributeError, TypeError, KeyError, IndexError):
+                # Do not echo untrusted event data (including possible credentials).
+                raise ApiResponseFormatError("API 串流事件格式錯誤", provider_outcome_unknown=True) from None
+            event_type = b""
+    # EOF or [DONE] alone is not proof of completion: minimax_chat checks stop.
+    result["choices"][0]["message"]["content"] = "".join(content)
+    return result
+
+
 def request_json(
     url: str,
     headers: dict[str, str],
@@ -1770,6 +1860,7 @@ def request_json(
     body: bytes | None = None,
     timeout: int,
     attempts: int = 4,
+    stream: bool = False,
 ) -> dict[str, Any]:
     if attempts < 1 or timeout <= 0:
         raise ValueError("attempts and timeout must be positive")
@@ -1789,33 +1880,35 @@ def request_json(
             with provider_transport_attempt():
                 try:
                     with urllib.request.urlopen(request, timeout=budget.remaining(timeout)) as response:
+                        if stream:
+                            return _read_chat_sse(response, budget, timeout=timeout, url=url,
+                                                  headers=headers, durable_post=durable_post)
                         raw = read_response(response, budget, read_timeout=timeout)
                 except urllib.error.HTTPError as exc:
                     try:
                         detail = read_response(exc, budget, 4096, read_timeout=timeout).decode("utf-8", errors="replace")
                     finally:
                         exc.close()
-                    secrets = {value for key, value in headers.items() if key.lower() in {"authorization", "x-api-key", "api-key"}}
-                    secrets.update(value.split(" ", 1)[-1] for value in list(secrets))
-                    detail = redact_values(detail, secrets)
                     # Classify only after reading and masking the provider's
                     # business code, while this attempt still owns its reserve.
-                    raise ApiRequestError(
-                        f"API HTTP {exc.code}（{public_url(url)}）：{detail[:1200]}",
-                        status_code=exc.code, response_body=detail, retry_after=retry_delay(exc, delay),
-                        provider_outcome_unknown=durable_post and (exc.code == 408 or exc.code >= 500),
-                    ) from exc
-                except (urllib.error.URLError, TimeoutError) as exc:
+                    raise _api_response_error(url, headers, detail, status_code=exc.code,
+                                              durable_post=durable_post, retry_after=retry_delay(exc, delay)) from None
+                except (urllib.error.URLError, TimeoutError, ConnectionError, http.client.IncompleteRead) as exc:
                     reason = getattr(exc, "reason", None) or type(exc).__name__
-                    raise ApiRequestError(f"API 網路錯誤：{reason}", provider_outcome_unknown=True) from exc
+                    reason = redact_values(str(reason), _api_header_secrets(headers))
+                    raise ApiRequestError(f"API 網路錯誤：{reason}", provider_outcome_unknown=True) from None
             break
+        except ApiResponseFormatError:
+            raise
         except ApiRequestError as exc:
             if durable_post and exc.provider_outcome_unknown:
                 raise
             category = classify_error(exc, exc.status_code, exc.response_body)
-            if exc.status_code in RETRY_STATUS and is_retryable(category) and attempt < attempts:
+            if (exc.status_code in RETRY_STATUS or (stream and exc.status_code is None
+                    and not exc.provider_outcome_unknown)) and is_retryable(category) and attempt < attempts:
                 wait = exc.retry_after if exc.retry_after is not None else delay
-                print(f"! API HTTP {exc.status_code}，{wait:.0f} 秒後重試（{attempt}/{attempts - 1}）")
+                label = f"HTTP {exc.status_code}" if exc.status_code is not None else "串流錯誤"
+                print(f"! API {label}，{wait:.0f} 秒後重試（{attempt}/{attempts - 1}）")
                 budget.sleep(wait)
                 delay *= 2
                 continue
@@ -1835,6 +1928,10 @@ def request_json(
 
 def post_json(url: str, headers: dict[str, str], body: bytes, timeout: int = 180) -> dict[str, Any]:
     return request_json(url, headers, method="POST", body=body, timeout=timeout)
+
+
+def post_json_stream(url: str, headers: dict[str, str], body: bytes, timeout: int = 180) -> dict[str, Any]:
+    return request_json(url, headers, method="POST", body=body, timeout=timeout, stream=True)
 
 
 def get_json(url: str, headers: dict[str, str]) -> dict[str, Any]:
@@ -2560,6 +2657,7 @@ def minimax_chat(
     thinking: str | None = None,
     operation: str = "chat.completions",
     max_completion_tokens: int | None = None,
+    stream: bool = False,
 ) -> str:
     # 預設不帶 max_tokens：小預算常在答案輸出前就被 <think> 吃完。
     # 但完全不帶時 MiniMax 會套用很小的伺服器預設輸出上限，長答案（整片影片分析）
@@ -2572,6 +2670,8 @@ def minimax_chat(
     }
     if thinking:
         payload["thinking"] = {"type": thinking}
+    if stream:
+        payload["stream"] = True
     if max_tokens:
         payload["max_tokens"] = max_tokens
     if max_completion_tokens:
@@ -2586,7 +2686,7 @@ def minimax_chat(
         request_units=prompt_units,
         response_units=int(max_completion_tokens or max_tokens or 0),
     ):
-        raw = post_json(
+        raw = (post_json_stream if stream else post_json)(
             minimax_endpoint(),
             {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
             json.dumps(payload, ensure_ascii=False).encode("utf-8"),
@@ -3657,6 +3757,7 @@ def _fill_video_event_gaps(
             model,
             timeout=max(1, timeout // 2),  # optional extra pass: keep the whole job inside its deadline
             max_completion_tokens=max_completion_tokens,
+            stream=True,
         )
         found = _parse_video_mp4_events(parse_json_object(response))
     except (DeadlineExceeded, ExecutionCancelled):
@@ -3795,6 +3896,7 @@ def _analyze_video_mp4_core(
             model,
             timeout=timeout,
             max_completion_tokens=max_completion_tokens,
+            stream=True,
         )
 
     def incomplete_result(
