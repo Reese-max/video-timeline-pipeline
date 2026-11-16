@@ -1683,6 +1683,9 @@ def _extract_gap_audio(source_path: Path, start: float, end: float, dest: Path) 
 
 
 RETRY_STATUS = {408, 425, 429, 500, 502, 503, 504}
+# MiniMax 529 (code 2064, "retry after a short wait") came back on ~30% of A1 video calls;
+# two spaced retries before the caller falls back to speech-only. 529 is not billed.
+OVERLOAD_RETRY_DELAYS = (30.0, 90.0)
 # urllib 預設送 Python-urllib/3.x，Groq 前面的 Cloudflare 會直接 403（error code 1010）。
 USER_AGENT = "video-library-pipeline/1.0"
 
@@ -1873,6 +1876,7 @@ def request_json(
     read_timeout = min(timeout, stream_idle_timeout_seconds()) if stream else timeout
     durable_post = method.upper() == "POST" and _DURABLE_TRANSPORT.get() is not None
     delay = 2.0
+    overload_retries = 0
     for attempt in range(1, attempts + 1):
         request = urllib.request.Request(url, data=body, headers=headers, method=method)
         try:
@@ -1907,6 +1911,13 @@ def request_json(
             if durable_post and exc.provider_outcome_unknown:
                 raise
             category = classify_error(exc, exc.status_code, exc.response_body)
+            if (exc.status_code == 529 and is_retryable(category)
+                    and overload_retries < len(OVERLOAD_RETRY_DELAYS) and attempt < attempts):
+                wait = OVERLOAD_RETRY_DELAYS[overload_retries]
+                overload_retries += 1
+                print(f"! API HTTP 529（供應商過載），{wait:.0f} 秒後重試（{overload_retries}/{len(OVERLOAD_RETRY_DELAYS)}）")
+                budget.sleep(wait)
+                continue
             if (exc.status_code in RETRY_STATUS or (stream and exc.status_code is None
                     and not exc.provider_outcome_unknown)) and is_retryable(category) and attempt < attempts:
                 wait = exc.retry_after if exc.retry_after is not None else delay
