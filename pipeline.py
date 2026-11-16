@@ -1868,6 +1868,9 @@ def request_json(
     # silently cut to the 900s default; VIDEO_API_TIMEOUT_SECONDS and the job deadline still win.
     budget = OperationBudget("API request", max(900, timeout), "VIDEO_API_TIMEOUT_SECONDS")
     headers = {"User-Agent": USER_AGENT, **headers}
+    # A live stream sends events every few seconds; silence this long means a dead
+    # connection, so give up and retry instead of waiting out the whole request timeout.
+    read_timeout = min(timeout, stream_idle_timeout_seconds()) if stream else timeout
     durable_post = method.upper() == "POST" and _DURABLE_TRANSPORT.get() is not None
     delay = 2.0
     for attempt in range(1, attempts + 1):
@@ -1879,9 +1882,9 @@ def request_json(
                 raise ExecutionCancelled("Durable task cancelled or lease expired")
             with provider_transport_attempt():
                 try:
-                    with urllib.request.urlopen(request, timeout=budget.remaining(timeout)) as response:
+                    with urllib.request.urlopen(request, timeout=budget.remaining(read_timeout)) as response:
                         if stream:
-                            return _read_chat_sse(response, budget, timeout=timeout, url=url,
+                            return _read_chat_sse(response, budget, timeout=read_timeout, url=url,
                                                   headers=headers, durable_post=durable_post)
                         raw = read_response(response, budget, read_timeout=timeout)
                 except urllib.error.HTTPError as exc:
@@ -1924,6 +1927,11 @@ def request_json(
         return result
     except (json.JSONDecodeError, UnicodeDecodeError) as exc:
         raise ApiRequestError(f"API 回應不是 JSON：{raw[:500]!r}", provider_outcome_unknown=True) from exc
+
+
+def stream_idle_timeout_seconds() -> int:
+    raw = os.getenv("MINIMAX_STREAM_IDLE_TIMEOUT_SECONDS", "").strip()
+    return max(10, int(raw) if raw else 300)
 
 
 def post_json(url: str, headers: dict[str, str], body: bytes, timeout: int = 180) -> dict[str, Any]:
@@ -2668,7 +2676,8 @@ def minimax_chat(
         "temperature": 0.1,
         "reasoning_split": True,
     }
-    if thinking:
+    # M3.1-Flash only accepts adaptive thinking; "disabled" is a 400 (code 2013).
+    if thinking and not (thinking == "disabled" and model.lower().startswith("minimax-m3.1-flash")):
         payload["thinking"] = {"type": thinking}
     if stream:
         payload["stream"] = True

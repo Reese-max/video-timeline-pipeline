@@ -3,6 +3,7 @@
 ## Unreleased
 
 - 修正：MiniMax 整支影片分析與畫面事件補漏改用 SSE 串流接收，避免長回應在非串流模式下遺失；保留完成狀態檢查、成本守衛、重試、取消與總時限，摘要及問答維持非串流。
+- 修正：串流超過 `MINIMAX_STREAM_IDLE_TIMEOUT_SECONDS`（預設 300 秒）收不到資料就中斷並重試，不再等滿影片請求的 3600 秒；`MINIMAX_MODEL=MiniMax-M3.1-Flash` 時摘要不送 `thinking: disabled`（該模型會回 HTTP 400 code 2013）。
 
 - 新增：`MCP_PREPARED_RETENTION_DAYS`（未設或 `0` 為關閉）讓每小時的 `media_retention.py` 也清理「只準備、沒有分析結果」的工作：工作內最後寫入與最後使用都超過該天數、播放連結已過期時，刪除本機影片、分段與預覽圖，紀錄保留。原本的清理規則都要求分析完成，這類工作會一直留在磁碟上。排隊中、執行中或分析失敗待處理的工作照舊不動。
 - 修正：每小時的 `media_retention.py` 不再為「本機已沒有影片可刪」的工作逐一向 Google Drive 查驗備份。這些查驗是在佇列資料庫寫入鎖內做的，工作一多整輪要一分多鐘，期間服務重啟後 `/health` 會回 500（`database is locked`）。另外，Drive 檢查留下的 `.drive-upload.lock` 不再被當成工作的新寫入而重新起算 7 天保留期。
