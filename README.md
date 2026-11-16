@@ -79,7 +79,7 @@ python pipeline.py --video 'D:\path\to\video.mp4' --dry-run --slide-extractor st
 不需要 Node 前端建置；一般 CLI 不需安裝 Web 套件。使用既有資料目錄時，先停止該目錄的寫入工作、備份 `library.db`／`operations.db`，再明確初始化：
 
 ```powershell
-python -m pip install -r requirements-web.txt
+python -X utf8 -m pip install -r requirements-web.txt
 python pipeline.py --root 'C:\Data\VideoLibrary' --web-init
 python pipeline.py --root 'C:\Data\VideoLibrary' --serve
 ```
@@ -215,7 +215,7 @@ cd /home/box/video-timeline-pipeline
 ```powershell
 cd 'C:\Users\Administrator\video-timeline-pipeline'
 python -m venv .venv
-.\.venv\Scripts\python -m pip install -r requirements.txt
+.\.venv\Scripts\python -X utf8 -m pip install -r requirements.txt
 ```
 
 啟動本機 MCP：
