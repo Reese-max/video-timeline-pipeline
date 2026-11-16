@@ -294,7 +294,7 @@ class CostAttemptTests(unittest.TestCase):
         # Field test c9289f71a482: four MiniMax 529s were each booked at the 0.63 USD reservation.
         bodies = {529: b'{"type":"error","error":{"type":"overloaded_error","message":"busy"}}',
                   429: b'{"error":{"code":"rate_limit"}}'}
-        for code, attempts in ((529, 1), (429, 4)):
+        for code, attempts, waits in ((529, 3, [30.0, 90.0]), (429, 4, [0.0, 0.0, 0.0])):
             with self.subTest(code=code), tempfile.TemporaryDirectory() as directory:
                 root = Path(directory)
                 def reject(*_args, **_kwargs):
@@ -302,17 +302,42 @@ class CostAttemptTests(unittest.TestCase):
                         "Provider rejected", {"Retry-After": "0"}, io.BytesIO(bodies[code]))
                 with cost_tracker.cost_root_scope(root), \
                         patch.object(urllib.request, "urlopen", side_effect=reject) as sender, \
-                        patch.object(pipeline.OperationBudget, "sleep", lambda *_: None):
+                        patch.object(pipeline.OperationBudget, "sleep") as sleep:
                     with self.assertRaises(pipeline.ApiRequestError):
                         pipeline.minimax_chat([{"role": "user", "content": "test"}], "offline-placeholder",
                                               "MiniMax-M3", max_completion_tokens=524288)
-                # 529 fails fast so the analysis falls back to speech-only; 429 keeps its bounded retries.
+                # MiniMax's 529 says "retry after a short wait": two spaced retries, then speech-only.
                 self.assertEqual(sender.call_count, attempts)
+                self.assertEqual([c.args[0] for c in sleep.call_args_list], waits)
                 usage = rows(root, "usage_costs")
                 self.assertEqual([(row["status"], row["cost_status"], row["estimated_micro_usd"]) for row in usage],
                                  [("failed", "zero_rejected", 0)] * attempts)
                 status = cost_tracker.get_budget_status(root)
                 self.assertEqual((status["spent_micro_usd"], status["outstanding_micro_usd"]), (0, 0))
+
+    def test_overloaded_once_then_answers(self):
+        # A1 2026-11-16: 4 of 13 MiniMax video calls got 529 (code 2064) and fell back to speech-only.
+        error = urllib.error.HTTPError("https://api.minimax.io/v1/chat/completions", 529, "Overloaded", {},
+                                       io.BytesIO(b'{"type":"error","error":{"type":"overloaded_error"}}'))
+        result = Response({"choices": [{"finish_reason": "stop", "message": {"content": "ok"}}]})
+        with patch.object(urllib.request, "urlopen", side_effect=[error, result]) as sender, \
+                patch.object(pipeline.OperationBudget, "sleep") as sleep:
+            self.assertEqual(pipeline.minimax_chat([{"role": "user", "content": "test"}],
+                                                 "offline-placeholder", "MiniMax-M3"), "ok")
+        self.assertEqual(sender.call_count, 2)
+        sleep.assert_called_once_with(30.0)
+        self.assertEqual([row["safe_error"] for row in rows(self.root, "usage_costs")], ["provider_5xx", None])
+
+    def test_overloaded_status_with_exhausted_quota_is_not_retried(self):
+        def reject(*_args, **_kwargs):
+            raise urllib.error.HTTPError("https://api.minimax.io/v1/chat/completions", 529, "Overloaded", {},
+                                         io.BytesIO(b'{"error":{"type":"insufficient_quota"}}'))
+        with patch.object(urllib.request, "urlopen", side_effect=reject) as sender, \
+                patch.object(pipeline.OperationBudget, "sleep") as sleep:
+            with self.assertRaises(pipeline.ApiRequestError):
+                pipeline.minimax_chat([{"role": "user", "content": "test"}], "offline-placeholder", "MiniMax-M3")
+        self.assertEqual(sender.call_count, 1)
+        sleep.assert_not_called()
 
     def test_known_actual_cost_wins_over_a_rejection_flag(self):
         cost_tracker.record_usage(self.root, provider="minimax", operation="chat.completions", status="failed",
