@@ -328,5 +328,28 @@ class MinimaxStreamingTests(unittest.TestCase):
         self.assertEqual(self.chat(), "joined")
 
 
+    def test_stream_idle_read_is_capped_below_long_request_timeout(self):
+        response = self.respond(completion(), chunk_size=65536)
+        self.assertEqual(self.chat(timeout=3600), "答案")
+        self.assertEqual(self.sender.call_args.kwargs["timeout"], 300)
+        self.assertTrue(response.socket.settimeout.call_args_list)
+        self.assertTrue(all(c.args[0] == 300 for c in response.socket.settimeout.call_args_list))
+
+    def test_stream_idle_cap_is_configurable(self):
+        os.environ["MINIMAX_STREAM_IDLE_TIMEOUT_SECONDS"] = "45"
+        response = self.respond(completion(), chunk_size=65536)
+        self.assertEqual(self.chat(timeout=3600), "答案")
+        self.assertEqual(self.sender.call_args.kwargs["timeout"], 45)
+        self.assertTrue(all(c.args[0] == 45 for c in response.socket.settimeout.call_args_list))
+
+    def test_flash_model_omits_unsupported_disabled_thinking(self):
+        reply = {"choices": [{"finish_reason": "stop", "message": {"content": "ok"}}]}
+        for model, expected in (("MiniMax-M3.1-Flash", None), ("MiniMax-M3", {"type": "disabled"})):
+            with patch.object(pipeline, "post_json", return_value=reply) as sender:
+                self.assertEqual(pipeline.minimax_chat([{"role": "user", "content": "q"}], KEY, model,
+                                                       thinking="disabled"), "ok")
+            self.assertEqual(json.loads(sender.call_args.args[2]).get("thinking"), expected, model)
+
+
 if __name__ == "__main__":
     unittest.main()
