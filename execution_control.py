@@ -5,7 +5,7 @@ import math
 import os
 import threading
 import time
-from typing import Any
+from typing import Any, Iterator
 
 
 class DeadlineExceeded(RuntimeError):
@@ -72,6 +72,11 @@ class OperationBudget:
 
 
 def read_response(response: Any, budget: OperationBudget, limit: int | None = None, *, read_timeout: float | None = None) -> bytes:
+    return b"".join(iter_response_chunks(response, budget, limit, read_timeout=read_timeout))
+
+
+def iter_response_chunks(response: Any, budget: OperationBudget, limit: int | None = None, *,
+                         read_timeout: float | None = None) -> Iterator[bytes]:
     """Read real HTTP streams in bounded chunks and re-check the shared deadline.
 
     urlopen/DNS cannot be forcibly cancelled by Python threads. The job supervisor
@@ -82,8 +87,8 @@ def read_response(response: Any, budget: OperationBudget, limit: int | None = No
     if not callable(read1):
         raw = response.read(limit) if limit is not None else response.read()
         budget.check()
-        return raw
-    chunks: list[bytes] = []
+        yield raw
+        return
     length = 0
     while limit is None or length < limit:
         remaining = budget.remaining(read_timeout)
@@ -96,6 +101,5 @@ def read_response(response: Any, budget: OperationBudget, limit: int | None = No
         budget.check()
         if not chunk:
             break
-        chunks.append(chunk)
         length += len(chunk)
-    return b"".join(chunks)
+        yield chunk
