@@ -87,17 +87,18 @@
                         border-radius: 10px; font-size: .88rem; }
     #gaps li::before { content: "⚠ "; color: var(--warn); }
     /* Evidence timeline */
-    #evidence { display: grid; gap: 10px; list-style: none; padding: 0; }
+    #evidence { display: grid; gap: 6px; list-style: none; padding: 0; }
     #evidence li, #library-list li { padding: 12px 14px; border: 1px solid var(--border); border-radius: 12px; background: var(--surface); }
+    #evidence li { padding: 6px 12px; }  /* 兩行一列（時間碼＋文字），約 64px 高 */
     #evidence li > button:first-child, #evidence li > span:first-child {
-      min-height: 32px; padding: 4px 12px; border-radius: 999px; background: var(--accent-soft); color: var(--accent);
+      min-height: 28px; padding: 2px 10px; border-radius: 999px; background: var(--accent-soft); color: var(--accent);
       font-variant-numeric: tabular-nums; font-weight: 650; font-size: .88rem; display: inline-flex; align-items: center; }
     #evidence li > button:first-child::before { content: "▶"; font-size: .65rem; margin-right: 6px; }
     #evidence li > span:first-child { background: transparent; border: 1px dashed var(--border-strong); color: var(--muted); }
     #library-list { list-style: none; padding: 0; display: grid; gap: 12px; }
     #library-list p { white-space: pre-wrap; }
-    #evidence p { white-space: pre-wrap; margin-top: 8px; line-height: 1.6; }
-    #evidence p.muted { margin-top: 6px; font-size: .84rem; }
+    #evidence p { white-space: pre-wrap; margin-top: 2px; line-height: 1.5; }
+    #evidence p.muted { margin-top: 0; font-size: .84rem; }
     .badge { font-size: .78rem; font-weight: 650; margin-left: 8px; padding: 3px 10px; border-radius: 999px;
              background: var(--speech-soft); color: var(--speech); vertical-align: middle; }
     .badge.visual { background: var(--visual-soft); color: var(--visual); }
@@ -575,7 +576,7 @@ function applyAnalysis(result) {
     const observation = row.data || {}, details = [];
     if (Array.isArray(observation.visible_text) && observation.visible_text.length) details.push("畫面文字：" + observation.visible_text.join("；"));
     if (typeof observation.confidence === "number") details.push("模型自評信心：" + observation.confidence + "（不代表已人工核對）");
-    evidenceRows.push({ type: "visual", timestamp: numericTime(row.timestamp), timestamp_reliable: observation.timestamp_reliable, end: null, text: String(observation.visual_summary || ""), detail: details.join("\n") });
+    evidenceRows.push({ type: "visual", timestamp: numericTime(row.timestamp), timestamp_reliable: observation.timestamp_reliable, end: null, text: String(observation.visual_summary || ""), detail: details.join(" · ") });
   }
   evidenceRows.sort((a, b) => (a.timestamp ?? Infinity) - (b.timestamp ?? Infinity));
   const gaps = [...(result.quality?.reasons || []), ...(result.quality?.warnings || []), ...(result.errors || [])];
