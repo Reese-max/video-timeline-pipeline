@@ -185,11 +185,14 @@
 <section id="analysis-report" hidden aria-label="A summary and report">
   <h2>A 摘要／報告（未獨立驗證作者或原片）</h2><p id="report-state" role="status"></p>
   <a id="report-link" hidden download="A_server_analysis.md">下載實際 A_server_analysis.md</a>
-  <label>明確提交的摘要<textarea id="report-summary"></textarea></label>
-  <label>來源／未知註記<textarea id="report-provenance"></textarea></label>
-  <button id="finalize-report" type="button">保存 caller_submitted 摘要</button>
   <button id="copy-merge" type="button" disabled>複製已核對報告的合併指令</button>
-  <textarea id="merge-prompt" readonly aria-label="Merge instruction"></textarea>
+  <textarea id="merge-prompt" readonly aria-label="Merge instruction" hidden></textarea>
+  <details id="report-manual">
+    <summary>手動提交摘要（選用）</summary>
+    <label>明確提交的摘要<textarea id="report-summary"></textarea></label>
+    <label>來源／未知註記<textarea id="report-provenance"></textarea></label>
+    <button id="finalize-report" type="button">保存 caller_submitted 摘要</button>
+  </details>
 </section>
 <script>
 "use strict";
@@ -878,7 +881,7 @@ async function copyText(text, box, version) {
     if (typeof navigator !== "undefined" && navigator.clipboard?.writeText) { await navigator.clipboard.writeText(text); return true; }
   } catch {}
   if (!current(version)) return null;  // The video changed while the host answered; leave the new UI alone.
-  box.value = text; box.focus?.(); box.select?.();
+  box.hidden = false; box.value = text; box.focus?.(); box.select?.();  // 合併指令框平時隱藏，剪貼簿被拒才露出來讓人手動複製
   try { return typeof document.execCommand === "function" && document.execCommand("copy") === true; }
   catch { return false; }
 }
