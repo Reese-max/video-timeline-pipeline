@@ -209,9 +209,11 @@ let data = null, analysisResult = null, activeOperation = null, driveOperation =
 let driveActing = false, driveConfigured = true, autoStartArmed = false, closed = false;
 // 同一 job 在此介面生命週期只自動啟動一次；重複 prepare 或失敗後改走手動按鈕（送出冪等由伺服器去重）。
 const autoStartedJobs = new Set();
+// 首屏只放前 10 筆，避免 ChatGPT 內嵌卡被證據撐到好幾個螢幕高；「顯示更多」一次補 50 筆。
+const EVIDENCE_PAGE = 10, EVIDENCE_MORE = 50;
 let lastPersisted = "";
 let stateWrites = Promise.resolve();
-let evidenceRows = [], shownCount = 60, selectedSegment = 0, pendingSeek = null;
+let evidenceRows = [], shownCount = EVIDENCE_PAGE, selectedSegment = 0, pendingSeek = null;
 let currentPrepareId = null;
 const supersededPrepares = new Set();
 const saved = host()?.widgetState?.privateContent || {};
@@ -515,7 +517,7 @@ function renderPrepared(prepared) {
     generation++; pollEpoch++; clearTimeout(pollTimer);
     stopDrivePolling(); driveConfigured = true;
     data = prepared; analysisResult = null; activeOperation = null; driveOperation = null; acting = false; driveActing = false; sending = false; uncertainStart = false;
-    evidenceRows = []; shownCount = 60;
+    evidenceRows = []; shownCount = EVIDENCE_PAGE;
     $("findings").hidden = true; $("drive-handoff").hidden = true; $("drive-prompt").value = "";
     $("operation").hidden = true; status("");
     $("filter").value = saved.jobId === prepared.job_id && ["all", "speech", "visual"].includes(saved.filter) ? saved.filter : "all";
@@ -720,7 +722,7 @@ function clearExpiredMedia(jobId) {
   resetLibrary();
   // Keep only the job identity for remount recovery; all previous media and evidence are stale.
   data = { job_id: jobId, segments: [] };
-  analysisResult = null; evidenceRows = []; shownCount = 60; pendingSeek = null;
+  analysisResult = null; evidenceRows = []; shownCount = EVIDENCE_PAGE; pendingSeek = null;
   driveOperation = null; stopDrivePolling();
   $("media").hidden = true; $("player").removeAttribute("src"); $("player").load();
   $("segment-link").hidden = true; $("segment-link").removeAttribute("href");
@@ -1102,8 +1104,8 @@ $("refresh").addEventListener("click", () => {
 $("segment").addEventListener("change", () => selectSegment(Number($("segment").value)));
 $("player").addEventListener("loadedmetadata", () => { if (pendingSeek !== null) { $("player").currentTime = pendingSeek; pendingSeek = null; } });
 $("player").addEventListener("error", () => status("此片段暫時無法播放；可在新分頁開啟，或重新取得工作狀態。證據文字仍可查看。"));
-$("filter").addEventListener("change", () => { shownCount = 60; renderEvidence(); saveState(); });
-$("more").addEventListener("click", () => { shownCount += 60; renderEvidence(); });
+$("filter").addEventListener("change", () => { shownCount = EVIDENCE_PAGE; renderEvidence(); saveState(); });
+$("more").addEventListener("click", () => { shownCount += EVIDENCE_MORE; renderEvidence(); });
 updateButtons();
 ensureBridge().catch(() => {});
 if (typeof ResizeObserver === "function") {
