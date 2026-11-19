@@ -46,7 +46,7 @@ function harness({ output = job('first'), saved = {}, snapshot, respond, bridge 
     Promise.resolve().then(async () => {
       try {
         if (!bridge) throw Object.assign(new Error('Unsupported bridge'), { code: -32601 });
-        if (message.method === 'ui/initialize') { assert.equal(message.params.appInfo?.name, 'video-timeline-pipeline'); assert.equal(message.params.appInfo?.version, '21'); assert.equal(message.params.protocolVersion, '2026-01-26'); assert.equal(typeof message.params.appCapabilities, 'object'); }
+        if (message.method === 'ui/initialize') { assert.equal(message.params.appInfo?.name, 'video-timeline-pipeline'); assert.equal(message.params.appInfo?.version, '22'); assert.equal(message.params.protocolVersion, '2026-01-26'); assert.equal(typeof message.params.appCapabilities, 'object'); }
         if (message.method === 'ui/message') { assert.equal(message.params.role, 'user'); assert(Array.isArray(message.params.content)); }
         const result = message.method === 'tools/call' ? await callTool(message.params.name, message.params.arguments) : message.method === 'ui/message' ? await send(message.params.content[0].text) : {};
         notify({ id: message.id, result });
@@ -590,7 +590,7 @@ async function test(name, run) { await run(); count++; console.log('ok ' + count
     assert(!box.selected);
   });
   await test('evidence filter and bounded pagination', async () => {
-    const result = analysis('first'); result.transcript.segments = Array.from({ length: 85 }, (_, i) => ({ start: i / 2, text: 'line ' + i })); const h = harness({ snapshot: { prepared: job('first'), analysis: result } }); await h.flush(); assert.equal(h.elements.get('evidence').children.length, 60); await h.click('more'); assert.equal(h.elements.get('evidence').children.length, 86); h.elements.get('filter').value = 'visual'; h.elements.get('filter').fire('change'); await h.flush(); assert.equal(h.elements.get('evidence').children.length, 1); assert.equal(h.openai.widgetState.privateContent.filter, 'visual'); assert.match(html, /min-height: 44px/); assert.match(html, /:focus-visible/);
+    const result = analysis('first'); result.transcript.segments = Array.from({ length: 85 }, (_, i) => ({ start: i / 2, text: 'line ' + i })); const h = harness({ snapshot: { prepared: job('first'), analysis: result } }); await h.flush(); assert.equal(h.elements.get('evidence').children.length, 10); await h.click('more'); assert.equal(h.elements.get('evidence').children.length, 60); await h.click('more'); assert.equal(h.elements.get('evidence').children.length, 86); h.elements.get('filter').value = 'visual'; h.elements.get('filter').fire('change'); await h.flush(); assert.equal(h.elements.get('evidence').children.length, 1); assert.equal(h.openai.widgetState.privateContent.filter, 'visual'); assert.match(html, /min-height: 44px/); assert.match(html, /:focus-visible/);
   });
   console.log('PASS: ' + count + ' widget background/evidence/recovery scenarios (mocked MCP host; no paid calls).');
 })().catch(error => { console.error(error); process.exitCode = 1; });
