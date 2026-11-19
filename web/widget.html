@@ -164,14 +164,17 @@
   </section>
   <section id="drive-handoff" aria-labelledby="drive-title" hidden>
     <h2 id="drive-title">Drive 原片交接</h2>
-    <p>已上傳不代表 ChatGPT 已讀取原片。按「複製並開新一般對話」會先複製以下內容，再嘗試開新對話（沒開啟就按隨後出現的連結）；在新對話選擇 Google Drive 後貼上即可。</p>
-    <label for="drive-prompt">交接內容（可選取並複製）</label>
-    <textarea id="drive-prompt" readonly></textarea>
+    <p>已上傳不代表 ChatGPT 已讀取原片。按「複製並開新一般對話」會先複製交接全文，再嘗試開新對話（沒開啟就按隨後出現的連結）；在新對話選擇 Google Drive 後貼上即可。</p>
     <div class="actions">
       <button id="open-chat" type="button" disabled>複製並開新一般對話</button>
       <button id="copy-handoff" type="button" disabled>只複製</button>
     </div>
     <a id="open-chat-link" class="external" href="https://chatgpt.com/" target="_blank" rel="noopener noreferrer" hidden>開啟 ChatGPT，建立一般對話</a>
+    <details id="drive-prompt-fold">
+      <summary>查看交接全文</summary>
+      <label for="drive-prompt">交接內容（可選取並複製）</label>
+      <textarea id="drive-prompt" readonly></textarea>
+    </details>
   </section>
   <details id="library-experiment" hidden>
     <summary>實驗：存到 ChatGPT 檔案庫（#59）</summary>
@@ -881,6 +884,7 @@ async function copyText(text, box, version) {
     if (typeof navigator !== "undefined" && navigator.clipboard?.writeText) { await navigator.clipboard.writeText(text); return true; }
   } catch {}
   if (!current(version)) return null;  // The video changed while the host answered; leave the new UI alone.
+  const fold = box.closest?.("details"); if (fold) fold.open = true;  // 收起的交接全文要展開，選取才看得到
   box.hidden = false; box.value = text; box.focus?.(); box.select?.();  // 合併指令框平時隱藏，剪貼簿被拒才露出來讓人手動複製
   try { return typeof document.execCommand === "function" && document.execCommand("copy") === true; }
   catch { return false; }
